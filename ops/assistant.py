@@ -1800,7 +1800,7 @@ def land(branch: str, adopt=(), override: str | None = None, batch: str | None =
                             "from": old[:12],
                             "land_start": t0,
                             "land_cmd_start": first["cmd_start"] if first else w_cmd,
-                            **({"landq": _landq_rowinfo(bq, first, shas[first["id"]])} if bq and first else {}),
+                            **({"landq": _landq_rowinfo(bq, first, shas[first["id"]], old)} if bq and first else {}),
                             "lock_wait_secs": lock_wait,
                             "verify": {"tries": tries + locked, "locked": locked, "serial": serial},
                             "tree": v["tree"],
@@ -2455,7 +2455,7 @@ def _landq_recover(b: dict, rc: int | None) -> dict:
                     "land_cmd_start": first.get("cmd_start"),
                     "tree": b.get("tree"),
                     "recovered": "deploy",
-                    "landq": _landq_rowinfo(b, first, shas.get(first["id"]) or main),
+                    "landq": _landq_rowinfo(b, first, shas.get(first["id"]) or main, old),
                 },
             )
         except Fail as e:
@@ -2482,7 +2482,9 @@ def _landq_shas(repo: Path, old: str, b: dict) -> dict:
     return out
 
 
-def _landq_rowinfo(b: dict, m: dict, sha: str) -> dict:
+def _landq_rowinfo(b: dict, m: dict, sha: str, start: str = "") -> dict:
+    """A land row's landq block: the member's entry, its batch, the queue time and its own commits on main
+    (start..sha: what the CI tab describes for this branch)."""
     return {
         "id": m["id"],
         "batch": b["id"],
@@ -2491,6 +2493,7 @@ def _landq_rowinfo(b: dict, m: dict, sha: str) -> dict:
         "queued_secs": round(max(0.0, float(b.get("since") or 0) - float(m.get("since") or 0)), 1),
         "members": [x["branch"] for x in b["members"]],
         "sha": sha,
+        **({"from": start[:12]} if start else {}),
     }
 
 
@@ -2502,15 +2505,16 @@ def _landq_member_rows(b: dict, shas: dict) -> None:
     if main_row is None:
         return
     have = {h["landq"].get("id") for h in rows}
-    for m in b["members"]:
+    for i, m in enumerate(b["members"]):
         if m["id"] in have:
             continue
         rec = {k: v for k, v in main_row.items() if k != "ts"}
         sha = shas.get(m["id"]) or main_row.get("sha")
+        start = str(main_row.get("from") or "") if i == 0 else shas.get(b["members"][i - 1]["id"]) or ""
         rec.update(
             branch=m["branch"],
             land_cmd_start=m.get("cmd_start"),
-            landq={**_landq_rowinfo(b, m, sha), "member_of": main_row.get("branch")},
+            landq={**_landq_rowinfo(b, m, sha, start), "member_of": main_row.get("branch")},
         )
         log(rec)
 
@@ -2763,9 +2767,10 @@ def _landq_child(branch: str, bid: str, adopt=()) -> int:
     try:
         r = land(branch, adopt, None, batch=bid)
     except Fail as e:
+        why = re.sub(re.escape(str(st())) + r"/land-[^/\s]+/wt", "its worktree", str(e))  # the batch's temp checkout
         write_json(
             _lq("results", bid + ".json"),
-            {"ok": False, "rc": e.code, "why": str(e)[:1000], "shared": e.shared, "at": clock.now()},
+            {"ok": False, "rc": e.code, "why": why[:1000], "shared": e.shared, "at": clock.now()},
         )
         raise
     write_json(

@@ -396,6 +396,11 @@ try:
     ok(n == 7 and len(calls) == n and not any(a_[-1].startswith('-') and a_[0] == 'log' and len(a_) < 4 for a_ in calls),
        f'desc: git asked once per shown land with a commit or branch, cached after ({n} calls)')
     C._git = real
+    two = git('rev-parse', c + '~1').strip()
+    m = C.desc({'op': 'land', 'ok': True, 'branch': 'member', 'from': base[:12], 'sha': c, 'release': c[:12],
+                'landq': {'batch': 'b7', 'size': 2, 'from': two[:12], 'sha': c}})
+    ok(m['desc'] == 'fixup three' and m['commits'] == 1,
+       f"desc: a batch member shows its own commits (landq.from..landq.sha), not the whole batch's ({m})")
     ok(C.line('x' * 99) == 'x' * 70 + '\u2026' and C.line(' \t ') is None and C.line('a\nb') == 'a b',
        'line(): one line, cut, None when empty')
     ok(C._body('a\nb\n\nc') == ['a b'] and C._body('Co-Authored-By: x\n\nreal') == ['real'] and C._body('') == []

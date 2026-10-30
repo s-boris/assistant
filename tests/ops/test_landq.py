@@ -180,6 +180,8 @@ def test_a_batch_of_three_is_one_runner_call_one_deploy_three_rows_three_pokes(e
     assert len(commits) == 3 and commits[-1] == main
     by = {r["branch"]: r for r in rows}
     assert [by[f"b{i}"]["landq"]["sha"] for i in (1, 2, 3)] == commits  # each member's own last commit on main
+    starts = [by[f"b{i}"]["landq"]["from"] for i in (1, 2, 3)]  # and where its own commits start (the CI tab's text)
+    assert starts == [bs[0]["tip"][:12], commits[0][:12], commits[1][:12]]
     pokes = [ln.split() for ln in q.board_log.read_text().splitlines()]
     landed = {p[2]: p[4] for p in pokes if p[:2] == ["poke", "landed"]}
     assert {k: v for k, v in landed.items() if k != "a0"} == {"b1": commits[0], "b2": commits[1], "b3": commits[2]}
@@ -203,6 +205,7 @@ def test_a_red_batch_lands_the_others_and_names_only_the_red_branch(env, q):
     assert [q.entry(i)["state"] for i in ids] == ["landed", "red", "landed"]
     red = q.entry(ids[1])
     assert red["rc"] == 6 and sorted(red["mates"]) == ["r1", "r3"]
+    assert "/land-" not in red["red"] and "its worktree" in red["red"]  # never the batch's temp checkout
     outcomes = [([m["branch"] for m in b["members"]], b["outcome"]) for b in q.batches()]
     assert outcomes[1:] == [
         (["r1", "r2", "r3"], "split"),

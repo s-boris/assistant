@@ -468,14 +468,16 @@ def _body(text):
 
 
 def desc(r):
-    """What a land was about, from git (read-only): {desc, body, commits}. One commit (or no usable `from`): desc = its
+    """What a land was about, from git (read-only): {desc, body, commits}; a land through the queue: its member's own
+    commits (landq.from..landq.sha), not the whole batch's. One commit (or no usable `from`): desc = its
     subject, body = its first paragraph (_body); several (from..sha, oldest first): desc = the first subject + "+N more",
     body = each subject (SUBJECTS, then "+N more"); a red land without a commit: its branch tip. Cached (a row never
     changes: by sha, a red row by branch + end), misses too; never raises."""
     none = {'desc': None, 'body': [], 'commits': None}
-    sha = str(r.get('sha') or r.get('release') or '')
+    lq = r.get('landq') if isinstance(r.get('landq'), dict) else {}     # a batch member: its own commits (from..sha)
+    sha = str(lq.get('sha') or r.get('sha') or r.get('release') or '')
     sha = sha if HEX.match(sha) else ''
-    frm = str(r.get('from') or '')
+    frm = str(lq.get('from') or r.get('from') or '')
     frm = frm if HEX.match(frm) else ''
     br = word(r.get('branch'), 96)
     key = ('c', sha, frm) if sha else ('b', br, r.get('end') or r.get('ts')) if br and not br.startswith('-') else None
