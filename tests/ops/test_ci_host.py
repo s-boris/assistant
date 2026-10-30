@@ -88,3 +88,72 @@ def test_empty_smoke_set_runs_no_tests(tool, tmp_path, monkeypatch):
     steps = json.loads(rep.read_text())["steps"]
     assert rc == 0 and [(s["name"], s["ok"]) for s in steps] == [("pytest-3.13", True)]
     assert "no host-bound tests" in steps[0]["detail"]
+
+
+def _ruff() -> Path | None:
+    """The ruff a CI run here uses (the tree's 3.13 venv, beside this python), else the runner's toolchain one, else
+    one on PATH."""
+    import os
+    import shutil
+
+    for cand in (
+        REPO / ".venv-3.13" / "bin" / "ruff",
+        Path(sys.executable).parent / "ruff",
+        Path(os.environ.get("ASSISTANT_CI_TOOLCHAIN") or "/nonexistent") / "bin" / "ruff",
+    ):
+        if cand.is_file():
+            return cand
+    found = shutil.which("ruff")
+    return Path(found) if found else None
+
+
+def test_host_runs_ruff_and_ast_so_a_lint_red_fails_the_land_early(tool, tmp_path, monkeypatch):
+    """`ci --host` (a land's part here) runs ruff + format and the AST ban: they take seconds, and a lint red then
+    fails the land before the runner's answer instead of after it. The rest of the runner's steps stay skipped."""
+    import json
+    import subprocess
+
+    assert {"ruff", "ast"}.isdisjoint(tool.HOST_ONLY_SKIP)
+    assert {"pyright", "schemas", "ratchet", "inbox-lint", "bun"} <= tool.HOST_ONLY_SKIP
+    ruff = _ruff()
+    if ruff is None:
+        pytest.skip("no ruff here")
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ASSISTANT_TEST", "1")
+    tree = tmp_path / "tree"
+    (tree / "scripts").mkdir(parents=True)
+    (tree / ".venv-3.13" / "bin").mkdir(parents=True)
+    (tree / ".venv-3.13" / "bin" / "ruff").symlink_to(ruff)
+    (tree / ".gitignore").write_text(".venv-3.13/\n")
+    (tree / "scripts" / "ok.py").write_text('"""ok."""\n\nX = 1\n')
+
+    def commit(msg: str) -> None:
+        for args in (["add", "-A"], ["commit", "-qm", msg]):
+            subprocess.run(
+                ["git", "-C", str(tree), "-c", "user.name=t", "-c", "user.email=t@t.invalid", *args],
+                check=True,
+                capture_output=True,
+            )
+
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tree)], check=True, capture_output=True)
+    commit("ok")
+    only = set(tool.CI_STEPS) - {"ruff", "ast"}  # these two only (no sync, tests, scans)
+
+    def steps(name: str) -> dict:
+        rep = tmp_path / f"{name}.json"
+        rc = tool.ci(tree, None, True, only, False, report=str(rep), host=True)
+        got = {s["name"]: s for s in json.loads(rep.read_text())["steps"]}
+        assert set(got) == {"ruff", "ast"}, got
+        return {"rc": rc, **{k: (v["ok"], v["detail"]) for k, v in got.items()}}
+
+    clean = steps("clean")
+    assert clean["rc"] == 0 and clean["ruff"][0] and clean["ast"][0], clean
+    (tree / "scripts" / "bad.py").write_text("import os\nx=1\n")  # an unused import, unformatted
+    commit("lint red")
+    red = steps("ruff-red")
+    assert red["rc"] != 0 and not red["ruff"][0] and red["ast"][0], red
+    (tree / "scripts" / "bad.py").write_text('"""no lint left, a banned helper."""\n\n\ndef load_json():\n    pass\n')
+    commit("ast red")
+    red = steps("ast-red")
+    assert red["rc"] != 0 and red["ruff"][0] and not red["ast"][0] and "load_json" in red["ast"][1], red

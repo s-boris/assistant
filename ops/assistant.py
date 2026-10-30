@@ -20,8 +20,9 @@
         bun test when adapters/tg changed. Green = stamp per git tree hash (state ci/<tree>.json).
         --host (what a land runs here; the hub runner is the test run): only the host-bound part -- the 3.13 venv,
         the host-bound tests (the untagged test lines of tests/runner-skip.txt), the host-bound tool suites (its
-        tests/legacy/<suite> lines, real-home suites, suites still in ~/opt), secretscan and precheck + publish scan
-        on the diff; never stamps. The runner (--toolchain) runs every other step and suite, its scripts'
+        tests/legacy/<suite> lines, real-home suites, suites still in ~/opt), ruff + format and the AST ban (seconds:
+        a lint red fails the land before the runner's answer), secretscan and precheck + publish scan on the diff;
+        never stamps. The runner (--toolchain) runs every other step and suite, its scripts'
         `#!/usr/local/bin/python3.13 -I` shebang resolving there (python:3.13 image) as here (uv's 3.13, linked there
         by ~/boot.sh; a leftover /usr/bin/python3 one is pointed at the runner's).
         On a clean checkout of main the suites' results go into main's record (all suites:
@@ -46,8 +47,9 @@
         `touch ~/.config/assistant/land-serial` (or ASSISTANT_LAND_SERIAL=1).
         The tests run once, on the hub's runner: a land runs `ci --host` here (the smoke set and the
         host-bound steps) and needs the runner's signed green record for the tree in every gate mode but off.
-        Here: uv sync, secretscan + the publish scan on the diff, precheck on the changed would-be ~/bin files, the
-        host-bound tool suites and tests (tests/runner-skip.txt); everything else (ruff, pyright, pytest, ast,
+        Here: uv sync, ruff + format and the AST ban (fast, so a lint red fails here first; the runner runs them
+        too, for its record), secretscan + the publish scan on the diff, precheck on the changed would-be ~/bin
+        files, the host-bound tool suites and tests (tests/runner-skip.txt); everything else (pyright, pytest,
         schemas, ratchet, inbox-lint, bun, the other tool suites) on the runner, under its own user with the
         would-be ~/bin.
         Rollback to the full local run (every step here, the runner per the gate mode as before):
@@ -218,8 +220,10 @@ PY_VERSIONS = (("3.13", "3.13", ".venv-3.13"),)  # 3.13 only: the runner's inter
 # (packages/hub/ciworker.py PROBE_FILE): add it here and drop it from ciworker.LOCAL_STEPS together. ratchet and
 # inbox-lint run over the would-be ~/bin the runner builds from the tree into its job HOME (_runner_home); bun on the
 # toolchain's vendored node_modules. legacy and pytest: `ci --host` runs only the host-bound suites and tests
-# (tests/runner-skip.txt lines, ~/opt suites, real-home ones), the runner the rest.
-HOST_ONLY_SKIP = {"ruff", "pyright", "ast", "schemas", "ratchet", "inbox-lint", "bun"}
+# (tests/runner-skip.txt lines, ~/opt suites, real-home ones), the runner the rest. ruff and ast run on both sides:
+# seconds here (the tree's venv ruff, same lock as the runner's), so a lint red fails a land before the runner's
+# answer instead of after it (6 of 15 runner reds on one day were ruff or ast).
+HOST_ONLY_SKIP = {"pyright", "schemas", "ratchet", "inbox-lint", "bun"}
 RUNNER_SKIP = ("tests", "runner-skip.txt")
 LEGACY_SLOW = 5.0  # a legacy suite this slow (s) or red: its time goes into the step record ("suites")
 CI_TMP_PREFIX = "assistant-ci."
