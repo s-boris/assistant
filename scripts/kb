@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3.13 -I
+#!/usr/bin/python3 -I
 """kb: ask everything I know and built; cited sources from recall's index + the memory2 fact store (token-free).
 
   kb ask "question" [-n 6] [--chat] [--since YYYY-MM-DD] [--json]
@@ -11,6 +11,9 @@
       per engine (recall = plain `recall -n 10`; kb = facts + passages; facts = what the per-turn hook injects).
 Retrieval = recall's search_hits() (FTS5 + EmbeddingGemma fusion; the shared embedding server when up) +
 memory2_core.search(); max 2 passages per file; a passage equal to a returned fact's line is dropped.
+Interpreter: recall's own (`#!/usr/bin/python3 -I`, never python3.13): kb runs recall in-process and its
+semantic half needs numpy, which only the system python3 has (python3-numpy, restored by ~/boot.sh); on 3.13 it fell
+back to text hits (29.10-30.10). tests/core/test_recall_interp.py keeps the two shebangs equal.
 """
 import argparse
 import importlib.machinery

@@ -22,6 +22,18 @@ BIN = os.environ.get("MEMORY2_BIN") or os.path.join(
 KB = os.environ.get("KB_BIN") or os.path.join(  # the tree's kb
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "scripts", "kb"
 )
+
+
+def _launch(path):
+    """A script by its shebang; the CI runner has no /usr/bin/python3 (kb's, recall's): its own interpreter then."""
+    with open(path, "rb") as f:
+        first = f.readline().decode()
+    parts = first[2:].split() if first.startswith("#!") else []
+    if parts and parts[0].startswith("/") and "python" in parts[0] and not os.path.exists(parts[0]):
+        return [sys.executable, *parts[1:], path]
+    return [path]
+
+
 CORE = os.path.join(os.path.dirname(os.path.realpath(BIN)), "lib", "memory2_core.py")
 HOOK = os.environ.get("M2_HOOK_SCRIPT", "/home/node/.claude/hooks/memory-recall.sh")
 PROJ = ".claude/projects/-home-node-workspace"
@@ -170,7 +182,9 @@ class Base(unittest.TestCase):
         return p
 
     def run_m(self, *args, env=None, rc=0, binp=None):
-        p = subprocess.run([binp or BIN, *args], env=env or self.env, capture_output=True, text=True, timeout=60)
+        p = subprocess.run(
+            [*_launch(binp or BIN), *args], env=env or self.env, capture_output=True, text=True, timeout=60
+        )
         if rc is not None:
             self.assertEqual(p.returncode, rc, p.stdout + p.stderr)
         return p.stdout
