@@ -16,7 +16,7 @@
 # removed, VM-only files kept, revert commit, not reloaded), a rename, rollback incomplete (copy back fails, a name
 # that is no exact filter rule), a failed reload (rolled back), a failed or partial copy (server restored, commit
 # undone, retry works), nginx warnings,
-# test, cert (suffix, injection refused, failure -> no pull), log, missing mirror, defaults, isolation.
+# test, cert (suffix, lowercased, injection refused, failure -> no pull + hint), helper (prints only), log, missing mirror, defaults, isolation.
 set -uo pipefail
 # Synthetic profile (tests never read the real one): tests/legacy/profile once that suite moves here, else ~/opt/profile-tests.
 _pf="$(cd "$(dirname "$0")/.." && pwd)"; [ -f "$_pf/profile/fixtures/profile.json" ] && _pf=$_pf/profile || _pf=$HOME/opt/profile-tests
@@ -137,6 +137,7 @@ echo "# help"
 run; eq "no args: rc 0" "$rc" "0"
 has "lists push" "$out" 'proxy push "message"'
 has "lists cert" "$out" "proxy cert NAME"
+has "lists helper" "$out" "proxy helper [--script]"
 hasnt "no code lines in the help" "$out" "host="
 eq "help = the comment block, ends with the workflow line" "$(echo "$out" | tail -1 | cut -c1-20)" "Workflow: proxy pull"
 eq "no ssh/rsync" "$(f ssh.log)$(f rsync.log)" ""
@@ -372,6 +373,7 @@ eq "rc 0" "$rc" "0"
 eq "NAME gets .example.org" "$(f certs.log)" "seerr.example.org"
 eq "then pulls with 'certbot: NAME'" "$(g log -1 --format=%s)" "certbot: seerr.example.org"
 has "cert config mirrored" "$(cat "$E/sites-available/seerr.example.org.conf" 2>/dev/null)" "ssl_certificate /etc/letsencrypt/live/seerr.example.org/"
+clean; run cert SeErR; eq "NAME lowercased (the helper takes a-z only)" "$rc|$(f certs.log)" "0|seerr.example.org"
 clean; run cert example.org; eq "apex kept" "$(f certs.log)" "example.org"
 clean; run cert x.example.org; eq "FQDN kept" "$(f certs.log)" "x.example.org"
 for bad in 'x; touch /tmp/pwned' '$(id)' 'a b' '-rf' '../etc' 'x`id`' 'x|y' '.example.org' 'a..b'; do
@@ -379,6 +381,15 @@ for bad in 'x; touch /tmp/pwned' '$(id)' 'a b' '-rf' '../etc' 'x`id`' 'x|y' '.ex
 done
 clean; echo 1 > "$FAKE/cert-rc"; h0=$(g rev-parse HEAD); run cert fail
 eq "cert fails: rc 1, no pull" "$rc|$(f rsync.log)|$(g rev-parse HEAD)" "1||$h0"
+has "cert fails: points at proxy helper" "$err" "'proxy helper' prints the owner's paste"
+
+echo "# helper (prints only)"
+clean; run helper; eq "rc 0, no ssh/rsync" "$rc|$(f ssh.log)$(f rsync.log)" "0|"
+has "domain filled in" "$out" "D=example.org"
+has "atomic install" "$out" "sudo mv /usr/local/sbin/claude-cert.new /usr/local/sbin/claude-cert"
+clean; run helper --script; eq "--script: just the script" "$(echo "$out" | head -1)" "#!/bin/sh"
+has "snap certbot first" "$out" "for c in /snap/bin/certbot /usr/bin/certbot; do"
+clean; PROXY_MIRROR=$T/nope run helper; eq "helper needs no mirror" "$rc" "0"
 
 echo "# log"
 clean; run log 2; eq "two lines" "$(echo "$out" | wc -l)" "2"

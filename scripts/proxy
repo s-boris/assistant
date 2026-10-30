@@ -8,16 +8,44 @@
 #                              the files this push added are removed, nginx -t checks it (not reloaded)
 #   proxy test                 nginx -t on the server
 #   proxy cert NAME            certificate for NAME.<domain> (or <domain>; profile network.domain) via /usr/local/sbin/claude-cert
+#   proxy helper [--script]    print the owner's root paste that installs /usr/local/sbin/claude-cert on the server (prints
+#                              only; --script: just the script). It runs the first certbot with the nginx plugin (snap first)
 #   proxy log [N]              git history of the mirror
 # Workflow: proxy pull → edit ~/opt/nginx-mirror/etc-nginx/... → proxy push "why". Ask the owner before exposing anything new.
 case "${1:-}" in
-  pull|push|test|cert|log) ;;
+  pull|push|test|cert|helper|log) ;;
   *) grep -v '^# managed: ' "$0" | sed -n '2,/^[^#]/p' | grep '^#' | sed 's/^# \{0,1\}//'
      case ${1:-} in ""|help|-h|--help) exit 0;; *) exit 2;; esac ;;
 esac
 # test seams (tests/legacy/proxy in ~/opt/assistant): the server and the mirror. The server's default and the domain come from the
 # profile (~/.config/assistant/profile.json via profile-get: next to this script, else on PATH).
 pg=$(dirname "$(readlink -f "$0")")/profile-get; [ -x "$pg" ] || pg=profile-get
+if [ "$1" = helper ]; then   # print only: never reaches the server
+  dom=$("$pg" network.domain) || exit 1; dom=$(printf %s "$dom" | tr 'A-Z' 'a-z')
+  case $dom in ""|-*|.*|*..*|*[!a-z0-9.-]*) echo "proxy: bad network.domain in the profile" >&2; exit 1;; esac
+  script=$(sed "s/@@DOMAIN@@/$dom/g" <<'EOF'
+#!/bin/sh
+# claude-cert NAME: certificate for NAME (@@DOMAIN@@ or a subdomain) via certbot's nginx plugin. Root-owned, run by the
+# brain through sudo (`proxy cert`); made by `proxy helper` (scripts/proxy in the assistant repo).
+# The first certbot with the nginx plugin wins: the snap one (current, ARI renewals) before apt's (no nginx plugin there).
+D=@@DOMAIN@@
+case "$1" in ""|-*|.*|*..*|*[!a-z0-9.-]*) echo "bad name"; exit 1;; esac
+case "$1" in "$D"|*."$D") ;; *) echo "only $D"; exit 1;; esac
+for c in /snap/bin/certbot /usr/bin/certbot; do
+  [ -x "$c" ] && "$c" plugins 2>/dev/null | grep -q '^\* nginx$' \
+    && exec "$c" --nginx --non-interactive --agree-tos --redirect -d "$1"
+done
+echo "no certbot with the nginx plugin (tried /snap/bin/certbot, /usr/bin/certbot)" >&2; exit 1
+EOF
+  ) || exit 1
+  [ "${2:-}" = --script ] && { printf '%s\n' "$script"; exit 0; }
+  echo "# On the web VM as an admin (the owner's step): replaces /usr/local/sbin/claude-cert atomically."
+  echo "sudo tee /usr/local/sbin/claude-cert.new >/dev/null <<'CLAUDE_CERT'"
+  printf '%s\n' "$script"
+  echo "CLAUDE_CERT"
+  echo "sudo chmod 755 /usr/local/sbin/claude-cert.new && sudo mv /usr/local/sbin/claude-cert.new /usr/local/sbin/claude-cert"
+  exit 0
+fi
 host=${PROXY_HOST:-$("$pg" network.hosts.web_vm)} || exit 1
 m=${PROXY_MIRROR:-$HOME/opt/nginx-mirror}
 cd "$m" || exit 1
@@ -123,10 +151,14 @@ case "$1" in
     fi
     exit 1 ;;
   test) ssh "$host" 'sudo -n /usr/sbin/nginx -t' ;;
-  cert) n=${2:?name}; dom=$("$pg" network.domain) || exit 1
+  cert) dom=$("$pg" network.domain) || exit 1; n=$(printf %s "${2:?name}" | tr 'A-Z' 'a-z')
+        dom=$(printf %s "$dom" | tr 'A-Z' 'a-z')
         case $n in *."$dom"|"$dom") ;; *) n=$n.$dom;; esac
         # n goes into a remote shell command: hostname characters only
         case $n in -*|.*|*..*|*[!A-Za-z0-9.-]*) echo "proxy: bad name: $2" >&2; exit 2;; esac
-        ssh "$host" "sudo -n /usr/local/sbin/claude-cert $n" && pull "certbot: $n" ;;
+        ssh "$host" "sudo -n /usr/local/sbin/claude-cert $n" && { pull "certbot: $n"; exit; }
+        echo "proxy: claude-cert failed for $n. If certbot said the nginx plugin is missing, the server's helper is the old one" \
+             "(apt certbot): 'proxy helper' prints the owner's paste that installs the current one." >&2
+        exit 1 ;;
   log) git log --oneline -"${2:-15}" ;;
 esac
