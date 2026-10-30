@@ -479,7 +479,7 @@ smoke = "node --check {dest}"
 
 # Skill and HA tail CLIs. Suites in
 # tests/legacy/<suite>/. kk-compare and lists import ~/bin/lib/assistant_profile (not in the repo): their suites default
-# to ~/bin and the land CI runs them on the overlay copy. kb's tests are memory2's (KB_BIN): smoke only. ha-audit's
+# to ~/bin and the land CI runs them on the overlay copy. kb is tested with memory2 (tests/memrows/). ha-audit's
 # fake HA (tests/legacy/ha-audit/fake_ha.py) also serves ha-avail's suite.
 [[file]]
 src = "scripts/divelog"
@@ -2069,8 +2069,6 @@ src = "scripts/memory2"
 dest = "bin/memory2"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
-suite = "memory2"
-seam = "MEMORY2_BIN"
 
 [[file]]
 src = "scripts/scraper-canary"
