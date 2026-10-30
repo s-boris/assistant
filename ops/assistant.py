@@ -5846,10 +5846,11 @@ LEGACY_TAILS = 5500  # all tails together (hub/hubci.py signs a step extra up to
 
 def _legacy_tail(out: str, err: str, n: int = 6) -> str:
     """A red suite's why: its last n non-empty stderr lines (where a missing tool or a traceback shows), plus its
-    first FAIL line from stdout; stdout's last lines when stderr is empty."""
+    first FAIL line from stdout (one starting with FAIL first: a passing check may name FAILED); stdout's last lines
+    when stderr is empty."""
     e = [ln.strip() for ln in err.splitlines() if ln.strip()][-n:]
     o = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    fail = [ln for ln in o if "FAIL" in ln][:1]
+    fail = ([ln for ln in o if ln.startswith("FAIL")] or [ln for ln in o if "FAIL" in ln])[:1]
     lines = (fail + e) if e else (fail + [ln for ln in o[-n:] if ln not in fail])
     return " | ".join(lines)[-LEGACY_TAIL:]
 

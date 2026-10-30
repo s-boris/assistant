@@ -244,6 +244,9 @@ def test_legacy_tails_fit_one_signed_extra(tool):
     assert len(json.dumps(tails)) <= tool.LEGACY_TAILS  # hub/hubci.py drops an extra over 6000 JSON chars
     assert tool.legacy_tails({"a": {"ok": True}}) == {}
     assert tool._legacy_tail("ok 1\nFAIL - x\n", "") == "FAIL - x | ok 1"  # no stderr: stdout's last lines
+    # a passing check whose name says FAILED is not the red one
+    out = "ok   - says FAILED (x)\nFAIL - y\nok 2\n"
+    assert tool._legacy_tail(out, "") == "FAIL - y | ok   - says FAILED (x) | ok 2"
 
 
 def test_bun_on_the_runner_uses_the_toolchains_node_modules(tool, tmp_path, monkeypatch):

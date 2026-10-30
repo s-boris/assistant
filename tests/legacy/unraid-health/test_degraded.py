@@ -178,7 +178,10 @@ ok("A2 report lists 12 data disks (the emulated one counts)", "2 parity + 12 dat
    [ln for ln in rep.splitlines() if "State:" in ln])
 
 st = state(sd)
-st["degraded"]["disk12"]["since"] = NOW - 8 * 86400
+# 8 calendar days back at local noon: NOW - 8 * 86400 lands on the next day between 23:00 and 24:00 in the week
+# after the autumn DST change (the rule counts local dates), so A3 read "(7 days)" then
+SINCE8 = dt.datetime.combine(TODAY - dt.timedelta(days=8), dt.time(12), TZ).timestamp()
+st["degraded"]["disk12"]["since"] = SINCE8
 (sd / "state.json").write_text(json.dumps(st))
 res = run(sd, GONE, "a3")
 d = find(res, "array:degraded")
@@ -190,7 +193,7 @@ ok("A4 rebuild running onto disk12: array:degraded is info", find(res, "array:de
    and any(x.startswith("Array degraded: disk12 being rebuilt") for x in res["info"]), (keys(res), res["info"]))
 ok("A4 disk12 status info, no CRIT for it", not [a for a in res["alerts"] if a["level"] == "crit"
                                                   and "disk12" in a["title"]], keys(res))
-ok("A4 start date kept during the rebuild", state(sd)["degraded"]["disk12"]["since"] == NOW - 8 * 86400,
+ok("A4 start date kept during the rebuild", state(sd)["degraded"]["disk12"]["since"] == SINCE8,
    state(sd).get("degraded"))
 done = set_var(set_disk(WITH12, "disk12", **dict(D12, id="TEST_DISK12B", idSb="TEST_DISK12B")),
                mdNumDisabled="0", mdNumInvalid="0")
