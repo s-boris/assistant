@@ -2715,7 +2715,7 @@ cron_line = "*/5 * * * * cron-fail --after 6 land-queue $HOME/bin/assistant land
 
 [jobs.media-digest-daily]
 line = "media-digest-daily"
-cron = "0 19 * * *"
+cron = "0 19 * * 0-4,6"
 class = "M"
 group = "collectors"
 queue = "slow"
@@ -2730,9 +2730,9 @@ after = 1
 ok = [3]
 feature = "media"
 owner_facing = true
-why = "daily media digest cards (switch: ~/.config/media/digest.json)"
+why = "daily media digest cards, not Fridays: the weekly card posts then (switch: ~/.config/media/digest.json)"
 target = "media-digest"
-cron_line = "0 19 * * * mkdir -p \"$HOME/.local/state/media\" && cron-fail --ok 3 media-digest-daily timeout 600 $HOME/bin/media digest --daily >> \"$HOME/.local/state/media/digest-cron.log\" 2>&1"
+cron_line = "0 19 * * 0-4,6 mkdir -p \"$HOME/.local/state/media\" && cron-fail --ok 3 media-digest-daily timeout 600 $HOME/bin/media digest --daily >> \"$HOME/.local/state/media/digest-cron.log\" 2>&1"
 
 [jobs.media-digest-weekly]
 line = "media-digest-weekly"
