@@ -485,7 +485,8 @@ class TripTests(Base):
         t = self.tmp.name
         FakeAPI.hits = []
         self.towns = os.path.join(t, "towns.json")
-        self.env.update(ROUTE_API=f"http://127.0.0.1:{self.srv.server_port}/v1", SHOP_TOWN_CACHE=self.towns,
+        self.env.update(ROUTE_API=f"http://127.0.0.1:{self.srv.server_port}/v1", TRANSPORT_FALLBACK_API="off",
+                        SHOP_TOWN_CACHE=self.towns,
                         SHOP_CALCACHE=CALCACHE, CALCACHE_DIR=os.path.join(t, "cc"),
                         CALCACHE_NOW="2026-10-19T18:00:00+02:00", HOME_PLACE_GEO="off",
                         HOME_PLACE_CACHE=os.path.join(t, "hp.json"))

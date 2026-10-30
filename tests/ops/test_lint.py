@@ -66,7 +66,6 @@ def test_ratchet_exempts_reviewed_managed_files(tool):
         "test-all": {"flock"},
         "window-watch": {"urlopen", "note_helpers"},
         "wled-sync": {"note_helpers", "flock"},
-        "gohome": {"urlopen"},  # adopted as is; its transport API fetch moves with a later core pass
         # adopted as is; store, fetches and locks move with a later core pass
         "divelog": {"load_json", "save_atomic", "flock"},
         "ha-dashboard-gen": {"urlopen"},

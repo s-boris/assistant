@@ -7,11 +7,12 @@ subprocess (`python -m phonegw.producers KIND`, timeout) so a broken tool never 
   leg       the next 🚆/🚌 leg (train-watch list, else calcache) + its live status (train-watch status, 6 s budget)
   trip      the next or current trip (trip-conditions trips.json): phase, days left, next leg
   fences    geofences: home + office (profile-get), gym/station/airport (~/.config/phonegw places), tonight's venue
-            (calcache + night-plan venues, geocoded via transport.opendata.ch, cached 0600)
+            (calcache + night-plan venues, geocoded via transport.opendata.ch, else timetable.search.ch; cached 0600)
   leaving   the Leaving card: next leg, battery, alarm, leave reminders, due items (gateway /internal/now passed in)
   depart    the first departure before the next 10:00 (train-watch legs + calcache travel events): leave-by, label
   geo       the offline place pack for the phone (/v1/geo/ch): {"towns":[[name,lat,lon]...],"stops":[...]}, stops
-            near home/office/venues/legs/config extras from transport.opendata.ch; towns = their stops' centroid
+            near home/office/venues/legs/config extras from transport.opendata.ch (else timetable.search.ch);
+            towns = their stops' centroid
 
 Personal values come only from profile-get and ~/.config at run time; nothing personal lives in this file.
 Test hooks (env): PRODUCERS_NOW (epoch), TG_STATUS_BIN, TRAIN_WATCH_BIN, CALCACHE_BIN, PROFILE_GET_BIN, TRIPS_JSON,
@@ -360,6 +361,45 @@ def geo_cache_path():
     return os.environ.get("GEO_CACHE") or os.path.join(C.Paths().state, "geo-cache.json")
 
 
+OPENDATA_LOCATIONS = "https://transport.opendata.ch/v1/locations"
+SEARCHCH_COMPLETION = "https://timetable.search.ch/api/completion.json"
+
+
+def _get_json(url):
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "phonegw"}), timeout=8) as r:
+        return json.load(r)
+
+
+def stations(qs):
+    """opendata /locations stations for qs ({type, query} or {type, x, y}: x = lat, y = lon). When opendata fails (an
+    {"errors": ...} payload, a non-2xx status, a timeout, no JSON) the same lookup goes to timetable.search.ch
+    completion.json (keyless; term or latlon), mapped to opendata's shape: core/transport's mapping, kept here as the
+    gateway runs from a hub release without the core library. Raises when both fail."""
+    try:
+        data = _get_json(OPENDATA_LOCATIONS + "?" + urllib.parse.urlencode(qs))
+        if isinstance(data, dict) and not data.get("errors") and isinstance(data.get("stations") or [], list):
+            return data.get("stations") or []
+    except Exception:
+        pass
+    sq = {"show_ids": 1, "show_coordinates": 1}
+    if qs.get("query"):
+        sq["term"] = qs["query"]
+    else:
+        sq["latlon"] = "%s,%s" % (qs["x"], qs["y"])
+    data = _get_json(SEARCHCH_COMPLETION + "?" + urllib.parse.urlencode(sq))
+    if not isinstance(data, list):
+        raise ValueError("search.ch: not a list")
+    out = []
+    for e in data:
+        if not isinstance(e, dict) or not e.get("label") or (qs.get("type") == "station" and not e.get("id")):
+            continue
+        lat, lon = e.get("lat"), e.get("lon")
+        ok = isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+        out.append({"id": str(e["id"]) if e.get("id") else None, "name": e["label"], "distance": e.get("dist"),
+                    "coordinate": {"type": "WGS84", "x": float(lat) if ok else None, "y": float(lon) if ok else None}})
+    return out
+
+
 def geocode(query, near=None):
     """Stop / station name (or near=(lat, lon): the nearest station) -> (lat, lon) or None. Cached 0600, 60 d."""
     fake = os.environ.get("GEO_FAKE")
@@ -379,12 +419,9 @@ def geocode(query, near=None):
         qs["query"] = query
     else:
         qs["x"], qs["y"] = "%.5f" % near[0], "%.5f" % near[1]
-    url = "https://transport.opendata.ch/v1/locations?" + urllib.parse.urlencode(qs)
     ll = None
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "phonegw"}), timeout=8) as r:
-            st = (json.load(r).get("stations") or [])
-        for s in st:
+        for s in stations(qs):
             c = s.get("coordinate") or {}
             if isinstance(c.get("x"), (int, float)) and isinstance(c.get("y"), (int, float)):
                 ll = (float(c["x"]), float(c["y"]))
@@ -408,18 +445,15 @@ def stations_near(lat, lon, limit=10):
     hit = cache.get(key)
     if hit and hit.get("at", 0) > time.time() - 60 * 86400:
         return [tuple(x) for x in hit.get("list") or []]
-    url = "https://transport.opendata.ch/v1/locations?" + urllib.parse.urlencode(
-        {"x": "%.5f" % lat, "y": "%.5f" % lon, "type": "station"})
     out = []
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "phonegw"}), timeout=8) as r:
-            for st in (json.load(r).get("stations") or [])[:limit + 1]:
-                c = st.get("coordinate") or {}
-                # Without an id it's the street address at the query point (opendata adds one even for type=station).
-                if not st.get("id") or privacy.address_like(st.get("name") or ""):
-                    continue
-                if st.get("name") and isinstance(c.get("x"), (int, float)) and isinstance(c.get("y"), (int, float)):
-                    out.append((st["name"], float(c["x"]), float(c["y"])))
+        for st in stations({"x": "%.5f" % lat, "y": "%.5f" % lon, "type": "station"})[:limit + 1]:
+            c = st.get("coordinate") or {}
+            # Without an id it's the street address at the query point (opendata adds one even for type=station).
+            if not st.get("id") or privacy.address_like(st.get("name") or ""):
+                continue
+            if st.get("name") and isinstance(c.get("x"), (int, float)) and isinstance(c.get("y"), (int, float)):
+                out.append((st["name"], float(c["x"]), float(c["y"])))
     except Exception:
         return []
     cache[key] = {"list": [list(x) for x in out], "at": int(time.time())}

@@ -1,4 +1,4 @@
-"""The transport tools with transport.opendata.ch down: night-plan and route answer through the
+"""The transport tools with transport.opendata.ch down: night-plan, route, gohome and shop answer through the
 timetable.search.ch fallback (core.transport). Each tool runs from the repo as a subprocess against a loopback fake:
 /v1/* answers opendata's router-outage payload (503), /api/route.json and /api/completion.json the recorded
 search.ch fixtures (public stations only). Synthetic profile; no network."""
@@ -89,8 +89,10 @@ def run(fake, tmp_path):
     Fake.log.clear()
 
     def go(tool, *args, extra=None):
+        """Run scripts/<tool> ARGS, or python's own options ("-c", CODE, ...) as given."""
+        argv = [tool, *args] if tool.startswith("-") else [str(REPO / "scripts" / tool), *args]
         p = subprocess.run(
-            [sys.executable, str(REPO / "scripts" / tool), *args],
+            [sys.executable, *argv],
             env={**env, **(extra or {})},
             capture_output=True,
             text=True,
@@ -158,3 +160,39 @@ def test_night_plan_through_searchch(run):
     paths = [urllib.parse.urlsplit(p).path for p in Fake.log]
     assert "/api/route.json" in paths and "/api/completion.json" in paths
     assert paths.count("/v1/connections") == 1 and paths.count("/v1/locations") == 1  # opendata asked once each
+
+
+def test_gohome_through_searchch(run):
+    code, out, err = run(
+        "gohome",
+        "Basel SBB",
+        "--json",
+        extra={"GOHOME_NOW": "2026-11-07 23:00", "GOHOME_PLACE": "off", "GOHOME_CALCACHE": "off"},
+    )
+    assert code == 0, err
+    j = json.loads(out)
+    assert [c["dep"][11:16] for c in j["next"]] == ["23:07", "23:16", "00:04"]
+    assert j["next"][0]["platform"] == "6" and j["last"]["dep"][11:16] == "01:20"
+    paths = [urllib.parse.urlsplit(p).path for p in Fake.log]
+    assert paths.count("/v1/connections") == 1 and paths.count("/v1/locations") == 1  # opendata asked once each
+
+
+SHOP = """
+import datetime as dt, importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("shop", sys.argv[1])
+spec = importlib.util.spec_from_loader("shop", loader)
+shop = importlib.util.module_from_spec(spec)
+loader.exec_module(shop)
+print(json.dumps([shop.pt_minutes("Basel SBB", "Zürich HB", dt.date(2026, 11, 7), {}), shop.Geo()("Basel SBB")]))
+"""
+
+
+def test_shop_through_searchch(run, tmp_path):
+    code, out, err = run(
+        "-c",
+        SHOP,
+        str(REPO / "scripts" / "shop"),
+        extra={"SHOP_TOWN_CACHE": str(tmp_path / "towns.json"), "SHOP_STATE_DIR": str(tmp_path / "s")},
+    )
+    assert code == 0, err
+    assert json.loads(out) == [53, [47.547403, 7.589564]]  # the fastest of the 3 rows from 12:00 (the recorded night)

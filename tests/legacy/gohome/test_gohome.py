@@ -199,6 +199,7 @@ def run(*args, now="2031-03-05 22:10", place=NO_PLACE, cal=None, api=None, **env
     e = {
         **os.environ,
         "GOHOME_API": api or API,
+        "TRANSPORT_FALLBACK_API": "off",  # opendata alone here; the search.ch fallback: tests/trains
         "GOHOME_NOW": now,
         "ASSISTANT_PROFILE": PROFILE,
         "HOME_PLACE_GEO": "off",

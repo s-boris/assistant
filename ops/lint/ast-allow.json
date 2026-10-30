@@ -86,9 +86,6 @@
   "tests/legacy/scraper-canary/test_deep.py": [
    "flock"
   ],
-  "scripts/gohome": [
-   "urlopen"
-  ],
   "scripts/divelog": [
    "load_json",
    "save_json",
@@ -293,7 +290,6 @@
   "scripts/window-watch": "its outdoor weather fetch (urlopen, open-meteo) and its inbox note (write_note) move with a later core.http / inbox.writer pass",
   "scripts/wled-sync": "its inbox note (write_note) and its run lock (flock) move with a later inbox.writer / core.locks pass",
   "tests/legacy/scraper-canary/test_deep.py": "the busy-lock test holds scraper-canary's own run lock the way the script takes it (fcntl.flock on state/.lock); it follows the script's later core.locks pass",
-  "scripts/gohome": "its transport API fetch (urlopen, transport.opendata.ch; the suite points GOHOME_API at a loopback fake) moves with a later core.http pass",
   "scripts/divelog": "its local logbook store (load_json/save_json on ~/.local/state/divelog, temp + replace) and its store lock (flock) move with a later core.jsonstate / core.locks pass; the suite uses a temp DIVELOG_DIR",
   "scripts/ha-dashboard-gen": "its one REST POST (urlopen, path-allowlisted to the all-lights-off script config and the config-entry flow on the owner's HA; the suite patches urllib.request.urlopen) moves with a later core.http pass",
   "scripts/kk-compare": "its BAG premium data download (urlopen into the ~/.cache/kk data dir, sha256 checked; the suite runs offline on the fixture and cache) moves with a later core.http pass",

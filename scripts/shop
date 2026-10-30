@@ -41,8 +41,9 @@ a Google Maps directions URL that starts and ends at the home TOWN (never his ad
 Files: ~/.local/state/shop/items.json (0600, under a lock), cron log ~/.local/state/shop/cron.log.
 Trips: store options = the picked offer when it has a store, else the item's other store offers (an item set to
 `--mode online` is skipped); only store names and towns are printed, never addresses. Town centres come from the
-transport API's station search, cached in ~/.cache/assistant/shop-towns.json (0600; SHOP_TOWN_CACHE).
-Env (tests): ROUTE_API (transport API base), SHOP_TRIPS (off), SHOP_CALCACHE (calcache binary, or "off"), SHOP_STATE_DIR, SHOP_HA (ha binary), SHOP_HA_LIST, SHOP_INBOX, SHOP_NOW (YYYY-MM-DD HH:MM),
+transport API's station search, cached in ~/.cache/assistant/shop-towns.json (0600; SHOP_TOWN_CACHE). Transport
+lookups: lib core/transport (transport.opendata.ch, else timetable.search.ch).
+Env (tests): ROUTE_API (transport API base), TRANSPORT_FALLBACK_API, SHOP_TRIPS (off), SHOP_CALCACHE (calcache binary, or "off"), SHOP_STATE_DIR, SHOP_HA (ha binary), SHOP_HA_LIST, SHOP_INBOX, SHOP_NOW (YYYY-MM-DD HH:MM),
 ASSISTANT_PROFILE. Tests: ~/opt/shop-tests/run.sh (stubbed ha, synthetic profile).
 Exit: 0 ok, 1 HA unreachable (sync/watch), 2 usage / unknown id / invalid JSON.
 """
@@ -57,7 +58,6 @@ import subprocess
 import sys
 import time
 import unicodedata
-import urllib.error
 import urllib.parse
 from pathlib import Path
 
@@ -68,7 +68,7 @@ for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "bin", "lib"), os.pa
 if not os.path.isdir(os.path.join(HERE, "lib", "core")) and os.path.isdir(os.path.join(HERE, "..", "core")):
     sys.path.insert(0, os.path.dirname(HERE))            # the repo checkout (scripts/): its own core
 import assistant_profile as profile  # noqa: E402
-from core import http as core_http, jsonstate, locks  # noqa: E402
+from core import jsonstate, locks, transport  # noqa: E402
 import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write_new into the inbox)
 
 STATE = Path(os.environ.get("SHOP_STATE_DIR") or os.path.expanduser("~/.local/state/shop"))
@@ -568,12 +568,16 @@ def home_towns():
 URLLIB_UA = "Python-urllib/%d.%d" % sys.version_info[:2]   # the UA these calls always sent
 
 
-def api(path, params):
-    """transport API JSON (route's API, seam ROUTE_API), None on any failure."""
+_TRANSPORT = {}
+
+
+def api(kind, **kw):
+    """core.transport lookup (route's API, seam ROUTE_API; else search.ch), None when both fail."""
+    if "c" not in _TRANSPORT:
+        _TRANSPORT["c"] = transport.Client(api=ROUTE_API, ua=URLLIB_UA, timeout=20)
     try:
-        with core_http.open(ROUTE_API + path + "?" + urllib.parse.urlencode(params), timeout=20, ua=URLLIB_UA) as r:
-            return json.load(r)
-    except (OSError, ValueError):
+        return getattr(_TRANSPORT["c"], kind)(**kw)
+    except transport.TransportError:
         return None
 
 
@@ -592,11 +596,11 @@ class Geo:
         if not k:
             return None
         if k not in self.d:
-            res = api("/locations", {"query": town, "type": "station"})
+            res = api("locations", query=town, type="station")
             if res is None:
                 return None                                  # API down: don't cache
             v = None
-            for s in res.get("stations") or []:
+            for s in res:
                 c = s.get("coordinate") or {}
                 if isinstance(c.get("x"), (int, float)) and isinstance(c.get("y"), (int, float)):
                     v = [c["x"], c["y"]]                     # WGS84: x = lat, y = lon
@@ -619,9 +623,9 @@ def pt_minutes(a, b, day, cache):
     """fastest public-transport time a -> b (minutes) around midday, None when unknown."""
     k = (fold(a), fold(b))
     if k not in cache:
-        res = api("/connections", {"from": a, "to": b, "date": day.isoformat(), "time": "12:00", "limit": 3})
+        res = api("connections", frm=a, to=b, when=dt.datetime.combine(day, dt.time(12, 0)), limit=3)
         mins = []
-        for c in (res or {}).get("connections") or []:
+        for c in res or []:
             m = re.match(r"(\d+)d(\d+):(\d+)", str(c.get("duration") or ""))
             if m:
                 mins.append(int(m[1]) * 1440 + int(m[2]) * 60 + int(m[3]))

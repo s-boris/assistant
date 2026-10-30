@@ -25,7 +25,9 @@ included; --json also gives each connection's last stop (`off`, `off_arr`) and t
 timetable doesn't know = "origin": null + "unknown_stop": the name (else null).
 Exit 0 = a card (also "where are you?" and "no connection found"), 1 = the transport API failed (one line on stderr),
 2 = usage.
-Env (tests): GOHOME_API (else ROUTE_API, else transport.opendata.ch), GOHOME_NOW ("YYYY-MM-DD HH:MM", Zurich),
+Sources: lib core/transport: transport.opendata.ch, else (an error payload, a non-2xx status, a timeout, no JSON)
+timetable.search.ch, mapped to opendata's shape (a changed platform: only the new one).
+Env (tests): GOHOME_API (else ROUTE_API, else transport.opendata.ch), TRANSPORT_FALLBACK_API, GOHOME_NOW ("YYYY-MM-DD HH:MM", Zurich),
 GOHOME_PLACE / GOHOME_CALCACHE (a JSON file shaped like `whereabouts ha now --json` / `calcache show --json`, or "off"),
 GOHOME_VENUES (else NIGHT_PLAN_VENUES, else ~/.config/night-plan/venues.json), ASSISTANT_PROFILE, HOME_PLACE_GEO,
 HOME_PLACE_CACHE. Tests: ~/opt/assistant/tests/legacy/gohome.
@@ -37,19 +39,21 @@ import re
 import subprocess
 import sys
 import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+_here = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(_here, 'lib'))
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))   # the repo checkout (scripts/): its own core
 import assistant_profile as profile  # noqa: E402
 import home_place  # noqa: E402
+from core import transport  # noqa: E402
 from sbb import sbb_link  # noqa: E402
 
 TZ = profile.tz()
 API = os.environ.get('GOHOME_API') or os.environ.get('ROUTE_API') or 'https://transport.opendata.ch/v1'
 UA = 'gohome/1.0 (personal trip planner)'
+_client = {}
 NEXT_N, EVENT_GRACE, LEG_AFTER, WAIT_SHOW = 3, dt.timedelta(hours=3), dt.timedelta(hours=8), 30
 NIGHT_END = dt.time(4, 45)          # the night gap: the last connection tonight reaches the door by then
 MIN = dt.timedelta(minutes=1)
@@ -167,19 +171,14 @@ def place_town(p):
 
 
 # ------------------------------------------------------------------------------------------------ connections
-def api(path, params):
-    url = f'{API}/{path}?{urllib.parse.urlencode(params)}'
+def api(kind, **kw):
+    """core.transport lookup (opendata, else search.ch; one client per run); both failing -> Fail."""
+    if 'c' not in _client:
+        _client['c'] = transport.Client(api=API, ua=UA, timeout=8)
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': UA}), timeout=8) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        try:
-            why = json.load(e)['errors'][0]['message']
-        except Exception:
-            why = f'HTTP {e.code}'
-        raise Fail(f'transport API error: {why}')
-    except (OSError, ValueError) as e:
-        raise Fail(f'transport API unreachable or broken: {getattr(e, "reason", e)}')
+        return getattr(_client['c'], kind)(**kw)
+    except transport.TransportError as e:
+        raise Fail(str(e)) from None
 
 
 def ts(s):
@@ -213,7 +212,7 @@ def conn(c):
         rd, ra = ts(d.get('departure')), ts(a.get('arrival'))
         if j and rd and ra:
             rides.append({'line': line_name(j), 'dep': rd, 'arr': ra, 'from': stname(d), 'at': stname(a),
-                          'platform': d.get('platform') or None})
+                          'platform': d.get('platform') or (d.get('prognosis') or {}).get('platform') or None})
     if not dep or not arr or not rides:
         return None
     waits = [{'at': b['from'] or a['at'], 'min': int((b['dep'] - a['arr']).total_seconds() // 60)}
@@ -225,10 +224,7 @@ def conn(c):
 
 
 def search(origin, home, when, arrive=False, limit=6):
-    p = {'from': origin, 'to': home, 'date': when.date().isoformat(), 'time': when.strftime('%H:%M'), 'limit': limit}
-    if arrive:
-        p['isArrivalTime'] = 1
-    out = [c for c in map(conn, api('connections', p).get('connections') or []) if c]
+    out = [c for c in map(conn, api('connections', frm=origin, to=home, when=when, limit=limit, arrive=arrive)) if c]
     # the Swiss timetable answers far-off stops with other days' connections: keep that night's only
     return [c for c in out if abs(((c['arr'] if arrive else c['dep']) - when).total_seconds()) <= 14 * 3600]
 
@@ -256,7 +252,7 @@ def stop_name(q):
     otherwise route from whatever it guesses)."""
     want = {w for w in words(q) if len(w) >= 2}
     best, score = None, 0
-    for st in (api('locations', {'query': q, 'type': 'station'}).get('stations') or [])[:5]:
+    for st in api('locations', query=q, type='station')[:5]:
         name = str(st.get('name') or '').strip()
         have = words(name)
         n = sum(1 for w in want if w in have or any(h.startswith(w) or w.startswith(h)
