@@ -2736,7 +2736,7 @@ cron_line = "0 19 * * * mkdir -p \"$HOME/.local/state/media\" && cron-fail --ok 
 
 [jobs.media-digest-weekly]
 line = "media-digest-weekly"
-cron = "5 19 * * 0"
+cron = "5 19 * * 5"
 class = "M"
 group = "collectors"
 queue = "slow"
@@ -2753,7 +2753,7 @@ feature = "media"
 owner_facing = true
 why = "weekly media digest cards (switch: ~/.config/media/digest.json)"
 target = "media-digest"
-cron_line = "5 19 * * 0 mkdir -p \"$HOME/.local/state/media\" && cron-fail --ok 3 media-digest-weekly timeout 600 $HOME/bin/media digest --weekly >> \"$HOME/.local/state/media/digest-cron.log\" 2>&1"
+cron_line = "5 19 * * 5 mkdir -p \"$HOME/.local/state/media\" && cron-fail --ok 3 media-digest-weekly timeout 600 $HOME/bin/media digest --weekly >> \"$HOME/.local/state/media/digest-cron.log\" 2>&1"
 
 # A token-free watch of the claude.ai usage limit (the 24.-28.10 pause went unnoticed for 4 days): stays in cron so it
 # runs whatever the session and the hub do.

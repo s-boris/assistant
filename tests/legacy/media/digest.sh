@@ -188,6 +188,9 @@ has "weekly full caption: week + counts" "$(cat "$T/reports/digest-weekly-2026-1
 has "weekly full caption: library line" "$(cat "$T/reports/digest-weekly-2026-10-25.txt")" "Library: 2 movies, 1 shows."
 hasnt "weekly full caption: no storage size" "$(cat "$T/reports/digest-weekly-2026-10-25.txt")" " GB"
 eq "weekly full: tiles without storage" "$(js '[t[0] for t in d["tiles"]]')" "['Movies', 'Shows']"
+MEDIA_NOW=2026-10-30T19:05:00+01:00 MEDIA_DIGEST_STATE=$T/state-fri.json run --weekly --dry-run --json
+eq "weekly on a Friday (the cron day): rc 0, the Friday's week, a rolling 7 days" \
+  "$(cat "$T/rc") $(head -1 "$T/reports/digest-weekly-2026-10-30.txt" 2>&1 | grep -o 'Week 44 on the server')" "0 Week 44 on the server"
 rm -f "$T/digest.json"
 eq "snapshot of today kept" "$(python3 -c "import json; print(sorted(json.load(open('$T/state.json'))['library']))")" "['2026-10-18', '2026-10-25']"
 

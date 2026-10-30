@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Offline tests for `media posters` (the weekly "Neu auf dem Server" collage). Exit 0 = all pass.
+# Offline tests for `media posters` (the weekly "New on the server" collage). Exit 0 = all pass.
 # posters_fx.py serves a fake Emby (views, items, series, poster images) and Radarr/Sonarr history; the clock is
 # Fri 2026-10-23 17:30 Zurich (KW 43). Checks: what counts as new (window, upgrades/renames, specials, virtual
-# episodes, extras, excluded library), series grouping, ranking + cap, PNG, cron note + send rule, failures,
+# episodes, extras, excluded library), series grouping, ranking + cap, PNG, English texts, cron note + group send rule, failures,
 # GET-only, the key only in a header, no key leaks. Also `media poster` (cached Primary images for tg-cmd's picture cards).
 set -uo pipefail
 _pf="$(cd "$(dirname "$0")/.." && pwd)"; [ -f "$_pf/profile/fixtures/profile.json" ] && _pf=$_pf/profile || _pf=$_pf/profile-tests
@@ -21,7 +21,8 @@ printf '{"seerr": {"url": "%s/seerr", "key": "SEERR-KEY-Zq81"}, "radarr": {"url"
   "$B" "$B" "$B" "$B" > "$T/cfg.json"
 mkdir -p "$T/inbox" "$T/reports"
 export MEDIA_SECRETS=$T/cfg.json MEDIA_NOW=2026-10-23T17:30:00+02:00 MEDIA_TIMEOUT=5 \
-  MEDIA_CONTINUE_EMBY_USER=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa MEDIA_POSTERS_INBOX=$T/inbox MEDIA_REPORT_DIR=$T/reports
+  MEDIA_CONTINUE_EMBY_USER=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa MEDIA_POSTERS_INBOX=$T/inbox MEDIA_REPORT_DIR=$T/reports \
+  MEDIA_POSTERS_CONFIG=$T/posters.json
 unset MEDIA_POSTERS_MAX MEDIA_POSTERS_SEND_MIN MEDIA_POSTERS_FONTS
 # no DejaVu or Noto font here (the CI runner's image has none): Bitstream Vera, DejaVu's base with its metrics, which
 # the CI toolchain's reportlab carries, under DejaVu's names
@@ -49,7 +50,7 @@ echo "# what counts as new"
 m posters --json --out "$T/a.png"
 eq "exit 3 (one poster failed to load)" "$rc" "3"
 eq "header + subtitle (KW of the clock, Zurich dates)" "$(jq_ '(d["header"], d["subtitle"])')" \
-  "('Neu auf dem Server · KW 43', 'New on the server this week · 16–23 Oct')"
+  "('New on the server · Week 43', 'Added this week · 16–23 Oct')"
 eq "movies: new in the window, best rated first; upgrade, rename, old, extra, excluded library out" \
   "$(jq_ '[x["title"] for x in d["items"] if x["kind"] == "movie"]')" "['Star Voyage', 'Broken Poster', 'New Then Better', 'No Poster']"
 eq "shows grouped by series with episodes counted, seasons, new series flag" \
@@ -59,7 +60,9 @@ eq "skipped: 2 movie + 1 episode upgrades, 1 special, 1 virtual" "$(jq_ 'sorted(
   "[('missing', 1), ('specials', 1), ('upgrades', 3)]"
 eq "counts line + totals" "$(jq_ '(d["counts"], d["total"], d["more"], d["send"])')" \
   "('4 movies · 3 shows (6 new episodes)', 7, 0, True)"
-has "German + English caption" "$(jq_ 'd["caption"]')" "Neu auf dem Server (KW 43): 4 Filme, 3 Serien (6 neue Folgen)."
+eq "English-only caption" "$(jq_ 'd["caption"]')" "🎬 New on the server (week 43): 4 movies · 3 shows (6 new episodes)."
+hasnt "no German in the caption" "$(jq_ 'd["caption"]')" "Neu"
+eq "post_chat unset by default" "$(jq_ 'd["post_chat"]')" "None"
 has "broken poster -> warning, placeholder tile" "$(jq_ 'd["warnings"]')" "poster HTTP 500"
 eq "PNG, 1080 wide" "$(pngsize "$T/a.png")" "PNG 1080 True"
 hasnt "excluded library never queried" "$(cat "$T/server.log")" "ParentId=20"
@@ -101,11 +104,19 @@ eq "cron: exit 3 (poster warning)" "$rc" "3"
 N="$T/inbox/media-posters-2026-10-23.md"
 eq "cron: PNG in the report dir" "$(pngsize "$T/reports/new-on-server-2026-10-23.png")" "PNG 1080 True"
 has "cron: note names the image" "$(cat "$N" 2>&1)" "- Image: $T/reports/new-on-server-2026-10-23.png (1080x"
-has "cron: send yes with 7 items" "$(cat "$N" 2>&1)" "- Send: yes"
-has "cron: note carries the caption" "$(cat "$N" 2>&1)" "- Caption: 🎬 Neu auf dem Server (KW 43)"
+has "cron, 7 items, no posters.json: group, post_chat not set" "$(cat "$N" 2>&1)" "- Send: group (post_chat not set)"
+hasnt "cron: never Send: yes (the owner)" "$(cat "$N" 2>&1)" "Send: yes"
+has "cron: note carries the English caption" "$(cat "$N" 2>&1)" "- Caption: 🎬 New on the server (week 43): 4 movies"
 rm -f "$T/inbox/media-posters-2026-10-23.md"
+echo '{"post_chat": ""}' > "$T/posters.json"
+m posters --cron
+has "cron, empty post_chat: not set" "$(cat "$N" 2>&1)" "- Send: group (post_chat not set)"
+echo '{"post_chat": "-100555"}' > "$T/posters.json"
+m posters --cron
+has "cron, post_chat set: Send: group <chat>" "$(cat "$N" 2>&1)" "- Send: group -100555"
+rm -f "$T/inbox/media-posters-2026-10-23.md" "$T/posters.json"
 m posters --cron --days 4
-has "cron, 3 items: send no" "$(cat "$N" 2>&1)" "- Send: no"
+has "cron, 3 items: send no" "$(cat "$N" 2>&1)" "- Send: no (fewer than 5 new items)"
 has "cron, 3 items: counts" "$(cat "$N" 2>&1)" "1 movie · 2 shows (4 new episodes) = 3 items"
 rm -f "$T/inbox/media-posters-2026-10-23.md" "$T/reports/new-on-server-2026-10-23.png"
 m posters --cron --days 1

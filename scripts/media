@@ -167,14 +167,16 @@ doctor [TITLE | --all] [--days 180] [--type T] [--mine] [--dry-run] [--no-probe]
     {"posters": {id: path|null}, "fetched", "cached", "warnings"}; exit 3 when a poster failed to load (not a 404).
 
   media posters [--days 7] [--max 24] [--out PATH] [--cron] [--json]
-    The "Neu auf dem Server · KW NN" collage: one dark 1080 px PNG (Pillow) of the movies and shows Emby added in the
+    The "New on the server · Week NN" collage (English text; titles as Emby returns them): one dark 1080 px PNG (Pillow) of the movies and shows Emby added in the
     last N days (his Emby user's visible movie/TV libraries minus his My Media / Latest excludes), posters from Emby's
     image API with title, year and a star rating; shows grouped by series with the new episodes counted (badge);
     specials, missing episodes and extras left out; upgrades, replacements and renames (Radarr/Sonarr history: file
     deletions or renames in the window >= imports) aren't new. Over --max (MEDIA_POSTERS_MAX, 24): the best rated per section (each gets half if it can use it) plus
     "+N more". Default OUT ~/reports/media/new-on-server-DATE.png (MEDIA_REPORT_DIR). --cron also writes
-    ~/inbox/media-posters-DATE.md (MEDIA_POSTERS_INBOX) with the path, counts, caption and send: yes when
-    MEDIA_POSTERS_SEND_MIN (5)+ items; nothing (no image, no note) when nothing is new. GET-only; exit 3 on a warning
+    ~/inbox/media-posters-DATE.md (MEDIA_POSTERS_INBOX) with the path, counts, caption and a Send line for the media
+    group (never the owner) when MEDIA_POSTERS_SEND_MIN (5)+ items: "Send: group CHAT" with "post_chat" set in
+    ~/.config/media/posters.json (MEDIA_POSTERS_CONFIG), else "Send: group (post_chat not set)"; fewer items "Send: no".
+    Nothing here posts anything. Nothing (no image, no note) when nothing is new. GET-only; exit 3 on a warning
     (an arr's history failed: upgrades then not filtered; a poster didn't load: placeholder tile). Fonts: MEDIA_POSTERS_FONTS (default /usr/share/fonts/truetype).
 
 Exit codes: 0 ok, 1 error, 2 health problems
@@ -6789,7 +6791,7 @@ def cmd_doctor(a):
         sys.exit(3)
 
 
-# ---------- posters: the weekly "Neu auf dem Server" collage (Emby + arr history GETs only; Pillow) ----------
+# ---------- posters: the weekly "New on the server" collage (Emby + arr history GETs only; Pillow) ----------
 # Items = movies and episodes Emby created in the window, from the libraries his Emby user sees (movie, TV and mixed
 # views, minus his My Media / Latest excludes); specials (season 0), missing/virtual episodes and extras stay out.
 # Radarr/Sonarr history tells upgrades apart: a title whose file deletions (or renames) in the window match its imports
@@ -6799,6 +6801,7 @@ PO_MAX = int(_env_num("MEDIA_POSTERS_MAX", 24))
 PO_NOTE_MIN = int(_env_num("MEDIA_POSTERS_SEND_MIN", 5))
 PO_INBOX = os.environ.get("MEDIA_POSTERS_INBOX") or "~/inbox"
 PO_FONTS = os.environ.get("MEDIA_POSTERS_FONTS") or "/usr/share/fonts/truetype"
+PO_CONF = os.environ.get("MEDIA_POSTERS_CONFIG") or "~/.config/media/posters.json"   # {"post_chat": ""}: the media group
 PO_VIEWS = {"movies", "tvshows", "mixed", ""}
 PO_FIELDS = ("DateCreated,ProductionYear,CommunityRating,ParentIndexNumber,IndexNumber,SeriesId,SeriesName,"
              "ProviderIds,LocationType,ImageTags,SeriesPrimaryImageTag")
@@ -6941,16 +6944,13 @@ def po_texts(now, days, movies, shows, eps):
     rng = (f"{start.day}–{loc.day} {PO_MON[loc.month - 1]}" if (start.month, start.year) == (loc.month, loc.year)
            else f"{start.day} {PO_MON[start.month - 1]} – {loc.day} {PO_MON[loc.month - 1]}")
     when = "this week" if days == 7 else f"in the last {days} days"
-    head = f"Neu auf dem Server · KW {kw}"
-    sub = f"New on the server {when} · {rng}"
+    head = f"New on the server · Week {kw}"
+    sub = f"Added {when} · {rng}"
     parts = [plural(movies, "movie")] if movies else []
     if shows:
         parts.append(f"{plural(shows, 'show')} ({plural(eps, 'new episode')})")
     counts = " · ".join(parts) or "nothing new"
-    de = [f"{movies} {'Film' if movies == 1 else 'Filme'}"] if movies else []
-    if shows:
-        de.append(f"{shows} {'Serie' if shows == 1 else 'Serien'} ({eps} {'neue Folge' if eps == 1 else 'neue Folgen'})")
-    caption = f"🎬 Neu auf dem Server (KW {kw}): {', '.join(de) or 'nichts'}.\nNew {when}: {counts}."
+    caption = f"🎬 New on the server (week {kw}): {counts}."
     return head, sub, counts, caption
 
 
@@ -7099,7 +7099,7 @@ def po_render(sections, more, head, sub, counts, out, warns):
             d.rounded_rectangle([x0 + 3, y0 + 6, x0 + tw + 3, y0 + th + 6], radius=18, fill=(5, 5, 9))
             img.paste(p, (x0, y0), mask)
             if it["kind"] == "show":
-                badge = ("NEU · " if it.get("new_series") else "+") + f"{it['episodes']} Ep."
+                badge = ("NEW · " if it.get("new_series") else "+") + f"{it['episodes']} ep."
                 bw = po_tw(d, badge, fb) + 26
                 d.rounded_rectangle([x0 + 10, y0 + 10, x0 + 10 + bw, y0 + 10 + fb.size + 16], radius=(fb.size + 16) // 2,
                                     fill=PO_C["a1"] if it.get("new_series") else PO_C["a2"])
@@ -7120,10 +7120,10 @@ def po_render(sections, more, head, sub, counts, out, warns):
                 d.text((mx + 2 * r + 6, ty), f"{it['rating']:.1f}", font=fm, fill=PO_C["star"])
         y += math.ceil(len(v) / cols) * (cell + G)
     if more:
-        s = f"+ {more} weitere · {more} more"
+        s = f"+ {more} more"
         d.text(((PO_W - po_tw(d, s, fsec)) // 2, y + 6), s, font=fsec, fill=PO_C["mute"])
         y += 70
-    s = "Wünsche? Über Seerr anfragen · Requests via Seerr"
+    s = "Missing something? Request it via Seerr"
     d.text(((PO_W - po_tw(d, s, fm)) // 2, y + 24), s, font=fm, fill=PO_C["mute"])
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     tmp = out + ".tmp"
@@ -7155,17 +7155,18 @@ def cmd_posters(a):
     out = os.path.expanduser(a.out or os.path.join(REPORT_DIR, f"new-on-server-{day}.png"))
     size = None
     if items:
-        sections = [("Filme · Movies", movies[:qm], len(movies)), ("Serien · Shows", shows[:qs], len(shows))]
+        sections = [("Movies", movies[:qm], len(movies)), ("Shows", shows[:qs], len(shows))]
         size = po_render(sections, more, head, sub, counts, out, warns)
     warns = list(dict.fromkeys(warns))
-    send = len(items) >= PO_NOTE_MIN
+    chat = re.sub(r"\s+", "", str(dg_json(PO_CONF).get("post_chat") or ""))[:64]
+    send = len(items) >= PO_NOTE_MIN    # to the media group only (post_chat), never the owner; nothing here posts
+    send_line = (f"group {chat}" if chat else "group (post_chat not set)") if send else f"no (fewer than {PO_NOTE_MIN} new items)"
     left = ", ".join(f"{v} {k}" for k, v in sorted(skipped.items()) if v)
     if a.cron and items:
         note = os.path.join(os.path.expanduser(PO_INBOX), f"media-posters-{day}.md")
         body = [f"# media posters: weekly collage ready ({head})", f"- Image: {out} ({size[0]}x{size[1]})",
                 f"- New: {counts} = {len(items)} items" + (f"; left out: {left}" if left else ""),
-                f"- Send: {'yes' if send else 'no'} (JOBS.md: to him as a photo only with >= {PO_NOTE_MIN} new items; "
-                "never to friends, he forwards it himself)",
+                f"- Send: {send_line}",
                 "- Caption: " + caption.replace("\n", " / ")]
         body += [f"- Warning: {w}" for w in warns]
         os.makedirs(os.path.dirname(note), exist_ok=True)
@@ -7175,7 +7176,7 @@ def cmd_posters(a):
     if a.json:
         emit_json({"path": out if items else None, "size": list(size) if size else None, "header": head,
                    "subtitle": sub, "counts": counts, "caption": caption, "movies": len(movies), "shows": len(shows),
-                   "episodes": eps, "total": len(items), "shown": len(shown), "more": more, "send": send,
+                   "episodes": eps, "total": len(items), "shown": len(shown), "more": more, "send": send, "post_chat": chat or None,
                    "skipped": dict(skipped), "warnings": warns,
                    "items": [{k: x.get(k) for k in ("kind", "id", "title", "year", "rating", "episodes", "seasons",
                                                     "new_series")} for x in shown]})
@@ -8465,7 +8466,7 @@ def cmd_digest(a):
         cap_c = "🎬 New today · " + " · ".join(short)
     else:
         kw = loc.isocalendar()[1]
-        start = loc - timedelta(days=6)         # Sunday 19:00 run: Mon-Sun
+        start = loc - timedelta(days=6)         # the 7 days ending today (Friday 19:05 run: Sat-Fri)
         rng = (f"{start.day}–{loc.day} {PO_MON[loc.month - 1]}" if start.month == loc.month
                else f"{start.day} {PO_MON[start.month - 1]} – {loc.day} {PO_MON[loc.month - 1]}")
         dg_tag_who(new, soft(lambda: dg_requests(uid, since, conf, set(), warns), warns, "Seerr requests") or [])
@@ -8779,7 +8780,7 @@ def main():
     ps.add_argument("ids", nargs="+", metavar="ID", help="Emby item ids (a series id for a show's poster)")
     ps.add_argument("--width", type=int, default=400, help="max width in px (default 400)")
     ps.add_argument("--json", action="store_true", help="machine-readable output")
-    po = sp.add_parser("posters", help="weekly 'Neu auf dem Server' collage PNG of what Emby added (GET-only)")
+    po = sp.add_parser("posters", help="weekly 'New on the server' collage PNG of what Emby added (GET-only)")
     po.add_argument("--days", type=int, default=7, help="window in days (default 7)")
     po.add_argument("--max", type=int, default=PO_MAX, help=f"posters at most (default {PO_MAX}); the rest = '+N more'")
     po.add_argument("--out", metavar="PATH", help="PNG path (default ~/reports/media/new-on-server-DATE.png)")
