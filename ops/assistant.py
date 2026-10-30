@@ -2645,8 +2645,12 @@ def _landq_view(e: dict, bs: dict) -> dict:
 
 
 def _landq_line(e: dict) -> str:
-    """The waiter's progress line (printed when it changes)."""
+    """The waiter's progress line, printed when it changes: the state, position, batch or phase (no running
+    seconds, so one line per step, not one per poll)."""
     b = _landq_read("batches", e.get("batch")) if e.get("batch") else None
+    if e.get("state") == "testing" and b:
+        members = ", ".join(m["branch"] for m in b.get("members") or [])
+        return f"{e['id']} {e['branch']}: testing in batch {b['id']} ({members}): {_landq_phase(b)[0]}"
     v = _landq_view(e, {b["id"]: b} if b else {})
     return f"{e['id']} {e['branch']}: {e.get('state')}, {v['detail']}"
 

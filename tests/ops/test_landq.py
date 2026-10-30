@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import sqlite3
 import time
@@ -137,11 +138,15 @@ def test_queued_then_status_then_wait(env, q):
     until(lambda: q.entry("q1").get("state") == "testing", "q1 testing")
     r = env.run("land", "status", "q1")
     assert r.returncode == 0 and "testing" in r.stdout and "batch b1" in r.stdout, r.stdout
+    p = env.popen("land", "status", "q1", "--wait")
+    time.sleep(2.5)  # the waiter polls 25 times while the CI holds: it prints a step once, not once per poll
     q.hold.unlink()
-    r = env.run("land", "status", "q1", "--wait", timeout=120)
-    assert r.returncode == 0, r.stderr
+    out, err = p.communicate(timeout=120)
+    assert p.returncode == 0, err
+    steps = [ln for ln in out.splitlines() if ln.startswith("q1 w1: ")]
+    assert steps and len({re.sub(r"\d+", "N", ln) for ln in steps}) == len(steps), steps
     main = env.git("rev-parse", "main")
-    assert f"landed w1 on main ({main[:12]})" in r.stdout
+    assert f"landed w1 on main ({main[:12]})" in out
     assert (env.home / "bin/a.txt").read_text() == "a-w1\n"
     (row,) = [h for h in q.rows() if h.get("branch") == "w1"]
     assert row["landq"]["id"] == "q1" and row["landq"]["batch"] == "b1" and row["landq"]["size"] == 1
