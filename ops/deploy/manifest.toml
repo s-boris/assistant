@@ -1973,15 +1973,13 @@ dest = "bin/lib/rotation/cli.py"
 mode = "0644"
 
 # container-watch (weekly container + UniFi OS VM update / advisory check, skill container-watch);
-# suite tests/legacy/container-watch (CW_BIN). --help only prints (no collection, no state).
+# tests tests/server/test_container_watch*.py. --help only prints (no collection, no state).
 
 [[file]]
 src = "scripts/container-watch"
 dest = "bin/container-watch"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
-suite = "container-watch"
-seam = "CW_BIN"
 
 # drive-watch (Waze traffic before his 🚗 legs and rule trips, JOBS.md cron); suite
 # tests/legacy/drive-watch (DRIVE_WATCH_BIN). --help only prints (no calendar, no state, no Waze).
