@@ -26,7 +26,6 @@ tests/legacy/test-all  # tests the gcc-built LD_PRELOAD netguard (~/opt/test-all
 # red in the runner itself (probe job 21ea037671b1f3ee, 29.10, the runner user + would-be ~/bin; the signed record's
 # legacy "tails" say why): host-bound until fixed. Missing in the runner: Pillow, pgrep (procps), ffmpeg, pdfinfo,
 # ~/opt venvs; the live crontab/boot.sh/state; or a failure not yet traced (unknown = see the tail)
-tests/legacy/media  # over the 240 s per-suite limit in the runner (probe 12 job 0073361d263f2db8: cut off in play/, the sub-suites before it green)
 # host-bound: what it needs is only on this host
 tests/legacy/tg-status  # the Due/Next split loads the heartbeat plugin's hb-gate (the live ~/plugins copy)
 # moved from ~/opt/<suite>-tests 30.10: a runner probe (job 8868b8345a84d7bf, 30.10) ran them there: 13 green
@@ -56,3 +55,5 @@ tests/legacy/heartbeat  # tests the live ~/plugins (bun, node_modules, the sessi
 tests/legacy/hb-gate  # tests the live ~/plugins (bun, node_modules, the session's plugin root)
 tests/legacy/unraid-do  # also runs the live ~/opt/unraid-lockdown/client/unraid-do (only this host has it)
 tests/legacy/boot  # a dry run against this host's ~/opt/runtimes and main checkout
+tests/media/test_digest.py  # the cards and pages render with Pillow under the tool's python3 (the runner's has none): red there (job b343c67972b992ed)
+tests/media/test_posters.py::test_poster_cache  # same: Pillow under the tool's python3

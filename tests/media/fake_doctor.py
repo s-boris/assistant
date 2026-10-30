@@ -1,6 +1,6 @@
-"""Fake Seerr + Radarr + Sonarr + Emby for `media doctor` (doctor.sh). Stateful: monitor PUTs and queue DELETEs
+"""Fake Seerr + Radarr + Sonarr + Emby for `media doctor` (test_doctor.py). Stateful: monitor PUTs and queue DELETEs
 change what later GETs return. Logs every request as 'METHOD /path?query BODY' to argv[2].
-Clock of the fixtures: 2026-10-20 12:00 Zurich (MEDIA_NOW in doctor.sh)."""
+Clock of the fixtures: 2026-10-20 12:00 Zurich (MEDIA_NOW in test_doctor.py)."""
 
 import json
 import os

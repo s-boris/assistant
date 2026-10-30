@@ -53,4 +53,4 @@ For "what's missing from my film series": `media franchise --poll-json`, then ON
 
 ## Notes
 - Friends use the same Seerr; requests show who asked. Friends' playback trouble: skill media-help.
-- After changing ~/opt/assistant/scripts/media, run its offline tests (`tests/legacy/media/run.sh`) and land it.
+- After changing ~/opt/assistant/scripts/media, run its offline tests (`tests/media/`, pytest) and land it.
