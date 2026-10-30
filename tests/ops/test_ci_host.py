@@ -144,7 +144,7 @@ def test_host_runs_ruff_and_ast_so_a_lint_red_fails_the_land_early(tool, tmp_pat
         rep = tmp_path / f"{name}.json"
         rc = tool.ci(tree, None, True, only, False, report=str(rep), host=True)
         got = {s["name"]: s for s in json.loads(rep.read_text())["steps"]}
-        assert set(got) == {"ruff", "ast"}, got
+        assert set(got) - {"error"} == {"ruff", "ast"}, got
         return {"rc": rc, **{k: (v["ok"], v["detail"]) for k, v in got.items()}}
 
     clean = steps("clean")
@@ -153,6 +153,10 @@ def test_host_runs_ruff_and_ast_so_a_lint_red_fails_the_land_early(tool, tmp_pat
     commit("lint red")
     red = steps("ruff-red")
     assert red["rc"] != 0 and not red["ruff"][0] and red["ast"][0], red
+    rep = tmp_path / "fast.json"  # a lint red ends the host part at once: secretscan (and suites, precheck) never run
+    rc = tool.ci(tree, None, True, only - {"secretscan"}, False, report=str(rep), host=True)
+    got = [(s["name"], s["ok"]) for s in json.loads(rep.read_text())["steps"]]
+    assert rc != 0 and got == [("ruff", False), ("ast", True), ("error", False)], got
     (tree / "scripts" / "bad.py").write_text('"""no lint left, a banned helper."""\n\n\ndef load_json():\n    pass\n')
     commit("ast red")
     red = steps("ast-red")

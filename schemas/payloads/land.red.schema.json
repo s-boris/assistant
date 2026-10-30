@@ -1,0 +1,61 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/land.red.schema.json",
+ "title": "assistant land (the land queue): a queued branch that ended red, in conflict or failed with nobody waiting",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "entry",
+  "branch",
+  "state",
+  "red"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "land.red"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "entry": {
+   "type": "string",
+   "pattern": "^q[0-9]{1,9}$"
+  },
+  "branch": {
+   "type": "string",
+   "maxLength": 120
+  },
+  "state": {
+   "enum": [
+    "red",
+    "conflict",
+    "error"
+   ]
+  },
+  "red": {
+   "type": "string",
+   "maxLength": 240
+  },
+  "batch": {
+   "type": "string",
+   "maxLength": 20
+  },
+  "mates": {
+   "type": "array",
+   "maxItems": 8,
+   "items": {
+    "type": "string",
+    "maxLength": 120
+   }
+  }
+ }
+}

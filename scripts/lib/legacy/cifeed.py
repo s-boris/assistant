@@ -21,6 +21,10 @@ Sources, all read-only (never runs `assistant`, never takes or probes the deploy
   ~/.local/state/assistant/deploy.queue/land-<pid>.phase   such a land's phase {pid, start, what, phase, since,
                                            land_since, rerun} (live = pid + start match): rebase, fail-fast, CI
                                            local / host + runner, runner, evals, waiting for lock; rerun = main moved
+  ~/.local/state/assistant/landq/          the land queue: entries/qN.json (queued -> "queued #pos" rows) and
+                                           batches/bN.json (testing -> one row: members joined with +, phase
+                                           "batch bN (size): <its land's phase>"); land rows' landq block (batch,
+                                           size, queued_secs) -> a land's batch, batch_n, queued_s
   ~/.local/state/assistant/ci-signed/      the hub runner's newest signed record (release, toolchain, python, ok)
   ~/.config/assistant/ci-gate              the land gate mode; ~/crontab: whether `assistant ci-nightly` is scheduled
   ~/opt/assistant (git, read-only)         the shown lands' `desc`, `body`, `commits`: the landed commit's subject and
@@ -193,14 +197,17 @@ def _land_procs():
         for i, x in enumerate(a[:-1]):
             if os.path.basename(x) in ('assistant', 'assistant.py') and a[i + 1] == 'land':
                 rest, skip = [], False
+                if '--worker' in a[i + 2:]:     # the land queue's worker: its batches show as their lands
+                    break
                 for y in a[i + 2:]:     # land BRANCH [--adopt X]... [--override WHY]: flags with a value skip it
                     if skip:
                         skip = False
-                    elif y in ('--adopt', '--override'):
+                    elif y in ('--adopt', '--override', '--timeout', '--batch'):
                         skip = True
                     elif not y.startswith('-'):
                         rest.append(y)
-                out[int(n)] = word(rest[0]) if rest else None
+                if rest and rest[0] != 'status':
+                    out[int(n)] = word(rest[0])
                 break
     return out
 
@@ -242,13 +249,63 @@ def queue(now):
                 and t.get('phase') in PHASES:
             phases[br] = {'phase': t['phase'], 'phase_since': num(t.get('since'), 0), 'since': num(t.get('land_since'), 0),
                           'rerun': int(t['rerun']) if isinstance(t.get('rerun'), int) and 0 <= t['rerun'] < 100 else 0}
+    lq, lq_names = landq(now)              # the land queue: its testing batches and queued entries
+    for b, ph in phases.items():           # a batch's land process has its phase record: "batch bN (size): phase"
+        if b in lq and lq[b].get('batch'):
+            lq[b].update(phase=f"batch {lq[b]['batch']} ({len(lq[b]['members'])}): {ph['phase']}",
+                         phase_since=ph['phase_since'], rerun=ph['rerun'])
     starting, seen_b = [], set()
     for p, b in sorted(procs.items()):     # wrappers (cron-fail, sh -c) carry the same argv: one row per branch
-        if p not in seen and b not in known and b not in seen_b:
+        if p not in seen and b not in known and b not in seen_b and b not in lq_names:
             seen_b.add(b)
-            starting.append({'op': 'land', 'branch': b, 'since': None, 'phase': None, 'phase_since': None, 'rerun': 0,
-                             **phases.get(b, {})})
-    return {'holder': holder, 'waiting': waiting[:12], 'starting': starting[:6]}
+            row = {'op': 'land', 'branch': b, 'since': None, 'phase': None, 'phase_since': None, 'rerun': 0,
+                   **phases.get(b, {})}
+            starting.append({**row, **lq.pop(b, {})})
+    for b in list(lq):                     # holder or waiter rows already show a batch's land: decorate those
+        for w in ([holder] if holder else []) + waiting:
+            if w.get('branch') == b:
+                w.update({k: v for k, v in lq.pop(b).items() if k in ('branch', 'batch', 'members')})
+                break
+    starting += [r for r in lq.values() if r.get('phase')]
+    return {'holder': holder, 'waiting': waiting[:12], 'starting': starting[:8]}
+
+
+def landq(now):
+    """The land queue (assistant's landq/: entries, batches), read-only -> ({key: row}, names). A testing batch's
+    row is keyed by its land's branch (landq/b-N): the members joined with + as the branch, the phase text starting
+    "batch bN (size)"; a queued entry's row has phase "queued #pos" (", gated lane"). names: the queued and testing
+    members' branches (their waiters' own land processes show no second row)."""
+    d = os.path.join(STATE, 'landq')
+    es, bs = [], {}
+    for f in _listdir(os.path.join(d, 'entries')):
+        e = _read_json_cached(os.path.join(d, 'entries', f)) if re.fullmatch(r'q\d{1,9}\.json', f) else None
+        if isinstance(e, dict) and e.get('state') in ('queued', 'testing') and word(e.get('branch')):
+            es.append(e)
+    for f in _listdir(os.path.join(d, 'batches')):
+        b = _read_json_cached(os.path.join(d, 'batches', f)) if re.fullmatch(r'b\d{1,9}\.json', f) else None
+        if isinstance(b, dict) and b.get('state') == 'testing':
+            bs[str(b.get('id'))] = b
+    rows, names, pos = {}, set(), {}
+    for e in sorted(es, key=lambda e: num(e.get('n'), 0) or 0):
+        names.add(word(e.get('branch')))
+        if e.get('state') != 'queued':
+            continue
+        lane = 'gated' if e.get('lane') == 'gated' else 'batch'
+        pos[lane] = pos.get(lane, 0) + 1
+        since = num(e.get('since'), 0)
+        rows['q:' + str(e.get('id'))] = {
+            'op': 'land', 'branch': word(e.get('branch')), 'since': since, 'phase_since': since, 'rerun': 0,
+            'phase': f"queued #{pos[lane]}" + (', gated lane' if lane == 'gated' else '')}
+    for bid, b in sorted(bs.items(), key=lambda x: num(x[1].get('n'), 0) or 0):
+        ms = [word(m.get('branch')) for m in b.get('members') or [] if isinstance(m, dict) and word(m.get('branch'))]
+        if not ms or not re.fullmatch(r'b\d{1,9}', bid):
+            continue
+        label = word('+'.join(ms))
+        rows['landq/b-' + bid[1:]] = {
+            'op': 'land', 'branch': label, 'batch': bid, 'members': ms[:8], 'since': num(b.get('since'), 0),
+            'phase_since': num(b.get('started') or b.get('since'), 0), 'rerun': 0,
+            'phase': f"batch {bid} ({len(ms)}): starting"}
+    return rows, names
 
 
 def _runs(r):
@@ -324,6 +381,7 @@ def _timeline(r, g, ru, end, cmd, start, ok):
 
 def land(r):
     g = r.get('gate') if isinstance(r.get('gate'), dict) else {}
+    lq = r.get('landq') if isinstance(r.get('landq'), dict) else {}     # a land through the queue: batch, queue time
     ru = r.get('runner') if isinstance(r.get('runner'), dict) else g.get('runner') if isinstance(g.get('runner'), dict) else {}
     end, start = num(r.get('end') or r.get('ts'), 0), num(r.get('land_start'), 0)
     cmd = num(r.get('land_cmd_start'), 0)     # the whole `assistant land` (CI + land); before 29.10 land_start covered it
@@ -360,6 +418,8 @@ def land(r):
         'sel': sel, 'files': cnt[0] if cnt else None, 'of': cnt[1] if cnt else None, 'tests': cnt[2] if cnt else None,
         'reruns': len(rr), 'rerun_ok': rr_ok if rr else None, 'quarantined': len(_ids(r.get('quarantined'))),
         'failed': failed, 'enforced': g.get('effective') == 'enforce' if g else None,
+        'batch': word(lq.get('batch'), 12), 'batch_n': lq.get('size') if isinstance(lq.get('size'), int) else None,
+        'queued_s': num(lq.get('queued_secs')),
     }
 
 
@@ -610,7 +670,8 @@ def timeline(rs, lands_all, now):
 
 
 TIME_KEYS = ('t', 'since', 'next', 'at', 'now', 'phase_since')
-PHASES = ('rebase', 'fail-fast', 'CI local', 'CI host + runner', 'runner', 'evals', 'waiting for lock')
+PHASES = ('rebase', 'fail-fast', 'quick checks', 'queued', 'CI local', 'CI host + runner', 'runner', 'evals',
+          'waiting for lock')
 
 
 def iso(t):

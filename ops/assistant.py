@@ -72,6 +72,35 @@
         After a land: `assistant-publish push --cron --bg` (a snapshot of main to its GitHub repo, scanned first),
         and `board poke landed BRANCH` (Board v2: the items whose done-when probes name the branch
         or one of its pre-rebase commits).
+  assistant land BRANCH [--wait | --no-wait] [--timeout S]   with the land queue on (~/.config/assistant/land-queue
+        holding "on"; ASSISTANT_LAND_QUEUE=0|1 wins; off = the land above; rollback: rm that file): verify, then
+        land. Here only the quick checks (rebase onto main, fail-fast, ruff + format, the AST ban, secretscan:
+        seconds; a conflict or red ends it now, exit 5 / 6), then the branch is queued (landq/entries/qN.json; a
+        queued entry of the same branch is superseded). --wait (the default everywhere: a subagent's shell and the
+        main session's carry the same Claude Code environment, AI_AGENT ending in _agent in both, so nothing tells
+        them apart) follows it to its end with the exit codes above (0 landed with main's commit, 5 conflict, 6
+        red with the red line, 7 --timeout (3600 s) or the queue stalled: the entry stays queued); --no-wait (the
+        main session) returns "queued qN". ONE worker (landq/worker.lock; started by land, land status, --wait and
+        the cron line; exits when idle) runs two lanes: the batch lane takes up to 4 queued entries in order,
+        rebased one onto the other on main into branch landq/b-N (a branch that conflicts with one before it
+        waits for the next batch; one that conflicts with main is a conflict), and runs the land above on it as a
+        child (`land landq/b-N --batch bN`): host CI beside ONE runner job, the eval subset, ONE fast-forward and
+        deploy; the deploy row names the first member (its land_cmd_start, landq {id, batch, size, lane,
+        queued_secs, members, sha}), one more land row and one board poke per other member, each with its own
+        last commit on main; a member's branch moves to that commit when it still stands where it was queued.
+        Main and ~/bin only ever get trees with a signed green record: the queue never reverts. The gated lane
+        (gated paths, --adopt) lands one entry at a time beside it. A red batch splits in halves at the front of
+        the queue (first half alone on main, then the second on top; a lone second half whose tree is the red
+        batch's tree is red without a run); one member left is red: exit 6 to its waiter, else one
+        ~/inbox/land-red-* note (kind land.red, at the beat) naming its batch-mates. Runner down or refusing:
+        back to queued, retried after 5 min. A smoke failure after the deploy (rolled back as before): each
+        member once alone. Crash: a new worker adopts a live batch land, else main at the batch tip = landed
+        (missing rows written, an undeployed tip deployed once), main unchanged = the members go back to the
+        front. --override skips the queue (the land above).
+  assistant land status [qN | BRANCH] [--json] [--wait]   the queue: queued (position, lane), testing (batch,
+        members, phase, seconds), landed (commit, time), red / conflict / error (exit, red line, batch-mates),
+        superseded; starts the worker when something waits. With qN or BRANCH and --wait: follow that entry
+        (e.g. one queued with --no-wait) to its end, exit codes as --wait. A branch named status can't be landed.
   assistant ci --runner hub [--path DIR] [--base REF] [--wait S]   run CI on the hub's runner (ci container: no
         network, no secrets) for DIR's committed HEAD; prints the signed record; exit 0 = signed green
   assistant ci-gate status [--json] [--lands N] | shadow|enforce|enforce-gated|off --reason TEXT [--force]
@@ -146,11 +175,14 @@ stderr) · 3 drift or refused · 4 smoke failed (rolled back), or the hub releas
 5 rebase conflict · 6 CI failed (or a suite red on main still red) · 7 lock timeout · 8 owner approval pending (hub
 protected paths) · 9 a voice call stayed live past --wait-calls (deploy --target hub; CURRENT unchanged).
 A stdout reader that quits early (`assistant status | head`) costs no traceback and never cuts a deploy short.
-Env: ASSISTANT_REPO (repo, default ~/opt/assistant) · ASSISTANT_LOCK_WAIT (s, 900; per queue position: the clock
+Env: ASSISTANT_REPO (repo, default ~/opt/assistant) · ASSISTANT_LAND_QUEUE (0|1: the land queue's switch) ·
+ASSISTANT_LOCK_WAIT (s, 900; per queue position: the clock
 restarts when a waiter moves up) · ASSISTANT_CI_LEGACY_OUT (ci writes its per-suite suite results there; land sets
 it) · ASSISTANT_TEST=1 (refuse the
 real home) · test seams honoured only with ASSISTANT_TEST=1: ASSISTANT_BRAIN_COMMIT_BIN, ASSISTANT_CRONTAB_BIN,
-ASSISTANT_LAND_CI (command run instead of `ci` by land), ASSISTANT_PUBLISH_BIN (started after a land),
+ASSISTANT_LAND_CI (command run instead of `ci` by land), ASSISTANT_LANDQ_CHECK (instead of the queue's quick
+checks; unset in test mode = skipped), ASSISTANT_LANDQ_TICK (the worker's and waiter's poll, s),
+ASSISTANT_PUBLISH_BIN (started after a land),
 ASSISTANT_BOARD_MARK_BIN (the `board` a land pokes),
 ASSISTANT_LIVE_BIN (the bin dir the inbox-lint step stages over, default ~/bin), ASSISTANT_INBOX_LINT
 (inbox_lint.py; its allowlist.txt is read from beside it), ASSISTANT_VOICE_RELAY_BIN (the call guard's
@@ -244,6 +276,7 @@ class Fail(Exception):
     def __init__(self, msg: str, code: int = 1):
         super().__init__(msg)
         self.code = code
+        self.shared = False  # a shared blocker (runner down or refusing), not the tree's own red
 
 
 def stdout_gone() -> None:
@@ -363,7 +396,17 @@ def _ticket_take(what: str) -> Path:
 
 
 _PHASE: dict = {}  # this process's land: {"branch", "rerun", "start"} while land() runs (the queue's phase record)
-PHASES = ("rebase", "fail-fast", "CI local", "CI host + runner", "runner", "evals", "waiting for lock")
+PHASES = (
+    "rebase",
+    "fail-fast",
+    "quick checks",
+    "queued",
+    "CI local",
+    "CI host + runner",
+    "runner",
+    "evals",
+    "waiting for lock",
+)
 
 
 def _land_phase(phase: str, **kw) -> None:
@@ -1551,11 +1594,9 @@ def _land_ready(repo: Path, branch: str) -> None:
     git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
 
 
-def _land_verify(repo: Path, wt: Path, branch: str, mode: str, override: str | None, prev: dict | None) -> dict:
-    """Rebase the branch onto main's current commit and check that tree: a green stamp, else the fail-fast
-    preflight and the CI; the runner job and its answer; the eval subset. Fail when anything is red. Runs outside
-    the deploy lock (land re-checks under it that main and the branch are still what this saw), or under it in the
-    serial flow. prev: an earlier pass of this land (its green eval subset is reused for the same changed files)."""
+def _rebase_on_main(repo: Path, wt: Path, branch: str) -> tuple[str, str, str]:
+    """The branch's worktree rebased onto main's current commit -> (base, head, tree). A conflict aborts the rebase
+    and fails with exit 5; uncommitted changes with exit 3. Shared by a land's verify pass and the queue's front."""
     if dirty(wt):
         raise Fail(f"{wt} has uncommitted changes: commit them first", 3)
     base = git(repo, "rev-parse", "main")  # read once: main may move while this runs
@@ -1565,8 +1606,15 @@ def _land_verify(repo: Path, wt: Path, branch: str, mode: str, override: str | N
         run(["git", "-C", str(wt), "rebase", "--abort"])
         log({"op": "land", "branch": branch, "ok": False, "why": "rebase conflict"})
         raise Fail(f"rebase onto main conflicts: in {wt} run `git rebase main`, resolve, commit, land again", 5)
-    tree = git(wt, "rev-parse", "HEAD^{tree}")
-    head = git(wt, "rev-parse", "HEAD")
+    return base, git(wt, "rev-parse", "HEAD"), git(wt, "rev-parse", "HEAD^{tree}")
+
+
+def _land_verify(repo: Path, wt: Path, branch: str, mode: str, override: str | None, prev: dict | None) -> dict:
+    """Rebase the branch onto main's current commit and check that tree: a green stamp, else the fail-fast
+    preflight and the CI; the runner job and its answer; the eval subset. Fail when anything is red. Runs outside
+    the deploy lock (land re-checks under it that main and the branch are still what this saw), or under it in the
+    serial flow. prev: an earlier pass of this land (its green eval subset is reused for the same changed files)."""
+    base, head, tree = _rebase_on_main(repo, wt, branch)
     stamp = read_json(st("ci", tree + ".json"), {})
     if not stamp.get("ok"):
         _land_phase("fail-fast")
@@ -1655,13 +1703,15 @@ def _land_verify(repo: Path, wt: Path, branch: str, mode: str, override: str | N
             _ci_blocked(shared[0], branch, shared[1])
         log({"op": "land", "branch": branch, "ok": False, "why": "no signed record", "tree": tree, "gate": gate})
         red = f"; runner RED (job {runner.get('job')}): {runner['red']}" if runner.get("red") else ""
-        raise Fail(
+        err = Fail(
             f"no signed green CI record from the hub runner for {tree[:12]} ({runner.get('state') or 'none'}"
             f"{': ' + str(runner.get('why')) if runner.get('why') else ''}){red}: fix and land again; the main "
             "session may `land --override 'REASON'`; runner down: `touch ~/.config/assistant/land-local-ci` runs "
             "the tests here",
             6,
         )
+        err.shared = bool(shared)  # the runner down or refusing, not this tree's red: the queue retries later
+        raise err
     if enforce and not evals.get("ok"):
         log({"op": "land", "branch": branch, "ok": False, "why": "eval subset", "tree": tree, "gate": gate})
         raise Fail(f"eval subset failed for {branch} ({evals.get('detail') or evals.get('rc')}): fix, land again", 6)
@@ -1676,13 +1726,20 @@ def _land_verify(repo: Path, wt: Path, branch: str, mode: str, override: str | N
     }
 
 
-def land(branch: str, adopt=(), override: str | None = None) -> None:
+def land(branch: str, adopt=(), override: str | None = None, batch: str | None = None) -> dict:
     """Rebase + CI outside the deploy lock (two lands' CIs overlap instead of queueing), then under the lock: main
     and the branch still what the CI saw -> fast-forward + deploy; main moved -> once more outside the lock, after
-    that under it (the old serial flow; land_serial() forces it)."""
+    that under it (the old serial flow; land_serial() forces it). batch: the land queue's worker lands a batch this
+    way (branch landq/b-N): the deploy row names its first member (that member's own land_cmd_start, a landq block),
+    one more land row and one board poke per other member, each with its own last commit on main.
+    -> {"sha": main, "shas": {entry id: its last commit on main}}"""
     repo = paths.repo()
     if branch in ("main", "HEAD"):
         raise Fail("land a feature branch, not main", 2)
+    bq = _landq_read("batches", batch) if batch else None
+    if batch and not (bq and bq.get("members")):
+        raise Fail(f"land queue: batch {batch} unknown", 2)
+    first = bq["members"][0] if bq else None
     if override is not None:
         if _subagent():
             raise Fail("--override is the main session's: a subagent can't land past the CI gate", 2)
@@ -1694,6 +1751,7 @@ def land(branch: str, adopt=(), override: str | None = None) -> None:
     _land_ready(repo, branch)
     wt = worktree_of(repo, branch)
     temp = None
+    shas: dict = {}
     partial = ""  # the land's suites were a selection: every suite on main afterwards (legacy_main_bg)
     if wt is None:
         temp = Path(tempfile.mkdtemp(prefix="land-", dir=st()))
@@ -1731,15 +1789,18 @@ def land(branch: str, adopt=(), override: str | None = None) -> None:
                     locked = True
                 old = git(repo, "rev-parse", "main")
                 git(repo, "merge", "--ff-only", "--quiet", v["head"])
+                if bq and first:
+                    shas = _landq_shas(repo, old, bq)
                 try:
                     deploy(
                         op="land",
                         adopt=adopt,
                         extra={
-                            "branch": branch,
+                            "branch": first["branch"] if first else branch,
                             "from": old[:12],
                             "land_start": t0,
-                            "land_cmd_start": w_cmd,
+                            "land_cmd_start": first["cmd_start"] if first else w_cmd,
+                            **({"landq": _landq_rowinfo(bq, first, shas[first["id"]])} if bq and first else {}),
                             "lock_wait_secs": lock_wait,
                             "verify": {"tries": tries + locked, "locked": locked, "serial": serial},
                             "tree": v["tree"],
@@ -1758,17 +1819,26 @@ def land(branch: str, adopt=(), override: str | None = None) -> None:
                     legacy_main_record(v["legacy_out"]["suites"], git(repo, "rev-parse", "main"), "land")
                 if (v["legacy_out"].get("selection") or {}).get("mode") == "impacted":
                     partial = branch
+                if bq:
+                    _landq_member_rows(bq, shas)
                 break
     finally:
         _land_phase_drop()
         if temp is not None:
             run(["git", "-C", str(repo), "worktree", "remove", "--force", str(temp / "wt")])
             shutil.rmtree(temp, ignore_errors=True)
-    say(f"landed {branch} on main ({git(repo, 'rev-parse', '--short=12', 'main')}) in {time.monotonic() - t_cmd:.0f} s")
-    board_mark(branch, git(repo, "rev-parse", "main"), pre)
+    main_sha = git(repo, "rev-parse", "main")
+    say(f"landed {branch} on main ({main_sha[:12]}) in {time.monotonic() - t_cmd:.0f} s")
+    if bq:
+        for m in bq["members"]:
+            sha = shas.get(m["id"]) or main_sha
+            board_mark(m["branch"], sha, [h for h in [m.get("head", ""), *m.get("pre", [])] if h])
+    else:
+        board_mark(branch, main_sha, pre)
     publish_bg()
     if partial:
         legacy_main_bg(partial)
+    return {"sha": main_sha, "shas": shas if bq else {}}
 
 
 def board_mark(branch: str, sha: str, pre: list[str]) -> None:
@@ -1805,6 +1875,903 @@ def publish_bg() -> None:
         run([exe, "push", "--cron", "--bg"], timeout=30)
     except Exception as e:  # noqa: BLE001  (the land is done: report, never raise)
         say(f"assistant-publish not started: {type(e).__name__}")
+
+
+# ---------------------------------------------------------------- land queue (verify, then land)
+# Switch: ~/.config/assistant/land-queue (content "on"; ASSISTANT_LAND_QUEUE=0|1 wins); absent = the direct land above.
+# On: `land BRANCH` runs the quick checks here (rebase onto main, the fail-fast preflight, ruff + format, the AST ban
+# and secretscan: seconds), queues the branch (an entry in landq/entries/) and then waits for its end (--wait, the
+# default: exit codes as a direct land) or returns at once (--no-wait: "queued qN"). ONE worker (flock on
+# landq/worker.lock; started by land, `land status` and --wait, and the cron line; it exits when idle) tests what
+# waits: the batch lane takes up to LANDQ_BATCH_MAX queued entries in order, rebased one onto the other on main into
+# branch landq/b-N (one that conflicts with an earlier one waits for the next batch, built on main after this one),
+# and runs today's land() on it as a child (`land landq/b-N --batch bN`): the host CI beside ONE runner job, the eval
+# subset, then under the deploy lock the fast-forward and ONE deploy; a land row and a board poke per member. Main and
+# ~/bin only ever get a tree with a signed green record (the gate as before), so nothing is ever reverted. The gated
+# lane (gated paths, --adopt) runs one entry at a time beside it: a long eval subset never holds the batch lane.
+# A red batch splits in halves at the front of the queue (never mixed with new entries): the first half alone on
+# main, then the second on top; a single member left is red (exit 6 to its waiter, else one ~/inbox/land-red-* note
+# naming its batch-mates); a second half of one branch whose tree is the red batch's tree is red without a run.
+# Runner down or refusing (a shared blocker): back to queued, retried after LANDQ_RETRY. Smoke failure after the
+# deploy (rolled back as before): each member once alone. Crash: entries and batch files are written atomically; a
+# new worker adopts a live child, else main at the batch tip = landed (missing rows written, an undeployed tip
+# deployed once), main unchanged = the members go back to the front of the queue.
+LANDQ_BATCH_MAX = 4
+LANDQ_WAIT = 3600.0  # --wait's default budget (s): queue + one batch with its eval subset
+LANDQ_RETRY = 300.0  # runner down or refusing: entries retry after this
+LANDQ_KEEP = 2 * 86400.0  # finished entries and batches are pruned after this
+LANDQ_TICK = 1.0
+LANDQ_STALL = 60.0  # --wait: no worker for this long although it was started = exit 7 (queue stalled)
+LANDQ_DONE = ("landed", "red", "conflict", "superseded", "error")
+LANDQ_QUICK_SKIP = "suites,pytest,pyright,schemas,ratchet,inbox-lint,precheck,bun"  # leaves sync ruff ast secretscan
+LANDQ_RED_PREFIX = "land-red"
+
+
+def land_queue() -> bool:
+    """The land queue's switch: ASSISTANT_LAND_QUEUE=0|1, else the file ~/.config/assistant/land-queue holding
+    "on" (or nothing). Off: `land BRANCH` lands directly; the worker still finishes what is queued."""
+    v = os.environ.get("ASSISTANT_LAND_QUEUE", "").strip().lower()
+    if v:
+        return v not in ("0", "no", "off", "false")
+    try:
+        return paths.config("land-queue").read_text(encoding="utf-8").strip().lower() in ("", "on", "1", "yes", "true")
+    except OSError:
+        return False
+
+
+def _lq(*parts: str) -> Path:
+    return st("landq", *parts)
+
+
+def _landq_tick() -> float:
+    try:
+        return float(test_seam("ASSISTANT_LANDQ_TICK") or LANDQ_TICK)
+    except ValueError:
+        return LANDQ_TICK
+
+
+@contextlib.contextmanager
+def _lq_lock():
+    """The queue's short state lock: every read-modify-write of entries, front groups and ids."""
+    p = _lq("state.lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _landq_read(kind: str, rid: str | None) -> dict | None:
+    if not rid or not re.fullmatch(r"[qb]\d{1,9}", rid):
+        return None
+    d = _read_json_safe(_lq(kind, rid + ".json"))
+    return d if d.get("id") == rid else None
+
+
+def _landq_write(kind: str, rec: dict) -> None:
+    rec["updated"] = round(clock.now(), 3)
+    write_json(_lq(kind, rec["id"] + ".json"), rec)
+
+
+def _landq_all(kind: str) -> list[dict]:
+    out = []
+    try:
+        files = list(_lq(kind).glob("*.json"))
+    except OSError:
+        return out
+    for f in files:
+        d = _read_json_safe(f)
+        if d.get("id") == f.stem:
+            out.append(d)
+    return sorted(out, key=lambda d: int(d.get("n") or 0))
+
+
+def _landq_next_id(kind: str) -> tuple[str, int]:
+    """The next entry (q) or batch (b) id; under _lq_lock. Never below an existing file's number."""
+    p = _lq("seq.json")
+    d = _read_json_safe(p)
+    have = [int(x.get("n") or 0) for x in _landq_all("entries" if kind == "q" else "batches")]
+    n = max([int(d.get(kind) or 0), *have]) + 1
+    d[kind] = n
+    write_json(p, d)
+    return f"{kind}{n}", n
+
+
+def _landq_front() -> list[dict]:
+    g = _read_json_safe(_lq("front.json")).get("groups")
+    return [x for x in g if isinstance(x, dict) and x.get("members")] if isinstance(g, list) else []
+
+
+def _landq_front_set(groups: list[dict]) -> None:
+    write_json(_lq("front.json"), {"groups": groups})
+
+
+def _landq_quick(wt: Path, branch: str, base: str, tree: str) -> None:
+    """The queue's quick checks on the rebased branch: `ci` with only sync, ruff + format, the AST ban and
+    secretscan (seconds); red = exit 6 now, before the branch is queued."""
+    seam = test_seam("ASSISTANT_LANDQ_CHECK")
+    if seam is None and paths.test_mode():
+        say("quick checks: skipped (test mode without ASSISTANT_LANDQ_CHECK)")
+        return
+    cmd = (
+        shlex.split(seam)
+        if seam
+        else [sys.executable, "-I", os.path.realpath(__file__), "ci", "--path", str(wt), "--base", base]
+        + ["--skip", LANDQ_QUICK_SKIP, "--no-stamp"]
+    )
+    _land_phase("quick checks")
+    say(f"quick checks for {branch} ({tree[:12]}): ruff + format, ast, secretscan ...")
+    rc = run_child(cmd, cwd=wt, timeout=900)
+    if rc != 0:
+        log({"op": "land", "branch": branch, "ok": False, "why": "quick checks", "tree": tree})
+        raise Fail(f"quick checks failed for {branch}: fix in {wt}, commit, land again", 6)
+
+
+def _land_front(branch: str, adopt=(), wait: bool = True, timeout: float = LANDQ_WAIT) -> int:
+    """`land BRANCH` with the queue on: the quick checks, then an entry in the queue; --wait follows it to its end."""
+    repo = paths.repo()
+    if branch in ("main", "HEAD") or branch.startswith("landq/"):
+        raise Fail("land a feature branch, not main (or a queue batch)", 2)
+    w_cmd = clock.now()
+    _land_ready(repo, branch)
+    wt = worktree_of(repo, branch)
+    temp = None
+    if wt is None:
+        temp = Path(tempfile.mkdtemp(prefix="land-", dir=st()))
+        git(repo, "worktree", "add", "--quiet", str(temp / "wt"), branch)
+        wt = temp / "wt"
+    _PHASE.update(branch=branch, rerun=0, start=w_cmd)
+    try:
+        pre = git(repo, "rev-list", "--max-count=30", f"main..{branch}", check=False).split()
+        base, head, tree = _rebase_on_main(repo, wt, branch)
+        if head == base:
+            say(f"nothing to land: {branch} has no commits beyond main ({base[:12]})")
+            return 0
+        if not read_json(st("ci", tree + ".json"), {}).get("ok"):
+            _land_phase("fail-fast")
+            _legacy_preflight(wt, branch, base, tree)  # a suite red on main and still red here: exit 6 now
+        _landq_quick(wt, branch, base, tree)
+        changed = [x for x in git(wt, "diff", "--name-only", f"{base}...HEAD").splitlines() if x]
+        root = _gate_root(wt, base)
+        try:
+            gated = gated_categories(changed, root)
+        finally:
+            if root != wt:
+                shutil.rmtree(root, ignore_errors=True)
+    finally:
+        _land_phase_drop()
+        if temp is not None:
+            run(["git", "-C", str(repo), "worktree", "remove", "--force", str(temp / "wt")])
+            shutil.rmtree(temp, ignore_errors=True)
+    e = landq_add(
+        branch, base=base, head=head, tree=tree, pre=pre, adopt=list(adopt), gated=gated, cmd_start=round(w_cmd, 3)
+    )
+    lane = ", gated lane" if e["lane"] == "gated" else ""
+    say(f"queued {e['id']} (position {landq_position(e)}{lane}) after {clock.now() - w_cmd:.0f} s of quick checks")
+    if not landq_kick():
+        say("land queue: worker not started (`assistant land status` starts it)")
+    if not wait:
+        say(
+            f"`assistant land status {e['id']}` shows it; a red or conflicting end with nobody waiting becomes one "
+            "~/inbox/land-red-* note"
+        )
+        return 0
+    return landq_wait(e["id"], timeout)
+
+
+def landq_add(branch: str, **kw) -> dict:
+    """A new queue entry for branch; a queued (not yet testing) entry of the same branch is superseded by it."""
+    now = round(clock.now(), 3)
+    with _lq_lock():
+        eid, n = _landq_next_id("q")
+        lane = "gated" if kw.get("gated") or kw.get("adopt") else "batch"
+        e = {"id": eid, "n": n, "branch": branch, "state": "queued", "lane": lane, "since": now, "tries": 0, **kw}
+        e["by"] = os.environ.get("AI_AGENT", "")[:40]
+        old = [o for o in _landq_all("entries") if o.get("branch") == branch and o.get("state") == "queued"]
+        for o in old:
+            o.update(state="superseded", superseded_by=eid, ended=now)
+            _landq_write("entries", o)
+        if old:
+            gone = {o["id"] for o in old}
+            groups = [{**g, "members": [m for m in g["members"] if m not in gone]} for g in _landq_front()]
+            _landq_front_set([g for g in groups if g["members"]])
+        _landq_write("entries", e)
+    for o in old:
+        say(f"{o['id']} (the earlier land of {branch}, still queued) is superseded by {eid}")
+    return e
+
+
+def landq_position(e: dict) -> int:
+    ahead = [o for o in _landq_all("entries") if o.get("state") == "queued" and o.get("lane") == e.get("lane")]
+    return 1 + sum(1 for o in ahead if int(o.get("n") or 0) < int(e.get("n") or 0))
+
+
+def _landq_worker_alive() -> bool:
+    """A worker holds landq/worker.lock (probed, never waited for)."""
+    p = _lq("worker.lock")
+    try:
+        fd = os.open(p, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def _landq_pending() -> bool:
+    return any(e.get("state") == "queued" for e in _landq_all("entries")) or any(
+        b.get("state") in ("building", "testing") for b in _landq_all("batches")
+    )
+
+
+def landq_kick() -> bool:
+    """Start the worker, detached (its own session, reparented to init), unless one runs. -> a worker runs."""
+    if _landq_worker_alive():
+        return True
+    if not _landq_pending():
+        return False
+    _lq().mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-I", os.path.realpath(__file__), "land", "--worker"]
+    pid = os.fork()
+    if pid == 0:  # double fork: the worker is never this process's child (no zombie while a waiter lives on)
+        code = 0
+        try:
+            with open(_lq("worker.log"), "a", encoding="utf-8") as f:
+                subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True
+                )
+        except BaseException:  # noqa: BLE001 (the fork's child must never return into the caller's code)
+            code = 1
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status) == 0
+
+
+def landq_worker(cron: bool = False) -> int:
+    """The one worker: runs both lanes until nothing is queued or testing, then exits. A second one exits at once."""
+    p = _lq("worker.lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 0
+            try:
+                me = _proc_stat(os.getpid())
+                write_json(_lq("worker.json"), {"pid": os.getpid(), "start": me[2] if me else "", "since": clock.now()})
+                if not cron or _landq_pending():
+                    _landq_run()
+                _landq_prune()
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            if not _landq_pending():  # an entry queued between the last look and the unlock: go on
+                return 0
+    finally:
+        os.close(fd)
+
+
+def _landq_alive(b: dict) -> bool:
+    try:
+        return bool(b.get("pid")) and _alive({"pid": int(b["pid"]), "start": str(b.get("start") or "")})
+    except (TypeError, ValueError):
+        return False
+
+
+def _landq_run() -> None:
+    running: dict[str, tuple[dict, subprocess.Popen | None]] = {}
+    for b in _landq_all("batches"):  # a worker before this one stopped: adopt or settle what it left
+        if b.get("state") == "building":
+            _landq_settle(b, None, {"requeue": True, "why": "the worker stopped while building it"})
+        elif b.get("state") == "testing":
+            if _landq_alive(b):
+                running[str(b.get("lane") or "batch")] = (b, None)
+                say(f"adopted {b['id']} (its land still runs, pid {b.get('pid')})")
+            else:
+                _landq_finish(b, None)
+    while True:
+        for lane, (b, proc) in list(running.items()):
+            if (proc.poll() is not None) if proc else not _landq_alive(b):
+                _landq_finish(_landq_read("batches", b["id"]) or b, proc.returncode if proc else None)
+                del running[lane]
+        for lane in ("batch", "gated"):
+            if lane not in running:
+                started = _landq_start(lane)
+                if started:
+                    running[lane] = started
+        if not running and not any(e.get("state") == "queued" for e in _landq_all("entries")):
+            return
+        time.sleep(_landq_tick())
+
+
+def _landq_pick(lane: str, now: float) -> tuple[list[dict], dict] | None:
+    """The next group for a lane (under _lq_lock): the batch lane takes the front groups first (bisect halves,
+    members back from a stopped land; never mixed with new entries), else up to LANDQ_BATCH_MAX queued entries in
+    order; the gated lane one entry."""
+    queued = {e["id"]: e for e in _landq_all("entries") if e.get("state") == "queued"}
+    groups = _landq_front()
+    if lane == "batch":
+        while groups:
+            g = groups.pop(0)
+            ms = [queued[i] for i in g["members"] if i in queued]
+            if ms:
+                _landq_front_set(groups)
+                return ms, g
+        _landq_front_set(groups)
+    infront = {i for g in groups for i in g["members"]}
+    ready = [
+        e
+        for e in queued.values()
+        if e.get("lane", "batch") == lane and e["id"] not in infront and float(e.get("not_before") or 0) <= now
+    ]
+    ready.sort(key=lambda e: int(e.get("n") or 0))
+    take = ready[: LANDQ_BATCH_MAX if lane == "batch" else 1]
+    return (take, {}) if take else None
+
+
+def _landq_build(entries: list[dict]) -> dict:
+    """Each entry's queued commits rebased onto main and then onto the one before it, in a temp worktree: -> members
+    (each with its commit count and tip), deferred (conflicts with an entry before it: next batch), conflict (with
+    main), empty (nothing beyond main), tip, tree and base (main)."""
+    repo = paths.repo()
+    base = git(repo, "rev-parse", "main")
+    out: dict = {"members": [], "deferred": [], "conflict": [], "empty": [], "base": base}
+    tmp = Path(tempfile.mkdtemp(prefix="landq-build-", dir=st()))
+    wt = tmp / "wt"
+    tip = base
+    git(repo, "worktree", "add", "--quiet", "--detach", str(wt), base)
+    try:
+        for e in entries:
+            head = str(e.get("head") or "")
+            if not head or run(["git", "-C", str(wt), "cat-file", "-e", head + "^{commit}"]).returncode != 0:
+                out["conflict"].append((e, "its queued commit is gone"))
+                continue
+            git(wt, "checkout", "--quiet", "--detach", head)
+            r = run(["git", "-C", str(wt), "rebase", "--quiet", tip])
+            if r.returncode != 0:
+                run(["git", "-C", str(wt), "rebase", "--abort"])
+                if out["members"]:
+                    out["deferred"].append(e)
+                else:
+                    out["conflict"].append((e, f"conflicts with main ({tip[:12]})"))
+                continue
+            new = git(wt, "rev-parse", "HEAD")
+            count = int(git(wt, "rev-list", "--count", f"{tip}..{new}") or 0)
+            if count == 0:
+                out["empty"].append(e)
+                continue
+            keep = ("id", "branch", "head", "pre", "cmd_start", "since", "adopt")
+            out["members"].append({**{k: e.get(k) for k in keep}, "count": count, "tip": new})
+            tip = new
+        out.update(tip=tip, tree=git(repo, "rev-parse", f"{tip}^{{tree}}"))
+    finally:
+        run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)])
+        shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
+def _landq_start(lane: str) -> tuple[dict, subprocess.Popen] | None:
+    """Pick, build and start the next batch of a lane: -> (batch, its land process), or None (nothing to run)."""
+    now = round(clock.now(), 3)
+    with _lq_lock():
+        picked = _landq_pick(lane, now)
+        if not picked:
+            return None
+        entries, g = picked
+        bid, n = _landq_next_id("b")
+        b = {
+            "id": bid,
+            "n": n,
+            "lane": lane,
+            "state": "building",
+            "since": now,
+            "members": [{"id": e["id"], "branch": e["branch"]} for e in entries],
+            "mates": list(g.get("mates") or []),
+            "alone": bool(g.get("alone")),
+            **({"red_tree": g["red_tree"], "red_why": g.get("red_why")} if g.get("red_tree") else {}),
+        }
+        for e in entries:
+            e.update(state="testing", batch=bid)
+            _landq_write("entries", e)
+        _landq_write("batches", b)
+    try:
+        bu = _landq_build(entries)
+    except (Fail, OSError, ValueError, subprocess.SubprocessError) as ex:
+        _landq_settle(b, None, {"requeue": True, "retry": True, "why": f"build: {ex}"[:300]})
+        return None
+    told = []
+    with _lq_lock():
+        for e, why in bu["conflict"]:
+            e.update(state="conflict", rc=5, ended=now, red=f"{why}: in its worktree run `git rebase main`, resolve, "
+                     "commit, land again")  # fmt: skip
+            told.append(e)
+        for e in bu["deferred"]:
+            e["defer"] = int(e.get("defer") or 0) + 1
+            if e["defer"] > 2:
+                e.update(state="conflict", rc=5, ended=now, red="conflicts with the branches queued before it, "
+                         "batch after batch: rebase it on main once they landed, land again")  # fmt: skip
+                told.append(e)
+            else:
+                e.update(state="queued", batch=None)
+        for e in bu["empty"]:
+            e.update(state="landed", sha=bu["base"], ended=now, note="nothing beyond main")
+        for e in [x for x, _w in bu["conflict"]] + bu["deferred"] + bu["empty"]:
+            _landq_write("entries", e)
+        b.update(members=bu["members"], base=bu["base"], tip=bu.get("tip"), tree=bu.get("tree"))
+        if not bu["members"]:
+            b.update(state="done", outcome="empty", ended=now)
+            _landq_write("batches", b)
+    for e in told:
+        _landq_tell(e)
+    if not bu["members"]:
+        return None
+    if b.get("red_tree") and len(bu["members"]) == 1 and bu["tree"] == b["red_tree"]:
+        _landq_settle(b, None, {"ok": False, "rc": 6, "why": f"{b.get('red_why') or 'red'} (its tree is the red "
+                                "batch's tree: red without another run)"})  # fmt: skip
+        return None
+    repo = paths.repo()
+    b["branch"] = f"landq/b-{n}"
+    git(repo, "branch", "-f", b["branch"], b["tip"])
+    adopt = [d for m in bu["members"] for d in (m.get("adopt") or [])] if lane == "gated" else []
+    cmd = [sys.executable, "-I", os.path.realpath(__file__), "land", b["branch"], "--batch", bid]
+    cmd += [x for d in adopt for x in ("--adopt", d)]
+    _lq("logs").mkdir(parents=True, exist_ok=True)
+    with open(_lq("logs", bid + ".log"), "a", encoding="utf-8") as f:
+        proc = subprocess.Popen(
+            cmd, cwd=str(repo), stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True
+        )
+    ps = _proc_stat(proc.pid)
+    b.update(state="testing", pid=proc.pid, start=ps[2] if ps else "", started=round(clock.now(), 3))
+    _landq_write("batches", b)
+    names = ", ".join(f"{m['id']} {m['branch']}" for m in bu["members"])
+    say(f"{bid}: testing {names} ({lane} lane) on main {bu['base'][:12]}")
+    return b, proc
+
+
+def _landq_finish(b: dict, rc: int | None) -> None:
+    res = _read_json_safe(_lq("results", b["id"] + ".json"))
+    _landq_settle(b, rc, res or _landq_recover(b, rc))
+
+
+def _landq_settle(b: dict, rc: int | None, res: dict) -> None:
+    """A batch's end into its entries: landed; back to the queue (runner down: after LANDQ_RETRY; a stopped land: at
+    the front); red with more than one member: halves at the front; smoke failure with more than one: each alone;
+    else red / conflict / error (the waiter's exit code, or one note)."""
+    now = round(clock.now(), 3)
+    ids = [m["id"] for m in b.get("members") or []]
+    branches = [m["branch"] for m in b.get("members") or []]
+    code = res.get("rc")
+    why = str(res.get("why") or (f"its land exited {rc}" if rc is not None else "its land stopped"))[:1000]
+    told = []
+    with _lq_lock():
+        es = [e for e in (_landq_read("entries", i) for i in ids) if e]
+        groups = _landq_front()
+        mates = sorted(set(b.get("mates") or []) | set(branches))
+        multi = len(es) > 1
+        if res.get("ok"):
+            for e in es:
+                e.update(state="landed", sha=(res.get("shas") or {}).get(e["id"]) or res.get("sha"), ended=now)
+            outcome = "landed"
+        elif res.get("requeue") or res.get("shared") or code == 7:
+            later = res.get("shared") or res.get("retry")
+            for e in es:
+                e.update(state="queued", batch=None, tries=int(e.get("tries") or 0) + 1)
+                e["not_before"] = now + LANDQ_RETRY if later else 0
+            if any(int(e.get("tries") or 0) > 3 for e in es):
+                for e in es:
+                    e.update(state="error", rc=code or 1, ended=now, red=f"back in the queue 4 times: {why}")
+                    told.append(e)
+                outcome = "error"
+            else:
+                if res.get("requeue") and multi and b.get("lane") == "batch":
+                    groups.insert(0, {"members": [e["id"] for e in es], "mates": list(b.get("mates") or [])})
+                outcome = "requeued"
+        elif multi and code == 6:
+            k = (len(es) + 1) // 2
+            first, second = [e["id"] for e in es[:k]], [e["id"] for e in es[k:]]
+            groups[:0] = [
+                {"members": first, "mates": mates},
+                {"members": second, "mates": mates, "red_tree": b.get("tree"), "red_why": why},
+            ]
+            for e in es:
+                e.update(state="queued", batch=None)
+            outcome = "split"
+        elif multi and code == 4:
+            groups[:0] = [{"members": [e["id"]], "alone": True} for e in es]
+            for e in es:
+                e.update(state="queued", batch=None)
+            outcome = "each alone"
+        elif multi and code == 5 and max(int(e.get("tries") or 0) for e in es) < 3:
+            groups.insert(0, {"members": [e["id"] for e in es], "mates": list(b.get("mates") or [])})
+            for e in es:  # main moved (the gated lane) and the batch conflicts with it: rebuilt on the new main
+                e.update(state="queued", batch=None, tries=int(e.get("tries") or 0) + 1)
+            outcome = "rebuild"
+        else:
+            state = {5: "conflict", 6: "red", 4: "red"}.get(code or 0, "error")
+            for e in es:
+                e.update(
+                    state=state,
+                    rc=code if isinstance(code, int) and code else (rc or 1),
+                    red=why,
+                    mates=[x for x in mates if x != e["branch"]],
+                    ended=now,
+                )
+                told.append(e)
+            outcome = state
+        for e in es:
+            _landq_write("entries", e)
+        _landq_front_set(groups)
+        b.update(state="done", outcome=outcome, ended=now, rc=code if code is not None else rc, why=why[:600])
+        _landq_write("batches", b)
+    if outcome == "landed":
+        _landq_reset_branches(b, res)
+    _landq_drop_branch(b)
+    for e in told:
+        _landq_tell(e)
+    say(f"{b['id']}: {outcome} ({', '.join(branches)})")
+
+
+def _landq_recover(b: dict, rc: int | None) -> dict:
+    """A batch whose land ended without a result (killed, crashed): main at its tip = landed (rows written when
+    missing, an undeployed tip deployed once); main unchanged = back to the queue."""
+    if b.get("state") != "testing" or not b.get("tip"):
+        return {"requeue": True, "why": "the worker stopped before its land started"}
+    repo = paths.repo()
+    row = next(
+        (
+            h
+            for h in reversed(history())
+            if h.get("op") == "land" and h.get("ok") and (h.get("landq") or {}).get("batch") == b["id"]
+        ),
+        None,
+    )
+    main = git(repo, "rev-parse", "main")
+    tip = git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{b.get('branch')}", check=False)
+    if row is None and not (tip and main == tip and main != b.get("base")):
+        return {"requeue": True, "why": f"its land stopped before the fast-forward (exit {rc})"}
+    old = b.get("base") or main
+    if row is not None and row.get("from"):
+        old = git(repo, "rev-parse", "--verify", "-q", f"{row['from']}^{{commit}}", check=False) or old
+    shas = _landq_shas(repo, old, b)
+    if row is None and read_json(st("deployed.json"), {}).get("sha") != main:
+        say(f"{b['id']}: main is at its tested tip ({main[:12]}) but not deployed: deploying it once")
+        first = b["members"][0]
+        try:
+            deploy(
+                op="land",
+                extra={
+                    "branch": first["branch"],
+                    "from": old[:12],
+                    "land_start": clock.now(),
+                    "land_cmd_start": first.get("cmd_start"),
+                    "tree": b.get("tree"),
+                    "recovered": "deploy",
+                    "landq": _landq_rowinfo(b, first, shas.get(first["id"]) or main),
+                },
+            )
+        except Fail as e:
+            return {"ok": False, "rc": e.code, "why": f"main is at the tested batch tip but its deploy failed ({e}): "
+                    "run `assistant deploy` by hand"}  # fmt: skip
+    _landq_member_rows(b, shas)
+    for m in b["members"]:
+        board_mark(m["branch"], shas.get(m["id"]) or main, [h for h in [m.get("head", ""), *(m.get("pre") or [])] if h])
+    return {"ok": True, "rc": 0, "sha": main, "shas": shas, "recovered": True}
+
+
+def _landq_shas(repo: Path, old: str, b: dict) -> dict:
+    """Each member's last commit on main (the batch's commits in member order, by their counts); main for all when
+    the counts don't add up (a commit dropped in a later rebase)."""
+    main = git(repo, "rev-parse", "main")
+    commits = git(repo, "rev-list", "--reverse", f"{old}..{main}", check=False).split()
+    counts = [int(m.get("count") or 0) for m in b["members"]]
+    if not commits or sum(counts) != len(commits) or 0 in counts:
+        return {m["id"]: main for m in b["members"]}
+    out, i = {}, 0
+    for m, c in zip(b["members"], counts, strict=True):
+        i += c
+        out[m["id"]] = commits[i - 1]
+    return out
+
+
+def _landq_rowinfo(b: dict, m: dict, sha: str) -> dict:
+    return {
+        "id": m["id"],
+        "batch": b["id"],
+        "size": len(b["members"]),
+        "lane": b.get("lane") or "batch",
+        "queued_secs": round(max(0.0, float(b.get("since") or 0) - float(m.get("since") or 0)), 1),
+        "members": [x["branch"] for x in b["members"]],
+        "sha": sha,
+    }
+
+
+def _landq_member_rows(b: dict, shas: dict) -> None:
+    """One land row per member that has none yet (the deploy row names the first), copied from the batch's deploy
+    row with the member's branch, its own land_cmd_start and its last commit on main."""
+    rows = [h for h in history() if h.get("op") == "land" and h.get("ok") and isinstance(h.get("landq"), dict)]
+    main_row = next((h for h in reversed(rows) if h["landq"].get("batch") == b["id"]), None)
+    if main_row is None:
+        return
+    have = {h["landq"].get("id") for h in rows}
+    for m in b["members"]:
+        if m["id"] in have:
+            continue
+        rec = {k: v for k, v in main_row.items() if k != "ts"}
+        sha = shas.get(m["id"]) or main_row.get("sha")
+        rec.update(
+            branch=m["branch"],
+            land_cmd_start=m.get("cmd_start"),
+            landq={**_landq_rowinfo(b, m, sha), "member_of": main_row.get("branch")},
+        )
+        log(rec)
+
+
+def _landq_reset_branches(b: dict, res: dict) -> None:
+    """A member rebased into the batch (its commits on main are copies): its branch moves to its commit on main, so
+    it counts as merged, unless it moved on since it was queued or its worktree has changes."""
+    repo = paths.repo()
+    for m in b.get("members") or []:
+        sha = (res.get("shas") or {}).get(m["id"]) or res.get("sha")
+        if not sha or sha == m.get("head"):
+            continue
+        try:
+            if git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{m['branch']}", check=False) != m.get("head"):
+                continue
+            wt = worktree_of(repo, m["branch"])
+            if wt is None:
+                run(["git", "-C", str(repo), "branch", "-f", m["branch"], sha])
+            elif not dirty(wt):
+                run(["git", "-C", str(wt), "reset", "--quiet", "--keep", sha])
+        except Fail:
+            continue
+
+
+def _landq_drop_branch(b: dict) -> None:
+    br = b.get("branch")
+    if not br:
+        return
+    repo = paths.repo()
+    try:
+        wt = worktree_of(repo, br)
+    except Fail:
+        wt = None
+    if wt is not None:  # a land killed mid-run left its temp worktree
+        run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)])
+        if wt.parent.name.startswith("land-") and wt.parent.parent == st():
+            shutil.rmtree(wt.parent, ignore_errors=True)
+    run(["git", "-C", str(repo), "branch", "-D", br])
+
+
+def _landq_tell(e: dict) -> None:
+    """A red, conflicting or failed entry: its live waiter prints it (exit code); nobody waiting -> one note."""
+    w = _read_json_safe(_lq("waits", e["id"] + ".json"))
+    try:
+        if w and _alive({"pid": int(w["pid"]), "start": str(w.get("start") or "")}):
+            return
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        _landq_note(e)
+    except Exception as ex:  # noqa: BLE001 (the queue goes on; `land status` still shows it)
+        say(f"land-red note not written ({type(ex).__name__})")
+
+
+def _landq_note(e: dict) -> None:
+    import core.notes as notes
+
+    what = {"red": "red", "conflict": "conflicts", "error": "failed"}.get(str(e.get("state")), str(e.get("state")))
+    red = " ".join(str(e.get("red") or "?").split())
+    mates = [str(m) for m in e.get("mates") or []]
+    lines = [
+        f"Branch: {e['branch']} · queue entry {e['id']} · batch {e.get('batch') or '-'} · exit {e.get('rc')}",
+        f"Why: {red[:500]}",
+    ]
+    if mates:
+        lines.append(f"Batch-mates: {', '.join(mates[:8])} (a flaky red names them too; landing it again is the fix)")
+    lines.append("Main and ~/bin don't have it: the queue only lands trees with a signed green record.")
+    body = notes.compose(
+        f"Land queue: {e['branch']} {what} ({e['id']})",
+        lines,
+        "fix it in its worktree (or hand it to the helper that made it), then `assistant land BRANCH` again; "
+        "`assistant land status` shows the queue",
+        source="assistant land",
+    )
+    payload = {
+        "entry": e["id"],
+        "branch": str(e["branch"])[:120],
+        "state": str(e.get("state")),
+        "red": red[:240],
+        "batch": str(e.get("batch") or "")[:20],
+        "mates": [m[:120] for m in mates[:8]],
+    }
+    try:
+        from inbox import writer
+
+        writer.new_note(LANDQ_RED_PREFIX, body, source="assistant land", kind="land.red", payload=payload)
+    except Exception:  # noqa: BLE001 (no ledger here: the plain note still reaches the beat)
+        notes.write_new(paths.inbox(), LANDQ_RED_PREFIX, body)
+
+
+def _landq_phase(b: dict | None) -> tuple[str, float | None]:
+    """A testing batch's phase: its land's phase record (deploy.queue/land-<pid>.phase), else "starting"."""
+    if not b or not b.get("pid"):
+        return "starting", None
+    d = _read_json_safe(_queue_dir() / f"land-{b['pid']}.phase")
+    if d.get("phase") and str(d.get("start")) == str(b.get("start")):
+        return str(d["phase"]), d.get("since")
+    return "starting", b.get("started")
+
+
+def _landq_view(e: dict, bs: dict) -> dict:
+    now = clock.now()
+    b = bs.get(e.get("batch") or "")
+    st_ = e.get("state")
+    v = {k: e.get(k) for k in ("id", "branch", "state", "lane", "batch", "since", "ended", "sha", "rc", "red", "mates")}
+    if st_ == "queued":
+        v["position"] = landq_position(e)
+        nb = float(e.get("not_before") or 0)
+        wait = f", retry after {time.strftime('%H:%M', time.localtime(nb))}" if nb > now else ""
+        detail = f"position {v['position']}{', gated lane' if e.get('lane') == 'gated' else ''}{wait}"
+    elif st_ == "testing" and b:
+        phase, since = _landq_phase(b)
+        v.update(phase=phase, members=[m["branch"] for m in b.get("members") or []])
+        secs = now - float(since or b.get("since") or now)
+        detail = f"batch {b['id']} ({len(v['members'])}: {', '.join(v['members'])}) · {phase} {secs:.0f} s"
+    elif st_ == "landed":
+        at = time.strftime("%H:%M", time.localtime(float(e.get("ended") or 0)))
+        detail = f"{str(e.get('sha') or '')[:12]} at {at}"
+    elif st_ == "superseded":
+        detail = f"by {e.get('superseded_by')}"
+    else:
+        red = " ".join(str(e.get("red") or "").split())
+        detail = f"exit {e.get('rc')} · {red[:160]}" + (f" (batch-mates: {', '.join(e.get('mates') or [])})"
+                                                         if e.get("mates") else "")  # fmt: skip
+    v["detail"] = detail
+    v["line"] = f"{e['id']:5} {str(e.get('branch'))[:40]:40} {st_:10} {detail}"
+    return v
+
+
+def _landq_line(e: dict) -> str:
+    """The waiter's progress line (printed when it changes)."""
+    b = _landq_read("batches", e.get("batch")) if e.get("batch") else None
+    v = _landq_view(e, {b["id"]: b} if b else {})
+    return f"{e['id']} {e['branch']}: {e.get('state')}, {v['detail']}"
+
+
+def landq_wait(eid: str, timeout: float = LANDQ_WAIT) -> int:
+    """Follow one entry to its end: exit 0 landed (prints main's commit), 5 conflict, 6 red (the red line), 7 the
+    budget ran out or the queue stalled (the entry stays queued); a newer land of the branch is followed."""
+    end = time.monotonic() + timeout
+    me = _proc_stat(os.getpid())
+    shown, nowork = "", None
+
+    def mark(i: str) -> None:
+        write_json(_lq("waits", i + ".json"), {"pid": os.getpid(), "start": me[2] if me else "", "since": clock.now()})
+
+    mark(eid)
+    try:
+        while True:
+            e = _landq_read("entries", eid)
+            if e is None:
+                raise Fail(f"land queue: entry {eid} is gone", 1)
+            if e.get("state") == "superseded" and e.get("superseded_by"):
+                say(f"{eid} was superseded by {e['superseded_by']} (a newer land of {e['branch']}): following that")
+                with contextlib.suppress(OSError):
+                    _lq("waits", eid + ".json").unlink()
+                eid = str(e["superseded_by"])
+                mark(eid)
+                continue
+            if e.get("state") in LANDQ_DONE:
+                return _landq_outcome(e)
+            line = _landq_line(e)
+            if line and line != shown:
+                say(line)
+                shown = line
+            if landq_kick() or _landq_worker_alive():
+                nowork = None
+            elif nowork is None:
+                nowork = time.monotonic()
+            elif time.monotonic() - nowork > LANDQ_STALL:
+                raise Fail(f"land queue stalled: no worker runs ({eid} {e.get('state')}); `assistant land status`", 7)
+            if time.monotonic() >= end:
+                raise Fail(
+                    f"{eid} ({e['branch']}) still {e.get('state')} after {timeout:.0f} s: it stays in the queue "
+                    f"(`assistant land status {eid}`)",
+                    7,
+                )
+            time.sleep(_landq_tick())
+    finally:
+        with contextlib.suppress(OSError):
+            _lq("waits", eid + ".json").unlink()
+
+
+def _landq_outcome(e: dict) -> int:
+    if e.get("state") == "landed":
+        secs = float(e.get("ended") or clock.now()) - float(e.get("cmd_start") or e.get("since") or 0)
+        say(
+            f"landed {e['branch']} on main ({str(e.get('sha') or '')[:12]}) in {secs:.0f} s "
+            f"(queue {e['id']}, batch {e.get('batch') or '-'})"
+        )
+        return 0
+    code = int(e.get("rc") or {"conflict": 5, "red": 6}.get(str(e.get("state")), 1))
+    mates = e.get("mates") or []
+    raise Fail(
+        f"{e['id']} {e['branch']} {e.get('state')}: {e.get('red') or '?'}"
+        + (f" (batch-mates: {', '.join(mates)})" if mates else ""),
+        code,
+    )
+
+
+def landq_status(ref: str | None, as_json: bool) -> int:
+    """The queue: queued (position), testing (batch, members, phase, seconds), landed, red, conflict, superseded;
+    starts the worker when something waits and none runs."""
+    if _landq_pending():
+        landq_kick()
+    es = _landq_all("entries")
+    bs = {b["id"]: b for b in _landq_all("batches")}
+    if ref:
+        sel = [e for e in es if e["id"] == ref] or [e for e in es if e.get("branch") == ref][-1:]
+        if not sel:
+            raise Fail(f"land queue: no entry {ref} (`assistant land status` lists them)", 3)
+    else:
+        live = [e for e in es if e.get("state") in ("queued", "testing")]
+        sel = live + [e for e in es if e.get("state") not in ("queued", "testing")][-8:]
+    rows = [_landq_view(e, bs) for e in sel]
+    worker = _landq_worker_alive()
+    if as_json:
+        say(json.dumps({"switch": land_queue(), "worker": worker, "entries": rows, "front": _landq_front()},
+                       sort_keys=True))  # fmt: skip
+        return 0
+    nq = sum(1 for e in es if e.get("state") == "queued")
+    nt = sum(1 for e in es if e.get("state") == "testing")
+    say(f"land queue: {'on' if land_queue() else 'off'} · worker {'running' if worker else 'idle'} · {nq} queued · "
+        f"{nt} testing")  # fmt: skip
+    for r in rows:
+        say("  " + r["line"])
+    return 0
+
+
+def _landq_prune() -> None:
+    cut = clock.now() - LANDQ_KEEP
+    for e in _landq_all("entries"):
+        if e.get("state") in LANDQ_DONE and float(e.get("ended") or e.get("updated") or 0) < cut:
+            with contextlib.suppress(OSError):
+                _lq("entries", e["id"] + ".json").unlink()
+    for b in _landq_all("batches"):
+        if b.get("state") == "done" and float(b.get("ended") or b.get("updated") or 0) < cut:
+            for p in (
+                _lq("batches", b["id"] + ".json"),
+                _lq("results", b["id"] + ".json"),
+                _lq("logs", b["id"] + ".log"),
+            ):
+                with contextlib.suppress(OSError):
+                    p.unlink()
+
+
+def _landq_child(branch: str, bid: str, adopt=()) -> int:
+    """`land landq/b-N --batch bN` (the worker's child): today's land() on the batch branch; its outcome goes to
+    landq/results/bN.json for the worker (exit codes as a direct land)."""
+    try:
+        r = land(branch, adopt, None, batch=bid)
+    except Fail as e:
+        write_json(
+            _lq("results", bid + ".json"),
+            {"ok": False, "rc": e.code, "why": str(e)[:1000], "shared": e.shared, "at": clock.now()},
+        )
+        raise
+    write_json(
+        _lq("results", bid + ".json"), {"ok": True, "rc": 0, "sha": r["sha"], "shas": r["shas"], "at": clock.now()}
+    )
+    return 0
 
 
 # ---------------------------------------------------------------- hub CI runner + land gate
@@ -4017,6 +4984,9 @@ def ci(
             allow = read_json(tree / "ops" / "lint" / "ast-allow.json", {}).get("allow", {})
             hits = ast_ban(tree, tracked, allow)
             did("ast", not hits, " | ".join(hits[:5]) or "no local json/note helpers, urlopen or flock outside core/")
+        lint_red = [s for s in ("ruff", "ast") if s in done and not done[s][0]]
+        if host and lint_red:  # a land's part here: a lint red ends it now (the suites and scans stop unseen)
+            raise Fail(f"{' + '.join(lint_red)} red: the rest of the host CI skipped; fix it, land again")
         if "schemas" not in skip:
             did(*_ci_schemas(tree, tracked, pyexe(".venv-3.13"), isolated=tc is None))
         if "ratchet" not in skip:
@@ -5358,10 +6328,19 @@ def main(argv=None) -> int:
     p = sub.add_parser("ci-status", help="shared CI blockers now (what stops every land) + 24 h blocked time")
     p.add_argument("--json", action="store_true")
     p.add_argument("--clear", metavar="KEY|all")
-    p = sub.add_parser("land")
-    p.add_argument("branch")
+    p = sub.add_parser("land", help="land BRANCH, or `land status [qN|BRANCH]` (the land queue)")
+    p.add_argument("branch", nargs="?")
+    p.add_argument("ref", nargs="?", help="land status: one entry (qN) or branch")
     p.add_argument("--adopt", action="append", default=[])
     p.add_argument("--override")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--wait", dest="wait", action="store_true", default=None, help="queue on: follow it (default)")
+    g.add_argument("--no-wait", dest="wait", action="store_false", help="queue on: return once queued")
+    p.add_argument("--timeout", type=float, default=LANDQ_WAIT, help="--wait's budget in s")
+    p.add_argument("--json", action="store_true", help="land status as JSON")
+    p.add_argument("--batch", help=argparse.SUPPRESS)  # the queue worker's child
+    p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--cron", action="store_true", help=argparse.SUPPRESS)
     p = sub.add_parser("ci-gate")
     p.add_argument("action", choices=("status",) + GATE_MODES)
     p.add_argument("--reason", default="")
@@ -5435,7 +6414,7 @@ def main(argv=None) -> int:
         if a.cmd == "ci-gate":
             return ci_gate(a.action, a.reason, a.force, a.json, a.lands)
         if a.cmd == "land":
-            land(a.branch, a.adopt, a.override)
+            return land_cmd(a)
         elif a.cmd in ("deploy", "rollback") and a.target == "hub":
             if getattr(a, "adopt", None):
                 raise Fail("--adopt is for the bin target", 2)
@@ -5488,6 +6467,32 @@ def main(argv=None) -> int:
     except paths.RealHomeRefused as e:
         print(f"assistant: {e}", file=sys.stderr)
         return 3
+
+
+def land_cmd(a) -> int:
+    """`assistant land ...`: the worker, `land status`, a batch child, the direct land (queue off, --override) or
+    the queue's front."""
+    if a.worker:
+        return landq_worker(a.cron)
+    if a.branch == "status":
+        if a.wait and a.ref:  # follow a queued entry (one queued with --no-wait) to its end
+            e = next((x for x in reversed(_landq_all("entries")) if a.ref in (x["id"], x.get("branch"))), None)
+            if e is None:
+                raise Fail(f"land queue: no entry {a.ref} (`assistant land status` lists them)", 3)
+            return landq_wait(e["id"], a.timeout)
+        return landq_status(a.ref, a.json)
+    if not a.branch:
+        raise Fail(
+            "usage: assistant land BRANCH [--wait | --no-wait] | assistant land status [qN | BRANCH] [--json]", 2
+        )
+    if a.ref:
+        raise Fail(f"land: unexpected argument {a.ref!r} (a branch named status can't be landed: rename it)", 2)
+    if a.batch:
+        return _landq_child(a.branch, a.batch, a.adopt)
+    if a.override is not None or not land_queue():
+        land(a.branch, a.adopt, a.override)
+        return 0
+    return _land_front(a.branch, a.adopt, a.wait is not False, a.timeout)
 
 
 def _home_rel(p: Path, home: Path) -> str:

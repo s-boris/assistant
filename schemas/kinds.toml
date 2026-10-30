@@ -377,3 +377,13 @@ labels = ["failure", "ci"]
 hint = "a shared CI blocker stops every land: assistant ci-status; fix it (or hand it to one helper), then ack"
 jobs = "Self-maintenance (nightly, no tokens)"
 payload = "payloads/ci.blocked.schema.json"
+# The land queue (ops/assistant.py): a queued branch that ended red, in conflict or failed while nobody waited for it
+# (`land --no-wait`); a waiting helper gets the exit code instead. One note per entry, at the beat (never Telegram).
+[kinds."land.red"]
+match = ["land-red-*"]
+priority = 5
+delivery = "beat"
+labels = ["failure", "ci"]
+hint = "a queued land ended red: fix it in its worktree (or hand it to its helper), land again; `assistant land status`"
+jobs = "Self-maintenance (nightly, no tokens)"
+payload = "payloads/land.red.schema.json"

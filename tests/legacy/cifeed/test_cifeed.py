@@ -301,6 +301,48 @@ try:
         f.write('{broken')
     ok(C.snapshot(NOW)['queue']['holder'] is None, 'queue: an unreadable lock file = no holder')
 
+    # the land queue (assistant's landq/): queued entries per lane with their position, a testing batch as one row
+    # (members joined with +, "batch bN (size): <its land's phase>"), no rows for the worker, `land status` or a
+    # member's own waiting `land BRANCH --wait`
+    LQ = os.path.join(ST, 'landq')
+    for d in ('entries', 'batches'):
+        os.makedirs(os.path.join(LQ, d))
+    for n, br, state, lane, since in ((1, 'q-one', 'queued', 'batch', NOW - 30), (2, 'q-gated', 'queued', 'gated', NOW - 20),
+                                      (3, 'm-one', 'testing', 'batch', NOW - 200), (4, 'm-two', 'testing', 'batch', NOW - 190),
+                                      (5, 'old-landed', 'landed', 'batch', NOW - 900), (6, 'q-two', 'queued', 'batch', NOW - 10)):
+        wj(os.path.join(LQ, 'entries', f'q{n}.json'), {'id': f'q{n}', 'n': n, 'branch': br, 'state': state, 'lane': lane,
+                                                       'since': since, 'batch': 'b2' if state == 'testing' else None})
+    wj(os.path.join(LQ, 'batches', 'b2.json'), {'id': 'b2', 'n': 2, 'state': 'testing', 'lane': 'batch', 'since': NOW - 150,
+                                                'started': NOW - 140, 'pid': 4110, 'start': '5000',
+                                                'members': [{'id': 'q3', 'branch': 'm-one'}, {'id': 'q4', 'branch': 'm-two'}]})
+    wj(os.path.join(LQ, 'batches', 'b1.json'), {'id': 'b1', 'n': 1, 'state': 'done', 'members': [{'id': 'q5', 'branch': 'old-landed'}]})
+    proc(4110, ['/usr/bin/python3', '-I', '/home/x/bin/assistant', 'land', 'landq/b-2', '--batch', 'b2'])
+    proc(4111, ['/usr/bin/python3', '-I', '/home/x/bin/assistant', 'land', '--worker'])
+    proc(4112, ['/usr/bin/python3', '-I', '/home/x/bin/assistant', 'land', 'm-one', '--wait', '--timeout', '600'])
+    proc(4113, ['/usr/bin/python3', '-I', '/home/x/bin/assistant', 'land', 'status'])
+    S = {w['branch']: w for w in C.snapshot(NOW)['queue']['starting']}
+    ok(set(S) == {'holder-br', 'reused', 'starting-br', 'm-one+m-two', 'q-one', 'q-gated', 'q-two'},
+       f'land queue: one row per queued entry and per testing batch, none for the worker, status or a waiter ({sorted(S)})')
+    ok(S['q-one']['phase'] == 'queued #1' and S['q-two']['phase'] == 'queued #2' and S['q-gated']['phase'] == 'queued #1, gated lane'
+       and S['q-one']['since'] == C.iso(NOW - 30), f"land queue: queued entries show their lane position ({S['q-one']}, {S['q-gated']})")
+    bt = S['m-one+m-two']
+    ok(bt['phase'] == 'batch b2 (2): starting' and bt['batch'] == 'b2' and bt['members'] == ['m-one', 'm-two'],
+       f'land queue: a testing batch before its land writes a phase ({bt})')
+    wj(os.path.join(ST, 'deploy.queue', 'land-4110.phase'), {'pid': 4110, 'start': '5000', 'what': 'land landq/b-2',
+                                                             'phase': 'CI host + runner', 'since': NOW - 60, 'land_since': NOW - 140})
+    bt = {w['branch']: w for w in C.snapshot(NOW)['queue']['starting']}['m-one+m-two']
+    ok(bt['phase'] == 'batch b2 (2): CI host + runner' and bt['phase_since'] == C.iso(NOW - 60),
+       f"land queue: a testing batch shows its land's phase ({bt})")
+    for f in ('land-4110.phase',):
+        os.remove(os.path.join(ST, 'deploy.queue', f))
+    shutil.rmtree(LQ)
+    L = C.land({'op': 'land', 'ok': True, 'branch': 'm-two', 'end': NOW, 'land_cmd_start': NOW - 300, 'land_start': NOW - 20,
+                'landq': {'id': 'q4', 'batch': 'b2', 'size': 2, 'queued_secs': 42.04}})
+    ok(L['batch'] == 'b2' and L['batch_n'] == 2 and L['queued_s'] == 42.0 and L['total_s'] == 300,
+       f"land queue: a land row shows its batch and queue time ({L['batch']}, {L['batch_n']}, {L['queued_s']})")
+    L = C.land({'op': 'land', 'ok': True, 'branch': 'plain', 'end': NOW})
+    ok(L['batch'] is None and L['batch_n'] is None and L['queued_s'] is None, 'land queue: a direct land has no batch')
+
     # desc / body / commits: the landed commit's subject and the first lines of its body (trailers skipped), several
     # commits as their subjects (max 5, then "+N more"), a red land's branch tip, plain and short; git asked once per row
     # (cached by sha), only for the shown lands, never for a row without commit or branch
