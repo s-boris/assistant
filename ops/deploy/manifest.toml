@@ -1220,7 +1220,7 @@ dest = "bin/plans-watch"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
 # Five scripts on core helpers (legacy suites via their *_BIN seams;
-# watch and sleepin suites gained theirs). Smokes only print help.
+# the watch suite gained its). Smokes only print help.
 [[file]]
 src = "scripts/damp-watch"
 dest = "bin/damp-watch"
@@ -1256,8 +1256,6 @@ src = "scripts/sleepin"
 dest = "bin/sleepin"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
-suite = "sleepin"
-seam = "SLEEPIN_BIN"
 
 [[file]]
 src = "scripts/event-card"
