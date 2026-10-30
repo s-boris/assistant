@@ -2868,7 +2868,9 @@ def gate_metric(rows: list[dict], repo: Path | None = None) -> dict:
 
 
 def _subagent() -> bool:
-    """A Claude Code subagent's shell: AI_AGENT ends in "_agent" there (seen 22.10); the main session's doesn't."""
+    """AI_AGENT ends in "_agent": a Claude Code subagent's shell, and the main session's too in current Claude Code
+    (every Bash shell gets the same environment, so nothing tells the two apart); --override then needs
+    `env -u AI_AGENT`, and the land queue waits by default everywhere (the main session passes --no-wait)."""
     return os.environ.get("AI_AGENT", "").endswith("_agent")
 
 
