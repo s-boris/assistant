@@ -13,7 +13,7 @@ def test_add_list_rm(env):
     ct = setup(env)
     r = env.run("cron", "add", "events-ingest", "* * * * *", "$HOME/bin/events ingest --cron")
     assert r.returncode == 0, r.stderr
-    assert ct.read_text() == CRON + "* * * * * $HOME/bin/events ingest --cron  # assistant:events-ingest\n"
+    assert ct.read_text() == CRON + f"* * * * * {env.home}/bin/events ingest --cron  # assistant:events-ingest\n"
     assert env.cron_log.read_text().strip() == str(ct)
     assert "assistant:events-ingest" in env.run("cron", "list").stdout
     assert env.run("cron", "add", "events-ingest", "* * * * *", "x").returncode == 3
@@ -77,9 +77,12 @@ def test_install_core_from_the_registry(env):
     lines = ct.read_text().splitlines()
     assert lines[0] == f"PATH={env.home}/bin:{env.home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
     assert sorted(ln.rsplit("# assistant:", 1)[1] for ln in lines[1:]) == core
-    assert all("$HOME/" in ln and str(env.home) not in ln for ln in lines[1:])  # home-neutral registry lines
+    assert all("$HOME/bin/" not in ln for ln in lines[1:])  # rendered as `cron add` writes it (live_form)
     assert env.cron_log.read_text().strip().endswith(str(ct))
-    assert schedules.parity(ct.read_text(), reg).changed == []
+    assert [ln.split("  # assistant:")[0] for ln in lines[1:]] == [
+        schedules.live_form(reg.lines[ln.rsplit(":", 1)[1]][0].cron_line, str(env.home)) for ln in lines[1:]
+    ]
+    assert schedules.parity(schedules.home_form(ct.read_text(), str(env.home)), reg).changed == []
     r = env.run("cron", "install")  # idempotent
     assert r.returncode == 0 and "nothing to add" in r.stdout and ct.read_text().splitlines() == lines
 
@@ -93,6 +96,48 @@ def test_install_keeps_lines_and_refuses_unknown_features(env):
     text = ct.read_text()
     assert text.startswith("PATH=") and CRON.strip() in text and "# assistant:media-doctor" in text
     assert "# assistant:log-rotate" in text  # core comes with every selection
+
+
+def test_cron_add_and_install_write_a_registry_line_the_same_way(env):
+    """land-queue (30.10) reached ~/crontab via `cron add` with a literal $HOME/bin/assistant while install-written
+    lines named the home: every write path spells a registry line one way (core.schedules.live_form)."""
+    from core import schedules
+
+    reg = schedules.load()
+    want = reg.lines["land-queue"][0].cron_line
+    assert "$HOME/bin/assistant" in want
+    sched, cmd = " ".join(want.split()[:5]), want.split(None, 5)[5]
+    ct = setup(env)
+    assert env.run("cron", "add", "land-queue", sched, cmd).returncode == 0
+    added = ct.read_text().splitlines()[-1]
+    ct.write_text(CRON)
+    r = env.run("cron", "install", "--features", "ci")
+    assert r.returncode == 0, r.stderr
+    installed = next(ln for ln in ct.read_text().splitlines() if ln.endswith("# assistant:land-queue"))
+    assert added == installed == f"{schedules.live_form(want, str(env.home))}  # assistant:land-queue"
+    assert "$HOME" not in added and f" {env.home}/bin/assistant land" in added
+    assert schedules.parity(schedules.home_form(added, str(env.home)), reg).changed == []
+
+
+def test_live_form_renders_unquoted_home_only():
+    from core import schedules
+
+    line = 'mkdir -p "$HOME/x" && sh -c \'$HOME/bin/a $($HOME/bin/b)\' >> $HOME/l 2>> "$HOME/e" $HOMEX ${HOME}'
+    out = schedules.live_form(line, "/srv/bot")
+    assert (
+        out
+        == 'mkdir -p "$HOME/x" && sh -c \'/srv/bot/bin/a $(/srv/bot/bin/b)\' >> /srv/bot/l 2>> "$HOME/e" $HOMEX ${HOME}'
+    )
+    assert schedules.home_form(out, "/srv/bot") == line
+    assert schedules.live_form(line, "/srv/my bot") == line  # a home cron's sh would split stays $HOME
+    for e in reg_lines():
+        assert schedules.home_form(schedules.live_form(e, "/srv/bot"), "/srv/bot") == e
+
+
+def reg_lines():
+    from core import schedules
+
+    return [es[0].cron_line for es in schedules.load().lines.values()]
 
 
 def test_parity_reads_a_literal_home_as_home():

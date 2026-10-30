@@ -143,6 +143,7 @@
   assistant status [--json]                 release, managed files, drift, lock, recent deploys, metric counts
   assistant cron list | add NAME 'SCHEDULE' 'COMMAND' | rm NAME
         edit ~/crontab under the deploy lock (lines tagged `# assistant:NAME`), validate, atomic mv, `crontab ~/crontab`
+        (add and install spell each $HOME outside double quotes as the literal home (core.schedules.live_form))
   assistant cron install [--features a,b | --features all] [--dry-run]
         a fresh ~/crontab from the registry (core/schedules.toml): the lines of the enabled features, each tagged.
         Features: --features (switch or registry feature names; all = every switch's features), else the profile's
@@ -3423,7 +3424,10 @@ def cron_edit(action: str, name: str = "", sched: str = "", command: str = "", d
                 raise Fail(f"cron entry {name} exists (rm it first)", 3)
             if "\n" in sched + command or not command.strip():
                 raise Fail("cron add: one-line SCHEDULE and COMMAND needed", 2)
-            line = f"{sched.strip()} {command.strip()}  # assistant:{name}"
+            from core import schedules
+
+            # the same spelling as `cron install` (core.schedules.live_form): $HOME/bin/x -> <home>/bin/x
+            line = f"{sched.strip()} {schedules.live_form(command.strip(), str(paths.home()))}  # assistant:{name}"
             if not cron_line_ok(line):
                 raise Fail(f"cron add: invalid line: {line}", 2)
             new_lines = lines + [line]
@@ -3517,12 +3521,15 @@ def cron_install(features: str | None, dry_run: bool) -> int:
                 say(f"cron install: no ~/crontab; starting from the installed crontab ({len(old.splitlines())} lines)")
         have = schedules.parity(old, reg)
         tagged = set(have.by_tag)
-        add = [(tag, reg.lines[tag][0].cron_line.rstrip()) for tag in tags if tag not in tagged]
+        home = str(paths.home())  # each line spelled as `cron add` writes it (core.schedules.live_form)
+        add = [
+            (tag, schedules.live_form(reg.lines[tag][0].cron_line.rstrip(), home)) for tag in tags if tag not in tagged
+        ]
         lines = old.splitlines()
         head = []
         if not any(ln.startswith("PATH=") for ln in lines):
-            h = str(paths.home())
-            head = [f"PATH={h}/bin:{h}/.local/bin:/usr/local/bin:/usr/bin:/bin"]  # cron does not expand $HOME here
+            # cron does not expand $HOME here
+            head = [f"PATH={home}/bin:{home}/.local/bin:/usr/local/bin:/usr/bin:/bin"]
         new_lines = head + lines + [f"{body}  # assistant:{tag}" for tag, body in add]
         bad = [ln for ln in new_lines if not cron_line_ok(ln)]
         if bad:

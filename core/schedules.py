@@ -19,6 +19,9 @@ census of ~/crontab (135 lines, 138 jobs) and is what the hub's schedules, `hub 
   end_state_ok(cmd)                True when sh would read "  # x" appended to cmd as a comment
   home_form(line, home=None)       the line with its literal home path spelled $HOME (parity and tag_text compare
                                    in that form: the registry is home-neutral, older crontabs name the home)
+  live_form(line, home=None)       the line as `assistant cron add|install` writes it to ~/crontab: each $HOME
+                                   outside double quotes spelled as the literal home (home_form's inverse: parity
+                                   still holds); "$HOME/..." state paths stay
   render_cron(e, home="$HOME")     the ~/crontab line of a registry job (cron-back shape)
   CORE_FEATURES, FEATURE_SWITCHES  what `assistant cron install` schedules: core always, the profile's switches mapped
   switch_features(names, known)    to registry features ((features, unknown names)); `all` = every switch
@@ -479,6 +482,18 @@ def home_form(line: str, home: str | None = None) -> str:
     if not h.startswith("/") or h == "/":
         return line
     return re.sub(re.escape(h) + r"(?![A-Za-z0-9_.-])", "$HOME", line)
+
+
+def live_form(line: str, home: str | None = None) -> str:
+    """A registry line the way every ~/crontab write spells it (cron add and cron install alike): each $HOME not
+    right after a double quote becomes the literal home ($HOME/bin/x -> /home/u/bin/x, also inside $( ) and
+    single-quoted sh -c text); quoted "$HOME/..." paths stay (JOBS.md: never a literal home path in redirects).
+    home_form(live_form(x)) == x. home: default $HOME of this process; one that is not a plain absolute path (a
+    space, a quote) leaves the line as it is, since cron's sh would split it."""
+    h = (os.environ.get("HOME", "") if home is None else home).rstrip("/")
+    if not h.startswith("/") or not re.fullmatch(r"[A-Za-z0-9._/+-]+", h):
+        return line
+    return re.sub(r'(?<!")\$HOME(?![A-Za-z0-9_])', lambda _m: h, line)
 
 
 def render_cron(e: Entry, home: str = "$HOME") -> str:
