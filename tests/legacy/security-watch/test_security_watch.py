@@ -595,6 +595,8 @@ class Mtls(Base):
     def setUp(self):
         super().setUp()
         self.config(mtls_probes=[dict(name=f"app.{DOMAIN}", port=8443, ca_file="~/ca.pem")])
+        (HOME / "ca.pem").write_text("CA\n")
+        self.addCleanup((HOME / "ca.pem").unlink, missing_ok=True)
         self.res = dict(self.DOWN)
         self.calls = []
         x = mock.patch.object(
@@ -627,6 +629,13 @@ class Mtls(Base):
             {f["key"]: f["sev"] for f in self.last()["findings"]},
             {f"mtls-open:app.{DOMAIN}:8443": 3, f"mtls-sni:app.{DOMAIN}:8443": 2, f"mtls-exp:app.{DOMAIN}:8443": 2},
         )
+
+    def test_missing_ca_file_is_a_low_finding_not_pending(self):
+        (HOME / "ca.pem").unlink()
+        self.run_sw("--only", "auth")
+        self.assertEqual({f["key"]: f["sev"] for f in self.last()["findings"]}, {f"mtls-ca:app.{DOMAIN}:8443": 1})
+        self.assertEqual(self.last()["metrics"]["auth"]["mtls"][0]["state"], "unchecked")
+        self.assertEqual(self.calls, [])
 
     def test_wrong_ca_is_medium(self):
         self.res = dict(self.GOOD, cert_ok=False, days=None, wrong_sni_answered=True, error="verify: self-signed")

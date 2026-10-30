@@ -591,7 +591,13 @@ def check_mtls(c):
     for p in probes:
         name, port = p["name"], int(p.get("port") or 443)
         key = f"{name}:{port}"
-        r = mtls_probe(ip, name, port, os.path.expanduser(p.get("ca_file") or ""))
+        ca = os.path.expanduser(p.get("ca_file") or "")
+        if not ca or not os.path.isfile(ca):              # else every run says "pending" and the path is never checked
+            c.find("auth", f"mtls-ca:{key}", 1, f"{key} probe can't check the app's internet path: CA file missing",
+                   "config mtls_probes ca_file: put the app gateway's public CA certificate there")
+            out.append(dict(name=key, state="unchecked", error="ca_file missing"))
+            continue
+        r = mtls_probe(ip, name, port, ca)
         if not r["cert_ok"] and not r["nocert_answered"] and not r["wrong_sni_answered"]:
             if live.get(key):
                 c.find("auth", f"mtls-down:{key}", 1, f"{key} (the app's internet path) does not answer",
