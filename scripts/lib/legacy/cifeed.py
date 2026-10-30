@@ -33,7 +33,7 @@ Sources, all read-only (never runs `assistant`, never takes or probes the deploy
 Shown: branch names, step names, releases (12 hex), commit subjects and body lines (<= 300 chars), times (local ISO 8601), counts. Never test
 ids, output or commands: every string is cut to a plain charset. Times in the owner's zone (profile locale.tz).
 Env (tests): CIFEED_STATE, CIFEED_GATE, CIFEED_CRONTAB, CIFEED_PROC, CIFEED_NOW, CIFEED_TZ, CIFEED_REPO.
-Tests: ~/opt/cifeed-tests/run.sh.
+Tests: the repo's tests/legacy/cifeed (run.sh; CIFEED_SRC=path tests another copy).
 """
 import datetime as dt
 import json

@@ -35,7 +35,7 @@ days (every tick: up to 2 days ago; `usage backfill`: up to yesterday).
 Context (coarse only: no coordinates, stops, titles or text): time (hour band, weekday, quiet, sleep-in, zone, trip),
 place (zone, band, town), motion (activity, driving), phone (screen, battery, net, vpn, roaming, dnd, car, buds,
 next alarm), calendar (office day, event before/during/after, travel leg, busy band, event night), home (TV,
-lights band, away mode, vacuum). Tests: ~/opt/usage-tests/run.sh.
+lights band, away mode, vacuum). Tests: the repo's tests/legacy/usage (run.sh).
 """
 import datetime as dt
 import html
