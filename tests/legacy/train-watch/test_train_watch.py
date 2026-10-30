@@ -2,7 +2,9 @@
 
 A loopback fake of the transport API (shape of transport.opendata.ch: /connections by from, to, date, time, limit;
 times with +0100 offsets; delay, prognosis.departure/arrival/platform) serves a synthetic timetable that each test
-sets; every request is recorded. http(s)_proxy point at the fake too, so nothing leaves the box even if the seam
+sets; the same timetable in timetable.search.ch's shape (route.json by from, to, date dd.mm.yyyy, time, num, pre;
+wall times without offset, dep_delay/arr_delay "+N", "X" = cancelled, track "4!" = changed) is the fallback; every
+request is recorded. SearchCh reruns every TW test with opendata down (an {"errors": ...} payload with 200). http(s)_proxy point at the fake too, so nothing leaves the box even if the seam
 breaks. Fictional stops, a synthetic profile and temporary state/inbox dirs only.
 Covers: cron fast path (no legs, outside the window, after departure), on time, delay + buckets + dedup,
 platform change, cancelled flag, missing connection (two runs / close to departure), replacement bus (EV, bus where
@@ -22,11 +24,13 @@ import tempfile
 import threading
 import unittest
 import urllib.parse
+import zoneinfo
 
 BIN = os.environ.get('TRAIN_WATCH_BIN') or os.path.expanduser('~/bin/train-watch')
 DAY = '2026-11-14'
 A, B, C = 'Alphadorf', 'Betastadt HB', 'Gammawil'
 CET = dt.timezone(dt.timedelta(hours=1))
+ZH = zoneinfo.ZoneInfo('Europe/Zurich')
 
 
 def t(hhmm, day=DAY):
@@ -74,6 +78,39 @@ def base(**over):
     return [c for c in rows.values() if c is not None]
 
 
+def wall(s):
+    """'...T16:31:00+0100' -> search.ch's '2026-11-14 16:31:00' (Zurich wall time, no offset)."""
+    if not s:
+        return None
+    s = s[:-2] + ':' + s[-2:] if s[-5] in '+-' and s[-3] != ':' else s
+    return dt.datetime.fromisoformat(s).astimezone(ZH).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def searchch(c):
+    """One opendata-shaped connection -> search.ch route.json shape."""
+    legs = []
+    for s in c['sections']:
+        j, d, a = s['journey'], s['departure'], s['arrival']
+        if not j:                                       # a walk (from the door)
+            legs.append({'departure': wall(d['departure']), 'name': d['station']['name'], 'type': 'walk',
+                         'exit': {'arrival': wall(a['arrival']), 'name': a['station']['name']}})
+            continue
+        cat, num = j['category'], j['number']
+        track = (d['prognosis'].get('platform') + '!') if d['prognosis'].get('platform') else d['platform']
+        kind = {'B': 'bus', 'EV': 'bus', 'T': 'tram'}.get(cat, 'strain' if cat == 'S' else 'express_train')
+        legs.append({'departure': wall(d['departure']), 'name': d['station']['name'], 'type': kind,
+                     'line': f'{cat}{num}' if cat in ('S', 'IC', 'IR', 'RE') else num, '*G': cat, '*L': num,
+                     'terminal': j['to'], 'operator': j['operator'], 'track': track,
+                     'dep_delay': 'X' if j.get('cancelled') else (f"+{d['delay']}" if d['delay'] else '+0'),
+                     'exit': {'arrival': wall(a['arrival']), 'name': a['station']['name'], 'track': '',
+                              'arr_delay': f"+{a['delay']}" if a['delay'] else '+0'}})
+    last = c['sections'][-1]['arrival']
+    legs.append({'arrival': wall(last['arrival']), 'name': last['station']['name']})
+    return {'from': c['from']['station']['name'], 'departure': wall(c['from']['departure']),
+            'dep_delay': f"+{c['from']['delay'] or 0}", 'to': c['to']['station']['name'],
+            'arrival': wall(c['to']['arrival']), 'arr_delay': f"+{c['to']['delay'] or 0}", 'legs': legs}
+
+
 class Fake(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -87,6 +124,19 @@ class Fake(http.server.BaseHTTPRequestHandler):
             return self.send(500, {'errors': [{'message': 'backend down'}]})
         if srv.mode == 'junk':
             return self.send(200, None, raw=b'<html>nope</html>')
+        if u.path.endswith('/connections') and srv.mode == 'down':      # opendata's router outage: 200 + errors
+            return self.send(200, {'errors': [{'message': 'The router is not reachable'}]})
+        if u.path.endswith('/connections') and srv.mode == 'down503':
+            return self.send(503, {'errors': [{'message': 'The router is not reachable'}]})
+        if u.path.endswith('/route.json'):
+            dd, mm, yy = q['date'].split('.')
+            when = f"{yy}-{mm}-{dd} {q['time']}:00"
+            rows = sorted((searchch(c) for c in srv.timetable if c['sections'][0]['departure']['station']['name']
+                           == q.get('from') and c['to']['station']['name'] == q.get('to')),
+                          key=lambda c: c['departure'])
+            i = next((n for n, c in enumerate(rows) if c['departure'] >= when), len(rows))
+            rows = rows[max(0, i - int(q.get('pre') or 0)):i + int(q.get('num') or 4)]
+            return self.send(200, {'count': len(rows), 'connections': rows})
         if u.path.endswith('/connections'):
             when = f"{q.get('date')}T{q.get('time')}:00+0100"
             rows = [c for c in srv.timetable if c['sections'][0]['departure']['station']['name'] == q.get('from')
@@ -104,6 +154,8 @@ class Fake(http.server.BaseHTTPRequestHandler):
 
 
 class TW(unittest.TestCase):
+    MODE = 'ok'                                         # SearchCh: 'down' (opendata errors, search.ch answers)
+
     @classmethod
     def setUpClass(cls):
         cls.srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Fake)
@@ -123,13 +175,14 @@ class TW(unittest.TestCase):
         with open(prof, 'w') as f:
             json.dump({'locale': {'tz': 'Europe/Zurich'}}, f)
         self.env = dict(os.environ, TRAIN_WATCH_API=self.url, TRAIN_WATCH_DIR=self.dir, TRAIN_WATCH_INBOX=self.inbox,
+                        TRAIN_WATCH_FALLBACK_API=self.url.replace('/v1', '/sc'),
                         ASSISTANT_PROFILE=prof, http_proxy=self.url, https_proxy=self.url,
                         HTTP_PROXY=self.url, HTTPS_PROXY=self.url, no_proxy='', NO_PROXY='',
                         HOME_PLACE_GEO='off', HOME_PLACE_CACHE=os.path.join(d, 'home-place.json'))
         self.env.pop('TRAIN_WATCH_NOW', None)
         self.env.pop('ROUTE_API', None)
         self.srv.requests.clear()
-        self.srv.timetable, self.srv.mode = base(), 'ok'
+        self.srv.timetable, self.srv.mode = base(), self.MODE
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -148,6 +201,16 @@ class TW(unittest.TestCase):
         r = self.run_tw(*args, now=now)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.split()[1].rstrip(':')
+
+    def lookups(self):
+        """(from, to, date, time) of every timetable lookup, whichever source got it (dates as YYYY-MM-DD)."""
+        out = []
+        for p, q in self.srv.requests:
+            if p.endswith('/route.json'):
+                out.append((q['from'], q['to'], '-'.join(reversed(q['date'].split('.'))), q['time']))
+            elif p.endswith('/connections') and self.MODE == 'ok':
+                out.append((q['from'], q['to'], q['date'], q['time']))
+        return out
 
     def notes(self):
         return sorted(glob.glob(os.path.join(self.inbox, 'train-watch-*.md')))
@@ -186,9 +249,7 @@ class TW(unittest.TestCase):
         r = self.check('13:31')
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, '', ''))
         self.assertEqual(self.notes(), [])
-        path, q = self.srv.requests[0]
-        self.assertTrue(path.endswith('/connections'))
-        self.assertEqual((q['from'], q['to'], q['date'], q['time']), (A, B, DAY, '16:31'))
+        self.assertEqual(self.lookups()[0], (A, B, DAY, '16:31'))
 
     # ------------------------------------------------------------------ problems
     def test_delay_note_dedup_and_buckets(self):
@@ -325,10 +386,11 @@ class TW(unittest.TestCase):
 
     def test_api_unreachable(self):
         self.add_leg()
-        self.env.update(TRAIN_WATCH_API='http://127.0.0.1:9/v1', no_proxy='127.0.0.1', NO_PROXY='127.0.0.1')
+        self.env.update(TRAIN_WATCH_API='http://127.0.0.1:9/v1', TRAIN_WATCH_FALLBACK_API='http://127.0.0.1:9/sc',
+                        no_proxy='127.0.0.1', NO_PROXY='127.0.0.1')
         r = self.check('15:00')
         self.assertEqual(r.returncode, 1)
-        self.assertIn('unreachable', r.stderr)
+        self.assertIn('fallback search.ch: transport API unreachable', r.stderr)
 
     def test_dry_run_writes_nothing(self):
         lid = self.add_leg()
@@ -531,8 +593,8 @@ class TW(unittest.TestCase):
         self.assertIn('16:20 → 17:23  home → Betastadt HB  [Bus 7 › S5]', r.stdout)
         self.assertNotIn('Probeweg', r.stdout)
         self.check('15:00')
-        qs = [q for p, q in self.srv.requests if p.endswith('/connections')]
-        self.assertTrue(qs and all(q['from'] == hq for q in qs), qs)        # coordinates, never the address text
+        qs = self.lookups()
+        self.assertTrue(qs and all(q[0] == hq for q in qs), qs)            # coordinates, never the address text
         n = self.note_text()                                             # the first bus is late: one note
         self.assertIn('(+6 min)', n)
         self.assertIn('home → Betastadt HB', n)
@@ -577,9 +639,9 @@ class TW(unittest.TestCase):
         lid = self.dst_leg(f'{d}T02:20:00+01:00', f'{d}T03:12:00+01:00')
         r = self.run_at('check', '--cron', at=f'{d}T02:30:00+02:00')
         self.assertEqual((r.returncode, r.stderr), (0, ''))
-        qs = [q for p, q in self.srv.requests if p.endswith('/connections')]
+        qs = self.lookups()
         self.assertTrue(qs, 'the leg 50 min ahead was not checked')
-        self.assertEqual((qs[0]['date'], qs[0]['time']), (d, '02:20'))   # the API gets his wall time
+        self.assertEqual(qs[0][2:], (d, '02:20'))                        # the API gets his wall time
         self.assertEqual(self.notes(), [])                                 # on time: silent
         j = json.loads(self.run_at('status', lid, '--json', at=f'{d}T02:30:00+02:00').stdout)
         self.assertTrue(j.get('fine'), j)
@@ -719,8 +781,96 @@ class Live(TW):
         self.assertEqual(self.calls(), [])
 
 
+class SearchCh(TW):
+    """Every TW test again with opendata down (200 + {"errors": ...}): the same verdicts through search.ch."""
+    MODE = 'down'
+
+    def test_platform_change(self):                     # search.ch marks the new track ("4!"), not the old one
+        self.add_leg()
+        self.srv.timetable = base(**{'16:31': s5('16:31', '17:23', new_pl='4')})
+        self.check('15:00')
+        self.assertIn(f'platform change at {A}: S5 now leaves from pl 4', self.note_text())
+        self.check('15:10')
+        self.assertEqual(len(self.notes()), 1)
+
+
+class LiveSearchCh(Live):
+    MODE = 'down'
+
+
+class Fallback(TW):
+    """The switch: opendata failing (error payload, 503, unreachable) -> search.ch, asked once per run; logged."""
+    def sources(self):
+        try:
+            with open(os.path.join(self.dir, 'sources.log')) as f:
+                return f.read()
+        except OSError:
+            return ''
+
+    def paths(self):
+        return [p.rsplit('/', 1)[-1] for p, _ in self.srv.requests]
+
+    def test_opendata_answers_no_fallback(self):
+        self.add_leg()
+        self.srv.timetable = base(**{'16:31': s5('16:31', '17:23', dd=7, ad=7)})
+        r = self.check('15:00')
+        self.assertEqual((r.returncode, r.stderr), (0, ''))
+        self.assertNotIn('route.json', self.paths())
+        self.assertIn(' opendata', self.sources())
+        self.assertNotIn('search.ch', self.sources())
+
+    def test_router_error_payload_falls_back(self):
+        self.add_leg()
+        self.srv.mode = 'down'
+        self.srv.timetable = base(**{'16:31': s5('16:31', '17:23', dd=7, ad=7)})
+        r = self.check('15:00')
+        self.assertEqual((r.returncode, r.stderr), (0, ''))             # --cron: quiet
+        self.assertIn('delayed', self.note_text())
+        self.assertIn('+7 min', self.note_text())
+        p = self.paths()
+        self.assertEqual(p.count('connections'), 1, p)                   # the broken source once per run
+        self.assertEqual(p[0], 'connections')
+        self.assertGreaterEqual(p.count('route.json'), 2, p)             # the leg, then the alternative
+        q = [q for x, q in self.srv.requests if x.endswith('/route.json')][0]
+        self.assertEqual((q['date'], q['time'], q['show_delays'], q['pre']), ('14.11.2026', '16:31', '1', '2'))
+        self.assertIn('search.ch (opendata: transport API error: The router is not reachable)', self.sources())
+
+    def test_503_falls_back_and_status_says_so(self):
+        lid = self.add_leg()
+        self.srv.mode = 'down503'
+        r = self.run_tw('status', lid, now='15:00')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('Live: 16:31 S5 → 17:23, pl 1, direct', r.stdout)
+        self.assertIn('train-watch: via search.ch', r.stderr)
+
+    def test_unreachable_falls_back(self):
+        self.add_leg()
+        self.env.update(TRAIN_WATCH_API='http://127.0.0.1:9/v1', no_proxy='127.0.0.1', NO_PROXY='127.0.0.1')
+        self.srv.timetable = base(**{'16:31': None})
+        self.check('16:10')                                              # under 25 min: gone at once
+        self.assertIn('gone from the live timetable', self.note_text())
+        self.assertIn('search.ch', self.sources())
+
+    def test_both_down_exit_1(self):
+        self.add_leg()
+        self.srv.mode = 'error'
+        r = self.check('15:00')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('backend down; fallback search.ch: transport API error: backend down', r.stderr)
+        self.assertEqual(self.notes(), [])
+
+    def test_searchch_cancelled_x(self):
+        self.add_leg()
+        self.srv.mode = 'down'
+        self.srv.timetable = base(**{'16:31': s5('16:31', '17:23', cancelled=True)})
+        self.check('15:00')
+        self.assertIn('cancelled', self.note_text())
+
+
 for _n in [n for n in dir(TW) if n.startswith('test')]:
     setattr(Live, _n, None)                       # Live reuses TW's fixtures, not its tests
+    if _n not in vars(Fallback):
+        setattr(Fallback, _n, None)
 
 
 if __name__ == '__main__':
