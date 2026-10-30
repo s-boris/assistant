@@ -2695,6 +2695,24 @@ why = "main's full suite every night; red or a stale quarantine entry -> one ~/i
 target = "land-speed"
 cron_line = "10 2 * * * nice -n 10 cron-fail ci-nightly $HOME/bin/assistant ci-nightly >/dev/null 2>&1"
 
+[jobs.land-queue]
+line = "land-queue"
+cron = "*/5 * * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/assistant", "land", "--worker", "--cron"]
+err = "out"
+timeout = 7200
+after = 6
+feature = "ci"
+owner_facing = false
+why = "the land queue's worker after a restart or a crash: picks up what is queued with nobody waiting (--no-wait lands); nothing to do = exits at once, a running worker = exits at once (one at a time by its own lock); no timeout: a batch's land may run its eval subset"
+target = "land-queue"
+cron_line = "*/5 * * * * cron-fail --after 6 land-queue $HOME/bin/assistant land --worker --cron >/dev/null 2>&1"
+
 [jobs.media-digest-daily]
 line = "media-digest-daily"
 cron = "0 19 * * *"
