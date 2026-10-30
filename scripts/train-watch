@@ -27,7 +27,9 @@ first/last stop (the SBB app can't resolve a free-text address).
 check: every leg whose departure is 0–180 min away is looked up with /connections (from, to, date, time = the
 planned departure). The planned connection is the one with that scheduled departure (to the minute, preferring
 the planned first line, then the planned arrival and lines), else the one with the planned arrival leaving up to 30 min after the event start (an event
-that starts at the door, with the station a bus ride later). Problems:
+that starts at the door, with the station a bus ride later), else one with a planned train (not bus or tram) arriving
+within 5 min of the planned arrival and leaving from 5 min before to 30 min after the start (another router's way to
+the same train: search.ch may take another tram to the station or another walk at the end). Problems:
   cancelled   a ride flagged cancelled, or the connection is gone from the live timetable (two runs in a row;
               one run when the departure is under 25 min away)
   delay       departure or arrival 5 min or more late (buckets 5/15/30/60: a worse bucket notes again)
@@ -46,7 +48,7 @@ Phone app: a Live Update chip (lib/livecount.py) per leg from 30 min before depa
 (tests: LIVECOUNT_PHONE = a stub phone; test state makes no chips without it).
 Sources: transport.opendata.ch /connections; when it fails (an {"errors": ...} payload even with 200, a non-2xx
 status, a timeout, no JSON) the same lookup goes to timetable.search.ch route.json (keyless; show_delays,
-show_trackchanges, pre=2 with the rows before the asked time dropped), mapped to the opendata shape (dep/arr,
+show_trackchanges, pre=2 with the rows over 5 min before the asked time dropped), mapped to the opendata shape (dep/arr,
 dep_delay/arr_delay, track with "!" = changed, delay "X" or a cancelled flag = cancelled, *G/*L = category/line).
 A failed opendata is not asked again in that run (one request per lookup). Which source answered:
 ~/.local/state/trains/sources.log (one line per source and run; a fallback is also said on stderr outside --cron).
@@ -98,6 +100,7 @@ MISS_FAST = dt.timedelta(minutes=25)        # closer than this: one miss is enou
 ALT_BEFORE = dt.timedelta(minutes=40)       # alternatives may leave this much before the planned departure
 LATER_STOP = dt.timedelta(minutes=30)      # match by arrival: the stop may be this far after the event start
 REACH = dt.timedelta(minutes=3)             # an alternative must leave at least this far from now
+ROUTE_SLACK = dt.timedelta(minutes=5)       # same planned train, another way to/from it: this much off at the ends
 TRAIN_ICON = '\U0001F686'
 BUS_CATS = {'B', 'BN', 'BUS', 'NFB', 'KB', 'EXB', 'BP', 'EV'}
 TRAM_CATS = {'T', 'TN', 'TRAM'}
@@ -561,7 +564,8 @@ def fetch_connections(frm, to, when, limit):
         raise Fail(f"{DOWN['opendata']}; fallback search.ch: {e}") from e
     source_log('search.ch', f"opendata: {DOWN['opendata']}")
     start = fixed(when).replace(second=0, microsecond=0)
-    return [c for c in sc_connections(data, start) if (iso(c['from']['departure']) or start) >= start]
+    keep = start - ROUTE_SLACK                            # match() may take a way leaving a few minutes earlier
+    return [c for c in sc_connections(data, start) if (iso(c['from']['departure']) or start) >= keep]
 
 
 def line_name(j):
@@ -639,6 +643,10 @@ def match(g, conns):
     if not near and arr:                                  # the event starts at the door, the stop is a bit later
         near = [c for c in conns if abs(c['sarr'] - arr) <= MIN and dep - 5 * MIN <= c['sdep'] <= dep + LATER_STOP]
     planned = {norm_line(x) for x in (g.get('lines') or [])}
+    rail = {x for x in planned if not x.startswith(('bus', 'ev', 'tram'))}
+    if not near and arr and rail:                         # another router's way to the same train (search.ch: another
+        near = [c for c in conns if abs(c['sarr'] - arr) <= ROUTE_SLACK  # tram to the station, another walk home)
+                and dep - ROUTE_SLACK <= c['sdep'] <= dep + LATER_STOP and rail & {norm_line(x) for x in c['lines']}]
     # same departure and first line (e.g. one tram, two ways on): the planned arrival, then the planned lines decide
     near.sort(key=lambda c: (norm_line(c['lines'][0]) not in want, abs(c['sarr'] - arr) if arr else dt.timedelta(0),
                              -len(planned & {norm_line(x) for x in c['lines']}), abs(c['sdep'] - dep)))

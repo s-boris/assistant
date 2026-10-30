@@ -181,6 +181,24 @@ def test_searchch_track_change_cancellation_and_replacement_bus(tw):
     assert (c["lines"], c["rides"][0]["bus"], c["rides"][0]["ev"]) == (["EV"], True, True)
 
 
+@pytest.mark.parametrize(
+    "dep,arr,lines,found",
+    [
+        ("17:04", "18:22", ["Tram 4", "IC8", "Tram 17"], True),  # another tram/walk to the planned IC 8: the same trip
+        ("17:04", "18:22", ["Tram 4", "IC5", "Tram 17"], False),  # no planned train in it
+        ("17:04", "18:26", ["Tram 4", "IC8", "Tram 17"], False),  # arrives too far off
+        ("17:04", "18:22", ["Tram 4", "Tram 17"], False),  # trams only: no train to hold on to
+    ],
+)
+def test_match_same_train_another_way(tw, dep, arr, lines, found):
+    rows = conns(tw, tw.sc_connections(fixture("searchch-route-walk-tram.json"), at(tw, "17:00")))
+    g = {"dep": f"2026-10-30T{dep}:00+01:00", "arr": f"2026-10-30T{arr}:00+01:00", "lines": lines}
+    c = tw.match(g, rows)
+    assert (c is not None) == found
+    if found:
+        assert c["sdep"].strftime("%H:%M") == "17:02" and c["lines"] == ["IC8", "Tram 17"]
+
+
 def test_searchch_wall_times_in_the_repeated_hour(tw):
     first = tw.iso("2031-10-26T02:20:00+02:00")  # 02:20 CEST, the first pass
     second = tw.iso("2031-10-26T02:20:00+01:00")  # 02:20 CET, an hour later
@@ -211,7 +229,11 @@ def test_opendata_failing_falls_back_to_searchch(tw, opendata):
     net = Net(tw, opendata=opendata, searchch=("ok", fixture("searchch-route.json")))
     g = {"from": "Bern", "to": "Zürich HB"}
     rows = tw.connections(g, at(tw, "17:36"), 4)
-    assert [c["sdep"].strftime("%H:%M") for c in rows][:3] == ["17:36", "18:02", "18:31"]  # earlier pre rows dropped
+    assert [c["sdep"].strftime("%H:%M") for c in rows][:3] == [
+        "17:31",
+        "17:36",
+        "18:02",
+    ]  # pre rows over 5 min early dropped
     tw.connections(g, at(tw, "17:36"), 6)  # the alternative's lookup in the same run
     assert net.hosts() == ["opendata", "searchch", "searchch"]  # the broken source once per run
     q = net.urls[1].split("?", 1)[1]

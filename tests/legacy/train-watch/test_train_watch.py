@@ -374,6 +374,20 @@ class TW(unittest.TestCase):
         self.check('15:10')
         self.assertIn('+9 min', self.note_text())
 
+    def test_same_train_another_way_to_it(self):
+        """The router takes another bus to the planned train and arrives 3 min off: the same trip, not gone."""
+        lid = self.add_leg(dep='16:26', arr='17:26', lines=('Bus 9', 'S5'), src=C)
+        c = conn(ride('B', '7', C, '16:28', A, '16:30'), ride('S', '5', A, '16:31', B, '17:23', dd=6, ad=6))
+        self.srv.timetable = base() + [c]
+        self.check('16:10')                                  # under 25 min: a miss would note at once
+        n = self.note_text()
+        self.assertIn('+6 min', n)
+        self.assertNotIn('gone from the live timetable', n)
+        self.srv.timetable = base() + [conn(ride('B', '7', C, '16:28', A, '16:30'), ride('IR', '9', A, '16:31', B,
+                                                                                       '17:23'))]
+        j = json.loads(self.run_tw('status', lid, '--json', now='16:10').stdout)
+        self.assertIn('cancelled', [p['key'] for p in j['problems']])   # no planned train in it: gone
+
     # ------------------------------------------------------------------ errors, dry run, status
     def test_api_error_exit_1_no_traceback(self):
         self.add_leg()
