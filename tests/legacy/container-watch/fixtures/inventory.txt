@@ -1,0 +1,69 @@
+@@meta
+now=2026-10-14T17:13:00Z
+@@containers
+{"name":"/claude-bot","image":"src-bot","imageId":"sha256:bot","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/radarr","image":"lscr.io/linuxserver/radarr:latest","imageId":"sha256:rad","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/sonarr","image":"linuxserver/sonarr","imageId":"sha256:son","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/paperless-ngx","image":"ghcr.io/paperless-ngx/paperless-ngx","imageId":"sha256:pap","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/paperless_redis","image":"redis:7.2.4","imageId":"sha256:red","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/HomeAssistant_inabox","image":"spaceinvaderone/ha_inabox:latest","imageId":"sha256:ha","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/unifi-controller","image":"11notes/unifi:9.0.114-unraid","imageId":"sha256:uni","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":""}
+{"name":"/binhex-sabnzbd","image":"binhex/arch-sabnzbd:latest","imageId":"sha256:sab","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/EmbyServer","image":"emby/embyserver:latest","imageId":"sha256:emb","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/tdarr","image":"ghcr.io/haveagitgat/tdarr","imageId":"sha256:tda","state":"exited","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+{"name":"/claude-vault","image":"claude-vault:latest","imageId":"sha256:vau","state":"running","startedAt":"2026-10-01T02:00:34.88731859Z","created":"2026-09-01T12:59:13.129052081Z","labels":{},"net":"bridge","ports":{},"ips":"172.17.0.9 "}
+@@env
+/claude-bot	NODE_VERSION=24.21.0
+/paperless_redis	REDIS_VERSION=7.2.4
+/unifi-controller	APP_VERSION=9.0.114
+@@images
+{"id":"sha256:rad","tags":["lscr.io/linuxserver/radarr:latest"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{"build_version":"Linuxserver.io version:- 5.8.3.8933-ls230 Build-date:- 2026-08-30T10:00:00+00:00","org.opencontainers.image.version":"5.8.3.8933-ls230"}}
+{"id":"sha256:son","tags":["linuxserver/sonarr:latest"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{"org.opencontainers.image.version":"4.0.20.3014-ls326"}}
+{"id":"sha256:pap","tags":["ghcr.io/paperless-ngx/paperless-ngx:latest"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{"org.opencontainers.image.version":"2.18.4"}}
+{"id":"sha256:red","tags":["redis:7.2.4"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{}}
+{"id":"sha256:ha","tags":["spaceinvaderone/ha_inabox:latest"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{"org.opencontainers.image.version":"latest"}}
+{"id":"sha256:uni","tags":["11notes/unifi:9.0.114-unraid"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{}}
+{"id":"sha256:sab","tags":["binhex/arch-sabnzbd:latest"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{}}
+{"id":"sha256:emb","tags":["emby/embyserver:latest"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{}}
+{"id":"sha256:tda","tags":["ghcr.io/haveagitgat/tdarr:latest"],"digests":[],"created":"2026-09-01T00:00:00Z","labels":{}}
+@@history
+sha256:sab	RELEASETAG=2026082801
+sha256:sab	RELEASETAG=4.3.2-1-01
+@@unraid-status
+{
+    "lscr.io/linuxserver/radarr:latest": {
+        "local": "sha256:1",
+        "remote": "sha256:2",
+        "status": "false"
+    },
+    "linuxserver/sonarr:latest": {
+        "local": "sha256:3",
+        "remote": "sha256:3",
+        "status": "true"
+    },
+    "library/redis:7.2.4": {
+        "local": "sha256:4",
+        "remote": "sha256:4",
+        "status": "true"
+    }
+}
+
+@@autoupdate
+{
+    "cron": {
+        "dockerCronFrequency": "Daily"
+    },
+    "global": {
+        "dockerUpdateAll": "no"
+    },
+    "containers": {
+        "radarr": {
+            "name": "radarr",
+            "update": true
+        }
+    }
+}
+
+@@mdns
+=;br0;IPv4;Home;_home-assistant._tcp;local;0000aaaa.local;198.51.100.50;8123;"location_name=Home" "version=2026.9.4" "internal_url=http://198.51.100.50:8123"
+@@end

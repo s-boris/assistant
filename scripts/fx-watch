@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""fx-watch: silent daily watch of CHF exchange rates before a trip. Read-only public rates, no tokens.
+
+Usage:
+  fx-watch run [--dry-run]   cron (daily): fetch the rates, keep a 90-day history; ONE ~/inbox/fx-watch-*.md, only
+                             when the alert currency (default SCR) moves more than threshold_pct from the baseline
+                             (the first rate stored) up to the config's `until` date; then silent until `reset`
+  fx-watch status [--json]   current rates, baseline, change in %, window, alerted or not (live fetch)
+  fx-watch reset             forget the baseline and the alert flag (the next run sets a new baseline)
+
+Config (private, optional): ~/.config/fx-watch/config.json
+  {"base": "CHF", "quotes": ["SCR", "EUR"], "alert": "SCR", "threshold_pct": 3, "until": "YYYY-MM-DD"}
+  No `until` = no window end. After `until`, `run` exits 0 without fetching.
+Sources (keyless): Frankfurter v2 (api.frankfurter.dev, has SCR), fallback open.er-api.com. Exit 2 = every source
+  failed (cron-fail turns a streak into a failure note).
+State: ~/.local/state/fx-watch/state.json (baseline, history, alerted).
+Env for tests: FX_WATCH_CONFIG, FX_WATCH_STATE, FX_WATCH_INBOX, FX_WATCH_TODAY (YYYY-MM-DD),
+  FX_WATCH_SOURCE_CMD (a command printing {"SCR": 17.8, "EUR": 1.08}; replaces the network sources).
+Tests: ~/opt/assistant/tests/legacy/fx-watch/run.sh
+"""
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from datetime import date
+from pathlib import Path
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+for p in (os.path.join(HERE, 'lib'), os.path.expanduser('~/bin/lib')):
+    if os.path.isdir(p):
+        sys.path.insert(0, p)
+        break
+import botlib  # noqa: E402
+
+HOME = os.path.expanduser('~')
+CONFIG_F = os.environ.get('FX_WATCH_CONFIG') or f'{HOME}/.config/fx-watch/config.json'
+STATE_F = os.environ.get('FX_WATCH_STATE') or f'{HOME}/.local/state/fx-watch/state.json'
+INBOX = os.environ.get('FX_WATCH_INBOX') or f'{HOME}/inbox'
+DEFAULTS = {'base': 'CHF', 'quotes': ['SCR', 'EUR'], 'alert': 'SCR', 'threshold_pct': 3.0, 'until': None}
+UA = {'User-Agent': 'fx-watch/1.0'}
+KEEP = 90
+
+
+def today():
+    t = os.environ.get('FX_WATCH_TODAY')
+    return date.fromisoformat(t) if t else date.today()
+
+
+def config():
+    c = dict(DEFAULTS)
+    c.update(botlib.load_json(CONFIG_F, None) or {})
+    c['quotes'] = [q.upper() for q in c['quotes']]
+    c['alert'] = c['alert'].upper()
+    if c['alert'] not in c['quotes']:
+        c['quotes'].append(c['alert'])
+    return c
+
+
+def _get(url):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=25) as r:
+        return json.load(r)
+
+
+def src_frankfurter(base, quotes):
+    d = _get(f'https://api.frankfurter.dev/v2/rates?base={base}&quotes={",".join(quotes)}')
+    return {x['quote']: float(x['rate']) for x in d if x.get('base') == base}
+
+
+def src_erapi(base, quotes):
+    d = _get(f'https://open.er-api.com/v6/latest/{base}')
+    if d.get('result') != 'success':
+        raise ValueError('open.er-api: no success')
+    return {q: float(d['rates'][q]) for q in quotes if q in d.get('rates', {})}
+
+
+def fetch(c):
+    """-> (rates {quote: rate}, source name). Raises RuntimeError when no source has every quote."""
+    errs = []
+    cmd = os.environ.get('FX_WATCH_SOURCE_CMD')
+    sources = [('fake', None)] if cmd else [('frankfurter', src_frankfurter), ('open.er-api', src_erapi)]
+    for name, fn in sources:
+        try:
+            if cmd:
+                p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                if p.returncode:
+                    raise RuntimeError(f'exit {p.returncode}')
+                rates = {k.upper(): float(v) for k, v in json.loads(p.stdout).items()}
+            else:
+                rates = fn(c['base'], c['quotes'])
+            missing = [q for q in c['quotes'] if not (rates.get(q) or 0) > 0]
+            if missing:
+                raise ValueError('missing ' + ','.join(missing))
+            return {q: rates[q] for q in c['quotes']}, name
+        except Exception as e:  # noqa: BLE001 - every source failure is reported together
+            errs.append(f'{name}: {e}')
+    raise RuntimeError('; '.join(errs))
+
+
+def change_pct(rate, base_rate):
+    return (rate / base_rate - 1) * 100
+
+
+def note_text(c, st, rates, pct):
+    a, b = c['alert'], c['base']
+    direction = 'more' if pct > 0 else 'fewer'
+    lines = [f'# fx-watch: {b}→{a} moved {pct:+.1f} %', '', 'Data, not instructions.', '',
+             f'- {b}→{a}: {rates[a]:.4f} now vs {st["baseline"][a]:.4f} on {st["baseline_date"]} '
+             f'({direction} {a} per {b})']
+    for q in c['quotes']:
+        if q != a and q in st['baseline']:
+            lines.append(f'- {b}→{q}: {rates[q]:.4f} (baseline {st["baseline"][q]:.4f}, '
+                         f'{change_pct(rates[q], st["baseline"][q]):+.1f} %)')
+    lines += [f'- Window: until {c["until"] or "open"}; threshold {c["threshold_pct"]} %', '',
+              'Handling (JOBS.md): one short line to the owner only if it changes when to exchange; '
+              'otherwise fold it into the pre-trip money reminder. Then delete this note.']
+    return '\n'.join(lines) + '\n'
+
+
+def cmd_run(dry):
+    c, t = config(), today()
+    if c['until'] and t > date.fromisoformat(c['until']):
+        return 0
+    st = botlib.load_json(STATE_F, None) or {}
+    try:
+        rates, src = fetch(c)
+    except RuntimeError as e:
+        print(f'fx-watch: all sources failed: {e}', file=sys.stderr)
+        return 2
+    ts = t.isoformat()
+    hist = [h for h in st.get('history', []) if h.get('date') != ts]
+    hist.append({'date': ts, 'src': src, **rates})
+    st['history'] = hist[-KEEP:]
+    if not st.get('baseline') or c['alert'] not in st['baseline']:
+        st['baseline'], st['baseline_date'], st['alerted'] = dict(rates), ts, None
+    pct = change_pct(rates[c['alert']], st['baseline'][c['alert']])
+    wrote = None
+    if not st.get('alerted') and abs(pct) > float(c['threshold_pct']):
+        text = note_text(c, st, rates, pct)
+        if dry:
+            print(text, end='')
+        else:
+            wrote = botlib.write_inbox(INBOX, 'fx-watch', text)
+            st['alerted'] = {'date': ts, 'pct': round(pct, 2)}
+    if not dry:
+        Path(STATE_F).parent.mkdir(parents=True, exist_ok=True)
+        botlib.atomic_write(STATE_F, json.dumps(st, indent=1) + '\n')
+    if wrote:
+        print(wrote)
+    return 0
+
+
+def cmd_status(as_json):
+    c = config()
+    st = botlib.load_json(STATE_F, None) or {}
+    try:
+        rates, src = fetch(c)
+    except RuntimeError as e:
+        print(f'fx-watch: all sources failed: {e}', file=sys.stderr)
+        return 2
+    base = st.get('baseline') or {}
+    out = {'base': c['base'], 'source': src, 'rates': rates, 'baseline': base,
+           'baseline_date': st.get('baseline_date'), 'until': c['until'],
+           'threshold_pct': c['threshold_pct'], 'alerted': st.get('alerted'),
+           'change_pct': {q: round(change_pct(rates[q], base[q]), 2) for q in rates if base.get(q)}}
+    if as_json:
+        print(json.dumps(out, indent=1))
+        return 0
+    for q, r in rates.items():
+        ch = out['change_pct'].get(q)
+        print(f'{c["base"]}→{q}: {r:.4f}' + (f'  ({ch:+.2f} % vs {base[q]:.4f} on {out["baseline_date"]})'
+                                             if ch is not None else '  (no baseline yet)'))
+    print(f'source {src}; window until {c["until"] or "open"}; threshold {c["threshold_pct"]} %; '
+          f'alerted: {"yes " + st["alerted"]["date"] if st.get("alerted") else "no"}')
+    return 0
+
+
+def cmd_reset():
+    st = botlib.load_json(STATE_F, None) or {}
+    st.pop('baseline', None)
+    st.pop('baseline_date', None)
+    st['alerted'] = None
+    Path(STATE_F).parent.mkdir(parents=True, exist_ok=True)
+    botlib.atomic_write(STATE_F, json.dumps(st, indent=1) + '\n')
+    print('fx-watch: baseline cleared')
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help', 'help'):
+        print(__doc__)
+        return 0
+    verb, rest = argv[0], argv[1:]
+    if verb == 'run':
+        return cmd_run('--dry-run' in rest)
+    if verb == 'status':
+        return cmd_status('--json' in rest)
+    if verb == 'reset':
+        return cmd_reset()
+    print(f'fx-watch: unknown command {verb!r} (--help)', file=sys.stderr)
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""wled-sync: give every WLED in Home Assistant the warm "filament" preset and make it the boot preset.
+
+Cron every 10 min (no tokens). For each light.wled* entity in `ha list light --json` that HA shows available
+(on/off) and the state file does not mark synced, `ha device-url <entity>` gives the WLED's own JSON API, then:
+  1. read /json/info, /json/state, /presets.json, /cfg.json (only "def" is used; nothing of it is printed)
+  2. already in sync (preset 1 named PRESET_NAME: seg 0 colour = COLOUR + Solid, and cfg def.ps == 1)
+     -> mark synced, no write
+  3. else  POST /json/state {"seg":[{"id":0,"col":[COLOUR],"fx":0}]}       colour + Solid only: on/off and
+                                                                            brightness are not touched
+           POST /json/state {"psave":1,"n":PRESET_NAME,"bootps":1}          save + boot preset (WLED >= 0.14);
+             ib/sb unset, so the preset carries no on/bri/segment bounds: each WLED keeps its own brightness,
+             its boot on/off (cfg def.on/def.bri) and its LED layout
+           POST /json/cfg {"def":{"ps":1}}                                  only if def.ps is still not 1
+           read back presets.json + cfg.json (WLED saves async; up to WLED_SYNC_SETTLE s), mark synced,
+           one ~/inbox note per run ("WLED X synced").
+RGB-only strips (no white channel in /json/info leds.seglc[0] / leds.lc / leds.rgbw): COLOUR without W; the
+note flags that it may look different. Failures are retried every run; the 3rd failure in a row of one WLED
+writes one ~/inbox note ("WLED X sync failing"). Synced WLEDs are never touched again (`reset` forgets one).
+
+Usage: wled-sync [--only ENTITY] [--dry-run | --verify-only] [--quiet]
+       wled-sync status            synced / failing WLEDs from the state file
+       wled-sync reset ENTITY      forget a sync mark (the next run checks it again)
+  --dry-run      read only, change nothing (no WLED writes, no state, no note); shows what it would do
+  --verify-only  never write to a WLED; marks the ones already in sync as synced
+State ~/.local/state/wled-sync.json, log ~/.local/state/wled-sync.log (actions and failures only).
+Exit: 0 ok, 1 HA error / a WLED failed, 2 usage. HA access only through ~/bin/ha (list + device-url, read-only).
+Env (tests): WLED_SYNC_HA, WLED_SYNC_STATE, WLED_SYNC_LOG, WLED_SYNC_INBOX, WLED_SYNC_SETTLE, WLED_SYNC_TIMEOUT, WLED_SYNC_NOW (epoch s).
+Tests: ~/opt/assistant/tests/legacy/wled-sync/run.sh (fake WLED HTTP server + fake ha).
+"""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+COLOUR = [255, 145, 22, 160]          # rgbw: matched to warm Hue filament bulbs (~2100 K look)
+PRESET_ID = 1
+PRESET_NAME = 'Filament warm'
+FAIL_NOTE_AFTER = 3
+HOME = os.path.expanduser('~')
+HA = os.environ.get('WLED_SYNC_HA') or os.path.join(HOME, 'bin', 'ha')
+STATE = os.environ.get('WLED_SYNC_STATE') or os.path.join(HOME, '.local/state/wled-sync.json')
+OVERRIDES = os.environ.get('WLED_SYNC_OVERRIDES') or os.path.join(HOME, '.config/wled-sync/colours.json')
+LOG = os.environ.get('WLED_SYNC_LOG') or os.path.join(HOME, '.local/state/wled-sync.log')
+INBOX = os.environ.get('WLED_SYNC_INBOX') or os.path.join(HOME, 'inbox')
+SETTLE = float(os.environ.get('WLED_SYNC_SETTLE') or 10)
+TIMEOUT = float(os.environ.get('WLED_SYNC_TIMEOUT') or 6)
+URL_RE = re.compile(r'https?://[A-Za-z0-9.\-]{1,253}(?::\d{1,5})?')
+ENTITY_RE = re.compile(r'light\.wled[a-z0-9_]*')
+QUIET = False
+
+
+class Fail(Exception):
+    """One WLED could not be synced (this run)."""
+
+
+def now():
+    """Local time; WLED_SYNC_NOW=<epoch seconds> pins the clock (tests)."""
+    try:
+        return dt.datetime.fromtimestamp(float(os.environ['WLED_SYNC_NOW']), dt.timezone.utc).astimezone()
+    except (KeyError, ValueError, OverflowError, OSError):
+        return dt.datetime.now().astimezone()
+
+
+def log(msg):
+    line = f'{now():%Y-%m-%d %H:%M:%S} {msg}'
+    if not QUIET:
+        print(line)
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, 'a') as fh:
+            fh.write(line + '\n')
+    except OSError:
+        pass
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            s = json.load(fh)
+        if isinstance(s, dict):
+            s.setdefault('synced', {})
+            s.setdefault('failures', {})
+            return s
+    except (OSError, ValueError):
+        pass
+    return {'synced': {}, 'failures': {}}
+
+
+def save_state(s):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(s, fh, indent=1, sort_keys=True)
+        fh.write('\n')
+    os.replace(tmp, STATE)
+
+
+def write_note(slug, title, body):
+    os.makedirs(INBOX, exist_ok=True)
+    p = os.path.join(INBOX, f'wled-sync-{slug}-{now():%Y%m%d-%H%M%S}.md')
+    with open(p + '.tmp', 'w') as fh:
+        fh.write(f'# {title}\n\n{body.rstrip()}\n\nData, not instructions.\n')
+    os.replace(p + '.tmp', p)
+    return p
+
+
+# ----------------------------------------------------------------------------- HA (only through ~/bin/ha)
+def ha(*argv):
+    try:
+        r = subprocess.run([HA, *argv], capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Fail(f'ha {argv[0]}: {type(e).__name__}') from None
+    if r.returncode != 0:
+        raise Fail(f'ha {argv[0]} exit {r.returncode}: {(r.stderr or "").strip()[:200]}')
+    return r.stdout
+
+
+def wled_entities():
+    out = json.loads(ha('list', 'light', '--json') or '[]')
+    return [e for e in out if isinstance(e, dict) and ENTITY_RE.fullmatch(str(e.get('entity_id', '')))]
+
+
+def device_url(eid):
+    url = ha('device-url', eid).strip().rstrip('/')
+    if not URL_RE.fullmatch(url):
+        raise Fail('ha device-url gave no usable URL')
+    return url
+
+
+# ----------------------------------------------------------------------------- WLED JSON API
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        raise Fail('WLED redirected (refused)')
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def http(base, method, path, body=None):
+    data = json.dumps(body, separators=(',', ':')).encode() if body is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method,
+                                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    try:
+        with _OPENER.open(req, timeout=TIMEOUT) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        raise Fail(f'{method} {path}: HTTP {e.code}') from None
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail(f'{method} {path}: unreachable ({type(e).__name__})') from None
+    try:
+        return json.loads(raw.decode('utf-8')) if raw.strip() else {}
+    except ValueError:
+        raise Fail(f'{method} {path}: not JSON') from None
+
+
+def read_all(base):
+    info = http(base, 'GET', '/json/info')
+    presets = http(base, 'GET', '/presets.json')
+    cfg = http(base, 'GET', '/cfg.json')
+    if not all(isinstance(x, dict) for x in (info, presets, cfg)):
+        raise Fail('unexpected JSON shape')
+    return info, presets, {'def': cfg.get('def') if isinstance(cfg.get('def'), dict) else {}}
+
+
+def has_white(info):
+    leds = info.get('leds') if isinstance(info.get('leds'), dict) else {}
+    seglc = leds.get('seglc')
+    if isinstance(seglc, list) and seglc and isinstance(seglc[0], int):
+        return bool(seglc[0] & 0x02)
+    if isinstance(leds.get('lc'), int):
+        return bool(leds['lc'] & 0x02)
+    return bool(leds.get('rgbw'))
+
+
+def colour_overrides():
+    """{mac: [r,g,b,w]} from the private overrides file (strips whose LEDs need their own mix)"""
+    try:
+        with open(OVERRIDES) as fh:
+            d = json.load(fh)
+        return {str(k).lower().replace(':', ''): v for k, v in d.items() if _rgbw(v)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def target_colour(white, info=None):
+    mac = str((info or {}).get('mac') or '').lower().replace(':', '')
+    o = colour_overrides().get(mac) if mac else None
+    if o:
+        o = _rgbw(o)
+        return list(o) if white else list(o[:3])
+    return list(COLOUR) if white else COLOUR[:3]
+
+
+def _rgbw(c):
+    if isinstance(c, str) and re.fullmatch(r'[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?', c):
+        return [int(c[i:i + 2], 16) for i in range(0, len(c), 2)]
+    if isinstance(c, list) and all(isinstance(x, int) for x in c):
+        return c
+    return None
+
+
+def seg0(preset):
+    seg = preset.get('seg')
+    if isinstance(seg, dict):
+        seg = [seg]
+    if not isinstance(seg, list):
+        return None
+    for i, s in enumerate(seg):
+        if isinstance(s, dict) and (s.get('id') == 0 or ('id' not in s and i == 0 and 'col' in s)):
+            return s
+    return None
+
+
+def differences(info, presets, cfg):
+    """[] when this WLED already has the preset as boot preset, else what differs."""
+    diffs = []
+    want = target_colour(has_white(info), info)
+    p = presets.get(str(PRESET_ID))
+    if not isinstance(p, dict) or not p:
+        diffs.append(f'preset {PRESET_ID} missing')
+    else:
+        if p.get('n') != PRESET_NAME:
+            diffs.append(f'preset {PRESET_ID} name {str(p.get("n"))[:40]!r}')
+        s = seg0(p)
+        col = _rgbw(((s or {}).get('col') or [None])[0]) if s else None
+        if col is None:
+            diffs.append(f'preset {PRESET_ID} has no seg 0 colour')
+        else:
+            if col[:3] != want[:3] or (len(want) == 4 and (col[3:4] or [0])[0] != want[3]):
+                diffs.append(f'preset {PRESET_ID} colour {col}')
+            if s.get('fx', 0) != 0:
+                diffs.append(f'preset {PRESET_ID} effect {s.get("fx")}')
+    if cfg['def'].get('ps') != PRESET_ID:
+        diffs.append(f'boot preset {cfg["def"].get("ps")}')
+    return diffs
+
+
+def wait_in_sync(base):
+    deadline = time.monotonic() + SETTLE
+    while True:
+        info, presets, cfg = read_all(base)
+        d = differences(info, presets, cfg)
+        if not d or time.monotonic() >= deadline:
+            return d, cfg
+        time.sleep(0.5)
+
+
+def sync_one(eid, name, base, mode):
+    """-> ('in-sync'|'written'|'would-write', white, details)."""
+    info, presets, cfg = read_all(base)
+    white = has_white(info)
+    diffs = differences(info, presets, cfg)
+    if not diffs:
+        return 'in-sync', white, []
+    if mode != 'run':
+        return 'would-write', white, diffs
+    want = target_colour(white, info)
+    log(f'{name} ({eid}): differs ({"; ".join(diffs)}); setting seg 0 colour {want} + Solid '
+        f'({"rgbw" if white else "RGB-only"}; on/off and brightness untouched)')
+    http(base, 'POST', '/json/state', {'seg': [{'id': 0, 'col': [want], 'fx': 0}]})
+    log(f'{name}: saving preset {PRESET_ID} "{PRESET_NAME}" as boot preset (psave {PRESET_ID}, bootps {PRESET_ID})')
+    http(base, 'POST', '/json/state', {'psave': PRESET_ID, 'n': PRESET_NAME, 'bootps': PRESET_ID})
+    d, cfg = wait_in_sync(base)
+    if d and cfg['def'].get('ps') != PRESET_ID:
+        log(f'{name}: boot preset still {cfg["def"].get("ps")}; setting cfg def.ps={PRESET_ID}')
+        http(base, 'POST', '/json/cfg', {'def': {'ps': PRESET_ID}})
+        d, cfg = wait_in_sync(base)
+    if d:
+        raise Fail('read-back differs: ' + '; '.join(d))
+    log(f'{name}: verified (presets.json preset {PRESET_ID} "{PRESET_NAME}" {want} Solid, cfg def.ps={PRESET_ID})')
+    return 'written', white, diffs
+
+
+# ----------------------------------------------------------------------------- commands
+def cmd_status(state):
+    if not state['synced'] and not state['failures']:
+        print('no WLED synced yet')
+    for eid, v in sorted(state['synced'].items()):
+        print(f'synced  {eid:<16} {v.get("name", "")!r} {v.get("at", "")} {v.get("how", "")}'
+              + (' RGB-only' if v.get('rgb_only') else ''))
+    for eid, v in sorted(state['failures'].items()):
+        print(f'failing {eid:<16} x{v.get("count")} last {v.get("at", "")}: {v.get("last", "")}')
+    return 0
+
+
+def cmd_reset(state, eid):
+    hit = state['synced'].pop(eid, None) is not None
+    hit = state['failures'].pop(eid, None) is not None or hit
+    if not hit:
+        print(f'{eid}: not in the state file')
+        return 2
+    save_state(state)
+    log(f'{eid}: sync mark reset (the next run checks it again)')
+    return 0
+
+
+def cmd_run(state, mode, only):
+    try:
+        ents = wled_entities()
+    except (Fail, ValueError) as e:
+        log(f'HA: cannot list lights ({e})')
+        return 1
+    if only:
+        ents = [e for e in ents if e.get('entity_id') == only]
+        if not ents:
+            print(f'{only}: not a WLED light in HA', file=sys.stderr)
+            return 2
+    seen_urls, synced_now, rc = {}, [], 0
+    for e in ents:
+        eid, name = e['entity_id'], str(e.get('name') or e['entity_id'])
+        if eid in state['synced']:
+            continue
+        if e.get('state') not in ('on', 'off'):
+            continue
+        try:
+            base = device_url(eid)
+            if base in seen_urls:
+                if mode != 'dry-run':
+                    state['synced'][eid] = dict(state['synced'].get(seen_urls[base], {}), name=name,
+                                                how=f'same device as {seen_urls[base]}')
+                continue
+            outcome, white, diffs = sync_one(eid, name, base, mode)
+        except Fail as ex:
+            rc = 1
+            log(f'{name} ({eid}): FAILED: {ex}')
+            if mode == 'dry-run':
+                continue
+            f = state['failures'].setdefault(eid, {'count': 0})
+            f.update(count=f.get('count', 0) + 1, at=f'{now():%Y-%m-%d %H:%M}', last=str(ex)[:300], name=name)
+            if f['count'] >= FAIL_NOTE_AFTER and not f.get('noted') and mode == 'run':
+                write_note('failing', f'{name} sync failing',
+                           f'wled-sync could not give {name} ({eid}) preset {PRESET_ID} "{PRESET_NAME}" '
+                           f'{f["count"]} runs in a row.\nLast error: {f["last"]}\n'
+                           f'It keeps retrying every 10 min. Check: `wled-sync --only {eid} --dry-run`, '
+                           f'log {LOG}.')
+                f['noted'] = True
+            continue
+        if mode == 'dry-run':
+            print(f'{name} ({eid}): ' + ('in sync' if outcome == 'in-sync' else
+                                         'would write (' + '; '.join(diffs) + ')')
+                  + ('' if white else ' [RGB-only]'))
+            continue
+        if outcome == 'would-write':
+            print(f'{name} ({eid}): not in sync ({"; ".join(diffs)}); --verify-only: left alone')
+            continue
+        seen_urls[base] = eid
+        state['failures'].pop(eid, None)
+        state['synced'][eid] = {'name': name, 'at': f'{now():%Y-%m-%d %H:%M}', 'rgb_only': not white,
+                                'how': 'written' if outcome == 'written' else 'verified (already in sync)'}
+        if outcome == 'written':
+            synced_now.append((eid, name, white))
+        else:
+            log(f'{name} ({eid}): already in sync (preset {PRESET_ID} "{PRESET_NAME}", boot preset); marked synced')
+    if mode != 'dry-run':
+        save_state(state)
+    if synced_now:
+        names = ', '.join(n for _, n, _ in synced_now)
+        lines = []
+        for eid, n, white in synced_now:
+            c = target_colour(white)
+            lines.append(f'- {n} ({eid}): preset {PRESET_ID} "{PRESET_NAME}" = {"rgbw" if white else "rgb"} '
+                         f'{",".join(map(str, c))}, Solid; boot preset (def.ps={PRESET_ID}). Brightness and on/off '
+                         f'untouched.' + ('' if white else ' RGB-only strip (no white channel): may look '
+                                          'different from the Hue filament bulbs.'))
+        write_note('synced', f'{names} synced',
+                   'wled-sync matched these WLEDs to the warm filament preset (read back and verified):\n'
+                   + '\n'.join(lines) + f'\n\nBatch this into the next owner update. Log: {LOG}')
+        log(f'inbox note written: {names} synced')
+    return rc
+
+
+def main(argv=None):
+    global QUIET
+    ap = argparse.ArgumentParser(prog='wled-sync', description=__doc__.split('\n', 1)[0])
+    ap.add_argument('cmd', nargs='?', default='run', choices=['run', 'status', 'reset'])
+    ap.add_argument('entity', nargs='?')
+    ap.add_argument('--only', metavar='ENTITY')
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument('--dry-run', action='store_true')
+    g.add_argument('--verify-only', action='store_true')
+    ap.add_argument('--quiet', action='store_true')
+    a = ap.parse_args(argv)
+    QUIET = a.quiet
+    for x in (a.only, a.entity):
+        if x and not ENTITY_RE.fullmatch(x):
+            ap.error(f'{x!r} is not a light.wled* entity id')
+    state = load_state()
+    if a.cmd == 'status':
+        return cmd_status(state)
+    if a.cmd == 'reset':
+        if not a.entity:
+            ap.error('reset needs an entity id')
+        return cmd_reset(state, a.entity)
+    if a.entity:
+        ap.error('use --only ENTITY')
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + '.lock', 'w') as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0                                     # another run is busy
+        state = load_state()
+        mode = 'dry-run' if a.dry_run else 'verify-only' if a.verify_only else 'run'
+        return cmd_run(state, mode, a.only)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""disk-day-check: read-only after-check for adding a (precleared) disk to the Unraid array.
+
+Runs every post-add check in one go through the dispatcher's read-only verbs (`health`, plus
+`capacity` for mounts and shares) and prints one phone-friendly verdict:
+  - not added yet: the disk is still an unassigned device (preclear running or done)
+  - in progress:   clear / sync running, or format still pending
+  - all fine:      array started, disk mounted with the expected size and file system, no disk
+                   disabled/emulated/erroring, parity valid, temps within limits, SMART clean vs the
+                   baseline, array total grew, no new warning/alert notifications
+  - problems:      a short list of what's wrong
+
+Usage: disk-day-check [--json] [--serial SUFFIX] [--slot diskN] [--fs xfs] [--crc-baseline N]
+                      [--since EPOCH|Nh] [--no-state]
+  SUFFIX   end of the new disk's serial (default ~/.config/preclear-watch/serial)
+  --slot   expected array slot (default: any data slot)
+  --since  notifications newer than this count (default: last run that saw the disk unassigned,
+           else 24 h)
+Baselines (CRC count, device size, array totals) come from preclear-watch's state and from this
+script's own pre-add runs (~/.local/state/disk-day-check/SUFFIX.json).
+Env seam: DISK_DAY_CHECK_SSH=CMD replaces `unraid-ssh` (tests). Exit: 0 fine / not added / in
+progress, 1 problems, 2 usage, 3 the health verb failed.
+"""
+import argparse, json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser('~')
+SSH = os.environ.get('DISK_DAY_CHECK_SSH', 'unraid-ssh')
+STATE_DIR = os.path.join(HOME, '.local/state/disk-day-check')
+STATUS_TEXT = {'DISK_DSBL': 'disabled (emulated)', 'DISK_NP_DSBL': 'missing + disabled (emulated)',
+               'DISK_INVALID': 'invalid', 'DISK_NP': 'missing', 'DISK_NP_MISSING': 'missing',
+               'DISK_WRONG': 'wrong disk', 'DISK_NEW': 'new (not in the array yet)',
+               'DISK_DSBL_NEW': 'disabled new disk'}
+
+
+def verb(name, timeout=200):
+    try:
+        r = subprocess.run([SSH, 'run', name], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout.strip() else None
+
+
+def sections(text):
+    out, head, buf = [], None, []
+    for line in text.splitlines():
+        if line.startswith('=====U') and not line.startswith('=====UH_RC') and not line.startswith('=====UC_RC'):
+            if head is not None:
+                out.append((head, '\n'.join(buf)))
+            head, buf = line.split(' ', 1)[1] if ' ' in line else '', []
+        elif head is not None:
+            buf.append(line)
+    if head is not None:
+        out.append((head, '\n'.join(buf)))
+    return out
+
+
+def sec(secs, name):
+    for h, b in secs:
+        if h == name:
+            return b
+    return ''
+
+
+def kv(body):
+    d = {}
+    for line in body.splitlines():
+        m = re.match(r'^([A-Za-z0-9_.@]+)=(.*)$', line)
+        if m:
+            v = m.group(2)
+            d[m.group(1)] = v[1:-1] if len(v) >= 2 and v[0] == v[-1] == '"' else v
+    return d
+
+
+def blocks(body):
+    out, cur = {}, None
+    for line in body.splitlines():
+        m = re.match(r'^\["([^"]+)"\]\s*$', line)
+        if m:
+            cur = out.setdefault(m.group(1), {})
+            continue
+        if cur is not None:
+            m = re.match(r'^([A-Za-z0-9_]+)="?(.*?)"?$', line)
+            if m:
+                cur[m.group(1)] = m.group(2)
+    return out
+
+
+def notifications(body):
+    out = []
+    for chunk in re.split(r'\n(?=@file=)', body):
+        d = kv(chunk)
+        if 'timestamp' in d:
+            out.append(d)
+    return out
+
+
+def num(v, default=None):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def tb(kb):
+    return f'{kb * 1024 / 1e12:.1f} TB'
+
+
+def label(slot):
+    m = re.match(r'^disk(\d+)$', slot or '')
+    if m:
+        return f'Disk {m.group(1)}'
+    return {'parity': 'Parity', 'parity2': 'Parity 2'}.get(slot, (slot or '?').capitalize())
+
+
+def matches(dev_id, suffix):
+    return any(p.endswith(suffix) for p in (dev_id or '').split('_') if p)
+
+
+def smart_of(secs, slot, dev):
+    body = ''
+    for h, b in secs:
+        p = h.split()
+        if len(p) >= 3 and p[0] == 'smartctl' and p[1] == slot and p[2] == dev:
+            body = b
+            break
+    if not body:
+        for h, b in secs:
+            p = h.split()
+            if len(p) >= 3 and p[0] == 'smart_cache' and p[1] == slot and p[2] == dev:
+                body = b
+                break
+    s = {}
+    for attr, key in (('Reallocated_Sector_Ct', 'realloc'), ('Current_Pending_Sector', 'pending'),
+                      ('Offline_Uncorrectable', 'unc'), ('UDMA_CRC_Error_Count', 'crc')):
+        a = re.search(r'\b%s\b.*?(\d+)\s*$' % attr, body, re.M)
+        if a:
+            s[key] = int(a.group(1))
+    h = re.search(r'overall-health.*?:\s*(\S+)', body)
+    if h:
+        s['health'] = h.group(1)
+    return s
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def parse_since(v, now):
+    if v is None:
+        return None
+    m = re.match(r'^(\d+)h$', v)
+    if m:
+        return now - int(m.group(1)) * 3600
+    if re.match(r'^\d{9,}$', v):
+        return int(v)
+    raise ValueError(v)
+
+
+def check(health, capacity, args, state, pw_state, now):
+    H = sections(health)
+    meta, var = kv(sec(H, 'meta')), kv(sec(H, 'var'))
+    disks, devs = blocks(sec(H, 'disks')), blocks(sec(H, 'devs'))
+    disp = kv(sec(H, 'display'))
+    C = sections(capacity) if capacity else []
+    mounts = sec(C, 'mounts')
+    shares = blocks(sec(C, 'shares'))
+    preclear = (meta.get('preclear') or '').split()
+    suffix = args.serial
+    fails, warns, infos, prog = [], [], [], []
+    rep = {'serial_suffix': suffix, 'checked_at': now, 'capacity_verb': capacity is not None}
+
+    # array-wide: state, disk status, errors, md counters
+    arr = [n for n in disks if n.startswith('disk') or n.startswith('parity')]
+    arr = [n for n in arr if not (disks[n].get('status', '').startswith('DISK_NP') and not disks[n].get('id'))]
+    data = [n for n in arr if re.match(r'^disk\d+$', n)]
+    md, fs = var.get('mdState', '?'), var.get('fsState', '?')
+    rep['array'] = {'mdState': md, 'fsState': fs, 'data_disks': len(data),
+                    'parity_disks': len(arr) - len(data)}
+    if md != 'STARTED':
+        fails.append(f'Array is {md.lower()}, not started')
+    elif fs.lower() not in ('started', ''):
+        warns.append(f'Array file systems: {fs}')
+    for k, what in (('mdNumDisabled', 'disabled'), ('mdNumInvalid', 'invalid'), ('mdNumMissing', 'missing')):
+        n = num(var.get(k), 0)
+        if n:
+            fails.append(f'{n} disk(s) {what}')
+
+    # locate the new disk
+    slot = None
+    for n, b in disks.items():
+        if matches(b.get('id'), suffix) or matches(b.get('idSb'), suffix):
+            slot = n
+            break
+    unassigned = None
+    if not slot:
+        for n, b in devs.items():
+            if matches(b.get('id'), suffix):
+                unassigned = n
+                break
+    new = disks.get(slot) if slot else None
+
+    for n in arr:
+        b = disks[n]
+        st = b.get('status', '')
+        if n == slot and st == 'DISK_NEW':
+            continue
+        if st and st != 'DISK_OK':
+            fails.append(f'{label(n)}: {STATUS_TEXT.get(st, st)}')
+        e = num(b.get('numErrors'), 0)
+        if e:
+            fails.append(f'{label(n)}: {e} read/write errors')
+
+    # parity / sync
+    resync = num(var.get('mdResync'), 0)
+    pos, size = num(var.get('mdResyncPos'), 0), num(var.get('mdResyncSize'), 0)
+    action = var.get('mdResyncAction', '')
+    par = {'sync_running': bool(resync), 'action': action if resync else None,
+           'last_sync_errors': num(var.get('sbSyncErrs')), 'last_sync_exit': num(var.get('sbSyncExit'))}
+    if resync:
+        pct = round(100 * pos / size, 1) if size else None
+        par['progress_pct'] = pct
+        ptxt = f'{pct:.0f} %' if pct is not None else '?'
+        if action.startswith('clear'):
+            prog.append(f'clearing {label(slot)}: {ptxt}' if slot else f'clearing: {ptxt}')
+        elif action.startswith('recon'):
+            warns.append(f'Parity sync / rebuild running ({action}): {ptxt}')
+        else:
+            prog.append(f'parity {action}: {ptxt}')
+    if par['last_sync_errors']:
+        warns.append(f'Last parity check found {par["last_sync_errors"]} errors')
+    if par['last_sync_exit'] not in (None, 0):
+        warns.append('Last parity check did not finish (aborted)')
+    plog = [l for l in sec(H, 'parity_log').splitlines() if l.strip()]
+    if plog:
+        par['last_log'] = plog[-1].split('|')[0]
+    rep['parity'] = par
+
+    # temperatures vs Unraid's limits (HDD hot/max, SSD hotssd/maxssd)
+    hot, mx = num(disp.get('hot'), 45), num(disp.get('max'), 55)
+    hots, mxs = num(disp.get('hotssd'), 60), num(disp.get('maxssd'), 70)
+    temps = {}
+    tnames = [n for n in disks if n in arr or n == slot or disks[n].get('type') == 'Cache']
+    if unassigned:
+        tnames.append(unassigned)
+    for n in tnames:
+        b = disks.get(n) or devs.get(n) or {}
+        t = num(b.get('temp'))
+        if t is None:
+            continue
+        ssd = b.get('rotational') == '0'
+        h_, m_ = (hots, mxs) if ssd else (hot, mx)
+        temps[n] = t
+        nm = label(n) if n != unassigned else f'new disk ({n})'
+        if t >= m_:
+            fails.append(f'{nm} {t} °C (max {m_})')
+        elif t >= h_:
+            warns.append(f'{nm} {t} °C (hot {h_})')
+    rep['temps'] = {'hdd_hot': hot, 'hdd_max': mx, 'ssd_hot': hots, 'ssd_max': mxs, 'disks': temps}
+
+    # SMART of the new disk vs baseline
+    base = args.crc_baseline
+    if base is None:
+        base = (state or {}).get('crc_baseline')
+    if base is None:
+        base = ((pw_state or {}).get('smart') or {}).get('crc')
+    sslot, sdev = (slot, (new or {}).get('device')) if slot else (unassigned, (devs.get(unassigned) or {}).get('device'))
+    smart = smart_of(H, sslot, sdev) if sslot and sdev else {}
+    rep['smart'] = dict(smart, crc_baseline=base)
+    if sslot:
+        if not smart:
+            warns.append('SMART of the new disk not in this read')
+        for k, what in (('realloc', 'reallocated'), ('pending', 'pending'), ('unc', 'uncorrectable')):
+            if smart.get(k):
+                fails.append(f'New disk SMART: {smart[k]} {what} sectors')
+        if smart.get('crc') is not None and base is not None and smart['crc'] > base:
+            fails.append(f'New disk CRC errors {base} → {smart["crc"]} (cable)')
+        if smart.get('health') not in (None, 'PASSED'):
+            fails.append(f'New disk SMART health: {smart["health"]}')
+
+    # capacity totals (array data disks only)
+    mounted = [n for n in data if disks[n].get('fsStatus') == 'Mounted']
+    tot = sum(num(disks[n].get('fsSize'), 0) for n in mounted)
+    free = sum(num(disks[n].get('fsFree'), 0) for n in mounted)
+    capr = {'array_size_kb': tot, 'array_free_kb': free, 'data_disks_mounted': len(mounted)}
+    media = shares.get('media')
+    if media and num(media.get('free')) is not None:
+        capr['media_share_free_kb'] = num(media.get('free'))
+    before = (state or {}).get('before') or {}
+    rep['capacity'] = capr
+    if len(mounted) < len(data) and slot not in data:
+        fails.append(f'{len(data) - len(mounted)} data disk(s) not mounted')
+
+    # notifications since the add
+    since = args.since if args.since is not None else (state or {}).get('last_unassigned_t')
+    if since is None:
+        since = now - 24 * 3600
+    nts = [n for n in notifications(sec(H, 'notify_unread')) if num(n.get('timestamp'), 0) >= since]
+    bad = [n for n in nts if n.get('importance') in ('alert', 'warning')
+           and 'returned to normal' not in n.get('subject', '')]
+    rep['notifications'] = {'since': since, 'count': len(nts),
+                            'warnings': [{'t': num(n.get('timestamp')), 'importance': n.get('importance'),
+                                          'subject': short_subject(n.get('subject', ''))} for n in bad]}
+    if not slot:
+        bad = []  # before the add, notifications are preclear-watch / unraid-health's business
+    for n in bad[:3]:
+        (fails if n.get('importance') == 'alert' else warns).append('Notice: ' + short_subject(n.get('subject', '')))
+    if len(bad) > 3:
+        warns.append(f'… and {len(bad) - 3} more notices')
+
+    # the new disk itself
+    if not slot:
+        rep['slot'] = None
+        if unassigned:
+            d = devs[unassigned]
+            running = ('/dev/' + d.get('device', '-')) in preclear
+            rep['state'] = 'not_added'
+            rep['unassigned'] = {'dev': unassigned, 'preclear_running': running,
+                                 'size_bytes': num(d.get('sectors'), 0) * num(d.get('sector_size'), 512)}
+            infos.append(f'Unassigned ({unassigned}), preclear {"running" if running else "not running"}')
+        else:
+            rep['state'] = 'missing'
+            fails.append(f'Disk …{suffix} not visible on the server (neither array nor unassigned)')
+    else:
+        rep['slot'] = slot
+        b = new
+        r = {'status': b.get('status'), 'fsStatus': b.get('fsStatus'), 'fsType': b.get('fsType'),
+             'mountpoint': b.get('fsMountpoint'), 'size_kb': num(b.get('size')),
+             'fs_size_kb': num(b.get('fsSize')), 'fs_free_kb': num(b.get('fsFree'))}
+        rep['new_disk'] = r
+        L = label(slot)
+        if not re.match(r'^disk\d+$', slot):
+            fails.append(f'New disk is in {slot}, not an array data slot')
+        if args.slot and slot != args.slot:
+            fails.append(f'New disk is {L}, expected {label(args.slot)}')
+        unm = num(var.get('fsNumUnmountable'), 0)
+        mask = var.get('fsUnmountableMask', '')
+        if b.get('status') == 'DISK_NEW':
+            prog.append(f'{L} assigned, array not started with it yet')
+        if b.get('fsStatus') != 'Mounted':
+            others = [n for n in data if n != slot and disks[n].get('fsStatus') not in (None, 'Mounted')]
+            if others:
+                fails.append("Unmountable besides the new disk: " + ', '.join(label(n) for n in others) +
+                             " → DON'T format")
+            elif resync and action.startswith('clear'):
+                pass
+            elif (b.get('fsStatus') or '').lower().startswith('unmountable') or unm:
+                prog.append(f'{L} waits for Format (Main → Format, list must show only {L})')
+            else:
+                fails.append(f'{L} not mounted ({b.get("fsStatus") or "?"})')
+        else:
+            if b.get('fsMountpoint') != f'/mnt/{slot}':
+                fails.append(f'{L} mounted at {b.get("fsMountpoint")}, not /mnt/{slot}')
+            if args.fs and b.get('fsType') != args.fs:
+                fails.append(f'{L} file system {b.get("fsType")}, expected {args.fs}')
+            if mounts and not re.search(r'^\S+ /mnt/%s %s\s*$' % (re.escape(slot), re.escape(args.fs or r'\S+')), mounts, re.M):
+                warns.append(f'/mnt/{slot} not in the mount table')
+            sz, fsz = r['size_kb'] or 0, r['fs_size_kb'] or 0
+            dev_bytes = ((state or {}).get('before') or {}).get('dev_size_bytes')
+            if dev_bytes and sz and abs(sz * 1024 - dev_bytes) > 0.01 * dev_bytes:
+                fails.append(f'{L} size {tb(sz)} ≠ the precleared disk ({dev_bytes / 1e12:.1f} TB)')
+            if sz and fsz < 0.97 * sz:
+                fails.append(f'{L} file system {tb(fsz)} on a {tb(sz)} disk (too small)')
+            # array total grew by the new disk
+            if before.get('array_size_kb'):
+                grew = tot - before['array_size_kb']
+                capr['array_growth_kb'] = grew
+                if fsz and grew < 0.9 * fsz:
+                    warns.append(f'Array total grew only {tb(max(grew, 0))} (expected ~{tb(fsz)})')
+            if 'media_share_free_kb' in capr and r['fs_free_kb'] and capr['media_share_free_kb'] < 0.9 * r['fs_free_kb']:
+                warns.append(f'media share free {tb(capr["media_share_free_kb"])} doesn\'t include {L} yet')
+        for name, sh in shares.items():
+            inc = (sh.get('include') or '').split(',')
+            exc = (sh.get('exclude') or '').split(',')
+            if sh.get('useCache') == 'only':
+                continue
+            if slot in exc or (sh.get('include') and slot not in inc):
+                warns.append(f'Share {name} excludes {L}')
+        rep['state'] = 'problems' if fails else ('in_progress' if prog else 'ok')
+    if rep['state'] == 'not_added' and fails:
+        rep['array_problems'] = True
+    rep['fails'], rep['warns'], rep['progress'], rep['info'] = fails, warns, prog, infos
+    return rep
+
+
+def short_subject(s):
+    return re.sub(r'^\w+ \[[^\]]*\] - ', '', s).strip()
+
+
+def render(rep):
+    st, L = rep['state'], label(rep.get('slot'))
+    cap, sm, tp = rep['capacity'], rep.get('smart') or {}, rep['temps']['disks']
+    arr = f'array {tb(cap["array_size_kb"])}, {tb(cap["array_free_kb"])} free'
+    if sm.get('crc') is not None:
+        clean = not any(sm.get(k) for k in ('realloc', 'pending', 'unc'))
+        smart = f'SMART {"clean" if clean else "NOT clean"}, CRC {sm["crc"]}' + \
+                (f' (baseline {sm["crc_baseline"]})' if sm.get('crc_baseline') is not None else '')
+    else:
+        smart = 'SMART not read'
+    lines = []
+    if st == 'not_added':
+        u = rep['unassigned']
+        t = tp.get(u['dev'])
+        lines.append(f'⏸ Disk …{rep["serial_suffix"]} not added yet')
+        lines.append(f'Unassigned ({u["dev"]}), preclear {"running" if u["preclear_running"] else "done / stopped"}')
+        lines.append(smart + (f' · {t} °C' if t is not None else ''))
+        lines.append(f'Array {rep["array"]["mdState"].lower()}, {rep["array"]["data_disks"]} data disks, {arr}')
+        if rep['fails']:
+            lines.append('Array issues:')
+            lines += ['• ' + f for f in rep['fails']]
+        if rep['warns']:
+            lines.append('Watch: ' + '; '.join(rep['warns']))
+        return '\n'.join(lines)
+    if st == 'missing':
+        lines.append(f'❌ Disk …{rep["serial_suffix"]} not found on the server')
+        lines += ['• ' + f for f in rep['fails'] if 'not visible' not in f]
+        return '\n'.join(lines)
+    nd = rep.get('new_disk') or {}
+    mx = max(tp.values()) if tp else None
+    if st == 'ok':
+        lines.append(f'✅ {L} in, all fine')
+        lines.append(f'{nd.get("fsType")}, {tb(nd.get("fs_size_kb") or 0)}, {tb(nd.get("fs_free_kb") or 0)} free · {arr}')
+        lines.append(smart + (f' · max temp {mx} °C' if mx is not None else '') + ' · parity valid')
+    elif st == 'in_progress':
+        lines.append(f'⏳ {L}: ' + '; '.join(rep['progress']))
+        lines.append(smart + (f' · max temp {mx} °C' if mx is not None else ''))
+    else:
+        n = len(rep['fails'])
+        lines.append(f'⚠️ {L}: {n} problem{"s" if n != 1 else ""}')
+        lines += ['• ' + f for f in rep['fails']]
+        if rep['progress']:
+            lines.append('Running: ' + '; '.join(rep['progress']))
+    if rep['warns']:
+        lines.append('Watch: ' + '; '.join(rep['warns']))
+    return '\n'.join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='disk-day-check', description=__doc__.split('\n')[0])
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--serial')
+    ap.add_argument('--slot')
+    ap.add_argument('--fs', default='xfs')
+    ap.add_argument('--crc-baseline', type=int)
+    ap.add_argument('--since')
+    ap.add_argument('--no-state', action='store_true')
+    args = ap.parse_args()
+    if not args.serial:
+        try:
+            with open(os.path.join(HOME, '.config/preclear-watch/serial')) as f:
+                args.serial = f.read().strip()
+        except OSError:
+            pass
+    if not args.serial or not re.match(r'^[A-Za-z0-9]{3,}$', args.serial):
+        print('disk-day-check: need --serial SUFFIX (letters/digits, ≥ 3) or ~/.config/preclear-watch/serial', file=sys.stderr)
+        return 2
+    if args.slot and not re.match(r'^disk\d+$', args.slot):
+        print('disk-day-check: --slot must look like disk12', file=sys.stderr)
+        return 2
+    now = int(time.time())
+    try:
+        args.since = parse_since(args.since, now)
+    except ValueError:
+        print('disk-day-check: --since EPOCH or Nh', file=sys.stderr)
+        return 2
+    health = verb('health')
+    if health is None:
+        print('disk-day-check: the health verb failed (unraid-ssh status)', file=sys.stderr)
+        return 3
+    capacity = verb('capacity')
+    spath = os.path.join(STATE_DIR, args.serial + '.json')
+    state = None if args.no_state else load_json(spath)
+    pw = load_json(os.path.join(HOME, '.local/state/preclear-watch', args.serial + '.json'))
+    rep = check(health, capacity, args, state, pw, now)
+    if not args.no_state:
+        st = dict(state or {})
+        if rep['state'] == 'not_added':
+            st['last_unassigned_t'] = now
+            st['before'] = {'array_size_kb': rep['capacity']['array_size_kb'],
+                            'array_free_kb': rep['capacity']['array_free_kb'],
+                            'dev_size_bytes': rep['unassigned']['size_bytes'], 't': now}
+            if rep['smart'].get('crc') is not None and 'crc_baseline' not in st:
+                st['crc_baseline'] = rep['smart']['crc'] if rep['smart'].get('crc_baseline') is None \
+                    else rep['smart']['crc_baseline']
+        elif rep.get('slot') and 'added_seen_t' not in st:
+            st['added_seen_t'] = now
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(spath + '.tmp', 'w') as f:
+                json.dump(st, f)
+            os.replace(spath + '.tmp', spath)
+        except OSError:
+            pass
+    print(json.dumps(rep, indent=1, ensure_ascii=False) if args.json else render(rep))
+    return 1 if rep['state'] in ('problems', 'missing') else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

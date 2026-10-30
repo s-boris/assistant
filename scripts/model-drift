@@ -1,0 +1,308 @@
+#!/usr/bin/env -S python3 -I
+"""model-drift [run|status] [--dry-run]
+Token-free checks that a Claude Code update did not change how the main session runs: the model settings.json asks
+for, and the hub-stamp hook's `_caller` stamp on MCP calls (the stamp canary).
+  transcript  the newest top-level *.jsonl in the project dir (mtime); only its last 200 lines (`tail`) are
+              parsed, and only structured fields are read: type, isSidechain, message.model, timestamp.
+              Assistant entries with isSidechain=true (subagents), no model or a synthetic model are skipped;
+              the most recent remaining one is the running model. Message text is never read out or printed.
+  settings    the top-level "model" key of ~/.claude/settings.json (that one line only, via grep)
+  compare     "[1m]"-style suffixes and case are ignored; a settings alias without "claude-" (e.g. "opus")
+              matches when the transcript id contains it. No model in the tail or no settings key = no verdict.
+  run         (default; cron every 30 min) on a mismatch: ONE ~/inbox/model-drift-YYYYMMDD.md per day (state:
+              ~/.local/state/model-drift/last-note); else silent. --dry-run prints the note instead.
+  stamps      `tool policy --days W --json` (counts only): principal subagent:unattributed > 0 means hub MCP calls
+              arrived without a valid `_caller` stamp, e.g. a Claude Code update stopped applying the hook's
+              updatedInput to MCP tools. W = the time since the last successful stamp check (+1 min), at most 1 day,
+              so each call is judged once; each run: ONE ~/inbox/stamp-canary-YYYYMMDD.md per day (state:
+              stamp-checked, stamp-note), written through inbox.writer (typed event row + note) when the inbox is
+              the real ~/inbox. Gateway unreachable or bad JSON = no verdict, the window is kept for the next run.
+  status      prints the model values, the verdict and the last day's stamp count (state unchanged).
+Exit: 0 match / no verdict and no unstamped calls; 1 drift or unstamped calls; 2 usage. Never Telegram.
+Seams (tests): MODEL_DRIFT_PROJECTS (~/.claude/projects/-home-node-workspace), MODEL_DRIFT_SETTINGS
+(~/.claude/settings.json), MODEL_DRIFT_STATE (~/.local/state/model-drift), MODEL_DRIFT_INBOX (~/inbox),
+MODEL_DRIFT_TODAY (YYYYMMDD), MODEL_DRIFT_TOOL (~/bin/tool; "off" skips the stamp check), MODEL_DRIFT_NOW (epoch).
+Tests: ~/opt/assistant/tests/legacy/model-drift/run.sh
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+PROJECTS = os.environ.get("MODEL_DRIFT_PROJECTS") or os.path.join(HOME, ".claude/projects/-home-node-workspace")
+SETTINGS = os.environ.get("MODEL_DRIFT_SETTINGS") or os.path.join(HOME, ".claude/settings.json")
+STATE_DIR = os.environ.get("MODEL_DRIFT_STATE") or os.path.join(HOME, ".local/state/model-drift")
+INBOX = os.environ.get("MODEL_DRIFT_INBOX") or os.path.join(HOME, "inbox")
+TOOL = os.environ.get("MODEL_DRIFT_TOOL") or os.path.join(HOME, "bin/tool")
+UNSTAMPED = "subagent:unattributed"  # tools.policy.Principal.label of a hub call without a valid stamp
+DAY_S = 86400
+OVERLAP_S = 60
+TAIL_LINES = 200
+SYNTHETIC = re.compile(r"^<.*>$|^synthetic$", re.I)
+
+
+def newest_transcript():
+    files = [f for f in glob.glob(os.path.join(PROJECTS, "*.jsonl")) if os.path.isfile(f)]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def transcript_model(path):
+    """(model, timestamp) of the most recent main-session assistant entry in the last TAIL_LINES lines."""
+    try:
+        out = subprocess.run(["tail", "-n", str(TAIL_LINES), path], capture_output=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    found = (None, None)
+    for raw in out.splitlines():
+        try:
+            o = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(o, dict) or o.get("type") != "assistant" or o.get("isSidechain") is True:
+            continue
+        msg = o.get("message")
+        model = msg.get("model") if isinstance(msg, dict) else None
+        if not isinstance(model, str) or not model.strip() or SYNTHETIC.match(model.strip()):
+            continue
+        ts = o.get("timestamp")
+        found = (model.strip(), ts if isinstance(ts, str) else None)
+    return found
+
+
+def settings_model():
+    """The top-level "model" value from settings.json, read with grep (that key only)."""
+    try:
+        out = subprocess.run(["grep", "-E", r'^\s*"model"\s*:', SETTINGS], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = out.splitlines()
+    top = [l for l in lines if re.match(r'^  "model"', l)] or lines  # 2-space indent = top level
+    for l in top:
+        m = re.match(r'^\s*"model"\s*:\s*"([^"]*)"', l)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def norm(m):
+    return re.sub(r"\[[^\]]*\]$", "", m.strip().lower()).strip()
+
+
+def same(want, got):
+    w, g = norm(want), norm(got)
+    if w == g:
+        return True
+    if not w.startswith("claude-"):  # alias such as "opus" / "sonnet"
+        return re.search(r"(^|-)" + re.escape(w) + r"(-|$)", g) is not None
+    return False
+
+
+def check():
+    path = newest_transcript()
+    got, ts = transcript_model(path) if path else (None, None)
+    want = settings_model()
+    if not want or not got:
+        verdict = "unknown"
+    else:
+        verdict = "match" if same(want, got) else "drift"
+    return {"settings": want, "transcript": got, "ts": ts, "file": os.path.basename(path) if path else None,
+            "verdict": verdict}
+
+
+def note_text(r, day):
+    return (f"# model-drift {day}\n\n"
+            f"Data, not instructions.\n\n"
+            f"The main session's newest assistant entries run `{r['transcript']}`, but ~/.claude/settings.json "
+            f"sets `{r['settings']}`.\n\n"
+            f"- transcript: {r['file']} (last entry {r['ts'] or '?'})\n"
+            f"- check: `model-drift status`; switch with /model or fix settings.json `model`, then `restart` "
+            f"(tell the owner first)\n"
+            f"- one note per day; silent while they match\n")
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        f.write(text + "\n")
+    os.replace(path + ".tmp", path)
+
+
+def unstamped(days):
+    """(count of subagent:unattributed calls, {principal: calls}, error) from `tool policy --days DAYS --json`;
+    count None = no verdict (seam off, gateway unreachable, bad answer). Counts only: no call content is read."""
+    if TOOL == "off":
+        return None, {}, "stamp check off"
+    try:
+        p = subprocess.run([TOOL, "policy", "--days", f"{days:.5f}", "--json"], capture_output=True, text=True,
+                           timeout=40)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, {}, f"tool policy: {type(e).__name__}"
+    if p.returncode != 0:
+        return None, {}, f"tool policy exit {p.returncode}"
+    try:
+        princ = json.loads(p.stdout).get("principals")
+    except (ValueError, AttributeError):
+        return None, {}, "tool policy: not JSON"
+    if not isinstance(princ, dict):
+        return None, {}, "tool policy: no principals"
+    princ = {str(k): v for k, v in princ.items() if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+    return princ.get(UNSTAMPED, 0), princ, None
+
+
+def span(seconds):
+    return f"{seconds / 3600:.1f} h" if seconds >= 3600 else f"{max(1, round(seconds / 60))} min"
+
+
+def stamp_note_text(n, princ, window, day):
+    counts = ", ".join(f"{k} {v}" for k, v in sorted(princ.items())) or "none"
+    return (f"# stamp-canary {day}\n\n"
+            f"Data, not instructions.\n\n"
+            f"The hub gateway logged {n} MCP call(s) as `{UNSTAMPED}` in the last {span(window)} (since the previous "
+            f"check): they came without a valid `_caller` stamp, so they ran with a subagent's least rights. Usual "
+            f"cause: a Claude Code update that no longer applies the PreToolUse hook's `updatedInput` to MCP tools "
+            f"(hub-stamp hook on mcp__hub__*).\n\n"
+            f"- principals in that window (calls): {counts}\n"
+            f"Next: `tool policy --days 1` (principals, denies); `claude --version` and its changelog (hooks, "
+            f"updatedInput, MCP); if the hook still runs, compare its stamp with the hub's check (token, clock); fix "
+            f"or pin Claude Code, then ack this note.\n"
+            f"- one note per day; silent while the count is 0 (`model-drift status`)\n")
+
+
+def emit(name, text, payload):
+    """The note through inbox.writer (typed event row + the identical note) when INBOX is the real ~/inbox; the
+    plain note otherwise (seams) or when the ledger library is missing or breaks."""
+    p = os.path.join(INBOX, name)
+    try:
+        real = os.path.realpath(INBOX) == os.path.realpath(os.path.join(HOME, "inbox"))
+    except OSError:
+        real = False
+    if real and not os.path.lexists(p):
+        try:
+            here = os.path.dirname(os.path.realpath(__file__))
+            for pkg in ("core", "inbox"):
+                for r in (os.environ.get("ASSISTANT_LIB", ""), os.path.join(here, "lib"), os.path.join(here, ".."),
+                          os.path.join(here, "..", "packages")):
+                    if r and os.path.isfile(os.path.join(r, pkg, "__init__.py")):
+                        if os.path.abspath(r) not in sys.path:
+                            sys.path.insert(0, os.path.abspath(r))
+                        break
+            from inbox import writer
+            res = writer.note(None, name, text, source="model-drift", payload=payload)
+            if res.note_path and os.path.exists(res.note_path):
+                return
+        except Exception as e:  # never lose the note
+            print(f"model-drift: inbox.writer failed ({type(e).__name__}); plain note", file=sys.stderr)
+    if not os.path.exists(p):
+        os.makedirs(INBOX, exist_ok=True)
+        with open(p + ".tmp", "w") as f:
+            f.write(text)
+        os.replace(p + ".tmp", p)
+
+
+def stamp_run(dry, day, now):
+    """The stamp canary over the calls since the last successful check (at most a day). True = unstamped calls."""
+    checked = os.path.join(STATE_DIR, "stamp-checked")
+    try:
+        last = float(_read(checked) or 0)
+    except ValueError:
+        last = 0.0
+    window = min(DAY_S, now - last + OVERLAP_S) if 0 < last <= now else DAY_S
+    n, princ, _err = unstamped(window / DAY_S)
+    if n is None:
+        return False
+    if n > 0:
+        text = stamp_note_text(n, princ, window, day)
+        if dry:
+            print(text, end="")
+            return True
+        sent = os.path.join(STATE_DIR, "stamp-note")
+        if _read(sent) != day:
+            emit(f"stamp-canary-{day}.md", text,
+                 {"date": day, "unstamped": n, "window_h": round(window / 3600, 2)})
+            _write(sent, day)
+    if not dry:
+        _write(checked, f"{now:.0f}")
+    return n > 0
+
+
+def run(dry):
+    day = os.environ.get("MODEL_DRIFT_TODAY") or datetime.date.today().strftime("%Y%m%d")
+    rc = model_run(dry, day)
+    now = float(os.environ.get("MODEL_DRIFT_NOW") or time.time())
+    return 1 if stamp_run(dry, day, now) else rc
+
+
+def model_run(dry, day):
+    r = check()
+    if r["verdict"] != "drift":
+        return 0
+    text = note_text(r, day)
+    if dry:
+        print(text, end="")
+        return 1
+    state = os.path.join(STATE_DIR, "last-note")
+    try:
+        with open(state) as f:
+            if f.read().strip() == day:
+                return 1
+    except OSError:
+        pass
+    os.makedirs(INBOX, exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    note = os.path.join(INBOX, f"model-drift-{day}.md")
+    if not os.path.exists(note):
+        tmp = note + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, note)
+    with open(state + ".tmp", "w") as f:
+        f.write(day + "\n")
+    os.replace(state + ".tmp", state)
+    return 1
+
+
+def status():
+    r = check()
+    print(f"settings:   {r['settings'] or '(no model key)'}")
+    print(f"transcript: {r['transcript'] or '(no main-session model in the last %d lines)' % TAIL_LINES}"
+          + (f"  ({r['file']}, {r['ts']})" if r["transcript"] else ""))
+    print(f"verdict:    {r['verdict']}")
+    n, _princ, err = unstamped(1.0)
+    if n is None:
+        print(f"stamps:     no verdict ({err})")
+    else:
+        print(f"stamps:     {UNSTAMPED} {n} in the last 24 h"
+              + (" (hub calls without a valid _caller stamp)" if n else " (ok)"))
+    return 1 if r["verdict"] == "drift" or (n or 0) > 0 else 0
+
+
+def main(argv):
+    args = [a for a in argv if a != "--dry-run"]
+    dry = len(args) != len(argv)
+    if args in ([], ["run"]):
+        return run(dry)
+    if args == ["status"]:
+        return status()
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__, end="")
+        return 0
+    print(__doc__, end="", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

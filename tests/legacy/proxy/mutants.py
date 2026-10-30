@@ -1,0 +1,111 @@
+MUTATIONS = [
+    (
+        "pull ignores untracked files",
+        '[ -z "$(git status --porcelain --untracked-files=all -- etc-nginx)" ] && git diff',
+        "git diff --quiet && git diff",
+    ),
+    ("pull ignores staged changes", 'etc-nginx)" ] && git diff --cached --quiet \\', 'etc-nginx)" ] \\'),
+    (
+        "pull keeps dash-www",
+        'rsync -a --delete --exclude=/dash-www "$host:/etc/nginx/" "$stash/"',
+        'rsync -a --delete "$host:/etc/nginx/" "$stash/"',
+    ),
+    (
+        "pull without --delete",
+        'rsync -a --delete --exclude=/dash-www "$stash/" etc-nginx/',
+        'rsync -a --exclude=/dash-www "$stash/" etc-nginx/',
+    ),
+    (
+        "stash not removed on refusal",
+        'push or discard them first" >&2; rm -rf "$stash"; return 1; }',
+        'push or discard them first" >&2; return 1; }',
+    ),
+    (
+        "push stages tracked only",
+        '    git add -A etc-nginx\n    git diff --cached --quiet && { echo "nothing to push"',
+        '    git add -u etc-nginx\n    git diff --cached --quiet && { echo "nothing to push"',
+    ),
+    ("copy failure keeps the commit", "      git reset -q --soft HEAD~1\n", "      :\n"),
+    (
+        "nginx -t stderr dropped",
+        "'sudo -n /usr/sbin/nginx -t' 2>&1 | tail -2 | grep",
+        "'sudo -n /usr/sbin/nginx -t' 2>/dev/null | tail -2 | grep",
+    ),
+    ("reload skipped", "ssh \"$host\" 'sudo -n /usr/bin/systemctl reload nginx' && {", "true && {"),
+    (
+        "reload failure message gone",
+        '      echo "proxy: nginx -t passed but the reload FAILED',
+        '      : "proxy: nginx -t passed but the reload FAILED',
+    ),
+    (
+        "rollback: reloads",
+        '      echo "rolled back (config restored, not reloaded)" >&2',
+        '      ssh "$host" \'sudo -n /usr/bin/systemctl reload nginx\'; echo "rolled back (config restored, not reloaded)" >&2',  # noqa: E501
+    ),
+    ("cert: no name check", "-*|.*|*..*|*[!A-Za-z0-9.-]*) echo", "NEVERMATCH) echo"),
+    ("cert: leading dash allowed", "-*|.*|*..*|*[!A-Za-z0-9.-]*) echo", ".*|*..*|*[!A-Za-z0-9.-]*) echo"),
+    ("cert: no suffix", "*) n=$n.$dom;; esac", "*) ;; esac"),
+    ("cert: pull even on failure", 'claude-cert $n" && pull', 'claude-cert $n"; pull'),
+    ("help: code lines shown", "sed -n '2,/^[^#]/p' \"$0\" | grep '^#'", "sed -n '2,/^[^#]/p' \"$0\""),
+    ("unknown command exits 0", '""|help|-h|--help) exit 0;; *) exit 2;;', "*) exit 0;;"),
+    ("default host changed", 'host=${PROXY_HOST:-$("$pg" network.hosts.web_vm)}', "host=${PROXY_HOST:-web@192.0.2.21}"),
+    ("default mirror changed", "m=${PROXY_MIRROR:-$HOME/opt/nginx-mirror}", "m=${PROXY_MIRROR:-$HOME/opt/nginx}"),
+    ("missing mirror goes on", 'cd "$m" || exit 1', 'cd "$m"'),
+    (
+        "push with --delete",
+        'if ! rsync $COPY etc-nginx/ "$host:/etc/nginx/"; then',
+        'if ! rsync $COPY --delete etc-nginx/ "$host:/etc/nginx/"; then',
+    ),
+    (
+        "copy failure exits 0",
+        "        leftovers\n      fi\n      exit 1\n",
+        "        leftovers\n      fi\n      exit 0\n",
+    ),
+    (
+        "reload failure counts as success",
+        "ssh \"$host\" 'sudo -n /usr/bin/systemctl reload nginx' && {",
+        "ssh \"$host\" 'sudo -n /usr/bin/systemctl reload nginx'; {",
+    ),
+    (
+        "rollback: no revert",
+        "if git revert --no-edit HEAD >/dev/null && restore HEAD; then",
+        "if true && restore HEAD; then",
+    ),
+    ("rollback: no copy back", '    && rsync $COPY "$r/etc-nginx/" "$host:/etc/nginx/" \\\n', ""),
+    (
+        "rollback: no verify",
+        '    && rm_added "$r" \\\n    && ssh "$host" \'sudo -n /usr/sbin/nginx -t\' >/dev/null 2>&1\n',
+        '    && rm_added "$r"\n',
+    ),
+    ("rollback: exit 0", "      leftovers\n    fi\n    exit 1 ;;", "      leftovers\n    fi\n    exit 0 ;;"),
+    (
+        "rollback: added = modified",
+        '--diff-filter=A HEAD~1 HEAD -- etc-nginx > "$tmp/added"',
+        '--diff-filter=M HEAD~1 HEAD -- etc-nginx > "$tmp/added"',
+    ),
+    (
+        "added list with rename detection",
+        "git diff --no-renames --name-only --diff-filter=A",
+        "git diff --name-only --diff-filter=A",
+    ),
+    ("rollback: added files not removed", '    && rm_added "$r" \\\n', ""),
+    ("removal without the filter", ' --filter="merge $1/rules" "$1/etc-nginx/"', ' "$1/etc-nginx/"'),
+    (
+        "copy failure: no restore",
+        '      if restore HEAD; then\n        echo "proxy: copy to the server FAILED; the server',
+        '      if true; then\n        echo "proxy: copy to the server FAILED; the server',
+    ),
+    ("no drift check", '    drift "$tmp/vm" > "$tmp/drift" ||', '    : > "$tmp/drift" ||'),
+    ("drift overlap not refused", 'if grep -Fxf "$tmp/mine" "$tmp/drift" > "$tmp/both"; then', "if false; then"),
+    (
+        "unreadable VM pushes anyway",
+        'nothing pushed (edits kept)" >&2; exit 1; }\n    drift',
+        'nothing pushed (edits kept)" >&2; }\n    drift',
+    ),
+    (
+        "edits not re-applied after drift",
+        "      git stash pop -q && git add -A etc-nginx \\\n",
+        "      git add -A etc-nginx \\\n",
+    ),
+    ("temp dir kept", "trap 'rm -rf \"${tmp:?}\"' EXIT", ":"),
+]

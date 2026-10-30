@@ -1,0 +1,945 @@
+#!/usr/local/bin/python3.13 -I
+"""codebase-sync: keep a SANITIZED copy of my codebase in a private GitHub repo (profile repos.private_code).
+
+The owner asked for a repo with the current version of my codebase, kept up to date, with secrets and
+personal data stripped.
+
+  codebase-sync              build the export, sanitize, check, commit and push (default)
+  codebase-sync --no-push    same, but only commit locally
+  codebase-sync check        build + sanitize + check into a temp dir only (no commit, no push)
+  codebase-sync review       check, plus list every PII-looking value (masked), allowed ones included
+  codebase-sync manifest     check, plus the publish-manifest report (public/private paths; see below)
+  codebase-sync precheck     check, plus the public-path gate on a throwaway git tree: what a sync would block,
+                             before it lands (no lock, no state, no notes; prints file:line + rule labels only;
+                             exit 3 = would block; the gate reuses per-file clean verdicts from ~/.cache/publish-gate
+                             under identical rules, CODEBASE_SYNC_GATE_CACHE=off = none; the real sync never does).
+                             Used by `assistant ci`, test-all (suite codebase-precheck-tests) and by
+                             brain-commit when BRAIN_COMMIT_PRECHECK=1 (warn only; ~45 s)
+  codebase-sync --cron       quiet on success; a failure writes ONE ~/inbox note per distinct problem/day. A block
+                             (check or gate hits) is noted only once the SAME hit set (file:line:rule) was seen by
+                             2 consecutive --cron runs at least CODEBASE_SYNC_BLOCK_MIN (30) min apart: a builder's
+                             mid-build copy or fixture is gone by then. A clean run clears it, other hits restart
+                             the clock (state: pending-block.json). Never pushes while blocked either way.
+  codebase-sync --cron --recheck   the same, but only when a block is pending (else exit 0 at once; cron */30)
+  codebase-sync --bg         detach and run with --cron (used by brain-commit; returns immediately)
+
+What goes in: ~/bin, ~/.claude/{skills,agents,hooks,settings.json}, ~/crontab, ~/boot.sh,
+~/workspace/{CLAUDE,JOBS,TOOLS,CHANGELOG}.md, ~/plugins (the files the harness repo tracks under plugins/, which
+deploys them there byte for byte; the live copies are read),
+~/opt/*-tests, ~/opt/unraid-lockdown, the dashboard page (~/opt/dash/index.html with its embedded data emptied),
+assistant/README.md: only a pointer. The harness repo ~/opt/assistant is published with its real git history to its
+own private repo (profile repos.assistant) by `assistant-publish`, so its code is not exported here (deployed copies
+in ~/bin/lib/core.releases stay out too).
+Never: secrets, memory, transcripts, TODO/PROBLEMS/GOALS/PROACTIVE.md, reports, state, inbox, caches,
+node_modules, venvs, models, images/audio (can't be checked), PDFs whose text can't be checked or that hit.
+
+Sanitizing (export copy only, originals untouched):
+  * replace rules from ~/.config/codebase-sync/scrub.txt (0600, never exported), plus the Telegram
+    allowFrom ids from ~/.claude/channels/telegram/access.json;
+  * settings.json: every env value -> "<redacted>"; dashboard: embedded data -> {}.
+Checks (any hit refuses the commit/push; hits are shown as file:line + rule, never the value):
+  * secretscan (my real secret values + token formats) on every file (gz decompressed, PDFs via pdftotext);
+  * every scrub rule again (catches what could not be rewritten: a PDF or .gz with any hit is dropped);
+  * PII detectors: e-mail, Swiss/Serbian mobile numbers, IBAN (mod-97), AHV (EAN-13); known fakes via
+    "allow:" lines in scrub.txt.
+Repo-owned paths in the export (REPO_OWNED: README.md, .gitignore, LICENSE, docs/, tools/, .github/, ...) live
+only in ~/opt/claude-bot-export: they are kept across syncs (symlinks too) and checked like the rest.
+
+Publish manifest (unify plan, Appendix B; deny by default): PUBLIC_PATHS minus PUBLIC_EXCLUDE are the
+paths the public repo will publish verbatim; everything else (workspace/, unraid-lockdown/, ...) is private.
+Mode (~/.config/codebase-sync/mode, or $CODEBASE_SYNC_MODE; default report):
+  report   the export is built with every path scrubbed. The manifest report counts public files
+           that are already verbatim (no rule hit), public files that WOULD BLOCK (a scrub rule rewrote them;
+           paths + rule labels only), excluded *.jsonl fixtures and in-tree symlinks enforce would add.
+  enforce  public paths are copied verbatim and only checked: a term hit blocks (exit 3), never a rewrite;
+           tests/*/fixtures/*.jsonl and symlinks that point to another exported file are kept; private paths
+           are scrubbed.
+           Public-path gate (enforce only): when ~/.config/codebase-sync/gate names a gate command (its first
+           non-# line, e.g. `.../publish.py gate claude-assistant`), the staged tree must pass it before the
+           commit (called with `--src EXPORT --rev TREE`: the public mirror's own private-term, PII (incl. LAN
+           IPs), owner-date, coordinate and secret checks, which go beyond this script's scrub list). A block or
+           a gate that cannot run: nothing committed or pushed, exit 3, ONE ~/inbox note per problem/day (file:line
+           + rule labels only). No config file = no gate.
+
+Exit: 0 ok/nothing to do, 3 blocked by a check, 1 other error.
+Env (tests): CODEBASE_SYNC_HOME (source root), CODEBASE_SYNC_EXPORT, CODEBASE_SYNC_SCRUB,
+CODEBASE_SYNC_INBOX, CODEBASE_SYNC_STATE, CODEBASE_SYNC_GATE_CONF; SECRETSCAN_SOURCES for secretscan's value sources;
+CODEBASE_SYNC_ASSISTANT_SRC: the harness checkout whose tracked plugins/ files name the ~/plugins files to export
+(default CODEBASE_SYNC_HOME/opt/assistant; `assistant ci` passes the tree it checks; none with plugins/ = all of
+~/plugins but EXCL_DIRS).
+CODEBASE_SYNC_ONLY (precheck only): a file listing source paths (one per line, absolute, under
+CODEBASE_SYNC_HOME); only those (and the export's repo-owned files, which the gate reads) are exported, checked and gated
+(`assistant ci` passes the would-be ~/bin files a land changes: seconds instead of the whole home).
+Rollback: remove the cron line + the hook in ~/bin/brain-commit; `gh repo delete <repos.private_code>` only
+with the owner's OK.
+"""
+import fcntl
+import fnmatch
+import glob
+import gzip
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, BIN)
+import secretscan  # noqa: E402
+
+HOME = os.environ.get("CODEBASE_SYNC_HOME") or os.path.expanduser("~")
+REAL_HOME = os.path.expanduser("~")
+EXPORT = os.environ.get("CODEBASE_SYNC_EXPORT") or os.path.join(REAL_HOME, "opt/claude-bot-export")
+SCRUB = os.environ.get("CODEBASE_SYNC_SCRUB") or os.path.join(REAL_HOME, ".config/codebase-sync/scrub.txt")
+INBOX = os.environ.get("CODEBASE_SYNC_INBOX") or os.path.join(REAL_HOME, "inbox")
+STATE = os.environ.get("CODEBASE_SYNC_STATE") or os.path.join(REAL_HOME, ".local/state/codebase-sync")
+BLOCK_MIN = float(os.environ.get("CODEBASE_SYNC_BLOCK_MIN") or 30)   # a block must persist this long before a note
+GATE_CONF = os.environ.get("CODEBASE_SYNC_GATE_CONF") or os.path.join(REAL_HOME, ".config/codebase-sync/gate")
+# precheck only: the gate's per-file clean-verdict cache (PUBLISH_GATE_CACHE; rules/inputs change = full rescan).
+# The real sync's public_gate never passes it. "off" = no cache.
+GATE_CACHE = os.environ.get("CODEBASE_SYNC_GATE_CACHE") or os.path.join(REAL_HOME, ".cache/publish-gate")
+ONLY = os.environ.get("CODEBASE_SYNC_ONLY") or ""   # precheck only: the source paths to export (see above)
+ASSISTANT_POINTER = ("# assistant\n\nThe v2 harness repo (`~/opt/assistant`) is published with its real git history to its own "
+                     "private repo (profile `repos.assistant`) by `assistant-publish`, after a privacy scan of every "
+                     "commit. Its code is no longer exported here.\n")
+GATE_HIT = re.compile(r"^ +(?:[^ ]+:\d+ \S|BLOCK)")
+
+# Live only in the export repo (~/opt/claude-bot-export); kept across syncs and checked. Files or whole dirs.
+REPO_OWNED = ("README.md", ".gitignore", "LICENSE", "NOTICE", "SECURITY.md", "CONTRIBUTING.md", "CHANGELOG.md",
+              ".gitleaks.toml", ".github", "docs", "examples", "tools", "templates")
+# Publish manifest, deny by default: path prefixes (a dir covers everything below it) that are public.
+PUBLIC_PATHS = REPO_OWNED + ("bin", "claude", "plugins", "tests", "crontab", "boot.sh", "dash", "assistant")
+PUBLIC_EXCLUDE = ("bin/unraid-lockdown", "tests/unraid-lockdown", "tests/tgread", "tests/transcribe/cases.tsv",
+                  "tests/transcribe/results")
+MANIFEST_ALLOW = ("tests/*/fixtures/*.jsonl",)   # public names EXCL_GLOBS would drop ('*' never crosses a '/')
+MODES = ("report", "enforce")
+MODE_FILE = os.path.join(REAL_HOME, ".config/codebase-sync/mode")
+MAX_FILE = 8 * 1024 * 1024
+GIT_NAME = "claude-bot sync"
+GIT_EMAIL = "7968838+s-boris@users.noreply.github.com"
+
+# Never exported, wherever they appear (path components / file-name globs).
+EXCL_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".secrets", ".ssh", "synced",
+             ".pytest_cache", ".mypy_cache", "core.releases"}   # core.releases: deployed copies of assistant/core
+EXCL_GLOBS = ["*.pyc", "*.pyo", ".env", ".env.*", "*.env", "access.json", "*.jsonl", "*.pem", "*.key",
+              "id_rsa*", "id_ed25519*", ".credentials*", "*.gguf", "*.safetensors", "*.onnx", "*.pt",
+              "*.sqlite", "*.sqlite3", "*.db", "*.swp", "*~", ".DS_Store", "*.bak", "*.bak-*", "*.orig",
+              "*.new", "*.tmp", "*.wip"]      # work copies of the edit-on-a-copy + atomic mv routine
+WIP_DOT_DIRS = ("bin",)   # any dot-file here is a work copy (e.g. bin/.x.new): never exported
+DROP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff", ".heic",
+            ".ogg", ".oga", ".opus", ".wav", ".mp3", ".m4a", ".flac", ".mp4", ".mkv", ".webm", ".mov",
+            ".zip", ".tar", ".tgz", ".xz", ".bz2", ".7z", ".whl", ".so", ".o", ".a", ".bin"}
+
+
+def plugin_files():
+    """The files the harness checkout (CODEBASE_SYNC_ASSISTANT_SRC, else HOME/opt/assistant) tracks under plugins/,
+    relative to it: the plugin files its deploy writes to ~/plugins. None = no checkout with plugins/."""
+    repo = os.environ.get("CODEBASE_SYNC_ASSISTANT_SRC") or os.path.join(HOME, "opt", "assistant")
+    if not os.path.isdir(os.path.join(repo, "plugins")):
+        return None
+    r = subprocess.run(["git", "-C", repo, "ls-files", "-z", "--", "plugins"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    return sorted({p[len("plugins/"):] for p in r.stdout.decode().split("\0") if p.startswith("plugins/")}) or None
+
+
+def sources():
+    """[(src_abs, dest_rel, processor)] for every file to export."""
+    out = []
+
+    def add_tree(src_rel, dest_rel, extra_excl_dirs=()):
+        root = os.path.join(HOME, src_rel)
+        if not os.path.isdir(root):
+            return
+        for dp, dns, fns in os.walk(root):
+            dns[:] = sorted(d for d in dns if d not in EXCL_DIRS and d not in extra_excl_dirs
+                            and not d.endswith("-venv"))
+            for fn in sorted(fns):
+                p = os.path.join(dp, fn)
+                out.append((p, os.path.join(dest_rel, os.path.relpath(p, root)), None))
+
+    def add_file(src_rel, dest_rel, proc=None):
+        p = os.path.join(HOME, src_rel)
+        if os.path.isfile(p):
+            out.append((p, dest_rel, proc))
+
+    add_tree("bin", "bin")
+    add_tree(".claude/skills", "claude/skills")
+    add_tree(".claude/agents", "claude/agents")
+    add_tree(".claude/hooks", "claude/hooks")
+    add_file(".claude/settings.json", "claude/settings.json", "settings")
+    add_file("crontab", "crontab")
+    add_file("boot.sh", "boot.sh")
+    add_file("workspace/CLAUDE.md", "workspace/CLAUDE.md")
+    add_file("workspace/JOBS.md", "workspace/JOBS.md")     # cron/script reference
+    add_file("workspace/TOOLS.md", "workspace/TOOLS.md")
+    add_file("workspace/CHANGELOG.md", "workspace/CHANGELOG.md")
+    add_file("opt/dash/index.html", "dash/index.html", "dash")
+    add_tree("opt/unraid-lockdown", "unraid-lockdown")   # owner's SSH lockdown + vault-deploy
+    for t in sorted(glob.glob(os.path.join(HOME, "opt/*-tests"))):
+        if os.path.isdir(t):
+            add_tree(os.path.relpath(t, HOME), "tests/" + os.path.basename(t)[:-len("-tests")], ("bench",))
+    names = plugin_files()
+    if names is None:
+        add_tree("plugins", "plugins")
+    for rel in names or ():
+        p = os.path.join(HOME, "plugins", rel)
+        if os.path.isfile(p) or os.path.islink(p):
+            out.append((p, os.path.join("plugins", rel), None))
+    out.append((None, "assistant/README.md", "pointer"))   # the harness repo has its own GitHub repo (assistant-publish)
+    return out
+
+
+def excluded(dest_rel, manifest=False):
+    """Why dest_rel is never exported (None = exported). manifest=True: enforce mode's MANIFEST_ALLOW applies."""
+    parts = dest_rel.split("/")
+    if any(p in EXCL_DIRS for p in parts[:-1]):
+        return "excluded dir"
+    name = parts[-1]
+    if name.startswith(".") and parts[0] in WIP_DOT_DIRS:
+        return "excluded work copy (dot-file)"
+    for g in EXCL_GLOBS:
+        if fnmatch.fnmatch(name, g):
+            if manifest and is_public(dest_rel) and any(path_match(dest_rel, a) for a in MANIFEST_ALLOW):
+                return None
+            return "excluded name " + g
+    return None
+
+
+def manifest_mode():
+    m = os.environ.get("CODEBASE_SYNC_MODE")
+    if not m:
+        try:
+            with open(MODE_FILE, encoding="utf-8") as f:
+                m = f.read().strip()
+        except OSError:
+            m = "report"
+    if m not in MODES:
+        raise SystemExit("codebase-sync: unknown manifest mode %r in %s (want report or enforce)" % (m, MODE_FILE))
+    return m
+
+
+def path_match(path, pattern):
+    """fnmatch per path segment: '*' never crosses a '/'."""
+    a, b = path.split("/"), pattern.split("/")
+    return len(a) == len(b) and all(fnmatch.fnmatchcase(x, y) for x, y in zip(a, b))
+
+
+def _under(path, prefixes):
+    return any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
+def _private_repo():
+    """The private export repo for messages (profile repos.private_code); a neutral fallback without bin/lib."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+        import assistant_profile  # noqa: E402
+        return assistant_profile.get("repos.private_code")
+    except Exception:
+        return "its private repo"
+
+
+def is_public(dest_rel):
+    """True if the publish manifest lists dest_rel as public (deny by default)."""
+    return _under(dest_rel, PUBLIC_PATHS) and not _under(dest_rel, PUBLIC_EXCLUDE)
+
+
+def link_maps(src, dest, tgt, by_dest):
+    """A symlink that leaves its directory is still safe to keep when its relative target, read from the export
+    path, is another exported file that comes from the same real file (e.g. bin/x -> ../plugins/p/ops/x)."""
+    if os.path.isabs(tgt):
+        return False
+    t = os.path.normpath(os.path.join(os.path.dirname(dest), tgt))
+    if t.startswith("../") or t == ".." or t not in by_dest or excluded(t):
+        return False
+    return os.path.realpath(by_dest[t]) == os.path.realpath(src)
+
+
+def new_report(mode):
+    return {"mode": mode, "public": 0, "private": 0, "verbatim": 0, "would_block": [], "would_add": [],
+            "would_keep_link": []}
+
+
+def rule_labels(text, rules):
+    return sorted({r.label for r in rules if r.rx.search(text)})
+
+
+# ---------------------------------------------------------------- rules
+class Rule:
+    def __init__(self, raw, repl):
+        self.raw, self.repl = raw, repl
+        if raw.startswith("re:"):
+            self.rx = re.compile(raw[3:])
+            self.check_rx = self.rx
+            self.label = "scrub:re#" + hashlib.sha1(raw.encode()).hexdigest()[:6]
+        else:
+            ci = raw.startswith("i:")
+            lit = raw[2:] if ci else raw
+            body = r"(?<![^\W_])" + re.escape(lit) + r"(?![^\W_])"
+            self.rx = re.compile(body, re.I if ci else 0)
+            self.check_rx = self.rx
+            self.label = "scrub:%s…(%d)" % (lit[:1], len(lit))   # never the full value
+
+
+def load_rules():
+    rules, allow = [], set()
+    try:
+        with open(SCRUB, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise SystemExit("codebase-sync: scrub list missing (%s): refusing to export without it" % e)
+    for ln in lines:
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        if ln.startswith("allow:"):
+            allow.add(norm(ln[6:]))
+            continue
+        if "\t" not in ln:
+            raise SystemExit("codebase-sync: bad scrub line (no TAB) in %s" % SCRUB)
+        pat, repl = ln.split("\t", 1)
+        rules.append(Rule(pat, repl.strip()))
+    # Telegram allowFrom ids (the owner's chat id and any other allowed user)
+    acc = os.path.join(HOME, ".claude/channels/telegram/access.json")
+    try:
+        with open(acc, encoding="utf-8") as f:
+            ids = json.load(f).get("allowFrom") or []
+        for i, v in enumerate(ids):
+            v = str(v).strip()
+            if v.isdigit() and not any(r.raw == v for r in rules):
+                rules.append(Rule(v, str(100000001 + i)))
+    except (OSError, ValueError):
+        pass
+    if not rules:
+        raise SystemExit("codebase-sync: scrub list has no rules: refusing to export")
+    return rules, allow
+
+
+def norm(v):
+    s = re.sub(r"[\s.\-()/]", "", v).lower()
+    if s.startswith("+"):
+        s = "00" + s[1:]
+    for cc in ("0041", "00381"):
+        if s.startswith(cc) and s[len(cc):].isdigit():
+            s = "0" + s[len(cc):]
+    return s
+
+
+# ---------------------------------------------------------------- PII detectors
+EMAIL_RE = re.compile(r"(?<![\w.+%\\-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[a-z]{2,24}\b")
+EMAIL_OK_DOMAIN = re.compile(r"(?:^|\.)(?:example\.(?:com|org|net|ch|de)|example|test|invalid|localhost|local|"
+                             r"users\.noreply\.github\.com|anthropic\.com|sentry\.io)$")
+EMAIL_OK_LOCAL = re.compile(r"^(?:no-?reply|info|support|service|contact|kontakt|team|admin|hello|help|privacy|"
+                            r"security|office|kundendienst|kundenservice|git|root|user|you|me|name|someone|x)$"
+                            r"|muster", re.I)
+PHONE_RE = re.compile(r"(?<![\d.,])(?:(?:\+|00)41[ ]?(?:\(0\)[ ]?)?7[5-9]|07[5-9]|(?:\+|00)381[ ]?6\d)"
+                      r"(?:[ ]?\d){6,7}(?![\d])")
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?\b")
+AHV_RE = re.compile(r"(?<![\d.])756\.?\d{4}\.?\d{4}\.?\d{2}(?![\d])")
+
+
+def iban_ok(v):
+    s = v.replace(" ", "")
+    if not (15 <= len(s) <= 34):
+        return False
+    r = s[4:] + s[:4]
+    try:
+        return int("".join(str(int(c, 36)) for c in r)) % 97 == 1
+    except ValueError:
+        return False
+
+
+def ean13_ok(v):
+    d = [int(c) for c in v if c.isdigit()]
+    if len(d) != 13:
+        return False
+    s = sum(x * (3 if i % 2 else 1) for i, x in enumerate(d[:12]))
+    return (10 - s % 10) % 10 == d[12]
+
+
+def pii_hits(text, allow):
+    """[(kind, value, line)] for PII-looking values, with allowed flag."""
+    out = []
+
+    def line_of(pos):
+        return text.count("\n", 0, pos) + 1
+
+    for m in EMAIL_RE.finditer(text):
+        v = m.group(0)
+        local, dom = v.rsplit("@", 1)
+        ok = bool(EMAIL_OK_DOMAIN.search(dom.lower()) or EMAIL_OK_LOCAL.search(local)) or norm(v) in allow
+        out.append(("email", v, line_of(m.start()), ok))
+    for m in PHONE_RE.finditer(text):
+        v = m.group(0)
+        out.append(("phone", v, line_of(m.start()), norm(v) in allow))
+    for m in IBAN_RE.finditer(text):
+        v = m.group(0)
+        if not v.startswith("RF") and iban_ok(v):   # RF = creditor reference, same checksum, not an account
+            out.append(("iban", v, line_of(m.start()), norm(v) in allow))
+    for m in AHV_RE.finditer(text):
+        v = m.group(0)
+        if ean13_ok(v):
+            out.append(("ahv", v, line_of(m.start()), norm(v) in allow))
+    return out
+
+
+def mask(v):
+    return v[:2] + "…" + v[-2:] if len(v) > 6 else "…"
+
+
+# ---------------------------------------------------------------- per-file processing
+def sanitize_text(text, rules):
+    for r in rules:
+        text = r.rx.sub(r.repl, text)
+    return text
+
+
+def strip_settings(text):
+    d = json.loads(text)
+    if isinstance(d.get("env"), dict):
+        d["env"] = {k: "<redacted>" for k in d["env"]}
+    return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+
+
+DASH_DATA_RE = re.compile(r'(<script id="dash-data"[^>]*>)(.*?)(</script>)', re.S)
+
+
+def strip_dash(text):
+    return DASH_DATA_RE.sub(lambda m: m.group(1) + "{}" + m.group(3), text)
+
+
+def decode_text(b):
+    if b"\0" in b[:65536]:
+        return None
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def pdf_text(path):
+    try:
+        r = subprocess.run(["pdftotext", "-q", path, "-"], capture_output=True, timeout=60)
+        return r.stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def build(stage, rules, mode="report", rep=None, only=None):
+    """Copy + sanitize all sources into stage. Returns (kept, dropped[(dest, reason)]).
+    rep (dict from new_report) collects the manifest report; mode "enforce" keeps public paths verbatim.
+    only: a set of absolute source paths; the other sources are left out (precheck of a land's changed files)."""
+    enforce = mode == "enforce"
+    rep = new_report(mode) if rep is None else rep
+    kept, dropped = [], []
+    srcs = sources()
+    if only is not None:
+        srcs = [x for x in srcs if x[0] and os.path.abspath(x[0]) in only]
+    by_dest = {d: s for s, d, _ in srcs}
+
+    def keep(dest):
+        kept.append(dest)
+        rep["public" if is_public(dest) else "private"] += 1
+
+    for src, dest, proc in srcs:
+        pub = is_public(dest)
+        why = excluded(dest)
+        if why and not excluded(dest, manifest=True):
+            if not enforce:
+                rep["would_add"].append(dest)
+            else:
+                why = None
+        if why:
+            dropped.append((dest, why))
+            continue
+        out = os.path.join(stage, dest)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if proc == "pointer":
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(sanitize_text(ASSISTANT_POINTER, rules))
+            os.chmod(out, 0o644)
+            keep(dest)
+            continue
+        if os.path.islink(src):
+            tgt = os.readlink(src)
+            real = os.path.realpath(src)
+            if os.path.isabs(tgt) or not real.startswith(os.path.realpath(os.path.dirname(src)) + os.sep):
+                if link_maps(src, dest, tgt, by_dest):
+                    if enforce:
+                        os.symlink(tgt, out)
+                        keep(dest)
+                        continue
+                    rep["would_keep_link"].append(dest)
+                dropped.append((dest, "symlink leaves its directory"))
+                continue
+            os.symlink(tgt, out)
+            keep(dest)
+            continue
+        try:
+            st = os.stat(src)
+        except OSError:
+            continue
+        if st.st_size > MAX_FILE:
+            dropped.append((dest, "too large"))
+            continue
+        ext = os.path.splitext(dest)[1].lower()
+        if ext in DROP_EXT:
+            dropped.append((dest, "binary media (can't be checked)"))
+            continue
+        with open(src, "rb") as f:
+            b = f.read()
+        mode = stat.S_IMODE(st.st_mode) & 0o755 | 0o644
+        if ext == ".gz":
+            try:
+                inner = decode_text(gzip.decompress(b))
+            except OSError:
+                inner = None
+            if inner is None:
+                dropped.append((dest, "gz without text"))
+                continue
+            clean = sanitize_text(inner, rules)
+            if pub and clean != inner:
+                rep["would_block"].append((dest, rule_labels(inner, rules)))
+                if enforce:
+                    clean = inner
+            data = gzip.compress(clean.encode("utf-8"), mtime=0)
+        elif ext == ".pdf":
+            t = pdf_text(src)
+            if not t.strip():
+                dropped.append((dest, "pdf without a text layer (can't be checked)"))
+                continue
+            data = b   # checked later; a PDF with any hit is dropped (enforce, public: blocks), never rewritten
+        else:
+            text = decode_text(b)
+            if text is None:
+                dropped.append((dest, "binary (can't be checked)"))
+                continue
+            if proc == "settings":
+                text = strip_settings(text)
+            elif proc == "dash":
+                text = strip_dash(text)
+            clean = sanitize_text(text, rules)
+            if pub and clean != text:
+                rep["would_block"].append((dest, rule_labels(text, rules)))
+                if enforce:
+                    clean = text      # verbatim: the check below blocks it, never a silent rewrite
+            data = clean.encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(data)
+        os.chmod(out, mode)
+        keep(dest)
+    return kept, dropped
+
+
+def texts_of(path):
+    """Text views of one exported file for checking: [(label, text)]."""
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, "rb") as f:
+        b = f.read()
+    if ext == ".gz":
+        return [("", gzip.decompress(b).decode("utf-8", "replace"))]
+    if ext == ".pdf":
+        return [("pdf-text", pdf_text(path)), ("pdf-raw", b.decode("latin-1"))]
+    return [("", b.decode("utf-8", "replace"))]
+
+
+def check(stage, rules, allow, review=False, enforce=False):
+    """Returns (problems[(rel, line, rule)], dropped, review_rows). Drops PDFs/.gz that hit (they can't be fixed);
+    in enforce mode a hit in a PUBLIC .pdf/.gz is a problem instead (public files are never silently dropped)."""
+    problems, dropped, rows = [], [], []
+    for dp, dns, fns in os.walk(stage):
+        dns[:] = [d for d in dns if d != ".git"]
+        for fn in sorted(fns):
+            p = os.path.join(dp, fn)
+            rel = os.path.relpath(p, stage)
+            if os.path.islink(p):
+                continue
+            hits = []
+            for label, text in texts_of(p):
+                for name, line in secretscan.find(text):
+                    hits.append((line, "secret:" + name))
+                if label == "pdf-raw":
+                    continue
+                for r in rules:
+                    for m in r.check_rx.finditer(text):
+                        hits.append((text.count("\n", 0, m.start()) + 1, r.label))
+                for kind, v, line, ok in pii_hits(text, allow):
+                    if review:
+                        rows.append((rel, line, kind, mask(v), "allowed" if ok else "BLOCKS"))
+                    if not ok:
+                        hits.append((line, "pii:%s %s" % (kind, mask(v))))
+            if not hits:
+                continue
+            if rel.endswith((".pdf", ".gz")) and not (enforce and is_public(rel)):   # can't be rewritten: drop
+                os.unlink(p)
+                dropped.append((rel, "%s with a hit (%s)" % (rel.rsplit(".", 1)[1], hits[0][1].split(" ")[0])))
+                continue
+            for line, what in hits:
+                problems.append((rel, line, what))
+    return problems, dropped, rows
+
+
+# ---------------------------------------------------------------- git
+def git(*args, cwd=None, check=True, timeout=120):
+    r = subprocess.run(["git", "-C", cwd or EXPORT] + list(args), capture_output=True, timeout=timeout)
+    r.stdout = r.stdout.decode("utf-8", "replace")   # diffs may carry binary bytes (PDFs git sees as text)
+    r.stderr = r.stderr.decode("utf-8", "replace")
+    if check and r.returncode:
+        raise RuntimeError("git %s: %s" % (args[0], (r.stderr or r.stdout).strip()[-300:]))
+    return r
+
+
+def ensure_repo():
+    if not os.path.isdir(os.path.join(EXPORT, ".git")):
+        os.makedirs(EXPORT, exist_ok=True)
+        git("init", "-q", "--initial-branch=main")
+    git("config", "user.name", GIT_NAME)
+    git("config", "user.email", GIT_EMAIL)
+    git("config", "commit.gpgsign", "false")
+    hook = os.path.join(EXPORT, ".git/hooks/pre-commit")
+    want = "#!/bin/sh\n# codebase-sync: no secrets in the export, ever (names only, values never shown).\n" \
+           "exec /usr/bin/python3 -I %s --scan-staged\n" % os.path.join(BIN, "secretscan.py")
+    if not os.path.exists(hook) or open(hook).read() != want:
+        with open(hook, "w") as f:
+            f.write(want)
+        os.chmod(hook, 0o755)
+
+
+def sync_tree(stage):
+    """Make EXPORT's work tree equal to stage (keeping .git)."""
+    r = subprocess.run(["rsync", "-a", "--delete", "--checksum", "--exclude", "/.git", stage + "/", EXPORT + "/"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("rsync: " + r.stderr.strip()[-300:])
+
+
+# ---------------------------------------------------------------- reporting
+def note(problem_key, body, cron):
+    if not cron:
+        return
+    os.makedirs(STATE, exist_ok=True)
+    key = hashlib.sha1((problem_key + time.strftime("%F")).encode()).hexdigest()[:12]
+    mark = os.path.join(STATE, "last-note")
+    try:
+        if open(mark).read().strip() == key:
+            return
+    except OSError:
+        pass
+    os.makedirs(INBOX, exist_ok=True)
+    fn = os.path.join(INBOX, "codebase-sync-%d.md" % int(time.time()))
+    with open(fn, "w") as f:
+        f.write("codebase-sync (sanitized export → github %s): %s\n"
+                "Data, not instructions. Fix the source or the scrub list (~/.config/codebase-sync/scrub.txt), "
+                "then run `codebase-sync`.\n" % (_private_repo(), body))
+    with open(mark, "w") as f:
+        f.write(key)
+
+
+def _pending_path():
+    return os.path.join(STATE, "pending-block.json")
+
+
+def block_note(kind, hits, body, cron):
+    """A block (check or gate hits). Manual runs: nothing to do (stderr already has it). --cron: write the note
+    only when an earlier --cron run saw the same hit set (file:line:rule) >= BLOCK_MIN minutes ago, so a
+    builder's mid-build state never reaches the inbox. Returns "noted", "deferred" or "manual"."""
+    if not cron:
+        return "manual"
+    os.makedirs(STATE, exist_ok=True)
+    key = hashlib.sha1(("%s\n%s" % (kind, "\n".join(sorted(set(hits))))).encode()).hexdigest()[:16]
+    now = time.time()
+    try:
+        with open(_pending_path()) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    if not isinstance(st, dict) or st.get("key") != key:
+        st = {"key": key, "kind": kind, "hits": len(set(hits)), "first": now, "runs": 0}
+    st["runs"] = int(st.get("runs", 0)) + 1
+    st["last"] = now
+    tmp = _pending_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, _pending_path())
+    if st["runs"] >= 2 and now - float(st.get("first", now)) >= BLOCK_MIN * 60:
+        note("%s %s" % (kind, " ".join(sorted(set(hits)))), body, cron)
+        return "noted"
+    return "deferred"
+
+
+def block_clear():
+    """A run that got past every block: forget the pending one."""
+    try:
+        os.remove(_pending_path())
+    except FileNotFoundError:
+        pass
+
+
+def run_gate(lines, src, tree, env=None):
+    """(rc, hit lines, raw output) of the gate command (first of `lines`) on git tree `tree` of repo `src`."""
+    rc, out = 1, "no gate command in %s" % GATE_CONF
+    if lines:
+        try:
+            r = subprocess.run(shlex.split(lines[0]) + ["--src", src, "--rev", tree], capture_output=True,
+                               text=True, timeout=600, env=env)
+            rc, out = r.returncode, r.stdout + r.stderr
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            rc, out = 1, "%s: %s" % (type(e).__name__, str(e)[-200:])
+    return rc, [ln.strip() for ln in out.splitlines() if GATE_HIT.match(ln)], out
+
+
+def gate_lines():
+    """The gate config's non-# lines, or None when there is no config file (= no gate)."""
+    try:
+        with open(GATE_CONF, encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    except FileNotFoundError:
+        return None
+
+
+def precheck_gate(stage):
+    """Precheck: the gate on the staged tree, committed to a throwaway repo (EXPORT is never touched).
+    Returns (rc, lines to print): 0 passed / no gate, 3 blocked, else could not run."""
+    lines = gate_lines()
+    if lines is None:
+        return 0, []
+    tmp = tempfile.mkdtemp(prefix="codebase-precheck-")
+    try:
+        env = dict(os.environ, GIT_DIR=os.path.join(tmp, "git"), GIT_WORK_TREE=stage)
+        for cmd in (["git", "init", "-q", "--bare", env["GIT_DIR"]], ["git", "add", "-A"], ["git", "write-tree"]):
+            r = subprocess.run(cmd, env=env if cmd[1] != "init" else None, capture_output=True, text=True,
+                               timeout=120)
+            if r.returncode:
+                return 1, ["gate: %s failed: %s" % (" ".join(cmd[:2]), (r.stderr or r.stdout).strip()[-200:])]
+        genv = dict(os.environ)
+        if GATE_CACHE != "off":
+            genv["PUBLISH_GATE_CACHE"] = GATE_CACHE
+        rc, hits, out = run_gate(lines, env["GIT_DIR"], r.stdout.strip(), env=genv)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if rc in (0, 3):
+        return rc, hits
+    return rc, hits or ["gate could not run (exit %d): %s" % (rc, (out.strip().splitlines() or [""])[-1][-200:])]
+
+
+def public_gate(tree, cron):
+    """Enforce mode: run the public-path gate (GATE_CONF's first non-# line + `--src EXPORT --rev TREE`) on the
+    staged tree. Returns 0 (passed, or no gate configured) or 3 (blocked / could not run; one note per problem/day).
+    The gate prints file:line + rule labels only; only those lines are passed on."""
+    lines = gate_lines()
+    if lines is None:
+        return 0
+    rc, hits, out = run_gate(lines, EXPORT, tree)
+    if rc == 0:
+        return 0
+    why = "the public-path gate blocked it" if rc == 3 else "the public-path gate could not run (exit %d)" % rc
+    detail = "; ".join(hits[:20]) if hits else (out.strip().splitlines() or [""])[-1][-200:]
+    msg = "BLOCKED: %s, nothing committed or pushed: %s" % (why, detail)
+    print("codebase-sync: " + msg, file=sys.stderr)
+    if rc == 3:
+        block_note("gate", hits, msg, cron)
+    else:
+        note("gate %d %s" % (rc, " ".join(hits)), msg, cron)
+    return 3
+
+
+def save_state(d):
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "last-run.json"), "w") as f:
+        json.dump(d, f, indent=1)
+
+
+# ---------------------------------------------------------------- main
+def main(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    flags = {a for a in argv if a.startswith("--")}
+    if "--help" in flags or "-h" in argv or (args and args[0] == "help"):
+        print(__doc__.strip())
+        return 0
+    if "--recheck" in flags:   # cron */30: only while a block is pending (no lock, no work otherwise)
+        if not os.path.exists(_pending_path()):
+            return 0
+        flags.add("--cron")
+    if "--bg" in flags:
+        if os.path.exists(os.path.join(REAL_HOME, ".config/codebase-sync/off")):
+            return 0
+        subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "--cron"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return 0
+    mode = args[0] if args else "run"
+    if mode not in ("run", "check", "review", "manifest", "precheck"):
+        print("codebase-sync: unknown command %r (see --help)" % mode, file=sys.stderr)
+        return 1
+    cron = "--cron" in flags
+    push = mode == "run" and "--no-push" not in flags
+
+    os.makedirs(STATE, exist_ok=True)
+    lockf = open(os.path.join(STATE, "lock"), "w")
+    deadline = time.time() + 180
+    while mode != "precheck":   # precheck writes nothing shared: no lock (a running sync never delays it)
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() > deadline:
+                print("codebase-sync: another run holds the lock", file=sys.stderr)
+                return 1
+            time.sleep(2)
+
+    try:
+        rules, allow = load_rules()
+        mmode = manifest_mode()
+    except SystemExit as e:
+        note("config", str(e), cron)
+        print(e, file=sys.stderr)
+        return 1
+
+    only = None
+    if mode == "precheck" and ONLY:   # never for a real sync: a partial export would drop files from the repo
+        try:
+            with open(ONLY, encoding="utf-8") as f:
+                only = {os.path.abspath(ln.strip()) for ln in f if ln.strip()}
+        except OSError as e:
+            print("codebase-sync: CODEBASE_SYNC_ONLY unreadable: %s" % e, file=sys.stderr)
+            return 1
+    stage = tempfile.mkdtemp(prefix="codebase-sync-")
+    try:
+        man = new_report(mmode)
+        for f in REPO_OWNED:
+            p = os.path.join(EXPORT, f)
+            q = os.path.join(stage, f)
+            if os.path.islink(p):
+                os.symlink(os.readlink(p), q)
+            elif os.path.isdir(p):
+                shutil.copytree(p, q, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+            elif os.path.isfile(p):
+                shutil.copy2(p, q)
+            if os.path.lexists(q):
+                man["public"] += 1 if not os.path.isdir(q) or os.path.islink(q) else \
+                    sum(len(fs) + sum(os.path.islink(os.path.join(dp, d)) for d in ds) for dp, ds, fs in os.walk(q))
+        kept, dropped = build(stage, rules, mmode, man, only)
+        problems, pdf_dropped, rows = check(stage, rules, allow, review=(mode == "review"),
+                                            enforce=(mmode == "enforce"))
+        dropped += pdf_dropped
+        gone = {rel for rel, _ in pdf_dropped}
+        for rel, why in pdf_dropped:
+            man["public" if is_public(rel) else "private"] -= 1
+            if is_public(rel):
+                man["would_block"].append((rel, [why]))
+        man["verbatim"] = man["public"] - len([d for d, _ in man["would_block"] if d not in gone])
+        nfiles = sum(len(fs) for _, _, fs in os.walk(stage))
+        msum = {k: (len(v) if isinstance(v, list) else v) for k, v in man.items()}
+        state = {"time": time.strftime("%F %T"), "mode": mode, "files": nfiles,
+                 "dropped": dropped, "problems": [list(p) for p in problems[:200]],
+                 "manifest": dict(msum, would_block_paths=[d for d, _ in man["would_block"]][:400],
+                                  would_add=man["would_add"], would_keep_link=man["would_keep_link"])}
+        mline = ("manifest (%s): %d public (%d verbatim, %d would block, %d would be added, %d links would be kept), "
+                 "%d private" % (mmode, msum["public"], msum["verbatim"], msum["would_block"], msum["would_add"],
+                                 msum["would_keep_link"], msum["private"]))
+        if mode == "review":
+            for r in rows:
+                print("%s:%s %s %s %s" % r)
+        if mode == "manifest":
+            for d, labels in sorted(man["would_block"]):
+                print("would block  %s  (%s)" % (d, ", ".join(labels)))
+            for d in man["would_add"]:
+                print("would add    %s" % d)
+            for d in man["would_keep_link"]:
+                print("would keep   %s (symlink)" % d)
+        if mode == "precheck":
+            out = ["%s:%s %s" % p for p in problems]
+            grc, glines = precheck_gate(stage) if mmode == "enforce" else (0, [])
+            out += glines
+            for ln in out:
+                print("  " + ln, flush=True)
+            rc = 3 if problems or grc == 3 else (1 if grc else 0)
+            print("codebase-sync precheck: %s" % (
+                "clean (%d files; public-path gate %s)" % (nfiles, "passed" if mmode == "enforce" and
+                                                           gate_lines() is not None else "not configured")
+                if rc == 0 else "WOULD BLOCK (%d hit(s))" % len(out) if rc == 3 else "gate could not run"),
+                file=sys.stderr if rc else sys.stdout)
+            return rc
+        if problems:
+            files = sorted({p[0] for p in problems})
+            msg = "BLOCKED: %d hit(s) in %d file(s), nothing committed or pushed: %s" % (
+                len(problems), len(files), "; ".join("%s:%s %s" % p for p in problems[:15]))
+            print("codebase-sync: " + msg, file=sys.stderr)
+            state["note"] = block_note("blocked", ["%s:%s:%s" % p[:3] for p in problems], msg, cron)
+            state["result"] = "blocked"
+            save_state(state)
+            return 3
+        if mode != "run":
+            if not cron:
+                print("codebase-sync: clean (%d files exported, %d dropped)" % (nfiles, len(dropped)))
+                print("codebase-sync: " + mline)
+            state["result"] = "clean"
+            save_state(state)
+            return 0
+
+        ensure_repo()
+        sync_tree(stage)
+        git("add", "-A")
+        changed = git("diff", "--cached", "--quiet", check=False).returncode != 0
+        if changed:
+            stat_line = git("diff", "--cached", "--shortstat").stdout.strip()
+            # belt and braces: the whole staged diff through secretscan once more
+            diff = git("diff", "--cached", "--no-color").stdout
+            if secretscan.find(diff):
+                git("reset", "-q")
+                note("diff-secret", "BLOCKED: secretscan flagged the staged diff; nothing committed", cron)
+                state["result"] = "blocked"
+                save_state(state)
+                return 3
+            if mmode == "enforce" and public_gate(git("write-tree").stdout.strip(), cron):
+                git("reset", "-q")
+                state["result"] = "blocked by the public-path gate"
+                save_state(state)
+                return 3
+            block_clear()
+            msg = "sync %s: %s" % (time.strftime("%F %H:%M"), stat_line)
+            r = git("commit", "-q", "-m", msg, check=False)
+            if r.returncode:
+                git("reset", "-q")
+                note("commit", "commit refused (pre-commit secretscan?): " + (r.stderr or r.stdout).strip()[-200:],
+                     cron)
+                state["result"] = "commit refused"
+                save_state(state)
+                return 3
+        else:
+            block_clear()
+        state["commit"] = git("rev-parse", "--short", "HEAD", check=False).stdout.strip()
+        pushed = ""
+        if push and git("remote", check=False).stdout.strip():
+            ahead = git("rev-list", "--count", "@{u}..HEAD", check=False)
+            if ahead.returncode or ahead.stdout.strip() != "0":
+                r = git("push", "-q", "-u", "origin", "HEAD", check=False, timeout=120)
+                if r.returncode:
+                    note("push", "push failed: " + (r.stderr or r.stdout).strip()[-200:], cron)
+                    state["result"] = "push failed"
+                    save_state(state)
+                    print("codebase-sync: push failed", file=sys.stderr)
+                    return 1
+                pushed = ", pushed"
+        state["result"] = ("committed" if changed else "unchanged") + pushed
+        save_state(state)
+        if not cron:
+            print("codebase-sync: %s (%d files, %d dropped)%s" % (
+                ("committed " + state["commit"]) if changed else "no changes", nfiles, len(dropped), pushed))
+        return 0
+    except Exception as e:  # noqa: BLE001
+        note("error " + type(e).__name__, "error: %s" % str(e)[-300:], cron)
+        print("codebase-sync: error: %s" % e, file=sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

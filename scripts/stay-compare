@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""stay-compare: compare accommodation shortlists for a multi-stop trip (styles x stops x date plans).
+
+usage:
+  stay-compare render DATA.json [--out FILE]   offline, phone-sized HTML comparison page (light + dark)
+  stay-compare summary DATA.json               Telegram-ready summary, <= 8 short lines
+  stay-compare section DATA.json [--out FILE]  a trip-pack extras section (JSON) with the shortlist per stop
+  stay-compare routes DATA.json                route totals per plan as JSON
+
+DATA (written by hand or by a research agent; trip values live with the data, never here):
+  {"trip", "people", "currency", "checked" (text), "book_by" (YYYY-MM-DD), "decision" (question text),
+   "plans": [{"id", "label", "legs": [{"stop", "from", "to"}]}]   first plan = primary,
+   "stops": [{"id", "name"}],
+   "poi": {"<stop id>": [{"name", "kind": "jetty|dive|other", "lat", "lon"}]},
+   "styles": [{"id", "label", "emoji", "blurb"}]   (default villa / resort / guesthouse),
+   "routes": [{"label", "picks": {"<stop id>": "<style id>"}, "why": {"<stop id>": text}, "note", "recommended"}]
+             extra mixed routes; a route with "why" also gets a combo card (per-stop reasons) on the page,
+   "style_routes": false   hide the pure one-style routes (default: shown first),
+   "options": [{"stop", "style", "name", "url", "type", "beds", "rating", "reviews", "lat", "lon", "breakfast",
+                "pick" (bool: preferred in its stop+style), "notes",
+                "prices": {"<plan id>": {"total", "free_cancel_until" (YYYY-MM-DD|null), "note"}}}]}
+Route totals: per plan, per style, the pick (else the cheapest priced option with free cancellation, else the
+cheapest) in each stop; p.p. = total / people. Distances: straight line to the stop's nearest jetty and dive
+centre (haversine), "~" because roads are longer.
+exit: 0 ok, 1 bad arguments or unreadable data. Logs one usage event per run (bin.stay-compare; USAGE=off).
+"""
+import html, json, math, os, sys
+from datetime import date
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+
+DEFAULT_STYLES = [{"id": "villa", "label": "Villa / apartment", "emoji": "🏡", "blurb": "own rooms + kitchen"},
+                  {"id": "resort", "label": "Resort / hotel", "emoji": "🏨", "blurb": "beach, service, breakfast"},
+                  {"id": "guesthouse", "label": "Guesthouse", "emoji": "🛏", "blurb": "small, local, breakfast"}]
+
+
+class Bad(Exception):
+    pass
+
+
+def load(path):
+    try:
+        with open(os.path.expanduser(path)) as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Bad(f"cannot read {path}: {type(e).__name__}")
+    if not isinstance(d, dict) or not d.get("plans") or not d.get("stops") or not isinstance(d.get("options"), list):
+        raise Bad("data needs plans, stops and options")
+    d.setdefault("people", 1)
+    d.setdefault("currency", "CHF")
+    d["styles"] = d.get("styles") or DEFAULT_STYLES
+    d["options"] = [o for o in d["options"] if isinstance(o, dict) and o.get("name") and o.get("stop")]
+    return d
+
+
+def km(a, b):
+    try:
+        la1, lo1, la2, lo2 = (math.radians(float(x)) for x in (a["lat"], a["lon"], b["lat"], b["lon"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+def nearest(d, o, kind):
+    best = None
+    for p in (d.get("poi") or {}).get(o["stop"]) or []:
+        if p.get("kind") == kind:
+            k = km(o, p)
+            if k is not None and (best is None or k < best[0]):
+                best = (k, p["name"])
+    return best
+
+
+def fmt_km(x):
+    return f"~{x * 1000:.0f} m" if x < 1 else f"~{x:.1f} km"
+
+
+def nights(leg):
+    try:
+        return (date.fromisoformat(leg["to"]) - date.fromisoformat(leg["from"])).days
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def price(o, plan):
+    p = (o.get("prices") or {}).get(plan)
+    return p if isinstance(p, dict) and isinstance(p.get("total"), (int, float)) else None
+
+
+def choose(d, stop, style, plan):
+    """The option a route uses: the pick, else the cheapest free-cancel option, else the cheapest; priced only."""
+    cands = [o for o in d["options"] if o["stop"] == stop and o.get("style") == style and price(o, plan)]
+    if not cands:
+        return None
+    picks = [o for o in cands if o.get("pick")]
+    if picks:
+        return picks[0]
+    free = [o for o in cands if price(o, plan).get("free_cancel_until")]
+    return min(free or cands, key=lambda o: price(o, plan)["total"])
+
+
+def routes(d):
+    out = []
+    specs = [] if d.get("style_routes") is False else [
+        {"label": f'{s.get("emoji", "")} {s["label"]}'.strip(), "style": s["id"],
+         "picks": {st["id"]: s["id"] for st in d["stops"]}} for s in d["styles"]]
+    specs += [dict(r, style="mix") for r in d.get("routes") or [] if isinstance(r, dict) and r.get("picks")]
+    for plan in d["plans"]:
+        for spec in specs:
+            total, parts, cancel, missing, legs = 0, [], [], [], []
+            for leg in plan.get("legs") or []:
+                o = choose(d, leg["stop"], spec["picks"].get(leg["stop"]), plan["id"])
+                if not o:
+                    missing.append(leg["stop"])
+                    continue
+                p = price(o, plan["id"])
+                total += p["total"]
+                parts.append(o["name"])
+                cancel.append(p.get("free_cancel_until"))
+                legs.append({"stop": leg["stop"], "nights": nights(leg), "name": o["name"], "url": o.get("url"),
+                             "total": round(p["total"]), "free_cancel_until": p.get("free_cancel_until")})
+            n = sum(nights(lg) or 0 for lg in plan.get("legs") or [])
+            ppl = max(int(d["people"]), 1)
+            out.append({"plan": plan["id"], "label": spec["label"], "style": spec["style"], "picks": spec["picks"],
+                        "total": round(total), "pp": round(total / ppl), "pp_night": round(total / ppl / n) if n else None,
+                        "options": parts, "missing": missing, "legs": legs,
+                        "why": spec.get("why") if isinstance(spec.get("why"), dict) else {},
+                        "note": spec.get("note") or "", "recommended": bool(spec.get("recommended")),
+                        "free_cancel_until": None if (None in cancel or not cancel) else min(cancel),
+                        "all_free": bool(cancel) and None not in cancel})
+    return out
+
+
+def stop_name(d, sid):
+    return next((s["name"] for s in d["stops"] if s["id"] == sid), sid)
+
+
+def ddmm(s):
+    try:
+        x = date.fromisoformat(s)
+        return f"{x.day:02d}.{x.month:02d}"
+    except (TypeError, ValueError):
+        return s or ""
+
+
+def summary(d):
+    plan = d["plans"][0]
+    rs = [r for r in routes(d) if r["plan"] == plan["id"]]
+    cur, lines = d["currency"], []
+    legs = " · ".join(f'{stop_name(d, lg["stop"]).split(" ·")[0]} {nights(lg)}' for lg in plan["legs"])
+    lines.append(f'{d.get("emoji", "🧳")} {d.get("trip", "Trip")} stays · {d["people"]} people · {legs} nights')
+    for r in rs[:4]:
+        if r["missing"]:
+            continue
+        lines.append(f'{r["label"]}: ~{cur} {r["pp"]:,} p.p. ({" + ".join(r["options"])})'.replace(",", "'"))
+    free = [r for r in rs if r["all_free"]]
+    if free:
+        first = min(r["free_cancel_until"] for r in free)
+        lines.append(f"All routes above cancel free; earliest deadline {ddmm(first)}")
+    if d.get("book_by"):
+        lines.append(f'Book by {ddmm(d["book_by"])}' + (f' ({d["book_by_why"]})' if d.get("book_by_why") else ""))
+    if d.get("decision"):
+        lines.append(f'Your call: {d["decision"]}')
+    return lines[:8]
+
+
+CSS = """
+:root{--ground:#f4f1ea;--paper:#fffdf8;--ink:#1c2430;--ink-2:#5a6472;--line:#ddd7cb;--accent:#0f6b6b;--accent-tint:#dcefed;
+--warm:#a5521b;--warm-tint:#f7e6d9;--bad:#a12a2a;--bad-tint:#f6dede;--ok:#2f7a3d;--shade:rgba(28,36,48,.06);
+--f-body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--f-mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--ground:#10161b;--paper:#172027;--ink:#e5eaee;--ink-2:#98a4b1;
+--line:#28333d;--accent:#6cc5c0;--accent-tint:#173331;--warm:#f0a46c;--warm-tint:#3a2618;--bad:#f08a8a;--bad-tint:#3a1c1c;--ok:#7ccf8a;
+--shade:rgba(0,0,0,.35);color-scheme:dark}}
+:root[data-theme="dark"]{--ground:#10161b;--paper:#172027;--ink:#e5eaee;--ink-2:#98a4b1;--line:#28333d;--accent:#6cc5c0;
+--accent-tint:#173331;--warm:#f0a46c;--warm-tint:#3a2618;--bad:#f08a8a;--bad-tint:#3a1c1c;--ok:#7ccf8a;--shade:rgba(0,0,0,.35);color-scheme:dark}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--f-body);line-height:1.45;-webkit-text-size-adjust:100%}
+a{color:var(--accent);text-underline-offset:3px;overflow-wrap:anywhere}
+.wrap{max-width:820px;margin:0 auto;padding:0 16px}
+header{padding:26px 0 8px}.eyebrow{font-family:var(--f-mono);font-size:.75rem;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2)}
+h1{font-size:clamp(1.8rem,7vw,2.6rem);line-height:1.1;margin:.2em 0}.sub{color:var(--ink-2);margin:0}
+h2{font-size:1.15rem;margin:0 0 8px}h3{font-size:1rem;margin:0}
+.bar{position:sticky;top:0;z-index:5;background:var(--ground);border-bottom:1px solid var(--line);padding:8px 0}
+.chips{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none}
+.chip{flex:none;border:1px solid var(--line);background:var(--paper);color:var(--ink);border-radius:999px;padding:5px 12px;font:inherit;font-size:.85rem}
+.chip[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--paper)}
+section{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:16px;margin:14px 0;box-shadow:0 1px 2px var(--shade)}
+.decide{border-color:var(--accent);background:var(--accent-tint)}
+.decide p{margin:.3em 0}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+td,th{text-align:left;padding:7px 4px;border-top:1px solid var(--line);vertical-align:top;font-size:.93rem}
+th{color:var(--ink-2);font-weight:600;border-top:0;font-size:.78rem}
+td.n{text-align:right;white-space:nowrap;font-family:var(--f-mono)}
+.cards{display:grid;gap:10px}
+.card{border:1px solid var(--line);border-radius:12px;padding:12px;background:var(--paper)}
+.card.pick{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.top{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.price{font-family:var(--f-mono);font-weight:700;font-size:1.1rem;white-space:nowrap;text-align:right}
+.pp{display:block;font-size:.78rem;color:var(--ink-2);font-weight:400}
+.meta{color:var(--ink-2);font-size:.88rem;margin:4px 0 0}
+.badges{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.b{font-size:.75rem;border-radius:999px;padding:1px 8px;border:1px solid var(--line);color:var(--ink-2)}
+.b.free{border-color:var(--ok);color:var(--ok)}.b.soon{border-color:var(--warm);color:var(--warm);background:var(--warm-tint)}
+.b.nr{border-color:var(--bad);color:var(--bad);background:var(--bad-tint)}.b.pk{border-color:var(--accent);color:var(--accent)}
+.style-h{margin:14px 0 6px;font-size:.8rem;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-2)}
+.muted{color:var(--ink-2);font-size:.88rem}
+.gone{opacity:.55}
+.combo{border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:10px}
+.combo.rec{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.legs{margin:8px 0 0;padding-left:1.2em}.legs li{margin:7px 0}
+[hidden]{display:none!important}
+footer{color:var(--ink-2);font-size:.8rem;padding:8px 0 40px}
+@media (max-width:420px){td,th{font-size:.85rem}.price{font-size:1rem}}
+@media print{.bar{display:none}section{break-inside:avoid;box-shadow:none}}
+"""
+
+
+def esc(s):
+    return html.escape(str(s if s is not None else ""))
+
+
+def money(d, x):
+    return f'{d["currency"]} {x:,.0f}'.replace(",", "'")
+
+
+def link_ok(u):
+    return isinstance(u, str) and (u.startswith("https://") or u.startswith("http://"))
+
+
+def cancel_badge(p, checked_day):
+    fc = p.get("free_cancel_until")
+    if not fc:
+        return '<span class="b nr">non-refundable</span>'
+    try:
+        days = (date.fromisoformat(fc) - checked_day).days
+    except ValueError:
+        return f'<span class="b free">free cancel {esc(fc)}</span>'
+    cls = "soon" if days <= 10 else "free"
+    return f'<span class="b {cls}">free cancel to {esc(ddmm(fc))}</span>'
+
+
+def render(d):
+    checked_day = date.fromisoformat(d["checked_day"]) if d.get("checked_day") else date.today()
+    plans, rs, ppl = d["plans"], routes(d), max(int(d["people"]), 1)
+    chips = "".join(f'<button class="chip" data-plan="{esc(p["id"])}" aria-pressed="{"true" if i == 0 else "false"}">'
+                    f'{esc(p.get("short") or p["label"])}</button>' for i, p in enumerate(plans))
+    chips += '<span style="width:10px;flex:none"></span>' + "".join(
+        f'<button class="chip" data-style="{esc(s["id"])}" aria-pressed="false">{esc(s.get("emoji", ""))} {esc(s["label"])}</button>'
+        for s in d["styles"])
+    out = []
+    dec = ""
+    if d.get("decision") or d.get("book_by"):
+        dec = '<section class="decide"><h2>The decision</h2>'
+        if d.get("decision"):
+            dec += f'<p><b>{esc(d["decision"])}</b></p>'
+        if d.get("book_by"):
+            dec += f'<p>Book by <b>{esc(ddmm(d["book_by"]))}</b>{" · " + esc(d["book_by_why"]) if d.get("book_by_why") else ""}</p>'
+        for x in d.get("advice") or []:
+            dec += f"<p>{esc(x)}</p>"
+        dec += "</section>"
+    out.append(dec)
+    for p in plans:
+        combos = [r for r in rs if r["plan"] == p["id"] and r["style"] == "mix" and r["why"] and not r["missing"]]
+        if not combos:
+            continue
+        cards = ""
+        for r in combos:
+            fc = (cancel_badge({"free_cancel_until": r["free_cancel_until"]}, checked_day) if r["all_free"]
+                  else '<span class="b nr">has a non-refundable part</span>')
+            rec_badge = '<span class="b pk">★ recommended</span>'
+            items = ""
+            for lg in r["legs"]:
+                nm = (f'<a href="{esc(lg["url"])}">{esc(lg["name"])}</a>' if link_ok(lg.get("url")) else esc(lg["name"]))
+                why = r["why"].get(lg["stop"])
+                items += (f'<li><b>{esc(stop_name(d, lg["stop"]).split(" ·")[0])} · {esc(lg["nights"])} n</b> · {nm} · '
+                          f'{money(d, lg["total"])}{"<div class=muted>" + esc(why) + "</div>" if why else ""}</li>')
+            cards += (f'<div class="combo{" rec" if r["recommended"] else ""}"><div class="top"><h3>{esc(r["label"])}</h3>'
+                      f'<div class="price">{money(d, r["pp"])}<span class="pp">p.p. · {money(d, r["total"])} total</span></div></div>'
+                      f'{"<p class=meta>" + esc(r["note"]) + "</p>" if r["note"] else ""}<ol class="legs">{items}</ol>'
+                      f'<div class="badges">{fc}{rec_badge if r["recommended"] else ""}</div></div>')
+        out.append(f'<section data-plan-sec="{esc(p["id"])}"><h2>Combos · {esc(p["label"])}</h2>{cards}</section>')
+    for p in plans:
+        legs = " → ".join(f'{esc(stop_name(d, lg["stop"]).split(" ·")[0])} {nights(lg)} n ({esc(ddmm(lg["from"]))})'
+                          for lg in p["legs"])
+        rows = ""
+        for r in [r for r in rs if r["plan"] == p["id"]]:
+            if r["missing"]:
+                rows += (f'<tr><td>{esc(r["label"])}</td><td class="muted" colspan="3">no priced option for '
+                         f'{esc(", ".join(stop_name(d, m) for m in r["missing"]))}</td></tr>')
+                continue
+            fc = (f'free to {esc(ddmm(r["free_cancel_until"]))}' if r["all_free"] else "has non-refundable part")
+            rows += (f'<tr><td><b>{esc(r["label"])}</b><div class="muted">{esc(" + ".join(r["options"]))}</div></td>'
+                     f'<td class="n">{money(d, r["total"])}</td><td class="n"><b>{money(d, r["pp"])}</b></td>'
+                     f'<td class="muted">{fc}</td></tr>')
+        out.append(f'<section data-plan-sec="{esc(p["id"])}"><h2>Route totals · {esc(p["label"])}</h2>'
+                   f'<p class="muted">{legs}</p><table><tr><th>Route</th><th>Total</th><th>Per person</th>'
+                   f'<th>Cancel</th></tr>{rows}</table></section>')
+    for st in d["stops"]:
+        opts = [o for o in d["options"] if o["stop"] == st["id"]]
+        body = ""
+        for s in d["styles"]:
+            group = [o for o in opts if o.get("style") == s["id"]]
+            if not group:
+                continue
+            group.sort(key=lambda o: (not o.get("pick"), (price(o, plans[0]["id"]) or {"total": 1e9})["total"]))
+            cards = ""
+            for o in group:
+                pr = ""
+                for p in plans:
+                    leg = next((lg for lg in p["legs"] if lg["stop"] == st["id"]), None)
+                    x = price(o, p["id"])
+                    n = nights(leg) if leg else None
+                    if x:
+                        ppn = f'{money(d, x["total"] / ppl / n)} p.p./night' if n else ""
+                        pr += (f'<div class="price" data-plan="{esc(p["id"])}">{money(d, x["total"])}'
+                               f'<span class="pp">{ppn}</span></div>')
+                    else:
+                        pr += f'<div class="price" data-plan="{esc(p["id"])}"><span class="pp">no price for these dates</span></div>'
+                badges = ""
+                for p in plans:
+                    x = price(o, p["id"])
+                    badges += f'<span data-plan="{esc(p["id"])}">{cancel_badge(x, checked_day) if x else ""}</span>'
+                if o.get("pick"):
+                    badges += '<span class="b pk">★ pick</span>'
+                if o.get("breakfast"):
+                    badges += '<span class="b">breakfast</span>'
+                if o.get("rating"):
+                    badges += f'<span class="b">{esc(o["rating"])}{" (" + esc(o["reviews"]) + ")" if o.get("reviews") else ""}</span>'
+                dist = []
+                for kind, lab in (("jetty", "⛴"), ("dive", "🤿")):
+                    nb = nearest(d, o, kind)
+                    if nb:
+                        dist.append(f"{lab} {esc(nb[1])} {fmt_km(nb[0])}")
+                if o.get("area_note"):
+                    dist.append(esc(o["area_note"]))
+                name = (f'<a href="{esc(o["url"])}">{esc(o["name"])}</a>' if link_ok(o.get("url")) else esc(o["name"]))
+                notes = "".join(f'<p class="meta" data-plan="{esc(p["id"])}">{esc(price(o, p["id"])["note"])}</p>'
+                                for p in plans if price(o, p["id"]) and price(o, p["id"]).get("note"))
+                cards += (f'<div class="card{" pick" if o.get("pick") else ""}" data-style="{esc(s["id"])}">'
+                          f'<div class="top"><div><h3>{name}</h3><p class="meta">{esc(o.get("type") or "")}'
+                          f'{" · " + esc(o["beds"]) if o.get("beds") else ""}</p></div>{pr}</div>'
+                          f'<p class="meta">{" · ".join(dist)}</p>'
+                          f'{"<p class=meta>" + esc(o["notes"]) + "</p>" if o.get("notes") else ""}{notes}'
+                          f'<div class="badges">{badges}</div></div>')
+            body += (f'<div data-style-group="{esc(s["id"])}"><div class="style-h">{esc(s.get("emoji", ""))} '
+                     f'{esc(s["label"])} · {esc(s.get("blurb", ""))}</div><div class="cards">{cards}</div></div>')
+        legs = " · ".join(f'{esc(p.get("short") or p["id"])}: {esc(ddmm(lg["from"]))}–{esc(ddmm(lg["to"]))}'
+                          for p in plans for lg in p["legs"] if lg["stop"] == st["id"])
+        out.append(f'<section><h2>{esc(st["name"])}</h2><p class="muted">{legs}</p>{body}</section>')
+    gone = [x for x in d.get("unavailable") or [] if isinstance(x, dict) and x.get("name")]
+    if gone:
+        out.append('<section class="gone"><h2>Checked, not available</h2><ul>' + "".join(
+            f'<li>{esc(x["name"])} · {esc(stop_name(d, x.get("stop", "")))}{" · " + esc(x["note"]) if x.get("note") else ""}</li>'
+            for x in gone) + "</ul></section>")
+    for x in d.get("footnotes") or []:
+        out.append(f'<p class="muted">{esc(x)}</p>')
+    js = """<script>(function(){var plan=null,style=null;
+function q(s){return document.querySelectorAll(s)}
+function apply(){q('[data-plan]').forEach(function(e){if(e.tagName!=='BUTTON')e.hidden=(e.dataset.plan!==plan)});
+q('[data-plan-sec]').forEach(function(e){e.hidden=(e.dataset.planSec!==plan)});
+q('[data-style-group]').forEach(function(e){e.hidden=!!style&&e.dataset.styleGroup!==style});
+q('button[data-plan]').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.plan===plan)});
+q('button[data-style]').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.style===style)});
+try{localStorage.setItem('stay-compare',JSON.stringify({plan:plan,style:style}))}catch(e){}}
+var first=document.querySelector('button[data-plan]');plan=first?first.dataset.plan:null;
+try{var s=JSON.parse(localStorage.getItem('stay-compare')||'{}');if(s.plan&&document.querySelector('button[data-plan="'+s.plan+'"]'))plan=s.plan;style=s.style||null}catch(e){}
+q('button[data-plan]').forEach(function(b){b.onclick=function(){plan=b.dataset.plan;apply()}});
+q('button[data-style]').forEach(function(b){b.onclick=function(){style=(style===b.dataset.style)?null:b.dataset.style;apply()}});
+apply()})();</script>"""
+    title = f'{d.get("trip", "Trip")} stays'
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" '
+            f'content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">'
+            f'<title>{esc(title)}</title><style>{CSS}</style></head><body><header class="wrap">'
+            f'<div class="eyebrow">Stay planner · {esc(d["people"])} people · nothing booked</div>'
+            f'<h1>{esc(d.get("emoji", ""))} {esc(title)}</h1><p class="sub">{esc(d.get("subtitle") or "")}</p>'
+            f'<p class="muted">Prices checked {esc(d.get("checked") or "")}. {esc(d.get("source_note") or "")}</p></header>'
+            f'<div class="bar"><div class="wrap chips">{chips}</div></div><main class="wrap">{"".join(out)}</main>'
+            f'<footer class="wrap">Made by stay-compare. Distances are straight lines. Prices move: re-check before booking. '
+            f'Works offline; links need a connection.</footer>{js}</body></html>\n')
+
+
+def section(d):
+    plan = d["plans"][0]
+    rs = [r for r in routes(d) if r["plan"] == plan["id"] and not r["missing"]]
+    groups = []
+    for st in d["stops"]:
+        rows = []
+        for s in d["styles"]:
+            for o in sorted([o for o in d["options"] if o["stop"] == st["id"] and o.get("style") == s["id"]],
+                            key=lambda o: (not o.get("pick"), (price(o, plan["id"]) or {"total": 1e9})["total"])):
+                p = price(o, plan["id"])
+                if not p:
+                    continue
+                nb = [f"{lab} {fmt_km(x[0])}" for kind, lab in (("jetty", "⛴"), ("dive", "🤿")) for x in [nearest(d, o, kind)] if x]
+                rows.append([f'{"★ " if o.get("pick") else ""}{o["name"]}', s.get("emoji", s["id"]),
+                             money(d, p["total"]),
+                             ("free to " + ddmm(p["free_cancel_until"])) if p.get("free_cancel_until") else "non-refundable",
+                             " ".join(nb)])
+        if rows:
+            links = [[o["name"], o["url"]] for o in d["options"]
+                     if o["stop"] == st["id"] and (o.get("pick") and link_ok(o.get("url")))]
+            groups.append({"title": st["name"], "table": {"head": ["Stay", "", plan.get("short") or "Total", "Cancel", "Distance"],
+                                                          "rows": rows}, "links": links})
+    return {"id": "stays", "title": "Stays shortlist",
+            "intro": f'{plan["label"]}. Nothing booked; prices checked {d.get("checked", "")}.',
+            "rows": [[r["label"], f'{money(d, r["pp"])} p.p. · ' + " + ".join(r["options"])] for r in rs],
+            "note": d.get("decision") and f'Open: {d["decision"]}', "groups": groups}
+
+
+def main(argv):
+    a = argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if a else 1
+    cmd, rest = a[0], a[1:]
+    out = None
+    if "--out" in rest:
+        i = rest.index("--out")
+        if i + 1 >= len(rest):
+            print("stay-compare: --out needs a file", file=sys.stderr)
+            return 1
+        out = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    if cmd not in ("render", "summary", "section", "routes") or len(rest) != 1:
+        print("stay-compare: render|summary|section|routes DATA.json [--out FILE] (--help)", file=sys.stderr)
+        return 1
+    try:
+        d = load(rest[0])
+    except Bad as e:
+        print(f"stay-compare: {e}", file=sys.stderr)
+        return 1
+    if cmd == "summary":
+        text = "\n".join(summary(d)) + "\n"
+    elif cmd == "routes":
+        text = json.dumps(routes(d), ensure_ascii=False, indent=1) + "\n"
+    elif cmd == "section":
+        text = json.dumps(section(d), ensure_ascii=False, indent=1) + "\n"
+    else:
+        text = render(d)
+    if out:
+        out = os.path.expanduser(out)
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        with open(out + ".tmp", "w") as f:
+            f.write(text)
+        os.replace(out + ".tmp", out)
+        print(f"stay-compare: {cmd} -> {out} ({os.path.getsize(out) // 1024} KB)")
+    else:
+        sys.stdout.write(text)
+    try:
+        import usage
+        usage.log("bin.stay-compare", "exec", outcome="ok", attrs={"cmd": cmd, "options": len(d["options"])})
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.error.json",
+  "title": "a frame the server rejected (ref = its id); no payload echoed",
+  "type": "object",
+  "properties": {
+    "code": {
+      "enum": [
+        "schema",
+        "unknown_type",
+        "too_big",
+        "bad_json",
+        "refused",
+        "rate"
+      ]
+    },
+    "ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "msg": {
+      "type": "string",
+      "maxLength": 200
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "code"
+  ]
+}

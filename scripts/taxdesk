@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""taxdesk: the owner's Tax & 3a helper: phone cards for Pillar 3a and the yearly tax return (home canton).
+
+  taxdesk 3a [--year Y] [--json] [--offline]   Pillar 3a card: the year's max (employees with a pension fund),
+                                               the credit deadline, what's logged as paid, and what paperless
+                                               holds for 3a this year (cards only: count, latest date, amount if on the card)
+  taxdesk 3a log AMOUNT [--date YYYY-MM-DD] [--year Y]
+                                               log a payment (local private state), then show the card
+  taxdesk 3a undo [--year Y]                   remove the last logged payment of the year
+  taxdesk return [YEAR] [--json] [--offline]   tax-return card: the canton's filing deadline and the expected documents,
+                                               each ✓ present / ✗ missing / ? unsure against paperless (ids shown)
+  taxdesk reminders [--year Y]                 PRINT (never add) the proposed `remind add --owner` lines: 3a on 01.12 +
+                                               15.12, tax checklist on 15.02 + 15.03; flags slots deadlines sync already has
+
+Reuses ~/bin/deadlines (imported): its data file (~/.config/deadlines/ch-<canton>.json: 3a amounts with sources,
+the tax-return date rule, the tax checklist items with their paperless queries) and its working-day rules.
+Paperless is read through `paperless search --json` and `paperless get ID --json` only (title, type, correspondent,
+tags, date, amount): never content, never `fields`, never writes.
+Default YEAR for `return`: last year until its filing deadline (or a profile tax_extension_until) has passed, else this year.
+
+State:  ~/.local/state/taxdesk/3a.json (0600): logged 3a payments {"payments": [{"year", "date", "chf"}]}
+Exit:   0 ok, 2 usage. Paperless errors don't fail a card (it says "paperless not reachable").
+Test seams: TAXDESK_TODAY=YYYY-MM-DD, TAXDESK_STATE (state dir), TAXDESK_PAPERLESS (paperless binary),
+TAXDESK_DEADLINES (deadlines script to import), TAXDESK_REMIND_DB (reminders file, read-only; else REMIND_DB),
+DEADLINES_DATA / DEADLINES_PROFILE (read by the imported deadlines), ASSISTANT_PROFILE (canton).
+"""
+import argparse, importlib.machinery, importlib.util, json, os, re, shlex, subprocess, sys, tempfile
+from datetime import date, datetime, timedelta
+
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+DEADLINES = os.environ.get('TAXDESK_DEADLINES') or os.path.join(HERE, 'deadlines')
+PAPERLESS = os.environ.get('TAXDESK_PAPERLESS') or (
+    os.path.join(HERE, 'paperless') if os.path.exists(os.path.join(HERE, 'paperless')) else 'paperless')
+STATE_DIR = os.environ.get('TAXDESK_STATE') or f'{HOME}/.local/state/taxdesk'
+REMIND_DB = (os.environ.get('TAXDESK_REMIND_DB') or os.environ.get('REMIND_DB')
+             or f'{HOME}/.local/state/remind/reminders.json')
+
+# Pillar 3a maximum ("kleiner Beitrag", employees with a pension fund). Primary source: the deadlines data file
+# (item pillar3a, "amounts" + sources). Fallback only when the data has no amount for the year:
+#   2025 + 2026: CHF 7,258 — BSV "Beiträge Säule 3a" https://www.bsv.admin.ch/de/beitrag-3-sauele
+#                ("höchstens aber 7258 Franken pro Jahr"; must be "spätestens am 31. Dezember … verbucht")
+#   2027:        CHF 7,373 — admin.ch press release 2026-10-05 "Höchstabzüge Säule 3a" https://www.admin.ch/de/newnsb/6ck3kzVxBNQ4
+MAX_3A_FALLBACK = {2025: 7258, 2026: 7258, 2027: 7373}
+MAX_3A_SOURCE = 'BSV'
+SAFE_DAY = 20          # providers' cut-offs vary: "pay by ~20.12 to be safe"
+# 31.12 is a bank holiday at most Swiss banks: the last banking day is the last working day on/before 30.12.
+LAST_BANK_DAY = 30
+
+# 3a in paperless metadata (title / type / correspondent / tags). Second-pillar words veto a match.
+THREE_A_RX = re.compile(r'\b3a\b|s[äa]ule\s*3|pillar\s*3|gebundene\s*(selbst)?vorsorge|vorsorgekonto|'
+                        r'vorsorgestiftung|retirement\s+sav|viac|frankly|finpension|selma|truewealth|'
+                        r'vorsorgeauszug|steuerbescheinigung\s*3a', re.I)
+SECOND_PILLAR_RX = re.compile(r'pensionskasse|personalvorsorge|\bbvg\b|vorsorgeausweis|freiz[üu]gigkeit', re.I)
+EXTRA_3A_QUERIES = ['3a', 'Säule 3a', 'Pillar 3a', 'Retirement Savings']
+
+# Phone labels for the deadlines checklist ids (display only; unknown ids use the data title up to " (").
+LABELS = {
+    'lohnausweis': 'Lohnausweis {y}',
+    'pillar3a-cert': '3a certificate {y}',
+    'bank-statements': 'Bank/broker year-end statements {y} (interest, dividends)',
+    'broker-foreign': 'Foreign broker statement {y} (dividends, withholding)',
+    'crypto': 'Crypto balances 31.12.{y}',
+    'pk-buyin': 'Pension fund buy-in confirmation {y}',
+    'commute': 'Commuting costs {y} (transport pass)',
+    'kk-premiums': 'Health insurance premium certificate {y}',
+    'donations': 'Donation receipts {y}',
+    'tax-bill': 'Provisional tax bill {y} + instalments paid',
+    'tax-form': 'Tax return form {y} + eFiling code',
+}
+
+
+def load_deadlines():
+    loader = importlib.machinery.SourceFileLoader('taxdesk_deadlines', DEADLINES)
+    spec = importlib.util.spec_from_loader('taxdesk_deadlines', loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+DL = load_deadlines()
+CANTON = DL.CANTON
+
+
+def today():
+    t = os.environ.get('TAXDESK_TODAY')
+    return date.fromisoformat(t) if t else datetime.now(DL.TZ).date()
+
+
+def dm(d, year=False):
+    wd = 'Mon Tue Wed Thu Fri Sat Sun'.split()[d.weekday()]
+    return f"{wd} {d:%d.%m.%Y}" if year else f"{wd} {d:%d.%m}"
+
+
+def chf(x):
+    s = f"{x:,.2f}".replace(',', '’')
+    return 'CHF ' + (s[:-3] if s.endswith('.00') else s)
+
+
+def parse_chf(s):
+    t = re.sub(r"(?i)chf|fr\.?|[\s']", '', str(s)).replace('’', '')
+    if re.fullmatch(r'\d{1,3}(,\d{3})+(\.\d+)?', t):
+        t = t.replace(',', '')
+    else:
+        t = t.replace(',', '.')
+    v = float(t)
+    if not 0 < v < 1_000_000:
+        raise ValueError(s)
+    return round(v, 2)
+
+
+def item(data, iid):
+    return next((i for i in data.get('deadlines', []) if i.get('id') == iid), None)
+
+
+# ---------------------------------------------------------------- paperless (search + cards only)
+
+_search = {}
+
+
+def p_search(q, n=25):
+    if q not in _search:
+        res = subprocess.run([PAPERLESS, 'search', q, '-n', str(n), '--json'], capture_output=True, text=True,
+                             timeout=90, stdin=subprocess.DEVNULL)
+        if res.returncode != 0:
+            raise RuntimeError((res.stderr or res.stdout).strip()[:200] or 'paperless search failed')
+        try:
+            out = json.loads(res.stdout or '{}')
+        except ValueError:
+            raise RuntimeError('paperless search: not JSON')
+        docs = []
+        for d in out.get('results') or []:
+            tags = d.get('tags') or []
+            docs.append({'id': int(d['id']), 'created': str(d.get('created') or '')[:10],
+                         'title': d.get('title') or '', 'type': d.get('document_type') or '',
+                         'corr': d.get('correspondent') or '',
+                         'tags': ', '.join(tags) if isinstance(tags, list) else str(tags)})
+        _search[q] = docs
+    return _search[q]
+
+
+def p_card(i):
+    res = subprocess.run([PAPERLESS, 'get', str(i), '--json'], capture_output=True, text=True, timeout=90,
+                         stdin=subprocess.DEVNULL)
+    try:
+        return json.loads(res.stdout) if res.returncode == 0 else {}
+    except ValueError:
+        return {}
+
+
+def meta(d):
+    return ' | '.join((d['title'], d['type'], d['corr'], d['tags']))
+
+
+def created(d):
+    try:
+        return date.fromisoformat(d['created'])
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------- 3a
+
+def max_3a(data, y):
+    it = item(data, 'pillar3a') or {}
+    s = (it.get('amounts') or {}).get(str(y))
+    if s:
+        try:
+            return parse_chf(s), (it.get('sources') or [{}])[0].get('title', MAX_3A_SOURCE).split(':')[0]
+        except ValueError:
+            pass
+    return MAX_3A_FALLBACK.get(y), MAX_3A_SOURCE
+
+
+def state_path():
+    return os.path.join(STATE_DIR, '3a.json')
+
+
+def load_state():
+    try:
+        with open(state_path()) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {'payments': []}
+    except (FileNotFoundError, ValueError):
+        return {'payments': []}
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix='.3a.')
+    with os.fdopen(fd, 'w') as f:
+        json.dump(st, f, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, state_path())
+
+
+def three_a_docs(data, y):
+    """Paperless cards for 3a created in year y (metadata says 3a, no second-pillar words)."""
+    cl = ((data.get('checklists') or {}).get('tax') or {}).get('items') or []
+    cert = next((c for c in cl if c.get('id') == 'pillar3a-cert'), {})
+    queries = list(dict.fromkeys(((cert.get('paperless') or {}).get('queries') or []) + EXTRA_3A_QUERIES))
+    seen = {}
+    for q in queries:
+        for d in p_search(q):
+            c = created(d)
+            if c and c.year == y and THREE_A_RX.search(meta(d)) and not SECOND_PILLAR_RX.search(meta(d)):
+                seen[d['id']] = d
+    docs = sorted(seen.values(), key=lambda d: (d['created'], d['id']), reverse=True)
+    for d in docs[:5]:
+        card = p_card(d['id'])
+        if card.get('amount') not in (None, ''):
+            d['amount'] = f"{card.get('currency') or 'CHF'} {card['amount']}"
+    return docs
+
+
+def card_3a(a):
+    data, _prof = DL.load_all()
+    t = today()
+    y = a.year or t.year
+    mx, src = max_3a(data, y)
+    nxt, _ = max_3a(data, y + 1)
+    bank = DL.shift(date(y, 12, LAST_BANK_DAY), 'before')
+    safe = DL.shift(date(y, 12, SAFE_DAY), 'before')
+    pays = [p for p in load_state().get('payments', []) if p.get('year') == y]
+    paid = round(sum(p['chf'] for p in pays), 2) if pays else None
+    docs, perr = [], None
+    if not a.offline:
+        try:
+            docs = three_a_docs(data, y)
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            perr = str(e)
+    out = {'year': y, 'max_chf': mx, 'max_source': src, 'next_year_max_chf': nxt,
+           'credit_by': bank.isoformat(), 'pay_by_safe': safe.isoformat(), 'paid_chf': paid,
+           'payments': pays, 'remaining_chf': (round(mx - paid, 2) if (mx and paid is not None) else None),
+           'days_left': (bank - t).days,
+           'paperless': None if a.offline else {'error': perr, 'count': len(docs),
+                                                 'latest': docs[0]['created'] if docs else None,
+                                                 'docs': [{k: d.get(k) for k in ('id', 'created', 'title', 'type',
+                                                                                   'amount')} for d in docs]},
+           'log_cmd': 'taxdesk 3a log AMOUNT'}
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return 0
+    lines = [f"🏦 Pillar 3a {y}"]
+    mxs = chf(mx) if mx else 'not in data yet'
+    lines.append(f"Max: {mxs} (employee with pension fund; {src})"
+                 + (f" · {y + 1}: {chf(nxt)}" if nxt and nxt != mx else ''))
+    if paid is None:
+        lines.append("Paid: unknown — tell me what you paid and I log it")
+    else:
+        last = max(p['date'] for p in pays)
+        rest = mx - paid if mx else None
+        tail = ('' if rest is None else f" · left {chf(rest)}" if rest > 0 else
+                ' · max reached ✓' if rest == 0 else f" · {chf(-rest)} OVER the max (ask the provider to refund)")
+        lines.append(f"Paid: {chf(paid)} ({len(pays)}×, last {date.fromisoformat(last):%d.%m}){tail}")
+    if t > bank:
+        lines.append(f"Deadline passed ({bank:%d.%m.%Y}): it counts for {y} only if credited by then.")
+    else:
+        lines.append(f"Credited by: {dm(bank)} (last banking day; cut-offs vary)")
+        lines.append(f"Pay by ~20.12 to be safe ({dm(safe)}) · {(bank - t).days} days left")
+    if a.offline:
+        pass
+    elif perr:
+        lines.append("Paperless: not reachable")
+    elif not docs:
+        lines.append(f"Paperless {y}: no 3a documents")
+    else:
+        d0 = docs[0]
+        amt = f", {d0['amount']}" if d0.get('amount') else ''
+        lines.append(f"Paperless {y}: {len(docs)} doc{'s' if len(docs) > 1 else ''}, latest "
+                     f"{date.fromisoformat(d0['created']):%d.%m} · #{d0['id']} {d0['title'][:40]}{amt}")
+        for d in docs[1:3]:
+            amt = f", {d['amount']}" if d.get('amount') else ''
+            lines.append(f"  #{d['id']} {d['created'][8:10]}.{d['created'][5:7]} {d['title'][:40]}{amt}")
+    if paid is None or (mx and paid < mx):
+        lines.append("→ log: taxdesk 3a log AMOUNT")
+    print('\n'.join(lines))
+    return 0
+
+
+def cmd_3a(a):
+    if a.action == 'log':
+        if not a.amount:
+            sys.exit('taxdesk: 3a log needs an AMOUNT (e.g. taxdesk 3a log 7258)')
+        try:
+            amt = parse_chf(a.amount)
+        except ValueError:
+            print(f"taxdesk: not an amount: {a.amount}", file=sys.stderr)
+            return 2
+        d = date.fromisoformat(a.date) if a.date else today()
+        y = a.year or d.year
+        st = load_state()
+        st.setdefault('payments', []).append({'year': y, 'date': d.isoformat(), 'chf': amt})
+        save_state(st)
+        print(f"Logged {chf(amt)} for {y} ({d:%d.%m.%Y}).")
+        a.year = y
+    elif a.action == 'undo':
+        y = a.year or today().year
+        st = load_state()
+        idx = [i for i, p in enumerate(st.get('payments', [])) if p.get('year') == y]
+        if not idx:
+            print(f"Nothing logged for {y}.")
+            return 0
+        p = st['payments'].pop(idx[-1])
+        save_state(st)
+        print(f"Removed {chf(p['chf'])} ({p['date']}) from {y}.")
+        a.year = y
+    elif a.action:
+        print(f"taxdesk: unknown 3a action '{a.action}' (log, undo)", file=sys.stderr)
+        return 2
+    return card_3a(a)
+
+
+# ---------------------------------------------------------------- tax return
+
+def filing(data, prof, y):
+    """(deadline date, extended-to date or None, hint) for the tax return of year y (filed in y+1)."""
+    it = item(data, 'tax-return')
+    due = None
+    if it:
+        occ = DL.occurrences(it, prof, date(y + 1, 1, 1), date(y + 1, 12, 31))
+        due = occ[0]['act_by'] if occ else None
+    ext = None
+    v = prof.get('tax_extension_until')
+    if v:
+        try:
+            e = date.fromisoformat(str(v))
+            ext = e if e.year == y + 1 else None
+        except ValueError:
+            pass
+    hint = (it or {}).get('remind_text') or ''
+    return due, ext, hint, (it or {}).get('verified')
+
+
+def default_return_year(data, prof):
+    t = today()
+    due, ext, _, _ = filing(data, prof, t.year - 1)
+    last = max(x for x in (due, ext, date(t.year, 3, 31)) if x)
+    return t.year - 1 if t <= last else t.year
+
+
+def classify(ci, y, claimed, default_excl, maybe_claimed):
+    """→ (mark, [ids], why). ✓ metadata confirms + dated for y; ? text hit or undated; ✗ nothing."""
+    pc = ci.get('paperless')
+    if not pc:
+        return '?', [], 'by mail, not in paperless'
+    own_excl = {t.lower() for t in pc.get('exclude_types', default_excl)}
+    all_excl = {t.lower() for t in default_excl}
+    rx = re.compile(pc['confirm'], re.I) if pc.get('confirm') else None
+    if ci.get('id') == 'pillar3a-cert':
+        rx0 = rx
+        rx = re.compile(f"(?:{rx0.pattern})|(?:{THREE_A_RX.pattern})" if rx0 else THREE_A_RX.pattern, re.I)
+    win_a, win_b = date(y, 12, 1), date(y + 1, 6, 30)
+    seen = {}
+    for q in pc.get('queries', []):
+        for d in p_search(q):
+            seen.setdefault(d['id'], d)
+    yes, maybe = [], []
+    for d in sorted(seen.values(), key=lambda d: d['id']):
+        if d['id'] in claimed:
+            continue
+        if d['id'] in maybe_claimed and not (rx and rx.search(meta(d))):
+            continue   # an unconfirmed text hit shows as "?" under the first item only
+        conf = bool(rx.search(meta(d))) if rx else True
+        if ci.get('id') == 'pillar3a-cert' and SECOND_PILLAR_RX.search(meta(d)):
+            conf = False
+        typ = d['type'].lower()
+        if typ in own_excl or (not conf and typ in all_excl):
+            continue
+        c = created(d)
+        ty = {int(x) for x in re.findall(r'\b(20\d\d)\b', d['title'])}
+        in_win = bool(c and win_a <= c <= win_b)
+        in_year = bool(c and c.year == y)
+        if ty:
+            if y not in ty:
+                continue
+            (yes if conf else maybe).append(d)
+        elif in_win:
+            (yes if conf else maybe).append(d)
+        elif in_year and conf:
+            maybe.append(d)
+    if yes:
+        claimed.update(d['id'] for d in yes)
+        return '✓', [d['id'] for d in yes], ''
+    if maybe:
+        maybe_claimed.update(d['id'] for d in maybe[:3])
+        return '?', [d['id'] for d in maybe[:3]], 'check'
+    return '✗', [], ''
+
+
+def cmd_return(a):
+    data, prof = DL.load_all()
+    y = a.year or default_return_year(data, prof)
+    due, ext, hint, verified = filing(data, prof, y)
+    cl = (data.get('checklists') or {}).get('tax') or {}
+    excl = cl.get('exclude_types', ())
+    rows, hidden, perr, claimed, maybe_claimed = [], 0, None, set(), set()
+    for ci in cl.get('items', []):
+        active, why = DL.applicability(ci, prof)
+        if not active and why.startswith('not applicable'):
+            hidden += 1
+            continue
+        label = LABELS.get(ci.get('id'), '').format(y=y) or DL.render(ci.get('title', ''), ci, y + 1).split(' (')[0]
+        if a.offline:
+            mark, ids, note = '·', [], 'not checked'
+        elif perr:
+            mark, ids, note = '!', [], 'paperless not reachable'
+        else:
+            try:
+                mark, ids, note = classify(ci, y, claimed, excl, maybe_claimed)
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+                perr = str(e)
+                mark, ids, note = '!', [], 'paperless not reachable'
+        if not active:
+            note = ', '.join(x for x in ('if applicable', note) if x)
+        rows.append({'id': ci.get('id'), 'label': label, 'mark': mark, 'docs': ids, 'note': note,
+                     'optional': bool(ci.get('optional'))})
+    if a.json:
+        print(json.dumps({'tax_year': y, 'canton': CANTON, 'due': due.isoformat() if due else None,
+                          'extended_to': ext.isoformat() if ext else None, 'due_verified': verified,
+                          'hint': hint, 'items': rows, 'hidden_not_applicable': hidden,
+                          'paperless_error': perr}, ensure_ascii=False, indent=1))
+        return 0
+    lines = [f"🧾 {CANTON} tax return {y}"]
+    if ext:
+        lines.append(f"Due: extended to {dm(ext, True)}")
+    elif due and due < today():
+        lines.append(f"Due: {dm(due, True)} (passed)")
+    elif due:
+        std = '' if verified == 'verified' else ' (standard date; your form shows the exact one)'
+        lines.append(f"Due: {dm(due, True)}{std}")
+    else:
+        lines.append("Due: not in the deadlines data (see the form)")
+    if hint and not ext and not (due and due < today()):
+        lines.append(hint)
+    lines.append("Documents (paperless, read-only):" if not a.offline else "Documents (paperless not checked):")
+    for r in rows:
+        ids = (' · ' + ' '.join(f"#{i}" for i in r['docs'])) if r['docs'] else ''
+        note = f" ({r['note']})" if r['note'] else ''
+        lines.append(f"{r['mark']} {r['label']}{ids}{note}")
+    n = {m: sum(r['mark'] == m for r in rows) for m in ('✓', '?', '✗')}
+    tail = f"{n['✓']} ✓ · {n['?']} ? · {n['✗']} ✗"
+    if today() < date(y + 1, 3, 1):
+        tail += f" — most arrive Jan–Feb {y + 1}"
+    lines.append(tail)
+    print('\n'.join(lines))
+    return 0
+
+
+# ---------------------------------------------------------------- reminders (proposal only)
+
+def existing_reminders():
+    try:
+        with open(REMIND_DB) as f:
+            rs = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return []
+    return [r for r in rs if isinstance(r, dict) and r.get('owner')
+            and re.match(r'(deadline:(pillar3a|tax-docs|tax-return)|taxdesk:)', str(r.get('tag') or ''))]
+
+
+def cmd_reminders(a):
+    data, prof = DL.load_all()
+    t = today()
+    y = a.year or (t.year if t <= date(t.year, 12, 15) else t.year + 1)
+    mx, _ = max_3a(data, y)
+    bank = DL.shift(date(y, 12, LAST_BANK_DAY), 'before')
+    due, ext, _, _ = filing(data, prof, y)
+    due_txt = f"{(ext or due):%d.%m.%Y}" if (ext or due) else 'the date on the form'
+    mxs = chf(mx) if mx else 'the max'
+    plan = [
+        (f"{y}-12-01 09:00", f"taxdesk:3a:{y}-12-01",
+         f"Pillar 3a {y}: max {mxs}, must be credited by {bank:%d.%m}. Pay by ~20.12 to be safe. "
+         f"Already paid? Tell me the amount."),
+        (f"{y}-12-15 09:00", f"taxdesk:3a:{y}-12-15",
+         f"Pillar 3a {y}: last call. Pay this week so it is credited by {bank:%d.%m}."),
+        (f"{y + 1}-02-15 18:00", f"taxdesk:return:{y + 1}-02-15",
+         f"Tax return {y}: Lohnausweis, 3a and bank statements should be in. Want the checklist?"),
+        (f"{y + 1}-03-15 18:00", f"taxdesk:return:{y + 1}-03-15",
+         f"Tax return {y} is due {due_txt}. File it, or extend online before the deadline. Checklist?"),
+    ]
+    have = existing_reminders()
+    tags = {r.get('tag') for r in have}
+    print(f"# Proposed (not added): run the lines you want.")
+    for when, tag, text in plan:
+        day = when[:10]
+        same = [r for r in have if str(r.get('at', ''))[:10] == day and not str(r.get('tag')).startswith('taxdesk:')]
+        if tag in tags:
+            print(f"# already added: {tag}")
+            continue
+        if same:
+            print(f"# overlaps {same[0]['tag']} at {same[0]['at']} (deadlines sync): skip or keep both")
+        if t > datetime.strptime(when, '%Y-%m-%d %H:%M').date():
+            print(f"# in the past: {when}")
+            continue
+        print(f"remind add --owner --tag {shlex.quote(tag)} {shlex.quote(when)} {shlex.quote(text)}")
+    near = [r for r in have if not str(r.get('tag')).startswith('taxdesk:')]
+    if near:
+        print("# Already scheduled by deadlines sync: " + ', '.join(
+            f"{str(r['at'])[8:10]}.{str(r['at'])[5:7]} {str(r['tag']).split(':')[1]}"
+            for r in sorted(near, key=lambda r: str(r.get('at')))))
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv):
+    p = argparse.ArgumentParser(prog='taxdesk', description=__doc__.split('\n')[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog='\n'.join(__doc__.split('\n')[2:]))
+    sp = p.add_subparsers(dest='cmd', required=True)
+    t = sp.add_parser('3a')
+    t.add_argument('action', nargs='?', choices=['log', 'undo'])
+    t.add_argument('amount', nargs='?')
+    t.add_argument('--year', type=int)
+    t.add_argument('--date')
+    t.add_argument('--json', action='store_true')
+    t.add_argument('--offline', action='store_true')
+    r = sp.add_parser('return')
+    r.add_argument('year', nargs='?', type=int)
+    r.add_argument('--json', action='store_true')
+    r.add_argument('--offline', action='store_true')
+    m = sp.add_parser('reminders')
+    m.add_argument('--year', type=int)
+    a = p.parse_args(argv[1:])
+    if getattr(a, 'date', None):
+        try:
+            date.fromisoformat(a.date)
+        except ValueError:
+            print(f"taxdesk: bad --date {a.date} (YYYY-MM-DD)", file=sys.stderr)
+            return 2
+    return {'3a': cmd_3a, 'return': cmd_return, 'reminders': cmd_reminders}[a.cmd](a)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

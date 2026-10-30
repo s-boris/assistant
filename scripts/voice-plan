@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""voice-plan: one message with several intents -> a confirm card -> every action at once.
+
+  voice-plan render FILE [--transcript TEXT|-] [--replace ID] [--json]
+        validate the action JSON in FILE ("-" = stdin), save it as a pending plan and print the card:
+        the card text, a blank line, then the button rows as one JSON line
+        [[✅ Do all (vp:ok:ID)] [✏️ Fix (vp:fix:ID)] [✖ (vp:no:ID)]] for the reply tool.
+        --transcript keeps the message text with the plan ("-" = read it from stdin when FILE is a path).
+        --replace ID drops that pending plan (a fixed version supersedes it).
+        --json: {"id", "text", "buttons", "actions"} instead.
+  voice-plan run ID [--json]
+        run a pending plan once: reminders via `remind add --owner --tag vp:ID`, list items and notes via
+        `lists add`; then prints one "✓/✗ line" per action and, last, one JSON line per event still to
+        create with the calendar tools (create_event fields: summary, startTime, endTime, allDay, location,
+        description). A plan already run or dropped is refused (exit 3); a plan whose times have passed
+        meanwhile is refused unchanged (exit 4: fix and render again).
+  voice-plan show ID [--json]     the card again (with its status), or the stored plan
+  voice-plan drop ID              cancel a pending plan
+
+Action JSON: a list, or {"actions": [...], "transcript": "..."}. Times are owner wall time (profile
+locale.tz) as "YYYY-MM-DD HH:MM" (ISO "T" and seconds work; a time with an offset or Z is converted).
+  {"kind": "reminder", "when": "YYYY-MM-DD HH:MM", "text": "..."}
+  {"kind": "event", "start": "YYYY-MM-DD HH:MM", "end": "...", "title": "...", "location": "...",
+   "description": "..."}            end optional (start + 1 h); location/description optional.
+                                    All-day: start "YYYY-MM-DD", end optional = last day (inclusive).
+  {"kind": "list", "list": "shopping", "items": ["...", "..."]}   list names as in `lists`
+  {"kind": "note", "text": "..."}   kept on the `notes` list (`lists show notes`)
+  {"kind": "warranty", "product": "...", "bought": "YYYY-MM-DD", "shop": "...", "months": 24, "remind_days": 30}
+                                    shop/months/remind_days optional (24 months = Swiss legal default; reminder
+                                    remind_days before the end at 09:00, or the next 09:00 when that has passed).
+                                    Run: `lists add warranty "product · shop · bought … · warranty to …"` + an owner
+                                    reminder. A warranty that has already ended is refused.
+Top level (optional, with "actions"): "source": "voice" | "photo" | "text" (photo = skill vision-actions: card
+heading 📷 and usage events for skill.vision-actions), "class": a short photo class token (poster, label, …).
+Validation (all problems reported at once, nothing saved, exit 1): unknown kind or field, missing or empty
+fields, bad times, end before start, reminders and events in the past, more than 20 actions.
+
+State: ~/.local/state/voice-plan/ID.json (0600; status pending | running | done | dropped, results).
+Plans older than 14 days are deleted on the next render.
+Env (tests): VOICE_PLAN_DIR (state dir), VOICE_PLAN_NOW ("YYYY-MM-DD HH:MM", owner wall time),
+VOICE_PLAN_REMIND (remind binary), VOICE_PLAN_LISTS (lists binary), VOICE_PLAN_SHOP (shop binary; "" = off).
+Shopping items go to `shop add` (Home Assistant's shopping list + my research, skill shopping), one call per
+item; other lists stay in `lists`. A test that sets VOICE_PLAN_LISTS without VOICE_PLAN_SHOP gets no shop.
+Exit: 0 ok, 1 validation failed / an action failed, 2 usage, 3 not pending, 4 times passed.
+"""
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+
+TZ = assistant_profile.tz()
+STATE = os.environ.get("VOICE_PLAN_DIR") or os.path.expanduser("~/.local/state/voice-plan")
+REMIND = os.environ.get("VOICE_PLAN_REMIND") or os.path.join(HERE, "remind")
+LISTS = os.environ.get("VOICE_PLAN_LISTS") or os.path.join(HERE, "lists")
+SHOP = os.environ.get("VOICE_PLAN_SHOP")
+if SHOP is None:
+    SHOP = "" if "VOICE_PLAN_LISTS" in os.environ else os.path.join(HERE, "shop")
+FMT = "%Y-%m-%d %H:%M"
+MAX_ACTIONS = 20
+MAX_ITEMS = 50
+KEEP = timedelta(days=14)
+RUN_TIMEOUT = 30
+LINE_MAX = 80
+NOTES_LIST = "notes"
+
+FIELDS = {
+    "reminder": ({"when", "text"}, set()),
+    "event": ({"start", "title"}, {"end", "location", "description"}),
+    "list": ({"list", "items"}, set()),
+    "note": ({"text"}, set()),
+    "warranty": ({"product", "bought"}, {"shop", "months", "remind_days"}),
+}
+KIND_EMOJI = {"reminder": "⏰", "event": "📅", "note": "📝", "warranty": "🛡"}
+SOURCES = ("voice", "photo", "text")
+VISION_FEATURE = "skill.vision-actions"
+WARRANTY_LIST = "warranty"
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+ID_RE = re.compile(r"[0-9a-f]{6}")
+
+
+class Invalid(Exception):
+    pass
+
+
+def now_local():
+    fake = os.environ.get("VOICE_PLAN_NOW")
+    if fake:
+        return datetime.strptime(fake, FMT)
+    return datetime.fromtimestamp(time.time(), TZ).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def _lists_module():
+    """The `lists` script as a module (list-name aliases and emoji); None when it can't be loaded."""
+    keep = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True   # no __pycache__ next to the scripts
+    try:
+        loader = importlib.machinery.SourceFileLoader("lists_mod", LISTS)
+        spec = importlib.util.spec_from_loader("lists_mod", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+    finally:
+        sys.dont_write_bytecode = keep
+
+
+_LM = []
+
+
+def lists_mod():
+    if not _LM:
+        _LM.append(_lists_module())
+    return _LM[0]
+
+
+def norm_list(name):
+    m = lists_mod()
+    if m is not None:
+        try:
+            return m.norm_list(name)
+        except m.UsageError as e:
+            raise Invalid(str(e)) from None
+    s = re.sub(r"\s+", "-", str(name).strip().lower())
+    if not s:
+        raise Invalid("empty list name")
+    return s
+
+
+def list_emoji(name):
+    m = lists_mod()
+    return m.emoji(name) if m is not None else "🗒️"
+
+
+# ------------------------------------------------------------------ parsing and validation
+
+def parse_time(v, what):
+    """'YYYY-MM-DD HH:MM' (or ISO, offset/Z converted to the owner zone) -> naive owner wall datetime."""
+    if not isinstance(v, str) or not v.strip():
+        raise Invalid(f"missing {what}")
+    s = v.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?", s):
+        raise Invalid(f'{what} "{s}" is not "YYYY-MM-DD HH:MM"')
+    try:
+        dt = datetime.fromisoformat(s.replace(" ", "T", 1))
+    except ValueError:
+        raise Invalid(f'{what} "{s}" is not a valid time') from None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(TZ).replace(tzinfo=None)
+    return dt.replace(second=0, microsecond=0)
+
+
+def parse_day(v, what):
+    try:
+        return date.fromisoformat(v.strip())
+    except ValueError:
+        raise Invalid(f'{what} "{v.strip()}" is not a valid date') from None
+
+
+def is_day(v):
+    return isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v.strip()) is not None
+
+
+def text_field(a, f):
+    v = a.get(f)
+    if not isinstance(v, str) or not v.strip():
+        raise Invalid(f"missing {f}")
+    return re.sub(r"\s+", " ", v).strip()
+
+
+def add_months(d, months):
+    """Calendar months later; the 31st becomes the month's last day."""
+    y, m = divmod(d.month - 1 + months, 12)
+    y, m = d.year + y, m + 1
+    nxt = date(y + (m == 12), m % 12 + 1, 1)
+    return date(y, m, min(d.day, (nxt - timedelta(days=1)).day))
+
+
+def plan_meta(raw):
+    """Optional top-level "source" / "class" -> dict. Raises Invalid."""
+    meta = {}
+    if not isinstance(raw, dict):
+        return meta
+    src = raw.get("source")
+    if src not in (None, ""):
+        if src not in SOURCES:
+            raise Invalid(f'source "{src}" must be one of {", ".join(SOURCES)}')
+        meta["source"] = src
+    cls = raw.get("class")
+    if cls not in (None, ""):
+        if not isinstance(cls, str) or not re.fullmatch(r"[a-z][a-z_-]{0,23}", cls):
+            raise Invalid('class must be a short lowercase token (poster, label, screenshot, …)')
+        meta["class"] = cls
+    return meta
+
+
+def vision_log(plan, kind, outcome=None, attrs=None):
+    """Usage event for photo plans (skill vision-actions). Never raises; tests set USAGE=off or USAGE_TEST=1."""
+    if plan.get("source") != "photo":
+        return
+    try:
+        from usage import log   # ~/bin/lib/usage.py (lib is on sys.path)
+        a = {"class": plan.get("class") or "other", "n": len(plan.get("actions") or [])}
+        a.update(attrs or {})
+        log(VISION_FEATURE, kind=kind, outcome=outcome, ref=plan.get("id"), attrs=a)
+    except Exception:
+        pass
+
+
+def check_action(a, now, check_past=True):
+    """One raw action -> normalized dict. Raises Invalid with every problem joined."""
+    if not isinstance(a, dict):
+        raise Invalid("not an object")
+    kind = a.get("kind")
+    if kind not in FIELDS:
+        raise Invalid(f'unknown kind "{kind}" (reminder, event, list, note, warranty)' if kind else "missing kind")
+    need, opt = FIELDS[kind]
+    problems = []
+    extra = sorted(set(a) - need - opt - {"kind"})
+    if extra:
+        problems.append("unknown field " + ", ".join(f'"{x}"' for x in extra))
+    out = {"kind": kind}
+
+    def attempt(fn):
+        try:
+            fn()
+        except Invalid as e:
+            problems.append(str(e))
+
+    if kind == "reminder":
+        def _when():
+            w = parse_time(a.get("when"), "when")
+            if check_past and w <= now:
+                raise Invalid(f"time {w:{FMT}} is in the past")
+            out["when"] = w.strftime(FMT)
+        attempt(_when)
+        attempt(lambda: out.__setitem__("text", text_field(a, "text")))
+    elif kind == "event":
+        attempt(lambda: out.__setitem__("title", text_field(a, "title")))
+        for f in ("location", "description"):
+            if a.get(f) not in (None, ""):
+                if isinstance(a[f], str):
+                    out[f] = a[f].strip() if f == "description" else re.sub(r"\s+", " ", a[f]).strip()
+                else:
+                    problems.append(f"{f} must be text")
+
+        def _times():
+            start, end = a.get("start"), a.get("end")
+            if is_day(start):
+                if end not in (None, "") and not is_day(end):
+                    raise Invalid(f'all-day end "{end}" must be a date "YYYY-MM-DD"')
+                s = parse_day(start, "start")
+                e = parse_day(end, "end") if end not in (None, "") else s
+                if e < s:
+                    raise Invalid("end is before start")
+                if check_past and s < now.date():
+                    raise Invalid(f"date {s} is in the past")
+                out.update(allDay=True, start=s.isoformat(), end=e.isoformat())
+                return
+            s = parse_time(start, "start")
+            e = parse_time(end, "end") if end not in (None, "") else s + timedelta(hours=1)
+            if e <= s:
+                raise Invalid("end is not after start")
+            if check_past and s <= now:
+                raise Invalid(f"start {s:{FMT}} is in the past")
+            out.update(allDay=False, start=s.strftime(FMT), end=e.strftime(FMT))
+        attempt(_times)
+    elif kind == "list":
+        attempt(lambda: out.__setitem__("list", norm_list(a.get("list") or "")))
+        items = a.get("items")
+        if not isinstance(items, list) or not items:
+            problems.append("missing items")
+        else:
+            clean = []
+            for i in items:
+                if not isinstance(i, str) or not i.strip():
+                    problems.append("empty item")
+                    break
+                clean.append(re.sub(r"\s+", " ", i).strip())
+            if len(items) > MAX_ITEMS:
+                problems.append(f"more than {MAX_ITEMS} items")
+            out["items"] = clean
+    elif kind == "note":
+        attempt(lambda: out.__setitem__("text", text_field(a, "text")))
+    elif kind == "warranty":
+        attempt(lambda: out.__setitem__("product", text_field(a, "product")))
+        if a.get("shop") not in (None, ""):
+            if isinstance(a["shop"], str):
+                out["shop"] = re.sub(r"\s+", " ", a["shop"]).strip()
+            else:
+                problems.append("shop must be text")
+
+        def _int(f, lo, hi, default):
+            v = a.get(f, default)
+            if v in (None, ""):
+                v = default
+            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+                raise Invalid(f"{f} must be a whole number {lo}–{hi}")
+            out[f] = v
+
+        attempt(lambda: _int("months", 1, 120, 24))
+        attempt(lambda: _int("remind_days", 0, 365, 30))
+
+        def _dates():
+            b = a.get("bought")
+            if not is_day(b):
+                raise Invalid(f'bought "{b}" must be a date "YYYY-MM-DD"' if b not in (None, "") else "missing bought")
+            bd = parse_day(b, "bought")
+            if bd > now.date():
+                raise Invalid(f"bought {bd} is in the future")
+            if "months" not in out or "remind_days" not in out:
+                return
+            until = add_months(bd, out["months"])
+            if check_past and until <= now.date():
+                raise Invalid(f"the warranty ended {until} (bought {bd} + {out['months']} months)")
+            rem = datetime.combine(until - timedelta(days=out["remind_days"]), datetime.min.time()).replace(hour=9)
+            if rem <= now:
+                rem = datetime.combine(now.date() + timedelta(days=1 if now.hour >= 9 else 0),
+                                       datetime.min.time()).replace(hour=9)
+            out.update(bought=bd.isoformat(), until=until.isoformat(), remind=rem.strftime(FMT))
+        attempt(_dates)
+    if problems:
+        raise Invalid("; ".join(problems))
+    return out
+
+
+def validate(raw, now, check_past=True):
+    """Raw action JSON -> (actions, transcript). Raises Invalid listing every problem as '#N kind: …'."""
+    transcript = None
+    if isinstance(raw, dict):
+        transcript = raw.get("transcript")
+        extra = sorted(set(raw) - {"actions", "transcript", "source", "class"})
+        if extra:
+            raise Invalid("unknown top-level field " + ", ".join(f'"{x}"' for x in extra))
+        raw = raw.get("actions")
+    if not isinstance(raw, list) or not raw:
+        raise Invalid("no actions (expected a non-empty list)")
+    if len(raw) > MAX_ACTIONS:
+        raise Invalid(f"{len(raw)} actions; at most {MAX_ACTIONS}")
+    out, problems = [], []
+    for n, a in enumerate(raw, 1):
+        try:
+            out.append(check_action(a, now, check_past))
+        except Invalid as e:
+            kind = a.get("kind") if isinstance(a, dict) and isinstance(a.get("kind"), str) else "action"
+            problems.append(f"#{n} {kind}: {e}")
+    if problems:
+        raise Invalid("\n".join(problems))
+    if transcript is not None and not isinstance(transcript, str):
+        transcript = None
+    return out, transcript
+
+
+# ------------------------------------------------------------------ rendering
+
+def short(s, n=LINE_MAX):
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def day_label(d, now):
+    if d == now.date():
+        return "Today"
+    if d == now.date() + timedelta(days=1):
+        return "Tomorrow"
+    label = f"{DAYS[d.weekday()]} {d.day} {MONTHS[d.month - 1]}"
+    return label if d.year == now.year else f"{label} {d.year}"
+
+
+def when_label(dt, now):
+    return f"{day_label(dt.date(), now)} {dt:%H:%M}"
+
+
+def span_label(a, now):
+    if a["allDay"]:
+        s, e = date.fromisoformat(a["start"]), date.fromisoformat(a["end"])
+        return f"{day_label(s, now)} (all day)" if s == e else f"{day_label(s, now)} → {day_label(e, now)}"
+    s, e = datetime.strptime(a["start"], FMT), datetime.strptime(a["end"], FMT)
+    if s.date() == e.date() or (e - s <= timedelta(hours=12) and e.time() <= s.time()):
+        return f"{when_label(s, now)}–{e:%H:%M}"
+    return f"{when_label(s, now)} → {when_label(e, now)}"
+
+
+def action_line(a, now):
+    k = a["kind"]
+    if k == "reminder":
+        return f"⏰ {when_label(datetime.strptime(a['when'], FMT), now)} · {a['text']}"
+    if k == "event":
+        loc = f" @ {a['location'].split(',')[0].strip()}" if a.get("location") else ""
+        return f"📅 {span_label(a, now)} · {a['title']}{loc}"
+    if k == "list":
+        items = a["items"]
+        shown = ", ".join(items[:6]) + (f" +{len(items) - 6} more" if len(items) > 6 else "")
+        return f"{list_emoji(a['list'])} {a['list']} +{len(items)}: {shown}"
+    if k == "warranty":
+        shop = f" ({a['shop']})" if a.get("shop") else ""
+        until = date.fromisoformat(a["until"])
+        rem = datetime.strptime(a["remind"], FMT)
+        return f"🛡 {a['product']}{shop} · warranty to {until:%d.%m.%Y} · ⏰ {rem:%d.%m.%Y}"
+    return f"📝 {a['text']}"
+
+
+def warranty_entry(a):
+    parts = [a["product"]] + ([a["shop"]] if a.get("shop") else []) + [
+        f"bought {date.fromisoformat(a['bought']):%d.%m.%Y}", f"warranty to {date.fromisoformat(a['until']):%d.%m.%Y}"]
+    return " · ".join(parts)
+
+
+def card(plan, now):
+    acts = plan["actions"]
+    icon = "📷" if plan.get("source") == "photo" else "📋"
+    head = f"{icon} {len(acts)} action{'s' if len(acts) != 1 else ''}:"
+    if plan.get("status") not in (None, "pending"):
+        head += f" ({plan['status']})"
+    lines = [head] + [f"{n}. {short(action_line(a, now))}" for n, a in enumerate(acts, 1)]
+    return "\n".join(lines)
+
+
+def buttons(pid):
+    return [[{"text": "✅ Do all", "data": f"vp:ok:{pid}", "style": "success"},
+             {"text": "✏️ Fix", "data": f"vp:fix:{pid}"},
+             {"text": "✖", "data": f"vp:no:{pid}"}]]
+
+
+# ------------------------------------------------------------------ storage
+
+def lock():
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(STATE, ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def plan_path(pid):
+    if not ID_RE.fullmatch(pid or ""):
+        raise SystemExit(2)
+    return os.path.join(STATE, pid + ".json")
+
+
+def load_plan(pid):
+    try:
+        with open(plan_path(pid)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save_plan(plan):
+    path = plan_path(plan["id"])
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(plan, f, indent=1, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def prune(now):
+    cutoff = (now - KEEP).strftime(FMT)
+    for name in os.listdir(STATE):
+        if not re.fullmatch(r"[0-9a-f]{6}\.json", name):
+            continue
+        path = os.path.join(STATE, name)
+        try:
+            with open(path) as f:
+                created = json.load(f).get("created") or ""
+        except (OSError, ValueError):
+            continue
+        if created and created < cutoff:
+            os.remove(path)
+
+
+def new_id():
+    for _ in range(100):
+        pid = secrets.token_hex(3)
+        if not os.path.exists(os.path.join(STATE, pid + ".json")):
+            return pid
+    raise SystemExit("voice-plan: no free plan id")
+
+
+# ------------------------------------------------------------------ running
+
+def run_cmd(argv):
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=RUN_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, type(e).__name__
+    msg = (p.stdout.strip() or p.stderr.strip()).splitlines()
+    return p.returncode == 0, (msg[-1] if msg else f"exit {p.returncode}")
+
+
+def execute(a, pid):
+    """Run one action. Returns (status, detail): ok / failed / todo (events: the session creates them)."""
+    k = a["kind"]
+    if k == "reminder":
+        ok, msg = run_cmd([REMIND, "add", "--owner", "--tag", f"vp:{pid}", a["when"], a["text"]])
+    elif k == "list" and a["list"] == "shopping" and SHOP and os.path.exists(SHOP):
+        res = [(t, run_cmd([SHOP, "add", t])) for t in a["items"]]
+        ok = all(r[0] for _, r in res)
+        added = [t for t, r in res if r[0] and not r[1].startswith("already")]
+        already = [t for t, r in res if r[0] and r[1].startswith("already")]
+        bad = [t for t, r in res if not r[0]]
+        parts = ([f"+{len(added)} ({', '.join(added)})"] if added else []) \
+            + ([f"already there: {', '.join(already)}"] if already else []) \
+            + ([f"failed: {', '.join(bad)}"] if bad else [])
+        msg = "🛒 shopping: " + "; ".join(parts)
+    elif k == "list":
+        ok, msg = run_cmd([LISTS, "add", a["list"], *a["items"]])
+    elif k == "note":
+        ok, msg = run_cmd([LISTS, "add", NOTES_LIST, a["text"]])
+    elif k == "warranty":
+        ok1, m1 = run_cmd([LISTS, "add", WARRANTY_LIST, warranty_entry(a)])
+        shop = f" ({a['shop']})" if a.get("shop") else ""
+        text = (f"🛡 Warranty for {a['product']}{shop} ends {date.fromisoformat(a['until']):%d.%m.%Y} "
+                f"(bought {date.fromisoformat(a['bought']):%d.%m.%Y}): still working fine?")
+        ok2, m2 = run_cmd([REMIND, "add", "--owner", "--tag", f"vp:{pid}", a["remind"], text])
+        ok = ok1 and ok2
+        msg = m1 if not ok1 else m2
+    else:
+        return "todo", "calendar"
+    return ("ok" if ok else "failed"), msg
+
+
+def passed(a, now):
+    """A stored (normalized) action whose time is no longer in the future."""
+    if a["kind"] == "reminder":
+        return datetime.strptime(a["when"], FMT) <= now
+    if a["kind"] == "warranty":
+        return datetime.strptime(a["remind"], FMT) <= now
+    if a["kind"] == "event":
+        if a["allDay"]:
+            return date.fromisoformat(a["start"]) < now.date()
+        return datetime.strptime(a["start"], FMT) <= now
+    return False
+
+
+def event_json(n, a):
+    if a["allDay"]:
+        s = date.fromisoformat(a["start"])
+        e = date.fromisoformat(a["end"]) + timedelta(days=1)   # Google all-day end is exclusive
+        st, et = f"{s.isoformat()}T00:00:00", f"{e.isoformat()}T00:00:00"
+    else:
+        st = datetime.strptime(a["start"], FMT).strftime("%Y-%m-%dT%H:%M:00")
+        et = datetime.strptime(a["end"], FMT).strftime("%Y-%m-%dT%H:%M:00")
+    ev = {"n": n, "summary": a["title"], "startTime": st, "endTime": et, "allDay": a["allDay"]}
+    for f in ("location", "description"):
+        if a.get(f):
+            ev[f] = a[f]
+    return ev
+
+
+# ------------------------------------------------------------------ commands
+
+def take_opt(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 >= len(args):
+            raise SystemExit(f"voice-plan: {flag} needs a value")
+        v = args[i + 1]
+        del args[i:i + 2]
+        return v
+    return None
+
+
+def take_flag(args, flag):
+    if flag in args:
+        args.remove(flag)
+        return True
+    return False
+
+
+def cmd_render(args, as_json):
+    transcript = take_opt(args, "--transcript")
+    replace = take_opt(args, "--replace")
+    if len(args) != 1:
+        return usage()
+    src = args[0]
+    if src == "-" and transcript == "-":
+        print("voice-plan: stdin can carry the actions or the transcript, not both", file=sys.stderr)
+        return 2
+    try:
+        text = sys.stdin.read() if src == "-" else open(src, encoding="utf-8").read()
+    except OSError as e:
+        print(f"voice-plan: can't read {src}: {e.strerror}", file=sys.stderr)
+        return 2
+    if transcript == "-":
+        transcript = sys.stdin.read()
+    try:
+        raw = json.loads(text)
+    except ValueError as e:
+        print(f"voice-plan: not JSON ({e})", file=sys.stderr)
+        return 1
+    now = now_local()
+    try:
+        actions, t2 = validate(raw, now)
+        meta = plan_meta(raw)
+    except Invalid as e:
+        print("voice-plan: invalid plan, nothing saved\n" + str(e), file=sys.stderr)
+        return 1
+    transcript = (transcript if transcript is not None else t2 or "").strip()
+    lk = lock()
+    try:
+        old = None
+        if replace:
+            old = load_plan(replace) if ID_RE.fullmatch(replace) else None
+            if old is None:
+                print(f"voice-plan: no plan {replace} to replace", file=sys.stderr)
+                return 2
+        prune(now)
+        pid = new_id()
+        plan = {"id": pid, "created": now.strftime(FMT), "status": "pending", "transcript": transcript,
+                "actions": actions, **meta}
+        save_plan(plan)
+        if old is not None and old.get("status") == "pending":
+            old.update(status="dropped", dropped=now.strftime(FMT), replaced_by=pid)
+            save_plan(old)
+    finally:
+        os.close(lk)
+    vision_log(plan, "invoke", outcome="card", attrs={"fix": bool(replace)})
+    text = card(plan, now)
+    if as_json:
+        print(json.dumps({"id": pid, "text": text, "buttons": buttons(pid), "actions": actions}, ensure_ascii=False))
+    else:
+        print(text)
+        print()
+        print(json.dumps(buttons(pid), ensure_ascii=False))
+    return 0
+
+
+def get_plan_or_exit(args):
+    if len(args) != 1 or not ID_RE.fullmatch(args[0]):
+        return None, usage()
+    plan = load_plan(args[0])
+    if plan is None:
+        print(f"voice-plan: no plan {args[0]}", file=sys.stderr)
+        return None, 2
+    return plan, 0
+
+
+def cmd_run(args, as_json):
+    if len(args) != 1 or not ID_RE.fullmatch(args[0]):
+        return usage()
+    now = now_local()
+    lk = lock()
+    try:
+        plan = load_plan(args[0])
+        if plan is None:
+            print(f"voice-plan: no plan {args[0]}", file=sys.stderr)
+            return 2
+        if plan.get("status") != "pending":
+            print(f"voice-plan: plan {plan['id']} is {plan.get('status')}, not run again", file=sys.stderr)
+            return 3
+        stale = [f"#{n} {short(action_line(a, now))}" for n, a in enumerate(plan["actions"], 1) if passed(a, now)]
+        if stale:
+            print("voice-plan: times have passed, nothing run (fix and render again)\n" + "\n".join(stale),
+                  file=sys.stderr)
+            return 4
+        plan.update(status="running", started=now.strftime(FMT))
+        save_plan(plan)
+    finally:
+        os.close(lk)
+    results, events, lines, failed = [], [], [], 0
+    for n, a in enumerate(plan["actions"], 1):
+        status, detail = execute(a, plan["id"])
+        results.append({"n": n, "kind": a["kind"], "status": status, "detail": detail})
+        if status == "todo":
+            events.append(event_json(n, a))
+            continue
+        if status == "failed":
+            failed += 1
+        if status == "ok":
+            shown = detail if a["kind"] == "list" else action_line(a, now)   # lists' own result shows dedupes
+            lines.append(f"✓ {n}. {short(shown)}")
+        else:
+            lines.append(f"✗ {n}. {short(action_line(a, now))} ({detail})")
+    lk = lock()
+    try:
+        plan.update(status="done", finished=now_local().strftime(FMT), results=results)
+        save_plan(plan)
+    finally:
+        os.close(lk)
+    vision_log(plan, "exec", outcome="failed" if failed else "ok",
+               attrs={"kinds": ",".join(sorted({a["kind"] for a in plan["actions"]}))})
+    if as_json:
+        print(json.dumps({"id": plan["id"], "status": "done", "failed": failed, "results": results,
+                          "events": events}, ensure_ascii=False))
+    else:
+        for ln in lines:
+            print(ln)
+        for ev in events:
+            print(json.dumps(ev, ensure_ascii=False))
+    return 1 if failed else 0
+
+
+def cmd_show(args, as_json):
+    plan, rc = get_plan_or_exit(args)
+    if plan is None:
+        return rc
+    if as_json:
+        print(json.dumps(plan, ensure_ascii=False))
+    else:
+        print(card(plan, now_local()))
+    return 0
+
+
+def cmd_drop(args):
+    if len(args) != 1 or not ID_RE.fullmatch(args[0]):
+        return usage()
+    lk = lock()
+    try:
+        plan = load_plan(args[0])
+        if plan is None:
+            print(f"voice-plan: no plan {args[0]}", file=sys.stderr)
+            return 2
+        if plan.get("status") != "pending":
+            print(f"voice-plan: plan {plan['id']} is {plan.get('status')}", file=sys.stderr)
+            return 3
+        plan.update(status="dropped", dropped=now_local().strftime(FMT))
+        save_plan(plan)
+    finally:
+        os.close(lk)
+    vision_log(plan, "dismissed")
+    print(f"dropped plan {plan['id']}")
+    return 0
+
+
+def usage():
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    cmd = args.pop(0)
+    as_json = take_flag(args, "--json")
+    try:
+        now_local()
+    except ValueError:
+        print('voice-plan: VOICE_PLAN_NOW must be "YYYY-MM-DD HH:MM"', file=sys.stderr)
+        return 2
+    if cmd == "render":
+        return cmd_render(args, as_json)
+    if cmd == "run":
+        return cmd_run(args, as_json)
+    if cmd == "show":
+        return cmd_show(args, as_json)
+    if cmd == "drop":
+        return cmd_drop(args)
+    return usage()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

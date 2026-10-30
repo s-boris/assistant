@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""drive-watch: live traffic before his car trips (token-free; Waze routes via pywaze, no key, no account).
+
+  drive-watch check [--cron] [--dry-run] [--at "YYYY-MM-DD HH:MM"] [--json]
+        car trips whose 2 h window before the event is open: ask Waze (town names only) at most every
+        check_every_min (15) per trip, compare the leave time with the plan, and write ONE
+        ~/inbox/drive-watch-*.md when it moves by >= threshold_min (10). Silent otherwise; never messages.
+        --dry-run: query and print, no state, no note. --at: pretend it is that owner wall time (Waze still
+        answers for a departure now: a dry run with today's traffic).
+  drive-watch plan [--days N] [--json]        car trips ahead (calcache 🚗 legs + config rules); no network
+  drive-watch route FROM TO [--in MIN] [--json]
+        one Waze query between two towns (live and usual minutes), departure in MIN minutes (default now)
+  drive-watch status [--json]                 trips in state: baseline, last check, notes written
+
+Car trips (calcache events, today on):
+  leg   a timed 🚗 event: leave = its start, arrive by = its end (start + Waze's usual time if it has no length);
+        from = the title's text before "→" (Home = the home town), else the home town; to = the town after
+        "→" (Home = the home town), else the event's town. Without an arrow, a title "Drive home from X",
+        "Home from X", "Drive back from X", "Heimfahrt von X", "Rückfahrt von X", "(Fahrt) nach Hause von X"
+        (or bare "Drive home", "Heimfahrt", "Nach Hause") is a leg home: from = the event's town (else X),
+        to = the home town. Anything else ("Drive to X", "Fahrt nach X") = home → the event's town (else X).
+        The away end of a leg home or from home is the event's town unless that is the home town (a leg's
+        location can be its departure), then the place in the title.
+  rule  config "rules" for events he drives to without a 🚗 leg: {"match": regex on the title (case-insensitive),
+        "arrive_early_min": 0, "usual_min": planned minutes (else Waze's usual time at the first check),
+        "all_day": true + "arrive_by": "HH:MM" for all-day markers, "to": destination town, "weekdays": [0..6]
+        (Mon = 0), "enabled": true}. A rule event with a 🚗 leg arriving in the 3 h before it is skipped.
+Leave time: delay = Waze live minutes - its usual minutes, both for a departure now (Waze shows live traffic
+  only for a departure about now; for one 45+ min ahead it returns its plain prediction), so a jam or closure that
+  exists now counts and town-level routes don't skew it; new leave = planned leave - delay. Waze's usual minutes
+  at the first check are the trip's baseline (the planned drive when neither a 🚗 leg nor usual_min gives one). A note when it moved >= threshold_min from the
+  plan; one more only when it moves another >= threshold_min from the noted time (max_notes, default 2).
+Privacy: Waze sees town names only (start = the profile's home town, never a street or coordinates of his
+  home); the search bias is config "bias" {lat, lon}, else the work town's coordinates when the profile marks
+  them town precision. Arguments with digits are refused. State and log hold titles, towns and minutes only.
+Sleep-in and quiet hours: while `sleepin active` holds or inside config "quiet" (default 00:00-08:00), a due
+  note waits until the new leave time is <= urgent_min (45) away; the note then says it was held.
+Config ~/.config/drive-watch/config.json; state ~/.local/state/drive-watch/ (0600): state.json, drive-watch.log.
+Waze runs in ~/opt/drive-venv (pywaze pinned in the repo's ops/requirements/drive.txt; boot.sh rebuilds it).
+Exit: 0 ok (also nothing due), 1 a due Waze check failed (cron-fail reports repeats), 2 usage, 3 no calendar cache.
+Phone app: a Live Update chip (lib/livecount.py) per trip from 60 min before the leave time ("Leave by HH:MM"), updated
+when Waze moves it, ended once it has passed; silent without a paired phone
+(tests: LIVECOUNT_PHONE = a stub phone; test state makes no chips without it).
+Env (tests): DRIVE_WATCH_NOW ("YYYY-MM-DD HH:MM" owner wall time), DRIVE_WATCH_STATE, DRIVE_WATCH_INBOX,
+  DRIVE_WATCH_CONFIG, DRIVE_WATCH_FAKE (JSON file {"FROM|TO": {"live": M, "usual": M} or {"error": "…"}};
+  replaces Waze), DRIVE_WATCH_SLEEPIN (the sleepin command), DRIVE_WATCH_VENV, CALCACHE_DIR, ASSISTANT_PROFILE.
+Offline suite: tests/legacy/drive-watch/run.sh (~/opt/assistant; DRIVE_WATCH_BIN=<copy>).
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+for _lib in (os.path.expanduser('~/bin/lib'), os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib')):
+    sys.path.insert(0, _lib)
+import assistant_profile as profile  # noqa: E402
+import livecount  # noqa: E402
+
+HOME_DIR = os.path.expanduser('~')
+STATE_DIR = os.environ.get('DRIVE_WATCH_STATE') or f'{HOME_DIR}/.local/state/drive-watch'
+STATE_F = os.path.join(STATE_DIR, 'state.json')
+LOG_F = os.path.join(STATE_DIR, 'drive-watch.log')
+INBOX = os.environ.get('DRIVE_WATCH_INBOX') or f'{HOME_DIR}/inbox'
+CONFIG_F = os.environ.get('DRIVE_WATCH_CONFIG') or f'{HOME_DIR}/.config/drive-watch/config.json'
+CAL_F = os.path.join(os.environ.get('CALCACHE_DIR') or f'{HOME_DIR}/.local/state/calcache', 'events.json')
+VENV_PY = os.path.join(os.environ.get('DRIVE_WATCH_VENV') or f'{HOME_DIR}/opt/drive-venv', 'bin', 'python')
+CAR = '\U0001F697'                       # 🚗
+ARROW_RE = re.compile(r'\s*(?:→|->|➡️?)\s*')
+DEFAULTS = {'threshold_min': 10, 'window_min': 120, 'check_every_min': 15, 'urgent_min': 45, 'max_notes': 2,
+            'quiet': ['00:00', '08:00'], 'country': '', 'bias': None, 'rules': []}
+LEG_COVERS_H = 3
+GEO_DAYS = 30
+
+WAZE_WORKER = r'''
+import asyncio, json, sys
+from pywaze.route_calculator import WazeRouteCalculator
+q = json.loads(sys.argv[1])
+async def main():
+    async with WazeRouteCalculator(region="EU", timeout=25) as c:
+        geo = {}
+        for k in ("start", "end"):
+            geo[k] = q.get(k + "_coords") or await c.address_to_coords(q[k], base_coords=q.get("bias"))
+        routes = await c.get_routes(geo["start"], geo["end"], alternatives=1, time_delta=int(q.get("time_delta", 0)))
+        r = routes[0]
+        res = r["results" if "results" in r else "result"]
+        b1, b2 = geo["start"].get("bounds") or {}, geo["end"].get("bounds") or {}
+        live, km = c._add_up_route(res, b1, b2, real_time=True)
+        usual, _ = c._add_up_route(res, b1, b2, real_time=False)
+        print(json.dumps({"live": live, "usual": usual, "km": km, "route": r.get("routeName", ""),
+                          "start_coords": geo["start"], "end_coords": geo["end"]}))
+asyncio.run(main())
+'''
+
+
+class Usage(Exception):
+    pass
+
+
+class WazeError(Exception):
+    pass
+
+
+# ---------- time, config, state ----------
+
+def tz():
+    return profile.tz()
+
+
+def now():
+    s = os.environ.get('DRIVE_WATCH_NOW')
+    if s:
+        return dt.datetime.strptime(s, '%Y-%m-%d %H:%M').replace(tzinfo=tz())
+    return dt.datetime.now(tz())
+
+
+def parse_at(s):
+    try:
+        return dt.datetime.strptime(s, '%Y-%m-%d %H:%M').replace(tzinfo=tz())
+    except ValueError:
+        raise Usage(f'--at wants "YYYY-MM-DD HH:MM", got {s!r}')
+
+
+def iso(s):
+    """calcache local ISO -> aware datetime (all-day: a date)."""
+    if len(s) == 10:
+        return dt.date.fromisoformat(s)
+    d = dt.datetime.fromisoformat(s)
+    return d if d.tzinfo else d.replace(tzinfo=tz())
+
+
+def hm(d):
+    return d.astimezone(tz()).strftime('%H:%M')
+
+
+def day(d):
+    return d.astimezone(tz()).strftime('%a %d.%m')
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_F) as f:
+            cfg.update(json.load(f) or {})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        raise Usage(f'config {CONFIG_F}: {e}')
+    return cfg
+
+
+def load_state():
+    try:
+        with open(STATE_F) as f:
+            st = json.load(f)
+    except (FileNotFoundError, ValueError):
+        st = {}
+    st.setdefault('trips', {})
+    st.setdefault('geo', {})
+    return st
+
+
+def atomic_write(path, text, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.tmp-')
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def save_state(st, t):
+    keep = t - dt.timedelta(days=2)
+    st['trips'] = {k: v for k, v in st['trips'].items() if iso(v['arrive']) > keep}
+    geo_keep = (t - dt.timedelta(days=GEO_DAYS)).isoformat()
+    st['geo'] = {k: v for k, v in st['geo'].items() if v.get('ts', '') > geo_keep}
+    atomic_write(STATE_F, json.dumps(st, ensure_ascii=False, indent=1) + '\n')
+
+
+def log(t, msg):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG_F, 'a') as f:
+        f.write(f'{t.strftime("%Y-%m-%d %H:%M")} {msg}\n')
+    os.chmod(LOG_F, 0o600)
+
+
+# ---------- trips ----------
+
+def home_town():
+    return profile.get('home.town', '') or None
+
+
+HOME_WORDS = ('home', 'zuhause', 'heim', 'nach hause')
+# a leg home without an arrow ("Drive home from X", "Home from X", "Drive back from X", "Heimfahrt von X",
+# "Rückfahrt von X", "(Fahrt) nach Hause von X"; also bare "Drive home", "Heimfahrt", "Nach Hause"): group = X
+HOME_FROM_RE = re.compile(r'(?i)^(?:(?:drive|fahrt)\s+)?(?:back\s+)?home(?:\s+from\s+(.+))?$'
+                          r'|^(?:(?:drive|fahrt)\s+)?back\s+from\s+(.+)$'
+                          r'|^(?:heim|rück|rueck)fahrt(?:\s+(?:von|ab)\s+(.+))?$'
+                          r'|^(?:fahrt\s+)?nach\s+hause(?:\s+(?:von|ab)\s+(.+))?$')
+DRIVE_TO_RE = re.compile(r'(?i)^(?:drive|fahrt)\s+(?:to|nach)\s+(.+)$')
+
+
+def clean(x):
+    x = ' '.join(re.sub(r'\([^)]*\)', ' ', x).split()).strip(' ,-')
+    return re.sub(r'(?i)^(?:drive|fahrt)\s+(?:back\s+)?(?:to|nach|from|von)\s+', '', x).strip()
+
+
+def is_home(x):
+    return x.casefold() in HOME_WORDS
+
+
+def townlike(x):
+    return x if x and len(x) <= 40 and len(x.split()) <= 4 and not re.search(r'\d', x) else None
+
+
+def leg_ends(ev):
+    """(from, to) towns of a 🚗 leg: "A → B" in the title (Home = the home town); a HOME_FROM_RE title ("Drive home
+    from X") = X → home; "Drive to X" / "Fahrt nach X" = home → X; else home → the event's town. X = the event's town,
+    unless it has none or it is the home town (a leg's location can be its departure): then the place in the title."""
+    home, town = home_town(), ev.get('town')
+    away = town if town and town != home else None
+    title = ev['title'].replace(CAR, ' ')
+    parts = ARROW_RE.split(title, maxsplit=1)
+    if len(parts) == 2:
+        a, b = clean(parts[0]), clean(parts[1])
+        if is_home(b):
+            return away or townlike(a), home
+        if is_home(a):
+            return home, away or townlike(b)
+        return townlike(a) or home, town or townlike(b)
+    bare = ' '.join(re.sub(r'\([^)]*\)', ' ', title).split()).strip(' ,-')
+    m = HOME_FROM_RE.match(bare)
+    if m:
+        return away or townlike(next((clean(g) for g in m.groups() if g), '')), home
+    m = DRIVE_TO_RE.match(bare)
+    if m:
+        x = clean(m.group(1))
+        return (away, home) if is_home(x) else (home, away or townlike(x))
+    return home, town
+
+
+def trip_id(ev):
+    return hashlib.sha1(f"{ev.get('id')}|{ev['start']}".encode()).hexdigest()[:10]
+
+
+def trips(events, cfg, t0, t1):
+    """Car trips whose arrival lies in [t0, t1]."""
+    home = home_town()
+    legs, out = [], []
+    for ev in events:
+        if ev.get('all_day') or (ev.get('flags') or {}).get('travel') != 'drive':
+            continue
+        s, e = iso(ev['start']), iso(ev['end'])
+        frm, to = leg_ends(ev)
+        legs.append(e if e > s else s)
+        if not (frm and to) or frm == to:
+            continue
+        out.append({'id': trip_id(ev), 'title': ev['title'], 'kind': 'leg', 'from': frm, 'to': to,
+                    'leave': s, 'arrive': e if e > s else None, 'planned_min': round((e - s).total_seconds() / 60)
+                    if e > s else None, 'event_start': s, 'source': 'calendar 🚗 leg'})
+    for ev in events:
+        if (ev.get('flags') or {}).get('travel'):
+            continue
+        for r in cfg.get('rules') or []:
+            if not r.get('enabled', True) or not r.get('match'):
+                continue
+            if not re.search(r['match'], ev['title'], re.I) or bool(r.get('all_day')) != bool(ev.get('all_day')):
+                continue
+            if ev.get('all_day'):
+                if not r.get('arrive_by'):
+                    continue
+                hh, mm = map(int, r['arrive_by'].split(':'))
+                start = dt.datetime.combine(iso(ev['start']), dt.time(hh, mm), tz())
+                arrive = start
+            else:
+                start = iso(ev['start'])
+                arrive = start - dt.timedelta(minutes=int(r.get('arrive_early_min') or 0))
+            if r.get('weekdays') is not None and start.weekday() not in r['weekdays']:
+                continue
+            to = r.get('to') or ev.get('town')
+            if not (home and to) or to == home:
+                continue
+            if any(start - dt.timedelta(hours=LEG_COVERS_H) <= le <= start for le in legs):
+                continue
+            usual = r.get('usual_min')
+            out.append({'id': trip_id(ev), 'title': ev['title'], 'kind': 'rule', 'from': home, 'to': to,
+                        'leave': arrive - dt.timedelta(minutes=int(usual)) if usual else None, 'arrive': arrive,
+                        'planned_min': int(usual) if usual else None, 'event_start': start,
+                        'source': f"rule \"{r['match']}\""})
+            break
+    out = [x for x in out if t0 <= (x['arrive'] or x['leave']) <= t1]
+    return sorted(out, key=lambda x: x['arrive'] or x['leave'])
+
+
+def load_events():
+    try:
+        with open(CAL_F) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise Usage(f'calendar cache {CAL_F}: {e}')
+    return data.get('events') or []
+
+
+# ---------- Waze ----------
+
+def check_town(s):
+    if not s or re.search(r'\d', s) or len(s) > 60:
+        raise Usage(f'towns only (no street, number or coordinates): {s!r}')
+    return s
+
+
+def bias(cfg):
+    b = cfg.get('bias')
+    if isinstance(b, dict) and 'lat' in b and 'lon' in b:
+        return {'lat': float(b['lat']), 'lon': float(b['lon'])}
+    if profile.get('work.precision', '') == 'town':
+        try:
+            return {'lat': float(profile.get('work.lat')), 'lon': float(profile.get('work.lon'))}
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def query_text(town, cfg):
+    c = (cfg.get('country') or '').strip()
+    return f'{town}, {c}' if c else town
+
+
+def waze(frm, to, time_delta, cfg, st, t):
+    """{'live', 'usual', 'km', 'route'} in minutes/km; WazeError on failure."""
+    check_town(frm), check_town(to)
+    fake = os.environ.get('DRIVE_WATCH_FAKE')
+    if fake:
+        with open(fake) as f:
+            r = json.load(f).get(f'{frm}|{to}')
+        if not r or r.get('error'):
+            raise WazeError((r or {}).get('error') or 'no fake route')
+        return {'live': float(r['live']), 'usual': float(r['usual']), 'km': float(r.get('km', 0)),
+                'route': r.get('route', ''), 'time_delta': time_delta}
+    if not os.path.exists(VENV_PY):
+        raise WazeError(f'no venv at {VENV_PY} (boot.sh rebuilds it)')
+    q = {'start': query_text(frm, cfg), 'end': query_text(to, cfg), 'bias': bias(cfg),
+         'time_delta': max(0, int(time_delta))}
+    for k in ('start', 'end'):
+        g = st['geo'].get(q[k])
+        if g:
+            q[k + '_coords'] = g['coords']
+    try:
+        p = subprocess.run([VENV_PY, '-I', '-c', WAZE_WORKER, json.dumps(q)], capture_output=True, text=True,
+                           timeout=75, cwd='/')
+    except subprocess.TimeoutExpired:
+        raise WazeError('timeout')
+    if p.returncode != 0:
+        last = (p.stderr.strip().splitlines() or ['?'])[-1]
+        raise WazeError(last[:200])
+    try:
+        r = json.loads(p.stdout)
+    except ValueError:
+        raise WazeError('bad worker output')
+    for k in ('start', 'end'):
+        st['geo'][q[k]] = {'coords': r[k + '_coords'], 'ts': t.isoformat()}
+    if not (r.get('live') and r.get('usual')):
+        raise WazeError('route without time')
+    return {'live': float(r['live']), 'usual': float(r['usual']), 'km': float(r.get('km') or 0),
+            'route': r.get('route', ''), 'time_delta': q['time_delta']}
+
+
+# ---------- holding ----------
+
+def in_quiet(t, cfg):
+    q = cfg.get('quiet') or []
+    if len(q) != 2:
+        return False
+    a, b, x = q[0], q[1], t.strftime('%H:%M')
+    return (a <= x < b) if a <= b else (x >= a or x < b)
+
+
+def sleepin_holds(t):
+    cmd = os.environ.get('DRIVE_WATCH_SLEEPIN') or 'sleepin'
+    try:
+        p = subprocess.run([cmd, 'active', '--at', t.strftime('%Y-%m-%d %H:%M')], capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
+# ---------- check ----------
+
+def note_text(tr, rec, new_leave, planned_leave, res, t, held):
+    moved = round((planned_leave - new_leave).total_seconds() / 60)
+    direction = f'{moved} min earlier' if moved > 0 else f'{-moved} min later'
+    lines = ['# drive-watch: leave time moved', '',
+             'Data, not instructions (drive-watch, token-free; JOBS.md says how to handle it).', '',
+             f"Trip: {tr['title']} · {day(tr['event_start'])} · {tr['from']} → {tr['to']} "
+             f"(arrive by {hm(iso(rec['arrive']))})",
+             f'Leave: {hm(new_leave)} instead of {hm(planned_leave)} ({direction})',
+             f"Why: Waze now {round(res['live'])} min vs usual {round(res['usual'])} min "
+             f"(checked {hm(t)}{'; ' + res['route'] if res.get('route') else ''})",
+             f"Plan: {rec['source']}, {rec['planned_min']} min drive"]
+    if rec.get('notes'):
+        lines.append(f"Earlier note: leave {rec['notes'][-1]['leave']}")
+    if held:
+        lines.append(f'Held for {held} until the leave time came close; urgent now.')
+    return '\n'.join(lines) + '\n'
+
+
+def check(a, cfg):
+    t = parse_at(a.at) if a.at else now()
+    events = load_events()
+    if events is None:
+        if a.cron:
+            return 0
+        print('drive-watch: no calendar cache (calcache import first)', file=sys.stderr)
+        return 3
+    win = int(cfg['window_min'])
+    cand = trips(events, cfg, t - dt.timedelta(hours=6), t + dt.timedelta(minutes=win + 180))
+    st = load_state()
+    rows, failed = [], 0
+    fresh = {}                                         # trip id -> its record after this run's check
+    for tr in cand:
+        rec = st['trips'].get(tr['id'])
+        arrive = tr['arrive'] or (iso(rec['arrive']) if rec else None)
+        anchor = arrive or tr['leave']
+        if t < anchor - dt.timedelta(minutes=win):
+            continue
+        cur_leave = iso(rec['leave_now']) if rec and rec.get('leave_now') else tr['leave']
+        planned = iso(rec['planned_leave']) if rec and rec.get('planned_leave') else tr['leave']
+        last = max([x for x in (cur_leave, planned) if x] or [anchor])
+        if t > last:
+            continue                                   # he has left (or should have)
+        if rec and rec.get('last_check') and not a.dry_run and \
+                t < iso(rec['last_check']) + dt.timedelta(minutes=int(cfg['check_every_min'])):
+            continue
+        try:
+            res = waze(tr['from'], tr['to'], 0, cfg, st, t)
+        except (WazeError, OSError, ValueError) as e:
+            failed += 1
+            if not a.dry_run:
+                log(t, f"{tr['id']} waze failed: {str(e)[:120]}")
+            rows.append({'trip': tr['title'], 'error': str(e)[:200]})
+            continue
+        if rec is None:
+            base = round(res['usual'])
+            pmin = tr['planned_min'] or base
+            arr = tr['arrive'] or tr['leave'] + dt.timedelta(minutes=base)
+            pl = tr['leave'] or arr - dt.timedelta(minutes=pmin)
+            rec = {'title': tr['title'], 'from': tr['from'], 'to': tr['to'], 'source': tr['source'],
+                   'event_start': tr['event_start'].isoformat(), 'arrive': arr.isoformat(),
+                   'planned_leave': pl.isoformat(), 'planned_min': pmin, 'baseline': base, 'notes': [], 'checks': 0}
+        delay = round(res['live'] - res['usual'])
+        planned = iso(rec['planned_leave'])
+        new_leave = planned - dt.timedelta(minutes=delay)
+        rec.update(last_check=t.isoformat(), leave_now=new_leave.isoformat(), last_live=round(res['live']),
+                   checks=rec.get('checks', 0) + 1)
+        fresh[tr['id']] = rec
+        ref = iso(rec['notes'][-1]['leave_iso']) if rec['notes'] else planned
+        moved = abs((ref - new_leave).total_seconds()) / 60
+        due = moved >= int(cfg['threshold_min']) and len(rec['notes']) < int(cfg['max_notes'])
+        held = None
+        if due:
+            hold = 'sleep-in morning' if sleepin_holds(t) else ('quiet hours' if in_quiet(t, cfg) else None)
+            if hold and (new_leave - t).total_seconds() / 60 > int(cfg['urgent_min']):
+                rec['held'] = hold
+                due = False
+            elif hold or rec.get('held'):
+                held = hold or rec.get('held')
+        row = {'trip': tr['title'], 'id': tr['id'], 'from': tr['from'], 'to': tr['to'], 'live_min': round(res['live']),
+               'usual_min': round(res['usual']), 'baseline_min': rec['baseline'], 'planned_leave': hm(planned),
+               'leave': hm(new_leave), 'delay_min': delay, 'note_due': due, 'held': rec.get('held') if not due else None,
+               'route': res.get('route', ''), 'departure_in_min': res.get('time_delta')}
+        rows.append(row)
+        if a.dry_run:
+            continue
+        log(t, f"{tr['id']} {tr['from']} -> {tr['to']}: live {round(res['live'])} usual {round(res['usual'])} "
+               f"base {rec['baseline']} leave {hm(new_leave)} (plan {hm(planned)}){' NOTE' if due else ''}")
+        if due:
+            text = note_text(tr, rec, new_leave, planned, res, t, held)
+            os.makedirs(INBOX, exist_ok=True)
+            path = os.path.join(INBOX, f"drive-watch-{tr['id']}-{int(t.timestamp())}.md")
+            atomic_write(path, text, 0o644)
+            rec['notes'].append({'at': t.isoformat(), 'leave': hm(new_leave), 'leave_iso': new_leave.isoformat()})
+            rec.pop('held', None)
+            row['note'] = path
+        st['trips'][tr['id']] = rec
+    if not a.dry_run:
+        save_state(st, t)
+    live = live_sync(a, cand, fresh, st, t)
+    if a.json:
+        print(json.dumps({'at': t.isoformat(), 'checked': rows, **({'live': live} if live else {})},
+                         ensure_ascii=False, indent=1))
+    elif not a.cron or a.dry_run:
+        if not rows:
+            print(f'drive-watch {t:%d.%m %H:%M}: no car trip in its window')
+        for r in rows:
+            if 'error' in r:
+                print(f"{r['trip']}: Waze failed: {r['error']}")
+            else:
+                print(f"{r['trip']}: {r['from']} → {r['to']} live {r['live_min']} / usual {r['usual_min']} min "
+                      f"(baseline {r['baseline_min']}) → leave {r['leave']} (plan {r['planned_leave']}, "
+                      f"{'+' if r['delay_min'] >= 0 else ''}{r['delay_min']} min){' · NOTE' if r['note_due'] else ''}"
+                      f"{' · held: ' + r['held'] if r.get('held') else ''}")
+        for line in live:
+            print(line)
+    return 1 if failed else 0
+
+
+LIVE_LEAD = dt.timedelta(minutes=60)               # the phone app's countdown chip starts this long before leaving
+
+
+def live_sync(a, cand, fresh, st, t):
+    """After the main work: one Live Update chip per car trip (phone app, livecount), a countdown to the current leave
+    time from LIVE_LEAD before it, updated when Waze moves it, ended once it has passed or the trip is gone.
+    Silent no-op without a paired phone; <= 5 s. -> the action lines (dry-run output)."""
+    chips = []
+    for tr in cand:
+        rec = fresh.get(tr['id']) or st['trips'].get(tr['id'])
+        leave = iso(rec['leave_now']) if rec and rec.get('leave_now') else None
+        if not leave or not t < leave <= t + LIVE_LEAD:
+            continue
+        moved = round((iso(rec['planned_leave']) - leave).total_seconds() / 60) if rec.get('planned_leave') else 0
+        body = (f'Traffic: leave {moved} min earlier' if moved >= 3 else
+                f'Light traffic: {-moved} min later' if moved <= -3 else 'Traffic as usual')
+        chips.append({'key': tr['id'], 'until': leave, 'title': f'Leave by {hm(leave)}', 'body': body})
+    test = bool(a.at or os.environ.get('DRIVE_WATCH_NOW') or os.environ.get('DRIVE_WATCH_STATE'))
+    return livecount.sync('drive', chips, now=t, test=test, dry=a.dry_run)
+
+
+# ---------- other commands ----------
+
+def cmd_plan(a, cfg):
+    t = now()
+    events = load_events()
+    if events is None:
+        print('drive-watch: no calendar cache', file=sys.stderr)
+        return 3
+    out = trips(events, cfg, t, t + dt.timedelta(days=a.days))
+    rows = [{'trip': x['title'], 'id': x['id'], 'kind': x['kind'], 'source': x['source'], 'from': x['from'],
+             'to': x['to'], 'day': day(x['event_start']),
+             'leave': hm(x['leave']) if x['leave'] else 'Waze usual at 1st check',
+             'arrive': hm(x['arrive']) if x['arrive'] else None,
+             'checks_from': hm((x['arrive'] or x['leave']) - dt.timedelta(minutes=int(cfg['window_min'])))}
+            for x in out]
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 0
+    if not rows:
+        print(f'no car trips in the next {a.days} days')
+    for r in rows:
+        print(f"{r['day']} {r['trip']}: {r['from']} → {r['to']} · leave {r['leave']} · arrive {r['arrive'] or '?'} "
+              f"· checks from {r['checks_from']} · {r['source']}")
+    return 0
+
+
+def cmd_route(a, cfg):
+    t = now()
+    st = load_state()
+    try:
+        r = waze(check_town(a.frm), check_town(a.to), a.inmin, cfg, st, t)
+    except WazeError as e:
+        print(f'drive-watch: Waze failed: {e}', file=sys.stderr)
+        return 1
+    save_state(st, t)
+    if a.json:
+        print(json.dumps(r, ensure_ascii=False))
+    else:
+        print(f"{a.frm} → {a.to}: live {round(r['live'])} min, usual {round(r['usual'])} min, "
+              f"{r['km']:.0f} km{' via ' + r['route'] if r['route'] else ''}")
+    return 0
+
+
+def cmd_status(a, cfg):
+    st = load_state()
+    if a.json:
+        print(json.dumps(st['trips'], ensure_ascii=False, indent=1))
+        return 0
+    if not st['trips']:
+        print('no trips checked yet')
+    for k, v in sorted(st['trips'].items(), key=lambda kv: kv[1]['arrive']):
+        print(f"{k} {v['title']}: {v['from']} → {v['to']} · arrive {v['arrive'][:16]} · plan leave "
+              f"{v['planned_leave'][11:16]} · now {v.get('leave_now', '?')[11:16]} · {v.get('checks', 0)} checks · "
+              f"{len(v.get('notes') or [])} notes{' · held: ' + v['held'] if v.get('held') else ''}")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog='drive-watch', description='live traffic before his car trips')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('check')
+    s.add_argument('--cron', action='store_true')
+    s.add_argument('--dry-run', action='store_true')
+    s.add_argument('--at')
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('plan')
+    s.add_argument('--days', type=int, default=7)
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('route')
+    s.add_argument('frm')
+    s.add_argument('to')
+    s.add_argument('--in', dest='inmin', type=int, default=0)
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    a = p.parse_args(argv)
+    try:
+        cfg = load_config()
+        return {'check': check, 'plan': cmd_plan, 'route': cmd_route, 'status': cmd_status}[a.cmd](a, cfg)
+    except Usage as e:
+        print(f'drive-watch: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

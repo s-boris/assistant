@@ -1,0 +1,1940 @@
+#!/usr/bin/env python3
+"""ha: the one safe CLI for the owner's Home Assistant (HA OS VM; URL: profile services.ha_url).
+
+Reads (output always passes the privacy gate, ~/bin/lib/ha_privacy.py):
+  ha state <entity_id|name> [--json]       one entity in detail (several name matches: a short list)
+  ha list [domain] [--area AREA] [--json]  one line per entity: id, state, name, area
+  ha find "<words>" [--domain D] [--json]  fuzzy match on friendly name, entity id and area
+  ha areas                                 areas with entity counts per domain
+  ha device-url <entity> [--json]          its device's configuration_url (LAN http only, e.g. a WLED's own
+                                           web/JSON API): printed as scheme://host[:port], the one output that
+                                           is not IP-masked; anything that is not a LAN URL is refused
+History (read-only; same gate: location, network, notification and Bluetooth entities stay hidden):
+  ha history <entity> [--since 24h|90m|7d|HH:MM|ISO] [--until ...] [--attrs a,b] [--limit N] [--json]
+                                           state changes (recorder, /api/history/period, minimal_response;
+                                           --attrs: also those gated attributes, every update) with durations
+  ha logbook [entity] [--since ...] [--until ...] [--limit N] [--json]
+                                           logbook entries (who/what changed it); hidden entities are left out
+  ha trace <automation|script> [--last N] [--json]
+                                           the last N stored runs (websocket trace/list + trace/get), summarised:
+                                           trigger, conditions passed/failed, actions run, errors (never variables
+                                           or service data)
+Writes (allowlisted domains/services, one unambiguous target, logged, read back old -> new):
+  ha on|off|toggle <target>...             or: ha on|off|toggle --area AREA [--domain light]
+  ha set <light>|--area AREA [--brightness 0-100] [--color-temp KELVIN] [--color NAME]
+  ha media <player> play|pause|stop|next|prev|mute|unmute|volume N     (N = 0-100)
+  ha scene run <scene>        ha script run <script>
+  ha call <domain.service> <entity> ['{"json": "data"}']
+To-do lists (only the lists in TODO_LISTS, default todo.shopping_list; more via ~/.config/ha/todo-lists.json
+{"lists": ["todo.x"]} or HA_TODO_LISTS=a,b): items are the owner's own list entries, printed through the gate
+  ha todo items [--list L] [--all] [--json]   open items (--all: completed too): uid, status, summary, description
+  ha todo add "<item>" [--description T] [--list L] [--json]   adds one item; prints its uid (exit 3: not seen)
+  ha todo done|undo|rm <uid|summary> [--list L] [--json]      tick off / reopen / remove one item (read back)
+  write options: -n/--dry-run (resolve + show, send nothing), --wait S (read-back timeout, default 8),
+                 --owner-ok "his words" (only for garage/gate/door-named covers, switches, buttons)
+Exit: 0 ok, 1 HA/connection error, 2 refused/ambiguous/usage, 3 sent but new state not confirmed.
+
+Safety by construction: every request passes check_request() before a byte is sent. REST for everything
+except traces:
+GET /api/states[/<entity>], GET /api/config/script/config/<id> (lock/garage check before a script runs),
+POST /api/template with the fixed AREA_TEMPLATE or DEVICE_URL_TEMPLATE (one validated entity id), POST /api/services/<domain>/<service> for the
+SERVICES allowlist (light switch input_boolean media_player remote scene script cover climate fan vacuum
+button update.install, todo add/update/remove/get_items; input_text, select and input_datetime only on the few
+helper/mode entities listed in INPUT_TEXT_WRITABLE, SELECT_WRITABLE, INPUT_DATETIME_WRITABLE) with an entity_id of that same domain and no target-redirecting keys;
+`?return_response` only for todo.get_items; todo calls target exactly one TODO_LISTS list with item fields only. No other websocket command, no config or
+registry writes (that is ha-apply's job), no raw state dumps. Read-only extras: GET /api/history/period/<ts> for
+exactly one entity (filter_entity_id, end_time, minimal_response, no_attributes, significant_changes_only=0) and
+GET /api/logbook/<ts> (end_time, entity); websocket only for trace/list and trace/get (automation|script, one item,
+check_ws()); its auth message is the handshake, not a command. lock and alarm_control_panel are never
+controllable; garage/gate/door covers, switches, buttons and update.install need --owner-ok; scenes/scripts that touch
+locks/alarms (or garages, without --owner-ok) are refused.
+Log: ~/.local/state/ha/actions.log (JSON lines: time, service, entity_ids, data, result, old -> new).
+Token: ~/.secrets/ha-admin-token (never printed). Tests: ~/opt/ha-tests/run.sh (fake HA).
+Env (tests): HA_URL, HA_TOKEN_FILE, HA_STATE_DIR, HA_TODO_LISTS, HA_TODO_CONFIG.
+"""
+import argparse
+import base64
+import contextlib
+import datetime as dt
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import struct
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+import ha_privacy as P  # noqa: E402
+
+
+def _profile_ha_url():
+    """services.ha_url from the private profile (bin/lib/assistant_profile); guarded: a copy without bin/lib or
+    a broken profile falls back to the public placeholder (then pass --url or HA_URL)."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+        import assistant_profile
+        return str(assistant_profile.get('services.ha_url'))
+    except Exception:
+        return 'http://198.51.100.7:8123'
+
+
+DEFAULT_URL = _profile_ha_url()          # = DEFAULT_URL in ~/bin/ha-audit
+DEFAULT_TOKEN_FILE = os.path.expanduser('~/.secrets/ha-admin-token')
+DEFAULT_STATE_DIR = os.path.expanduser('~/.local/state/ha')
+
+try:  # the token by handle "ha" (core.egress)
+    _lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib')
+    if _lib not in sys.path:
+        sys.path.append(_lib)  # append, so ~/bin/lib never shadows anything
+    from core import egress as _egress
+except Exception:  # a copy without ~/bin/lib: the direct path
+    _egress = None
+_REFUSED = (_egress.Refused,) if _egress is not None else ()
+
+
+def egress_handle(token_file, url_env):
+    """The handle "ha" when this run uses the live default token file and URL (a test's own token or HA_URL: direct)."""
+    if _egress is None or url_env:
+        return None
+    return 'ha' if os.path.realpath(token_file) == os.path.realpath(DEFAULT_TOKEN_FILE) else None
+
+SERVICES = {
+    'light': {'turn_on', 'turn_off', 'toggle'},
+    'switch': {'turn_on', 'turn_off', 'toggle'},
+    'input_boolean': {'turn_on', 'turn_off', 'toggle'},
+    'media_player': {'turn_on', 'turn_off', 'toggle', 'volume_up', 'volume_down', 'volume_set', 'volume_mute',
+                     'media_play', 'media_pause', 'media_play_pause', 'media_stop', 'media_next_track',
+                     'media_previous_track', 'media_seek', 'select_source', 'select_sound_mode', 'play_media',
+                     'shuffle_set', 'repeat_set', 'clear_playlist'},
+    'remote': {'turn_on', 'turn_off', 'toggle', 'send_command'},
+    'scene': {'turn_on'},
+    'script': {'turn_on', 'turn_off', 'toggle'},
+    'cover': {'open_cover', 'close_cover', 'stop_cover', 'toggle', 'set_cover_position', 'open_cover_tilt',
+              'close_cover_tilt', 'stop_cover_tilt', 'set_cover_tilt_position', 'toggle_cover_tilt'},
+    'climate': {'turn_on', 'turn_off', 'toggle', 'set_temperature', 'set_hvac_mode', 'set_preset_mode',
+                'set_fan_mode', 'set_humidity', 'set_swing_mode', 'set_swing_horizontal_mode'},
+    'fan': {'turn_on', 'turn_off', 'toggle', 'set_percentage', 'increase_speed', 'decrease_speed', 'oscillate',
+            'set_direction', 'set_preset_mode'},
+    'vacuum': {'start', 'pause', 'stop', 'return_to_base', 'locate', 'clean_spot', 'set_fan_speed'},
+    'button': {'press'},
+    'update': {'install'},
+    'todo': {'get_items', 'add_item', 'update_item', 'remove_item'},
+    'input_text': {'set_value'},          # only INPUT_TEXT_WRITABLE (feed helpers), value <= 255 chars
+    'select': {'select_option'},          # only SELECT_WRITABLE entities and their listed options
+    'input_datetime': {'set_datetime'},   # only INPUT_DATETIME_WRITABLE, one date or datetime value
+}
+# services whose answer is read with ?return_response (HA REST); nothing else may carry a query string
+RESPONSE_SERVICES = {('todo', 'get_items')}
+# todo: the item fields each service may carry (no target keys; strings only, bounded)
+TODO_FIELDS = {'get_items': {'status'}, 'add_item': {'item', 'description', 'due_date', 'due_datetime'},
+               'update_item': {'item', 'rename', 'status', 'description', 'due_date', 'due_datetime'},
+               'remove_item': {'item'}}
+TODO_STATUSES = {'needs_action', 'completed'}
+DEFAULT_TODO_LISTS = ('todo.shopping_list',)
+NEVER_DOMAINS = {'lock', 'alarm_control_panel'}
+# input_text helpers ha may write: Home autopilot 2's phone-context feed (home-ctx); nothing else
+INPUT_TEXT_WRITABLE = ('input_text.phone_context',)
+# select entities ha may set, with the only options allowed: the vacuum's work mode (vacuum / mop runs)
+SELECT_WRITABLE = {'select.deebot_work_mode': ('vacuum', 'vacuum_and_mop', 'mop_after_vacuum')}
+# input_datetime helpers ha may set: the vacuum autopilot's last mop run ("mop tomorrow" / "I mopped today")
+INPUT_DATETIME_WRITABLE = ('input_datetime.deebot_last_mop',)
+DATE_RE = re.compile(r'\d{4}-\d{2}-\d{2}')
+DATETIME_RE = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?')
+TARGET_KEYS = {'entity_id', 'device_id', 'area_id', 'floor_id', 'label_id', 'target'}
+ON_DOMAINS = ('light', 'switch', 'input_boolean', 'media_player', 'remote', 'fan', 'climate', 'scene', 'script')
+OFF_DOMAINS = ('light', 'switch', 'input_boolean', 'media_player', 'remote', 'fan', 'climate', 'script')
+TOGGLE_DOMAINS = ('light', 'switch', 'input_boolean', 'media_player', 'remote', 'fan', 'climate', 'cover')
+GARAGE_RE = re.compile(r'garag|\bgates?\b|\btor\b|einfahrt|door ?open|turoffner|tueroeffner|buzzer')
+GARAGE_CLASSES = {'garage', 'gate', 'door'}
+GUARDED_DOMAINS = {'cover', 'switch', 'button', 'remote'}
+LOCK_REF_RE = re.compile(r'\b(?:lock|alarm_control_panel)\.[a-z0-9_]+|"domain": ?"(?:lock|alarm_control_panel)"')
+GARAGE_REF_RE = re.compile(r'garag|\bgates?\b|\btor\b')
+DANGER_RE = re.compile(r'unlock|\bopen|disarm|alarm_trigger|toggle|homeassistant\.turn_on')
+
+ENTITY_ID_RE = re.compile(r'^([a-z][a-z0-9_]*)\.([a-z0-9_]+)$')
+GET_ALLOW = (re.compile(r'/api/states'), re.compile(r'/api/states/[a-z][a-z0-9_]*\.[a-z0-9_]+'),
+             re.compile(r'/api/config/script/config/[a-z0-9_]{1,120}'))
+SERVICE_PATH_RE = re.compile(r'/api/services/([a-z_]+)/([a-z0-9_]+)(\?return_response)?')
+AREA_TEMPLATE = (
+    "{%- set ns = namespace(a=[], b=[]) -%}"
+    "{%- for aid in areas() -%}{%- set ns.a = ns.a + [[aid, area_name(aid), area_entities(aid)]] -%}{%- endfor -%}"
+    "{%- for p in ['ibeacon', 'private_ble_device', 'bluetooth_le_tracker', 'bluetooth'] -%}"
+    "{%- set ns.b = ns.b + integration_entities(p) -%}{%- endfor -%}"
+    "{{ {'areas': ns.a, 'bt': ns.b} | tojson }}")
+MAX_TARGETS = 60
+# device-url: the configuration_url of one entity's device (fixed template; only the entity id varies, and
+# it must match ENTITY_ID_RE, which allows no quotes or braces)
+DEVICE_URL_TEMPLATE = "{{ {'url': device_attr(device_id('%s'), 'configuration_url')} | tojson }}"
+DEVICE_URL_TEMPLATE_RE = re.compile(re.escape(DEVICE_URL_TEMPLATE.split('%s')[0]) + r'[a-z][a-z0-9_]*\.[a-z0-9_]+'
+                                    + re.escape(DEVICE_URL_TEMPLATE.split('%s')[1]))
+LAN_URL_RE = re.compile(r'(https?)://([A-Za-z0-9][A-Za-z0-9.\-]{0,252})(?::(\d{1,5}))?/?')
+# RFC 1918 private-use blocks 10/8, 172.16/12 and 192.168/16, built from their leading octets so the public
+# tree carries no private-range address literal (its gate treats each one as a possible home-network value)
+LAN_NETS = tuple(ipaddress.ip_network((bytes([a, b, 0, 0]), p))
+                 for a, b, p in ((10, 0, 8), (172, 16, 12), (192, 168, 16)))
+LAN_SUFFIXES = ('.local', '.lan', '.home.arpa', '.fritz.box')
+# read-only history/logbook (REST) and traces (websocket); timestamps always UTC, seconds precision
+TS_PAT = r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00'
+TS_RE = re.compile(TS_PAT)
+READ_PATHS = {'history': re.compile(r'/api/history/period/' + TS_PAT), 'logbook': re.compile(r'/api/logbook/' + TS_PAT)}
+READ_QUERY = {'history': {'filter_entity_id': 'eid', 'end_time': 'ts', 'minimal_response': 'flag',
+                          'no_attributes': 'flag', 'significant_changes_only': 'zero'},
+              'logbook': {'entity': 'eid', 'end_time': 'ts'}}
+READ_REQUIRED = {'history': {'filter_entity_id', 'end_time'}, 'logbook': {'end_time'}}
+WS_ALLOW = {'trace/list': {'domain', 'item_id'}, 'trace/get': {'domain', 'item_id', 'run_id'}}
+TRACE_DOMAINS = ('automation', 'script')
+ITEM_ID_RE = re.compile(r'[A-Za-z0-9_.\-]{1,80}')
+RUN_ID_RE = re.compile(r'[A-Za-z0-9_\-]{1,64}')
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+WS_MAX = 16 << 20
+# gate classes whose history/logbook stays hidden (his whereabouts come from `vault ha now`)
+HIDE_HISTORY = {'location', 'location/network/notification', 'bluetooth'}
+GATE_HINT_ATTRS = ('friendly_name', 'unit_of_measurement', 'device_class')
+MAX_SPAN_DAYS = 31
+
+_SECRETS = []
+
+
+class Refused(Exception):
+    """Not allowed / ambiguous / not found: exit 2, nothing sent."""
+
+
+class HAError(Exception):
+    """HA or network failure: exit 1."""
+
+
+# ----------------------------------------------------------------------------- output (always gated)
+def emit(line='', err=False):
+    print(P.text_gate(line, _SECRETS), file=sys.stderr if err else sys.stdout)
+
+
+def emit_json(obj):
+    print(P.text_gate(json.dumps(obj, ensure_ascii=False, indent=1), _SECRETS))
+
+
+# ----------------------------------------------------------------------------- guard
+def check_service(domain, service, body):
+    if domain in NEVER_DOMAINS:
+        raise Refused(f'{domain} is never controlled by ha (locks/alarms need the owner himself)')
+    if domain not in SERVICES:
+        raise Refused(f'domain {domain!r} is not on the ha allowlist ({", ".join(sorted(SERVICES))})')
+    if service not in SERVICES[domain]:
+        raise Refused(f'{domain}.{service} is not on the ha allowlist '
+                      f'(allowed: {", ".join(sorted(SERVICES[domain]))})')
+    if not isinstance(body, dict):
+        raise Refused('service data must be a JSON object')
+    bad = (set(body) & TARGET_KEYS) - {'entity_id'}
+    if bad:
+        raise Refused(f'service data may not carry target keys {sorted(bad)}')
+    ids = body.get('entity_id')
+    ids = [ids] if isinstance(ids, str) else ids
+    if not ids or not isinstance(ids, list) or len(ids) > MAX_TARGETS:
+        raise Refused('a service call needs 1-%d explicit entity ids' % MAX_TARGETS)
+    for e in ids:
+        m = ENTITY_ID_RE.match(e) if isinstance(e, str) else None
+        if not m or m.group(1) != domain:
+            raise Refused(f'{e!r} is not a {domain} entity id')
+    if len(json.dumps(body)) > 4096:
+        raise Refused('service data too large')
+    if domain == 'input_text':
+        if any(e not in INPUT_TEXT_WRITABLE for e in ids):
+            raise Refused(f'only {", ".join(INPUT_TEXT_WRITABLE)} may be written (input_text)')
+        if set(body) - {'entity_id', 'value'} or not isinstance(body.get('value'), str) or len(body['value']) > 255:
+            raise Refused('input_text.set_value takes exactly one string "value" of at most 255 characters')
+    if domain == 'select':
+        if any(e not in SELECT_WRITABLE for e in ids):
+            raise Refused(f'only {", ".join(SELECT_WRITABLE)} may be set (select)')
+        if set(body) - {'entity_id', 'option'} or any(body.get('option') not in SELECT_WRITABLE[e] for e in ids):
+            raise Refused('select.select_option takes exactly one allowed "option" '
+                          f'({"; ".join(e + ": " + ", ".join(o) for e, o in SELECT_WRITABLE.items())})')
+    if domain == 'input_datetime':
+        if any(e not in INPUT_DATETIME_WRITABLE for e in ids):
+            raise Refused(f'only {", ".join(INPUT_DATETIME_WRITABLE)} may be set (input_datetime)')
+        keys = set(body) - {'entity_id'}
+        ok = (keys == {'datetime'} and isinstance(body['datetime'], str) and DATETIME_RE.fullmatch(body['datetime'])) \
+            or (keys == {'date'} and isinstance(body['date'], str) and DATE_RE.fullmatch(body['date']))
+        if not ok:
+            raise Refused('input_datetime.set_datetime takes exactly one "datetime" (YYYY-MM-DD HH:MM[:SS]) '
+                          'or "date" (YYYY-MM-DD)')
+    if domain == 'todo':
+        check_todo(service, body, ids)
+
+
+def todo_lists():
+    """The to-do lists ha may read and write: DEFAULT_TODO_LISTS + HA_TODO_LISTS (comma list) + the config file."""
+    out = list(DEFAULT_TODO_LISTS)
+    env = os.environ.get('HA_TODO_LISTS')
+    if env:
+        out += [x.strip() for x in env.split(',') if x.strip()]
+    cfg = os.environ.get('HA_TODO_CONFIG') or os.path.expanduser('~/.config/ha/todo-lists.json')
+    try:
+        with open(cfg) as fh:
+            extra = (json.load(fh) or {}).get('lists') or []
+        out += [x for x in extra if isinstance(x, str)]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return [x for x in dict.fromkeys(out) if ENTITY_ID_RE.match(x) and x.startswith('todo.')]
+
+
+def check_todo(service, body, ids):
+    if len(ids) != 1:
+        raise Refused('a todo call targets exactly one list')
+    if ids[0] not in todo_lists():
+        raise Refused(f'{ids[0]} is not an allowed to-do list (allowed: {", ".join(todo_lists())})')
+    extra = set(body) - {'entity_id'} - TODO_FIELDS[service]
+    if extra:
+        raise Refused(f'todo.{service} may not carry {sorted(extra)}')
+    for k, v in body.items():
+        if k == 'entity_id':
+            continue
+        if k == 'status' and service == 'get_items':
+            vals = [v] if isinstance(v, str) else v
+            if not isinstance(vals, list) or not vals or any(x not in TODO_STATUSES for x in vals):
+                raise Refused('todo status must be needs_action and/or completed')
+            continue
+        if not isinstance(v, str) or not v.strip() or len(v) > (1000 if k == 'description' else 255):
+            raise Refused(f'todo field {k!r} must be a non-empty string (max {1000 if k == "description" else 255})')
+        if k == 'status' and v not in TODO_STATUSES:
+            raise Refused('todo status must be needs_action or completed')
+    if service != 'get_items' and 'item' not in body:
+        raise Refused(f'todo.{service} needs an item')
+
+
+def check_read_query(path):
+    """history: exactly one entity, fixed keys; logbook: at most one entity. Anything else is refused."""
+    base, _, q = path.partition('?')
+    kind = next((k for k, rx in READ_PATHS.items() if rx.fullmatch(base)), None)
+    if not kind:
+        raise Refused(f'GET {base!r} is not on the ha allowlist')
+    try:
+        pairs = urllib.parse.parse_qsl(q, keep_blank_values=True, strict_parsing=True) if q else []
+    except ValueError:
+        raise Refused(f'GET {kind}: malformed query') from None
+    keys = [k for k, _ in pairs]
+    allowed = READ_QUERY[kind]
+    if len(set(keys)) != len(keys) or set(keys) - set(allowed) or READ_REQUIRED[kind] - set(keys):
+        raise Refused(f'GET {kind}: query keys {sorted(keys)} not allowed')
+    for k, v in pairs:
+        how = allowed[k]
+        ok = {'eid': lambda: bool(ENTITY_ID_RE.fullmatch(v)), 'ts': lambda: bool(TS_RE.fullmatch(v)),
+              'flag': lambda: v == '', 'zero': lambda: v == '0'}[how]()
+        if not ok:
+            raise Refused(f'GET {kind}: {k}={v[:60]!r} not allowed')
+
+
+def check_ws(msg_type, params):
+    """The only websocket commands ha sends: trace/list and trace/get of one automation or script."""
+    if msg_type not in WS_ALLOW:
+        raise Refused(f'websocket {msg_type!r} is not on the ha allowlist (only trace/list, trace/get)')
+    if set(params) != WS_ALLOW[msg_type]:
+        raise Refused(f'websocket {msg_type}: keys must be {sorted(WS_ALLOW[msg_type])}')
+    if params['domain'] not in TRACE_DOMAINS:
+        raise Refused(f'websocket {msg_type}: domain must be automation or script')
+    if not isinstance(params['item_id'], str) or not ITEM_ID_RE.fullmatch(params['item_id']):
+        raise Refused(f'websocket {msg_type}: bad item_id')
+    if 'run_id' in params and (not isinstance(params['run_id'], str) or not RUN_ID_RE.fullmatch(params['run_id'])):
+        raise Refused(f'websocket {msg_type}: bad run_id')
+
+
+def check_request(method, path, body=None):
+    """The only door to HA: raises Refused before anything that is not allowlisted is sent."""
+    if method == 'GET':
+        if body is None and isinstance(path, str) and path.startswith(('/api/history/', '/api/logbook/')):
+            return check_read_query(path)
+        if body is not None or not isinstance(path, str) or not any(p.fullmatch(path) for p in GET_ALLOW):
+            raise Refused(f'GET {path!r} is not on the ha allowlist')
+        return
+    if method != 'POST':
+        raise Refused(f'{method} is not allowed')
+    if path == '/api/template':
+        if body == {'template': AREA_TEMPLATE}:
+            return
+        if (isinstance(body, dict) and list(body) == ['template'] and isinstance(body['template'], str)
+                and DEVICE_URL_TEMPLATE_RE.fullmatch(body['template'])):
+            return
+        raise Refused('only the fixed area and device-url templates may be rendered')
+    m = SERVICE_PATH_RE.fullmatch(path or '')
+    if not m:
+        raise Refused(f'POST {path!r} is not on the ha allowlist')
+    if bool(m.group(3)) != ((m.group(1), m.group(2)) in RESPONSE_SERVICES):
+        raise Refused(f'POST {path!r}: ?return_response only (and always) for '
+                      + ', '.join(f'{d}.{s}' for d, s in sorted(RESPONSE_SERVICES)))
+    check_service(m.group(1), m.group(2), body)
+
+
+# ----------------------------------------------------------------------------- client
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        raise HAError('redirect refused')
+
+
+class Client:
+    def __init__(self, base, token, timeout=20, handle=None):
+        self.base = base.rstrip('/')
+        self._token = token
+        self.timeout = timeout
+        self._opener = urllib.request.build_opener(_NoRedirect())
+        self.handle = handle  # "ha" = REST by handle through core.egress (the websocket stays direct)
+
+    def _send(self, method, url, data, direct=False):
+        """REST bytes. Hub/shadow mode: through core.egress (hub: the hub puts the token on the wire). direct (the
+        all-entity logbook, MiB-sized: ~8-12 s through the hub's masking) and a GET the hub can't hand back (over its
+        8 MiB cap: response_too_large) go direct with the local token, and so do a read while the hub is down or stalled
+        (a land's CI can stall it for minutes) and a write the hub never got (connection refused, no hub token)."""
+        def req(tok):
+            return urllib.request.Request(url, data=data, method=method,
+                                          headers={'Authorization': 'Bearer ' + tok,
+                                                   'Content-Type': 'application/json', 'Accept': 'application/json'})
+        if self.handle and not (direct and self._token) and _egress.mode(self.handle) in ('hub', 'shadow'):
+            wait = min(self.timeout, 8) if method == 'GET' else self.timeout  # HA reads take < 1 s direct
+            try:
+                with _egress.open(req(_egress.secret(self.handle)), self.handle, timeout=wait) as r:
+                    return r.read()
+            except _REFUSED as e:
+                if not (method == 'GET' and e.error == 'response_too_large' and self._token):
+                    raise
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, OSError) as e:  # the hub, not HA: down, stalled or no hub token
+                reason = getattr(e, 'reason', e)
+                unsent = isinstance(reason, (ConnectionRefusedError, socket.gaierror)) or 'hub unreachable' in str(e)
+                if not (self._token and (method == 'GET' or unsent)):
+                    raise
+        if not self._token:
+            raise HAError('no local HA token for this call')
+        with self._opener.open(req(self._token), timeout=self.timeout) as r:
+            return r.read()
+
+    def request(self, method, path, body=None, raw=False):
+        check_request(method, path, body)
+        data = json.dumps(body).encode() if body is not None else None
+        p, q = (path.split('?', 1) + [''])[:2] if '?' in path else (path, '')
+        url = self.base + urllib.parse.quote(p, safe='/:') + ('?' + q if q else '')
+        big = method == 'GET' and p.startswith('/api/logbook/') and 'entity' not in urllib.parse.parse_qs(q)
+        try:
+            out = self._send(method, url, data, direct=big)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            try:
+                msg = json.loads(e.read(4096).decode('utf-8', 'replace')).get('message', '')
+            except Exception:
+                msg = ''
+            raise HAError(f'HA said HTTP {e.code}' + (f': {str(msg)[:200]}' if msg else '')) from None
+        except _REFUSED as e:
+            raise HAError(f'the hub refused the HA call ({e.error})') from None
+        except (urllib.error.URLError, OSError) as e:
+            raise HAError(f'cannot reach Home Assistant ({type(e).__name__})') from None
+        if raw:
+            return out.decode('utf-8', 'replace')
+        return json.loads(out.decode('utf-8')) if out else None
+
+    def states(self):
+        return self.request('GET', '/api/states') or []
+
+    def state(self, eid):
+        return self.request('GET', '/api/states/' + eid)
+
+    def area_info(self):
+        txt = self.request('POST', '/api/template', {'template': AREA_TEMPLATE}, raw=True)
+        return json.loads(txt or '{}')
+
+    def device_url(self, eid):
+        if not ENTITY_ID_RE.match(eid or ''):
+            raise Refused(f'{eid!r} is not an entity id')
+        txt = self.request('POST', '/api/template', {'template': DEVICE_URL_TEMPLATE % eid}, raw=True)
+        try:
+            return (json.loads(txt or '{}') or {}).get('url')
+        except (ValueError, AttributeError):
+            raise HAError('device-url: unexpected template answer') from None
+
+    def script_config(self, obj):
+        return self.request('GET', '/api/config/script/config/' + obj)
+
+    def call(self, domain, service, body):
+        return self.request('POST', f'/api/services/{domain}/{service}', body)
+
+    def todo_items(self, eid, statuses=('needs_action',)):
+        """todo.get_items of one allowed list -> [{uid, summary, status, description?, due?}]."""
+        ans = self.request('POST', '/api/services/todo/get_items?return_response',
+                           {'entity_id': eid, 'status': list(statuses)})
+        resp = (ans or {}).get('service_response') if isinstance(ans, dict) else None
+        items = ((resp or {}).get(eid) or {}).get('items')
+        if not isinstance(items, list):
+            raise HAError('todo.get_items: unexpected answer')
+        return [i for i in items if isinstance(i, dict) and i.get('uid')]
+
+    def history(self, eid, start, end, attrs=False):
+        """Recorded states of ONE entity (minimal_response + no_attributes unless attributes are wanted)."""
+        q = {'filter_entity_id': eid, 'end_time': iso_utc(end)}
+        q.update({'significant_changes_only': '0'} if attrs else {'minimal_response': '', 'no_attributes': ''})
+        ans = self.request('GET', '/api/history/period/' + iso_utc(start) + '?' + urllib.parse.urlencode(q))
+        for ser in ans or []:
+            if isinstance(ser, list) and ser and (not isinstance(ser[0], dict) or ser[0].get('entity_id') in (None, eid)):
+                return ser
+        return []
+
+    def logbook(self, start, end, eid=None):
+        q = {'end_time': iso_utc(end)}
+        if eid:
+            q['entity'] = eid
+        ans = self.request('GET', '/api/logbook/' + iso_utc(start) + '?' + urllib.parse.urlencode(q))
+        return ans if isinstance(ans, list) else []
+
+    def ws(self):
+        if not self._token:
+            raise HAError('no local HA token for the websocket (traces)')
+        return WSClient(self.base, self._token, self.timeout)
+
+
+class WSClient:
+    """Minimal RFC 6455 client (stdlib) for the read-only trace commands; call() passes check_ws() first."""
+
+    def __init__(self, base, token, timeout=20):
+        u = urllib.parse.urlparse(base)
+        if u.scheme not in ('http', 'https') or not u.hostname:
+            raise HAError('HA URL is not http(s)')
+        self.sock, self._buf, self._id = None, bytearray(), 0
+        try:
+            sock = socket.create_connection((u.hostname, u.port or (443 if u.scheme == 'https' else 80)), timeout=timeout)
+            self.sock = (ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+                         if u.scheme == 'https' else sock)
+            self._handshake(u, token)
+        except (OSError, ValueError, struct.error) as e:
+            self.close()
+            raise HAError(f'cannot reach the Home Assistant websocket ({type(e).__name__})') from None
+        except HAError:
+            self.close()
+            raise
+
+    def _handshake(self, u, token):
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f'GET {u.path.rstrip("/")}/api/websocket HTTP/1.1\r\nHost: {u.netloc}\r\n'
+                           f'Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
+                           f'Sec-WebSocket-Version: 13\r\n\r\n').encode())
+        lines = self._until(b'\r\n\r\n').decode('latin-1').split('\r\n')
+        status = lines[0].split()
+        if len(status) < 2 or status[1] != '101':
+            raise HAError(f'websocket upgrade refused (HTTP {status[1] if len(status) > 1 else "?"})')
+        hdrs = {ln.split(':', 1)[0].strip().lower(): ln.split(':', 1)[1].strip() for ln in lines[1:] if ':' in ln}
+        if hdrs.get('sec-websocket-accept') != base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode():
+            raise HAError('websocket accept key mismatch')
+        if self._recv().get('type') != 'auth_required':
+            raise HAError('websocket: no auth_required')
+        self._send({'type': 'auth', 'access_token': token})
+        if self._recv().get('type') != 'auth_ok':
+            raise HAError('websocket auth failed')
+
+    def _until(self, delim):
+        while delim not in self._buf:
+            if len(self._buf) > 65536:
+                raise HAError('websocket handshake too long')
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise HAError('websocket closed during the handshake')
+            self._buf.extend(chunk)
+        i = self._buf.index(delim) + len(delim)
+        out = bytes(self._buf[:i])
+        del self._buf[:i]
+        return out
+
+    def _exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(min(max(n - len(self._buf), 4096), 1 << 20))
+            if not chunk:
+                raise HAError('websocket closed')
+            self._buf.extend(chunk)
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def _frame(self, op, payload):
+        n, mask = len(payload), os.urandom(4)
+        if n < 126:
+            hdr = bytes([0x80 | op, 0x80 | n])
+        elif n < 65536:
+            hdr = bytes([0x80 | op, 0x80 | 126]) + struct.pack('!H', n)
+        else:
+            hdr = bytes([0x80 | op, 0x80 | 127]) + struct.pack('!Q', n)
+        self.sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _recv(self):
+        parts, size = [], 0
+        while True:
+            b1, b2 = self._exact(2)
+            op, n = b1 & 0x0F, b2 & 0x7F
+            if n == 126:
+                n = struct.unpack('!H', self._exact(2))[0]
+            elif n == 127:
+                n = struct.unpack('!Q', self._exact(8))[0]
+            size += n
+            if size > WS_MAX:
+                raise HAError('websocket message too large')
+            mask = self._exact(4) if b2 & 0x80 else None
+            data = self._exact(n)
+            if mask:
+                data = bytes(c ^ mask[i % 4] for i, c in enumerate(data))
+            if op == 0x9:              # ping -> pong (control frame, not an HA command)
+                self._frame(0xA, data)
+                size -= n
+                continue
+            if op == 0xA:
+                size -= n
+                continue
+            if op == 0x8:
+                raise HAError('websocket closed by HA')
+            parts.append(data)
+            if b1 & 0x80:
+                return json.loads(b''.join(parts).decode('utf-8'))
+
+    def _send(self, obj):
+        self._frame(0x1, json.dumps(obj).encode('utf-8'))
+
+    def call(self, msg_type, **params):
+        """One allowlisted command -> its result (None for not_found)."""
+        check_ws(msg_type, params)
+        self._id += 1
+        mid = self._id
+        try:
+            self._send(dict(params, id=mid, type=msg_type))
+            for _ in range(500):
+                msg = self._recv()
+                if msg.get('id') != mid or msg.get('type') != 'result':
+                    continue
+                if msg.get('success'):
+                    return msg.get('result')
+                err = msg.get('error') or {}
+                if err.get('code') == 'not_found':
+                    return None
+                raise HAError(f'HA websocket {msg_type}: {str(err.get("message") or err.get("code"))[:200]}')
+        except (OSError, ValueError, struct.error) as e:
+            raise HAError(f'websocket {msg_type} failed ({type(e).__name__})') from None
+        raise HAError(f'websocket {msg_type}: no answer')
+
+    def close(self):
+        if self.sock is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            self._frame(0x8, struct.pack('!H', 1000))
+        with contextlib.suppress(OSError):
+            self.sock.close()
+        self.sock = None
+
+
+# ----------------------------------------------------------------------------- world model
+class World:
+    def __init__(self, client):
+        self.c = client
+        self.raw = {s['entity_id']: s for s in client.states() if isinstance(s, dict) and s.get('entity_id')}
+        self.zone_names = [(s.get('attributes') or {}).get('friendly_name') or eid.split('.', 1)[1]
+                           for eid, s in self.raw.items() if eid.startswith('zone.')]
+        self.areas, self.area_of, self.bt = [], {}, set()
+        try:
+            info = client.area_info()
+            for aid, name, eids in info.get('areas') or []:
+                self.areas.append((aid, name, list(eids or [])))
+                for e in eids or []:
+                    self.area_of[e] = name
+            self.bt = set(info.get('bt') or [])
+        except (HAError, ValueError, TypeError) as e:
+            emit(f'ha: note: areas unavailable ({e})', err=True)
+        self._g = {}
+
+    def gated(self, eid, s=None):
+        if s is not None:
+            return P.gate_state(s, self.zone_names, self.bt, self.area_of.get(eid))
+        if eid not in self._g:
+            self._g[eid] = P.gate_state(self.raw[eid], self.zone_names, self.bt, self.area_of.get(eid))
+        return self._g[eid]
+
+    def lookup_id(self, t):
+        """An entity id as typed, or as ha printed it (privacy-masked, e.g. vacuum.<email>) -> real id|None."""
+        if t in self.raw:
+            return t
+        if '<' in t or '[' in t:
+            hits = [e for e in self.raw if self.gated(e)['entity_id'] == t]
+            if len(hits) == 1:
+                return hits[0]
+            if hits:
+                raise Refused(f'{t} stands for {len(hits)} entities; use a name or ha find')
+        return None
+
+    def resolve_area(self, q):
+        if not self.areas:
+            raise Refused('no areas known')
+        nq = P.norm(q)
+        hits = [a for a in self.areas if a[0] == q or P.norm(a[1]) == nq]
+        if not hits:
+            hits = [a for a in self.areas if P.norm(a[1]).startswith(nq) or nq in P.norm(a[1])]
+        if len(hits) == 1:
+            return hits[0]
+        names = ', '.join(sorted(a[1] for a in (hits or self.areas)))
+        raise Refused(f'area {q!r} is {"ambiguous" if hits else "unknown"}; areas: {names}')
+
+
+def _tok_ok(tok, words, joined):
+    t = tok[:-1] if len(tok) > 3 and tok.endswith('s') else tok
+    return any(w.startswith(t) for w in words) or (len(t) >= 4 and t in joined)
+
+
+def match_score(world, eid, query):
+    """0 = no match; higher = better. Matches the gated name, the entity id and the area."""
+    g = world.gated(eid)
+    dom, _, obj = g['entity_id'].partition('.')
+    name, area = P.norm(g['name']), P.norm(g['area'] or '')
+    toks = P.norm(query).split()
+    if not toks:
+        return 0
+    words = (name + ' ' + P.norm(obj) + ' ' + area + ' ' + P.norm(dom)).split()
+    joined = ''.join(words)
+    if not all(_tok_ok(t, words, joined) for t in toks):
+        return 0
+    nq = ' '.join(toks)
+    score = 10
+    if name == nq or P.norm(obj) == nq:
+        score = 100
+    elif all(_tok_ok(t, name.split(), name.replace(' ', '')) for t in toks):
+        score = 50
+    if world.raw[eid].get('state') not in ('unavailable', 'unknown'):
+        score += 1
+    return score
+
+
+def _cands(ids, world):
+    out = []
+    for e in sorted(ids):
+        st = world.raw.get(e, {}).get('state')
+        out.append(e + (' (unavailable)' if st == 'unavailable' else ''))
+    return out
+
+
+def resolve(world, target, domains, what):
+    """target -> exactly one entity id of one of `domains`, or Refused (ambiguous: candidate ids only)."""
+    t = (target or '').strip()
+    real = world.lookup_id(t) if ('<' in t or '[' in t) else None
+    if real:
+        t = real
+    m = ENTITY_ID_RE.match(t)
+    if m:
+        dom = m.group(1)
+        if dom in NEVER_DOMAINS:
+            raise Refused(f'{t}: {dom} is never controlled by ha (locks/alarms need the owner himself)')
+        if t not in world.raw:
+            raise Refused(f'{t}: no such entity (try: ha find "<words>")')
+        if dom not in domains:
+            raise Refused(f'{t}: {what} does not apply to {dom} (works on: {", ".join(domains)})')
+        return t
+    pool = [e for e in world.raw if e.split('.', 1)[0] in domains]
+    slug = P.slugify(t)
+    by_obj = [e for e in pool if e.split('.', 1)[1] == slug]
+    if len(by_obj) == 1:
+        return by_obj[0]
+    nt = P.norm(t)
+    by_name = [e for e in pool if P.norm(world.gated(e)['name']) == nt]
+    if len(by_name) == 1:
+        return by_name[0]
+    hits = by_name if len(by_name) > 1 else [e for e in pool if match_score(world, e, t)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise Refused(f'no {"/".join(domains)} entity matches {t!r} (try: ha find "<words>")')
+    lst = _cands(hits, world)
+    more = f' (+{len(lst) - 20} more)' if len(lst) > 20 else ''
+    raise Refused(f'{t!r} is ambiguous ({len(hits)} matches); use an entity id:\n  ' + '\n  '.join(lst[:20]) + more)
+
+
+# ----------------------------------------------------------------------------- formatting
+def brief(g):
+    """state plus the few attributes that matter for control, from a GATED dict."""
+    s, a, dom = str(g['state']), g['attributes'], g['entity_id'].split('.', 1)[0]
+    bits = [s]
+    if dom == 'light' and s == 'on':
+        if isinstance(a.get('brightness'), (int, float)):
+            bits.append(f"{round(a['brightness'] / 255 * 100)}%")
+        if a.get('color_temp_kelvin'):
+            bits.append(f"{a['color_temp_kelvin']}K")
+    elif dom == 'media_player' and s not in ('off', 'unavailable', 'unknown'):
+        if isinstance(a.get('volume_level'), (int, float)):
+            bits.append(f"vol {round(a['volume_level'] * 100)}%")
+        if a.get('is_volume_muted'):
+            bits.append('muted')
+        if a.get('source'):
+            bits.append(f"src {a['source']}")
+        elif a.get('app_name'):
+            bits.append(f"app {a['app_name']}")
+    elif dom == 'climate':
+        if a.get('current_temperature') is not None:
+            bits.append(f"now {a['current_temperature']}°")
+        if a.get('temperature') is not None:
+            bits.append(f"target {a['temperature']}°")
+    elif dom == 'cover' and a.get('current_position') is not None:
+        bits.append(f"{a['current_position']}%")
+    elif dom == 'fan' and s == 'on' and a.get('percentage') is not None:
+        bits.append(f"{a['percentage']}%")
+    elif dom == 'script' and a.get('last_triggered'):
+        bits.append(f"last {a['last_triggered']}")
+    elif a.get('unit_of_measurement') and s not in ('unavailable', 'unknown', '<hidden>'):
+        bits[0] = f"{s} {a['unit_of_measurement']}"
+    return ' '.join(str(b) for b in bits)
+
+
+def line(g):
+    name = f'"{g["name"]}"' if g['name'] else ''
+    area = f'[{g["area"]}]' if g['area'] else ''
+    return f'{g["entity_id"]:<44} {brief(g):<22} {name} {area}'.rstrip()
+
+
+def _fmt_val(v):
+    if isinstance(v, (dict, list)):
+        v = json.dumps(v, ensure_ascii=False)
+    s = str(v)
+    return s if len(s) <= 160 else s[:157] + '...'
+
+
+# ----------------------------------------------------------------------------- reads
+def cmd_state(world, args):
+    t = args.target.strip()
+    real = world.lookup_id(t)
+    if real or ENTITY_ID_RE.match(t):
+        if not real:
+            raise Refused(f'{t}: no such entity (try: ha find "<words>")')
+        ids = [real]
+    else:
+        scored = sorted(((match_score(world, e, t), e) for e in world.raw), key=lambda x: (-x[0], x[1]))
+        scored = [x for x in scored if x[0]]
+        if not scored:
+            raise Refused(f'nothing matches {t!r}')
+        top = [e for sc, e in scored if sc >= 100]
+        ids = top if len(top) == 1 else [e for _, e in scored]
+    if len(ids) > 1:
+        if args.json:
+            emit_json([world.gated(e) for e in ids[:15]])
+        else:
+            emit(f'{len(ids)} entities match {t!r}:')
+            for e in ids[:15]:
+                emit(line(world.gated(e)))
+            if len(ids) > 15:
+                emit(f'... +{len(ids) - 15} more (narrow it, or ha find)')
+        return 0
+    g = world.gated(ids[0])
+    if args.json:
+        emit_json(g)
+        return 0
+    head = g['entity_id'] + (f' "{g["name"]}"' if g['name'] else '') + (f' [{g["area"]}]' if g['area'] else '')
+    emit(head)
+    emit(f'state: {g["state"]}')
+    for k, v in sorted(g['attributes'].items()):
+        if k in ('supported_features', 'icon'):
+            continue
+        emit(f'  {k}: {_fmt_val(v)}')
+    if g['hidden']:
+        emit(f'  ({g["hidden"]} details hidden by the privacy gate)')
+    return 0
+
+
+def cmd_list(world, args):
+    ids = list(world.raw)
+    if args.domain:
+        ids = [e for e in ids if e.split('.', 1)[0] == args.domain]
+    if args.area:
+        aid, aname, aeids = world.resolve_area(args.area)
+        ids = [e for e in ids if e in set(aeids)]
+    ids.sort(key=lambda e: (world.area_of.get(e) or '~', e))
+    if args.json:
+        emit_json([world.gated(e) for e in ids[:args.limit]])
+        return 0
+    for e in ids[:args.limit]:
+        emit(line(world.gated(e)))
+    if len(ids) > args.limit:
+        emit(f'... {len(ids) - args.limit} more (narrow with a domain or --area, or --limit N)')
+    if not ids:
+        emit('(nothing)')
+    return 0
+
+
+def cmd_find(world, args):
+    pool = [e for e in world.raw if not args.domain or e.split('.', 1)[0] == args.domain]
+    scored = sorted(((match_score(world, e, args.words), e) for e in pool), key=lambda x: (-x[0], x[1]))
+    hits = [e for sc, e in scored if sc][:args.limit]
+    if args.json:
+        emit_json([world.gated(e) for e in hits])
+        return 0
+    for e in hits:
+        emit(line(world.gated(e)))
+    if not hits:
+        emit(f'nothing matches {args.words!r}')
+        return 2
+    return 0
+
+
+def cmd_areas(world, args):
+    counted = set()
+    for aid, name, eids in sorted(world.areas, key=lambda a: P.norm(a[1])):
+        doms = {}
+        for e in eids:
+            if e in world.raw:
+                d = e.split('.', 1)[0]
+                doms[d] = doms.get(d, 0) + 1
+                counted.add(e)
+        top = ', '.join(f'{n} {d}' for d, n in sorted(doms.items(), key=lambda x: (-x[1], x[0]))[:8])
+        emit(f'{name} ({aid}): {top or "no entities"}')
+    rest = len(set(world.raw) - counted)
+    emit(f'(no area): {rest} entities')
+    return 0
+
+
+# ----------------------------------------------------------------------------- writes
+def lan_url(u):
+    """configuration_url -> 'scheme://host[:port]' when it points into the LAN (RFC 1918 IPv4, or a
+    single-label / .local / .lan / .home.arpa hostname), else None (also for any path, user or query)."""
+    m = LAN_URL_RE.fullmatch(u.strip()) if isinstance(u, str) else None
+    if not m:
+        return None
+    scheme, host, port = m.groups()
+    if port and not 0 < int(port) < 65536:
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        if not any(ip in n for n in LAN_NETS):
+            return None
+    elif re.fullmatch(r'[0-9.]+', host) or not ('.' not in host or host.lower().endswith(LAN_SUFFIXES)):
+        return None
+    return f'{scheme}://{host}' + (f':{port}' if port else '')
+
+
+def cmd_device_url(world, args):
+    """Read-only. The URL is printed as is (no IP mask): it was validated to be a bare LAN http URL."""
+    doms = sorted({e.split('.', 1)[0] for e in world.raw} - set(NEVER_DOMAINS)) or ['light']
+    eid = resolve(world, args.target, doms, 'device-url')
+    url = world.c.device_url(eid)
+    if not url:
+        raise Refused(f'{world.gated(eid)["entity_id"]}: its device has no configuration_url')
+    lan = lan_url(url)
+    if not lan:
+        raise Refused(f'{world.gated(eid)["entity_id"]}: configuration_url is not a LAN http URL (not printed)')
+    if args.json:
+        print(json.dumps({'entity_id': world.gated(eid)['entity_id'], 'url': lan}))
+    else:
+        print(lan)
+    return 0
+
+
+def is_garage(world, eid):
+    dom = eid.split('.', 1)[0]
+    if dom not in GUARDED_DOMAINS:
+        return False
+    a = world.raw[eid].get('attributes') or {}
+    if dom == 'cover' and str(a.get('device_class') or '') in GARAGE_CLASSES:
+        return True
+    return bool(GARAGE_RE.search(P.norm(eid.split('.', 1)[1].replace('_', ' ') + ' ' +
+                                        str(a.get('friendly_name') or ''))))
+
+
+def check_targets(world, domain, service, eids, args):
+    """Domain-independent safety checks that need state: garage-ish entities, scenes/scripts touching
+    locks/alarms/garages."""
+    notes = []
+    for e in eids:
+        if world.raw[e].get('state') == 'unavailable':
+            raise Refused(f'{e} is unavailable in HA (device off or unreachable); HA would ignore the call')
+        if domain == 'update' and not args.owner_ok:
+            raise Refused(f'{e}: installing an update needs the owner\'s OK for this update: ask him, then rerun with '
+                          f'--owner-ok "<his words>"')
+        if is_garage(world, e) and not args.owner_ok:
+            raise Refused(f'{e} looks like a garage/gate/door opener: ask the owner first, then rerun with '
+                          f'--owner-ok "<his words>"')
+        if domain == 'scene' and service == 'turn_on':
+            members = (world.raw[e].get('attributes') or {}).get('entity_id') or []
+            members = [members] if isinstance(members, str) else members
+            if any(str(m).split('.', 1)[0] in NEVER_DOMAINS for m in members):
+                raise Refused(f'{e} sets a lock/alarm: not with ha (the owner does that himself)')
+            if any(str(m) in world.raw and is_garage(world, str(m)) for m in members) and not args.owner_ok:
+                raise Refused(f'{e} moves a garage/gate/door: ask the owner first, then --owner-ok "<his words>"')
+        if domain == 'script' and service in ('turn_on', 'toggle'):
+            cfg = None
+            try:
+                cfg = world.c.script_config(e.split('.', 1)[1])
+            except HAError:
+                cfg = None
+            if not cfg:
+                notes.append(f'{e}: config not readable (YAML script?), lock/garage check skipped')
+                continue
+            txt = json.dumps(cfg).lower()
+            if LOCK_REF_RE.search(txt) and DANGER_RE.search(txt):
+                raise Refused(f'{e} can unlock/disarm/open a lock or alarm: not with ha (the owner does that himself)')
+            if GARAGE_REF_RE.search(txt) and DANGER_RE.search(txt) and not args.owner_ok:
+                raise Refused(f'{e} can open a garage/gate: ask the owner first, then --owner-ok "<his words>"')
+    return notes
+
+
+def log_action(entry):
+    d = os.environ.get('HA_STATE_DIR') or DEFAULT_STATE_DIR
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(d, 'actions.log'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, 'a') as fh:
+        fh.write(P.text_gate(json.dumps(entry, ensure_ascii=False), _SECRETS) + '\n')
+
+
+def do_write(world, domain, service, eids, data, args, expect, label=None):
+    """Send one allowlisted call, log it, read back every target and print old -> new."""
+    bad = set(data or {}) & TARGET_KEYS
+    if bad:
+        raise Refused(f'service data may not carry target keys {sorted(bad)}')
+    body = dict(data or {})
+    body['entity_id'] = eids[0] if len(eids) == 1 else list(eids)
+    check_service(domain, service, body)                      # refuse early (Client re-checks)
+    notes = check_targets(world, domain, service, eids, args)
+    for n in notes:
+        emit('note: ' + n, err=True)
+    svc = f'{domain}.{service}'
+    old = {e: world.gated(e) for e in eids}
+    if args.dry_run:
+        extra = f' {json.dumps(data, ensure_ascii=False)}' if data else ''
+        emit(f'dry run: would call {svc}{extra} on:')
+        for e in eids:
+            emit(f'  {old[e]["entity_id"]}: {brief(old[e])}')
+        return 0
+    entry = {'ts': dt.datetime.now().astimezone().isoformat(timespec='seconds'), 'service': svc,
+             'entity_ids': list(eids), 'data': data or {}, 'cmd': label}
+    if args.owner_ok:
+        entry['owner_ok'] = args.owner_ok
+    try:
+        world.c.call(domain, service, body)
+    except (HAError, Refused) as e:
+        entry['result'] = f'error: {e}'
+        log_action(entry)
+        raise
+    deadline = time.monotonic() + max(0.0, args.wait)
+    new, done = {}, set()
+    while True:
+        for e in eids:
+            if e in done:
+                continue
+            try:
+                s = world.c.state(e)
+            except HAError:
+                s = None
+            if s:
+                new[e] = s
+                if expect is None or expect(world.raw[e], s):
+                    done.add(e)
+        if len(done) == len(eids) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.4)
+    ok = len(done) == len(eids)
+    entry['result'] = 'ok' if ok else ('sent' if expect is None else 'unconfirmed')
+    entry['old'] = {e: brief(old[e]) for e in eids}
+    entry['new'] = {e: brief(world.gated(e, new[e])) if e in new else '?' for e in eids}
+    log_action(entry)
+    for e in eids:
+        was = brief(old[e])
+        now = entry['new'][e]
+        mark = ''
+        if expect is not None:
+            already = expect(world.raw[e], world.raw[e]) and service not in ('toggle',)
+            mark = ' ok' if e in done else f' (not confirmed after {args.wait:g}s)'
+            if e in done and already and was == now:
+                mark = ' ok (already)'
+        elif was == now:
+            mark = ' (no visible change)'
+        emit(f'{world.gated(e)["entity_id"]}: {was} -> {now}{mark}')
+    return 0 if ok or expect is None else 3
+
+
+def _st(s):
+    return str((s or {}).get('state'))
+
+
+def _attr(s, k):
+    return ((s or {}).get('attributes') or {}).get(k)
+
+
+def _changed(o, n):
+    return _st(o) != _st(n) or (n or {}).get('last_updated') != (o or {}).get('last_updated') or \
+        _attr(o, 'last_triggered') != _attr(n, 'last_triggered')
+
+
+def expect_on(o, n):
+    return _st(n) not in ('off', 'unavailable', 'unknown', 'standby')
+
+
+def expect_off(o, n):
+    return _st(n) in ('off', 'standby')
+
+
+def expect_toggle(o, n):
+    return _st(n) != _st(o) and _st(n) not in ('unavailable', 'unknown')
+
+
+def area_targets(world, args, domains):
+    dom = args.domain or 'light'
+    if dom not in domains or dom in ('scene', 'script'):
+        raise Refused(f'--area works on: {", ".join(d for d in domains if d not in ("scene", "script"))}')
+    aid, aname, aeids = world.resolve_area(args.area)
+    ids = sorted(e for e in aeids if e.split('.', 1)[0] == dom and e in world.raw
+                 and world.raw[e].get('state') not in ('unavailable', 'unknown'))
+    if not ids:
+        raise Refused(f'no available {dom} entities in {aname}')
+    if len(ids) > MAX_TARGETS:
+        raise Refused('too many targets')
+    return ids
+
+
+def cmd_onoff(world, args):
+    action = args.cmd
+    domains = {'on': ON_DOMAINS, 'off': OFF_DOMAINS, 'toggle': TOGGLE_DOMAINS}[action]
+    if args.area:
+        if args.targets:
+            raise Refused('give targets or --area, not both')
+        ids = area_targets(world, args, domains)
+    else:
+        if not args.targets:
+            raise Refused(f'usage: ha {action} <target>... | --area AREA [--domain light]')
+        ids = [resolve(world, t, domains, action) for t in args.targets]
+    rc = 0
+    by_dom = {}
+    for e in dict.fromkeys(ids):
+        by_dom.setdefault(e.split('.', 1)[0], []).append(e)
+    for dom, eids in by_dom.items():
+        if action == 'on':
+            exp = _changed if dom in ('scene', 'script') else expect_on
+            svc = 'turn_on'
+        elif action == 'off':
+            exp, svc = expect_off, 'turn_off'
+        else:
+            exp, svc = expect_toggle, 'toggle'
+        rc = max(rc, do_write(world, dom, svc, eids, None, args, exp, label=f'{action}'))
+    return rc
+
+
+def cmd_set(world, args):
+    data = {}
+    if args.brightness is not None:
+        if not 0 <= args.brightness <= 100:
+            raise Refused('--brightness is a percentage 0-100')
+        data['brightness_pct'] = args.brightness
+    if args.color_temp is not None:
+        if not 1000 <= args.color_temp <= 12000:
+            raise Refused('--color-temp is in kelvin (e.g. 2700 warm, 4000 neutral, 6500 cold)')
+        data['color_temp_kelvin'] = args.color_temp
+    if args.color:
+        if not re.fullmatch(r'[a-z]{3,25}', args.color.lower()):
+            raise Refused('--color takes a CSS colour name (red, blue, warmwhite is not one: use --color-temp)')
+        data['color_name'] = args.color.lower()
+    if not data:
+        raise Refused('nothing to set: --brightness N, --color-temp K or --color NAME')
+    if args.area:
+        if args.target:
+            raise Refused('give a light or --area, not both')
+        args.domain = 'light'
+        ids = area_targets(world, args, ('light',))
+    else:
+        if not args.target:
+            raise Refused('usage: ha set <light>|--area AREA --brightness N ...')
+        ids = [resolve(world, args.target, ('light',), 'set')]
+
+    def exp(o, n):
+        if args.brightness == 0:
+            return _st(n) == 'off'
+        if _st(n) != 'on':
+            return False
+        if args.brightness is not None:
+            b = _attr(n, 'brightness')
+            if not isinstance(b, (int, float)) or abs(b / 255 * 100 - args.brightness) > 3:
+                return False
+        if args.color_temp is not None:
+            k = _attr(n, 'color_temp_kelvin')
+            if not isinstance(k, (int, float)) or abs(k - args.color_temp) > max(60, args.color_temp * 0.03):
+                return False
+        return True
+    return do_write(world, 'light', 'turn_on', ids, data, args, exp if not args.color else _changed, label='set')
+
+
+MEDIA = {'play': ('media_play', lambda o, n: _st(n) == 'playing'),
+         'pause': ('media_pause', lambda o, n: _st(n) == 'paused'),
+         'stop': ('media_stop', lambda o, n: _st(n) not in ('playing', 'unavailable')),
+         'next': ('media_next_track', _changed),
+         'prev': ('media_previous_track', _changed),
+         'mute': ('volume_mute', lambda o, n: _attr(n, 'is_volume_muted') is True),
+         'unmute': ('volume_mute', lambda o, n: _attr(n, 'is_volume_muted') is False)}
+
+
+def cmd_media(world, args):
+    eid = resolve(world, args.player, ('media_player',), 'media')
+    act = args.action
+    if act == 'volume':
+        if args.value is None or not 0 <= args.value <= 100:
+            raise Refused('usage: ha media <player> volume N   (N = 0-100)')
+        lvl = round(args.value / 100, 2)
+        return do_write(world, 'media_player', 'volume_set', [eid], {'volume_level': lvl}, args,
+                        lambda o, n: isinstance(_attr(n, 'volume_level'), (int, float)) and
+                        abs(_attr(n, 'volume_level') - lvl) <= 0.021, label='media volume')
+    svc, exp = MEDIA[act]
+    data = {'is_volume_muted': act == 'mute'} if act in ('mute', 'unmute') else None
+    return do_write(world, 'media_player', svc, [eid], data, args, exp, label=f'media {act}')
+
+
+def cmd_run(world, args):
+    dom = args.cmd
+    eid = resolve(world, args.target, (dom,), f'{dom} run')
+    return do_write(world, dom, 'turn_on', [eid], None, args, _changed, label=f'{dom} run')
+
+
+def cmd_call(world, args):
+    m = re.fullmatch(r'([a-z_]+)\.([a-z0-9_]+)', args.service or '')
+    if not m:
+        raise Refused('usage: ha call <domain.service> <entity> [json]')
+    domain, service = m.groups()
+    data = {}
+    if args.data:
+        try:
+            data = json.loads(args.data)
+        except ValueError:
+            raise Refused('the data argument must be JSON, e.g. \'{"source": "HDMI 1"}\'') from None
+        if not isinstance(data, dict):
+            raise Refused('the data argument must be a JSON object')
+    if domain == 'script' and service not in SERVICES['script'] and service != 'reload':
+        # script.<name> -> script.turn_on on that script (non-blocking, same checks)
+        if not args.entity:
+            args.entity, service = f'script.{service}', 'turn_on'
+            data = {'variables': data} if data else {}
+    bad = set(data) & TARGET_KEYS
+    if bad:
+        raise Refused(f'service data may not carry target keys {sorted(bad)}')
+    probe = (todo_lists() or ['todo.x'])[0] if domain == 'todo' else \
+        {'input_text': INPUT_TEXT_WRITABLE[0], 'select': next(iter(SELECT_WRITABLE)),
+         'input_datetime': INPUT_DATETIME_WRITABLE[0]}.get(domain, f'{domain}.x')
+    check_service(domain, service, dict(data, entity_id=probe))   # domain/service first
+    if not args.entity:
+        raise Refused('ha call needs a target entity')
+    eid = resolve(world, args.entity, (domain,), f'{domain}.{service}')
+    # select: confirmed only once the entity reports the chosen option (a mode the device refused stays visible)
+    expect = (lambda o, n, want=data.get('option'): _st(n) == want) if domain == 'select' else None
+    return do_write(world, domain, service, [eid], data, args, expect, label='call')
+
+
+def _todo_row(i):
+    row = {'uid': str(i.get('uid')), 'summary': str(i.get('summary') or ''), 'status': str(i.get('status') or '')}
+    for k in ('description', 'due'):
+        if i.get(k):
+            row[k] = str(i[k])
+    return row
+
+
+def _todo_match(items, ref):
+    """uid exactly, else summary (case-insensitive, open items first) -> one item, or Refused."""
+    hits = [i for i in items if i['uid'] == ref]
+    if not hits:
+        n = P.norm(ref)
+        same = [i for i in items if P.norm(i['summary']) == n]
+        hits = [i for i in same if i['status'] == 'needs_action'] or same
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise Refused(f'no item {ref!r} on the list (ha todo items --all)')
+    raise Refused(f'{ref!r} matches {len(hits)} items; use the uid: ' + ', '.join(i['uid'] for i in hits[:10]))
+
+
+def cmd_todo(world, args):
+    """ha todo items|add|done|undo|rm on one allowed to-do list; writes go through do_write + a read-back."""
+    eid = args.list
+    if eid not in todo_lists():
+        raise Refused(f'{eid} is not an allowed to-do list (allowed: {", ".join(todo_lists())})')
+    if eid not in world.raw:
+        raise Refused(f'{eid}: no such entity in HA')
+    both = ('needs_action', 'completed')
+    if args.verb == 'items':
+        if args.text:
+            raise Refused('usage: ha todo items [--list L] [--all] [--json]')
+        rows = [_todo_row(i) for i in world.c.todo_items(eid, both if args.all else ('needs_action',))]
+        if args.json:
+            emit_json(rows)
+        else:
+            for r in rows:
+                emit('\t'.join([r['uid'], r['status'], r['summary']] + ([r['description']] if r.get('description') else [])))
+            if not rows:
+                emit('(no open items)' if not args.all else '(empty list)')
+        return 0
+    if not args.text:
+        raise Refused(f'usage: ha todo {args.verb} <{"item" if args.verb == "add" else "uid|summary"}>')
+    before = [_todo_row(i) for i in world.c.todo_items(eid, both)]
+    if args.verb == 'add':
+        data = {'item': args.text}
+        if args.description:
+            data['description'] = args.description
+        service, label = 'add_item', 'todo add'
+    else:
+        if args.description:
+            raise Refused('--description only with add')
+        it = _todo_match(before, args.text)
+        if args.verb == 'rm':
+            data, service = {'item': it['uid']}, 'remove_item'
+        else:
+            data = {'item': it['uid'], 'status': 'completed' if args.verb == 'done' else 'needs_action'}
+            service = 'update_item'
+        label = f'todo {args.verb}'
+    out = sys.stderr if args.json else sys.stdout
+    with contextlib.redirect_stdout(out):
+        rc = do_write(world, 'todo', service, [eid], data, args, None, label=label)
+    if args.dry_run or rc:
+        return rc
+    after, deadline, found = [], time.monotonic() + max(0.0, args.wait), None
+    while True:
+        try:
+            after = [_todo_row(i) for i in world.c.todo_items(eid, both)]
+        except HAError:
+            after = []
+        if args.verb == 'add':
+            known = {i['uid'] for i in before}
+            new = [i for i in after if i['uid'] not in known and P.norm(i['summary']) == P.norm(args.text)]
+            found = new[-1] if new else None
+        elif args.verb == 'rm':
+            found = None if any(i['uid'] == data['item'] for i in after) else {'uid': data['item'], 'status': 'removed'}
+        else:
+            hit = [i for i in after if i['uid'] == data['item'] and i['status'] == data['status']]
+            found = hit[0] if hit else None
+        if found or time.monotonic() >= deadline:
+            break
+        time.sleep(0.4)
+    if not found:
+        emit(f'ha: todo {args.verb}: not confirmed after {args.wait:g}s', err=True)
+        return 3
+    if args.json:
+        emit_json(found)
+    else:
+        emit(f'{args.verb}: ' + '\t'.join(x for x in (found.get('uid'), found.get('status'), found.get('summary')) if x))
+    return 0
+
+
+# ----------------------------------------------------------------------------- main
+# ----------------------------------------------------------------------------- history, logbook, traces (read-only)
+REL_RE = re.compile(r'(?:\d{1,6}[smhdw])+')
+REL_UNITS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+
+
+def iso_utc(t):
+    return t.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def iso_local(t):
+    return t.astimezone().replace(microsecond=0).isoformat() if t else None
+
+
+def fmt_local(t):
+    return t.astimezone().strftime('%d.%m %H:%M:%S') if t else '?'
+
+
+def parse_ts(v):
+    """HA timestamp (ISO string or epoch float) -> aware datetime | None."""
+    try:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return dt.datetime.fromtimestamp(v, dt.timezone.utc)
+        t = dt.datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+        return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def parse_when(s, now, what):
+    """24h | 90m | 1d12h | 2w | now | HH:MM (last such time) | ISO date/time (naive = local) -> aware datetime."""
+    s = (s or '').strip()
+    if s == 'now':
+        return now
+    if REL_RE.fullmatch(s):
+        return now - dt.timedelta(seconds=sum(int(n) * REL_UNITS[u] for n, u in re.findall(r'(\d+)([smhdw])', s)))
+    m = re.fullmatch(r'([01]?\d|2[0-3]):([0-5]\d)', s)
+    if m:
+        t = now.astimezone().replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        return t - dt.timedelta(days=1) if t > now else t
+    try:
+        t = dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except ValueError:
+        raise Refused(f'{what} {s!r}: use 24h, 90m, 7d, HH:MM or an ISO date/time') from None
+    return t if t.tzinfo else t.astimezone()
+
+
+def fmt_dur(sec):
+    sec = int(max(sec, 0))
+    if sec < 60:
+        return f'{sec}s'
+    if sec < 3600:
+        return f'{sec // 60}m'
+    if sec < 86400:
+        return f'{sec // 3600}h{sec % 3600 // 60:02d}m'
+    return f'{sec // 86400}d{sec % 86400 // 3600}h'
+
+
+def _span(args, now):
+    since = parse_when(args.since, now, '--since')
+    until = min(parse_when(args.until, now, '--until'), now) if args.until else now
+    if since >= until:
+        raise Refused('--since must be before --until (and in the past)')
+    if until - since > dt.timedelta(days=MAX_SPAN_DAYS):
+        raise Refused(f'at most {MAX_SPAN_DAYS} days per query (the recorder keeps about 10)')
+    return since, until
+
+
+def resolve_any(world, target):
+    """Read-side resolution: one entity of any domain (id, masked id or a name that matches only one)."""
+    t = (target or '').strip()
+    real = world.lookup_id(t)
+    if real:
+        return real
+    if ENTITY_ID_RE.fullmatch(t):
+        if t in world.raw:
+            return t
+        raise Refused(f'{t}: no such entity (try: ha find "<words>")')
+    return resolve(world, t, tuple(sorted({e.split('.', 1)[0] for e in world.raw})), 'this')
+
+
+def _gate_entry(world, eid, state, attrs=None):
+    """A recorded state of eid through the same gate as `ha state` (current name/unit decide the class)."""
+    base = {k: v for k, v in ((world.raw.get(eid) or {}).get('attributes') or {}).items() if k in GATE_HINT_ATTRS}
+    base.update(attrs if isinstance(attrs, dict) else {})
+    return world.gated(eid, {'entity_id': eid, 'state': state, 'attributes': base})
+
+
+def _hidden_class(world, eid):
+    return (world.gated(eid) if eid in world.raw else _gate_entry(world, eid, 'unknown'))['hidden']
+
+
+def _readable(world, eid, what):
+    g = world.gated(eid)
+    if g['hidden'] in HIDE_HISTORY:
+        raise Refused(f'{g["entity_id"]}: its {what} stays hidden by the privacy gate ({g["hidden"]}); '
+                      'whereabouts come from `vault ha now`')
+    return g
+
+
+ID_IN_TEXT_RE = re.compile(r'\b[a-z][a-z0-9_]*\.[a-z0-9_]+\b')
+
+
+def _mask_ids(world, text):
+    """Entity ids inside HA text (messages, errors): Bluetooth ones masked like `ha list` does."""
+    doms = world.__dict__.setdefault('_doms', {x.split('.', 1)[0] for x in world.raw})
+
+    def rep(m):
+        e = m.group(0)
+        if e not in world.raw and e.split('.', 1)[0] not in doms:
+            return e
+        if _hidden_class(world, e) == 'bluetooth':
+            return world.gated(e)['entity_id'] if e in world.raw else P.bt_mask(e)
+        return e
+    return ID_IN_TEXT_RE.sub(rep, text or '')
+
+
+def _shown_id(world, eid):
+    return world.gated(eid)['entity_id'] if eid in world.raw else _gate_entry(world, eid, 'unknown')['entity_id']
+
+
+def _head(g):
+    return g['entity_id'] + (f' "{g["name"]}"' if g['name'] else '') + (f' [{g["area"]}]' if g['area'] else '')
+
+
+def cmd_history(world, args):
+    eid = resolve_any(world, args.target)
+    g = _readable(world, eid, 'history')
+    want = [a.strip() for a in (args.attrs or '').split(',') if a.strip()]
+    bad = [a for a in want if not re.fullmatch(r'[a-z0-9_]{1,60}', a)]
+    if bad:
+        raise Refused(f'--attrs: {", ".join(bad)} is not an attribute name')
+    now = dt.datetime.now(dt.timezone.utc)
+    since, until = _span(args, now)
+    unit = g['attributes'].get('unit_of_measurement') or ''
+    rows, prev = [], None
+    for e in world.c.history(eid, since, until, attrs=bool(want)):
+        if not isinstance(e, dict):
+            continue
+        t = parse_ts((e.get('last_updated') if want else None) or e.get('last_changed') or e.get('last_updated'))
+        if t is None:
+            continue
+        ge = _gate_entry(world, eid, e.get('state'), e.get('attributes') if want else None)
+        a = {k: ge['attributes'][k] for k in want if k in ge['attributes']}
+        key = (str(ge['state']), json.dumps(a, sort_keys=True, default=str))
+        if key == prev:
+            continue
+        prev = key
+        rows.append({'t': max(t, since), 'state': ge['state'], 'attrs': a})
+    for i, r in enumerate(rows):
+        r['sec'] = ((rows[i + 1]['t'] if i + 1 < len(rows) else until) - r['t']).total_seconds()
+    shown = rows[-args.limit:] if args.limit > 0 else rows
+    earlier = len(rows) - len(shown)
+    missing = [k for k in want if not any(k in r['attrs'] for r in rows)]
+    if args.json:
+        emit_json({'entity_id': g['entity_id'], 'name': g['name'], 'area': g['area'], 'unit': unit or None,
+                   'since': iso_local(since), 'until': iso_local(until),
+                   'changes': [dict({'time': iso_local(r['t']), 'state': r['state'], 'seconds': int(r['sec'])},
+                                    **({'attrs': r['attrs']} if want else {})) for r in shown],
+                   'earlier_not_shown': earlier, 'attrs_not_seen': missing})
+        return 0
+    upto = 'now' if until >= now - dt.timedelta(seconds=5) else fmt_local(until)
+    emit(f'{_head(g)}: {max(len(rows) - 1, 0)} changes, {fmt_local(since)} -> {upto}')
+    if not rows:
+        emit('  (nothing recorded in that window; the recorder keeps about 10 days)')
+    if earlier:
+        emit(f'  ... {earlier} earlier (raise --limit)')
+    for i, r in enumerate(shown):
+        st = str(r['state'])
+        if unit and st not in ('unavailable', 'unknown', '<hidden>'):
+            st = f'{st} {unit}'
+        extra = '  ' + ' '.join(f'{k}={_fmt_val(v)}' for k, v in r['attrs'].items()) if r['attrs'] else ''
+        tail = '  (at start)' if r['t'] <= since and not earlier and i == 0 else ''
+        emit(f'  {fmt_local(r["t"])}  {st:<18} {fmt_dur(r["sec"]):>7}{extra}{tail}')
+    if missing:
+        emit(f'  (not shown: {", ".join(missing)}: absent or dropped by the privacy gate)')
+    return 0
+
+
+def _logbook_by(world, e):
+    ce = e.get('context_entity_id')
+    if isinstance(ce, str) and ENTITY_ID_RE.fullmatch(ce):
+        if _hidden_class(world, ce) in HIDE_HISTORY:
+            return '<hidden entity>'
+        nm = e.get('context_entity_id_name') or e.get('context_name')
+        return _shown_id(world, ce) + (f' "{P.clean(nm)}"' if nm and _hidden_class(world, ce) != 'bluetooth' else '')
+    if e.get('context_domain') and e.get('context_service'):
+        return (f"{P.clean(e['context_domain'])}.{P.clean(e['context_service'])}"
+                + (' (a user)' if e.get('context_user_id') else ''))
+    if e.get('context_user_id'):
+        return 'a user'
+    return None
+
+
+def cmd_logbook(world, args):
+    eid = resolve_any(world, args.target) if args.target else None
+    g = _readable(world, eid, 'logbook') if eid else None
+    now = dt.datetime.now(dt.timezone.utc)
+    since, until = _span(args, now)
+    rows, hidden = [], 0
+    for e in world.c.logbook(since, until, eid):
+        if not isinstance(e, dict):
+            continue
+        t = parse_ts(e.get('when'))
+        if t is None:
+            continue
+        ent = e.get('entity_id') if isinstance(e.get('entity_id'), str) else None
+        if ent and not ENTITY_ID_RE.fullmatch(ent):
+            ent = None
+        if ent and _hidden_class(world, ent) in HIDE_HISTORY:
+            hidden += 1
+            continue
+        if ent and e.get('state') is not None and not e.get('message'):
+            what = f"changed to {_gate_entry(world, ent, e.get('state'))['state']}"
+        else:
+            what = _mask_ids(world, P.clean(str(e.get('message') or '')))
+        name = P.clean(str(e.get('name') or ''))
+        rows.append({'t': t, 'entity_id': _shown_id(world, ent) if ent else None, 'name': name,
+                     'what': what.strip(), 'by': _logbook_by(world, e)})
+    shown = rows[-args.limit:] if args.limit > 0 else rows
+    if args.json:
+        emit_json({'entity_id': g['entity_id'] if g else None, 'since': iso_local(since), 'until': iso_local(until),
+                   'entries': [{'time': iso_local(r['t']), 'entity_id': r['entity_id'], 'name': r['name'],
+                                'what': r['what'], 'by': r['by']} for r in shown],
+                   'earlier_not_shown': len(rows) - len(shown), 'hidden_entries': hidden})
+        return 0
+    emit(f'{_head(g) + ": " if g else ""}{len(rows)} logbook entries, {fmt_local(since)} -> '
+         f'{"now" if until >= now - dt.timedelta(seconds=5) else fmt_local(until)}')
+    if len(rows) > len(shown):
+        emit(f'  ... {len(rows) - len(shown)} earlier (raise --limit)')
+    for r in shown:
+        label = '' if g else f'{r["name"] or r["entity_id"] or "?"}: '
+        by = f'  <- {r["by"]}' if r['by'] else ''
+        emit(f'  {fmt_local(r["t"])}  {label}{r["what"]}{by}')
+    if hidden:
+        emit(f'  ({hidden} entries of location/network/Bluetooth entities left out by the privacy gate)')
+    return 0
+
+
+CFG_ALIASES = {'condition': ('conditions', 'condition'), 'action': ('actions', 'action'),
+               'trigger': ('triggers', 'trigger')}
+STEP_KEYS = ('choose', 'if', 'repeat', 'parallel', 'sequence', 'wait_template', 'wait_for_trigger', 'delay',
+             'condition', 'event', 'stop', 'variables', 'scene', 'device_id')
+
+
+def _cfg_at(cfg, parts):
+    """The config node at a trace path (condition/0/entity_id/1 -> conditions[0].entity_id[1]) | None."""
+    node = cfg
+    for p in parts:
+        if p.isdigit():
+            if isinstance(node, list):
+                node = node[int(p)] if int(p) < len(node) else None
+            elif p != '0':          # a single item written without a list
+                return None
+        elif isinstance(node, dict):
+            node = next((node[k] for k in CFG_ALIASES.get(p, (p,)) if k in node), None)
+        else:
+            return None
+        if node is None:
+            return None
+    return node
+
+
+def _node_entity(node):
+    if isinstance(node, str) and ENTITY_ID_RE.fullmatch(node):
+        return node
+    if isinstance(node, dict):
+        e = node.get('entity_id')
+        if isinstance(e, list) and len(e) == 1:
+            e = e[0]
+        if isinstance(e, str) and ENTITY_ID_RE.fullmatch(e):
+            return e
+    return None
+
+
+def _safe_val(world, ent, v):
+    if isinstance(v, list):
+        return '[' + ', '.join(str(_safe_val(world, ent, x)) for x in v[:5]) + ']'
+    if ent:
+        return _gate_entry(world, ent, v)['state']
+    s = str(v)
+    return s if s in P.SAFE_STATES or re.fullmatch(r'-?\d{1,9}(?:\.\d{1,3})?', s) else '<value>'
+
+
+def _cond_detail(world, cfg, parts, res):
+    ent = _node_entity(_cfg_at(cfg, parts)) or _node_entity(_cfg_at(cfg, parts[:2]))
+    bits = [f'{k.replace("wanted_state", "wanted")} {_safe_val(world, ent, res[k])}'
+            for k in ('state', 'wanted_state', 'wanted_state_above', 'wanted_state_below') if k in res]
+    if not bits:
+        return None
+    return (_shown_id(world, ent) + ': ' if ent else '') + ', '.join(bits)
+
+
+def _targets(world, target, data):
+    ids, other = [], []
+    for src in (target, data):
+        if not isinstance(src, dict):
+            continue
+        e = src.get('entity_id')
+        for x in ([e] if isinstance(e, str) else e if isinstance(e, list) else []):
+            ids += [y.strip() for y in str(x).split(',') if ENTITY_ID_RE.fullmatch(y.strip())]
+        if src is target:
+            for k in ('device_id', 'area_id', 'floor_id', 'label_id'):
+                v = src.get(k)
+                n = len(v) if isinstance(v, list) else (1 if v else 0)
+                if n:
+                    other.append(f'{n} {k[:-3]}{"s" if n > 1 else ""}')
+    shown = [_shown_id(world, i) for i in dict.fromkeys(ids)]
+    out = ', '.join(shown[:6]) + (f' +{len(shown) - 6}' if len(shown) > 6 else '')
+    return ', '.join(x for x in [out] + other if x)
+
+
+def _step_what(cfg, parts, res, el):
+    p = res.get('params')
+    if isinstance(p, dict):
+        return 'call', f"{P.clean(p.get('domain'))}.{P.clean(p.get('service') or p.get('action'))}"
+    if 'delay' in res:
+        d = res['delay']
+        return 'delay', f"delay {fmt_dur(d) if isinstance(d, (int, float)) else P.clean(str(d))}" + (
+            ' done' if res.get('done') else ' (not done)' if res.get('done') is False else '')
+    if isinstance(res.get('wait'), dict):
+        w = res['wait']
+        return 'wait', 'wait ' + ('done' if w.get('completed') or w.get('trigger') else 'timed out')
+    if 'choice' in res:
+        return 'choose', f"choose -> {P.clean(str(res['choice']))}"
+    if isinstance(res.get('result'), bool):
+        return 'check', 'check ' + ('passed' if res['result'] else 'failed')
+    if 'event' in res:
+        return 'event', f"event {P.clean(str(res['event']))[:60]}"
+    if 'stop' in res:
+        return 'stop', f"stop: {P.clean(str(res['stop']))[:80]}"
+    node = _cfg_at(cfg, parts)
+    if isinstance(node, dict) and isinstance(node.get('action') or node.get('service'), str):
+        return 'call', P.clean(node.get('action') or node.get('service'))     # a call that never got its result
+    if isinstance(node, dict):
+        k = next((k for k in STEP_KEYS if k in node), None)
+        if k:
+            return k, k
+    if el.get('changed_variables') and not res:
+        return 'variables', 'variables set'
+    return 'step', 'step'
+
+
+def _trigger_change(world, trig):
+    ent = trig.get('entity_id')
+    fs, ts = trig.get('from_state'), trig.get('to_state')
+    if isinstance(ent, str) and ENTITY_ID_RE.fullmatch(ent) and (isinstance(fs, dict) or isinstance(ts, dict)):
+        def gs(s):
+            return _gate_entry(world, ent, s.get('state'))['state'] if isinstance(s, dict) else '-'
+        return f'{gs(fs)} -> {gs(ts)}'
+    if isinstance(trig.get('event'), str) and trig.get('event') in ('enter', 'leave'):
+        return f"zone {trig['event']}"
+    return None
+
+
+def summarize_trace(world, tr):
+    """One HA trace -> a small gated summary (never variables, service data or the config itself)."""
+    ts = tr.get('timestamp') if isinstance(tr.get('timestamp'), dict) else {}
+    start, finish = parse_ts(ts.get('start')), parse_ts(ts.get('finish'))
+    cfg = tr.get('config') if isinstance(tr.get('config'), dict) else {}
+    err = tr.get('error')
+    r = {'run_id': P.clean(str(tr.get('run_id') or '')), 'start': iso_local(start),
+         'seconds': round((finish - start).total_seconds(), 1) if start and finish else None,
+         'state': P.clean(tr.get('state')), 'result': P.clean(tr.get('script_execution')),
+         'trigger': _mask_ids(world, P.clean(str(tr['trigger']))) if tr.get('trigger') else None,
+         'trigger_change': None, 'conditions': [], 'steps': [],
+         'error': _mask_ids(world, P.clean(str(err)))[:300] if err else None}
+    trace = tr.get('trace') if isinstance(tr.get('trace'), dict) else {}
+    for path, elems in trace.items():
+        parts = str(path).split('/')
+        for el in elems if isinstance(elems, list) else []:
+            if not isinstance(el, dict):
+                continue
+            res = el.get('result') if isinstance(el.get('result'), dict) else {}
+            e_err = _mask_ids(world, P.clean(str(el['error'])))[:200] if el.get('error') else None
+            if parts[0] == 'trigger':
+                trig = (el.get('changed_variables') or {}).get('trigger')
+                if isinstance(trig, dict) and r['trigger_change'] is None:
+                    r['trigger_change'] = _trigger_change(world, trig)
+            elif parts[0] == 'condition':
+                if len(parts) == 2:
+                    r['conditions'].append({'path': path, 'passed': res.get('result') if isinstance(
+                        res.get('result'), bool) else None, 'detail': None, 'error': e_err})
+                elif r['conditions'] and res.get('result') is False and r['conditions'][-1]['detail'] is None:
+                    r['conditions'][-1]['detail'] = _cond_detail(world, cfg, parts, res)
+            elif parts[0] in ('action', 'sequence'):
+                kind, what = _step_what(cfg, parts, res, el)
+                p = res.get('params') if isinstance(res.get('params'), dict) else {}
+                if not p and kind == 'call':
+                    p = _cfg_at(cfg, parts) or {}
+                tgt = _targets(world, p.get('target'), p.get('service_data') or p.get('data')) if p else ''
+                if kind == 'check' and res.get('result') is False:
+                    det = _cond_detail(world, cfg, parts, res)
+                    what += f' ({det})' if det else ''
+                r['steps'].append({'path': path, 'kind': kind, 'what': what, 'target': tgt or None, 'error': e_err})
+    return r
+
+
+def cmd_trace(world, args):
+    eid = resolve(world, args.target, TRACE_DOMAINS, 'trace')
+    dom, obj = eid.split('.', 1)
+    item = str((world.raw[eid].get('attributes') or {}).get('id') or '') if dom == 'automation' else obj
+    if not item:
+        raise Refused(f'{eid} has no id (an automation without an id keeps no traces)')
+    if not ITEM_ID_RE.fullmatch(item):
+        raise Refused(f'{eid}: unexpected id format')
+    n = max(1, min(args.last, 20))
+    ws = world.c.ws()
+    try:
+        lst = [x for x in (ws.call('trace/list', domain=dom, item_id=item) or [])
+               if isinstance(x, dict) and isinstance(x.get('run_id'), str) and RUN_ID_RE.fullmatch(x['run_id'])]
+        lst.sort(key=lambda x: str((x.get('timestamp') or {}).get('start') or ''), reverse=True)
+        runs = []
+        for x in lst[:n]:
+            full = ws.call('trace/get', domain=dom, item_id=item, run_id=x['run_id'])
+            runs.append(summarize_trace(world, full if isinstance(full, dict) else x))
+    finally:
+        ws.close()
+    g = world.gated(eid)
+    if args.json:
+        emit_json({'entity_id': g['entity_id'], 'name': g['name'], 'stored_runs': len(lst), 'runs': runs})
+        return 0
+    emit(f'{_head(g)}: {len(runs)} of {len(lst)} stored runs, newest first')
+    if not lst:
+        emit('  (no stored traces)')
+    for r in runs:
+        took = f' {r["seconds"]}s' if r['seconds'] is not None else ''
+        emit(f'- {fmt_local(parse_ts(r["start"]))}  {r["result"] or r["state"] or "?"}{took}  run {r["run_id"]}')
+        if r['trigger'] or r['trigger_change']:
+            emit(f'  trigger: {r["trigger"] or "?"}' + (f' ({r["trigger_change"]})' if r['trigger_change'] else ''))
+        if r['conditions']:
+            emit('  conditions: ' + '  '.join(
+                ('ok ' if c['passed'] else 'FAILED ' if c['passed'] is False else '? ') + c['path']
+                + (f' ({c["detail"]})' if c['detail'] else '') + (f' error: {c["error"]}' if c['error'] else '')
+                for c in r['conditions']))
+        for s in r['steps'][:15]:
+            emit(f'  {s["path"]}  {s["what"]}' + (f' -> {s["target"]}' if s['target'] else '')
+                 + (f'  ERROR: {s["error"]}' if s['error'] else ''))
+        if len(r['steps']) > 15:
+            emit(f'  ... +{len(r["steps"]) - 15} more steps (--json for all)')
+        if not r['steps'] and r['result'] not in ('failed_conditions',):
+            emit('  (no actions ran)')
+        if r['error']:
+            emit(f'  error: {r["error"]}')
+    return 0
+
+
+def read_token(path):
+    try:
+        with open(path) as fh:
+            t = fh.read().strip()
+    except OSError:
+        raise HAError('token file not readable') from None
+    if len(t) < 20:
+        raise HAError('token file empty or invalid')
+    return t
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog='ha', description='Safe CLI for the owner\'s Home Assistant.')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('state')
+    p.add_argument('target', nargs='+')
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('list')
+    p.add_argument('domain', nargs='?')
+    p.add_argument('--area')
+    p.add_argument('--limit', type=int, default=300)
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('find')
+    p.add_argument('words', nargs='+')
+    p.add_argument('--domain')
+    p.add_argument('--limit', type=int, default=25)
+    p.add_argument('--json', action='store_true')
+    sub.add_parser('areas')
+    p = sub.add_parser('device-url')
+    p.add_argument('target', nargs='+')
+    p.add_argument('--json', action='store_true')
+
+    def wopts(p):
+        p.add_argument('-n', '--dry-run', action='store_true')
+        p.add_argument('--wait', type=float, default=8.0)
+        p.add_argument('--owner-ok', metavar='HIS_WORDS')
+    for c in ('on', 'off', 'toggle'):
+        p = sub.add_parser(c)
+        p.add_argument('targets', nargs='*')
+        p.add_argument('--area')
+        p.add_argument('--domain')
+        wopts(p)
+    p = sub.add_parser('set')
+    p.add_argument('target', nargs='*')
+    p.add_argument('--area')
+    p.add_argument('--brightness', type=int)
+    p.add_argument('--color-temp', type=int)
+    p.add_argument('--color')
+    wopts(p)
+    p = sub.add_parser('media')
+    p.add_argument('words', nargs='+', metavar='PLAYER... ACTION [N]')
+    wopts(p)
+    for c in ('scene', 'script'):
+        p = sub.add_parser(c)
+        p.add_argument('verb', choices=['run'])
+        p.add_argument('target', nargs='+')
+        wopts(p)
+    p = sub.add_parser('call')
+    p.add_argument('service')
+    p.add_argument('rest', nargs='*', metavar='ENTITY [JSON]')
+    wopts(p)
+    p = sub.add_parser('history')
+    p.add_argument('target', nargs='+')
+    p.add_argument('--since', default='24h')
+    p.add_argument('--until')
+    p.add_argument('--attrs', metavar='A,B')
+    p.add_argument('--limit', type=int, default=100)
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('logbook')
+    p.add_argument('target', nargs='*')
+    p.add_argument('--since', default='24h')
+    p.add_argument('--until')
+    p.add_argument('--limit', type=int, default=60)
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('trace')
+    p.add_argument('target', nargs='+')
+    p.add_argument('--last', type=int, default=3)
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('todo')
+    p.add_argument('verb', choices=['items', 'add', 'done', 'undo', 'rm'])
+    p.add_argument('words', nargs='*', metavar='ITEM')
+    p.add_argument('--list', default=DEFAULT_TODO_LISTS[0])
+    p.add_argument('--all', action='store_true')
+    p.add_argument('--description')
+    p.add_argument('--json', action='store_true')
+    wopts(p)
+    return ap
+
+
+MEDIA_ACTIONS = ('play', 'pause', 'stop', 'next', 'prev', 'mute', 'unmute', 'volume')
+
+
+def _idlike(t):
+    return bool(ENTITY_ID_RE.match(t)) or ('.' in t and ('<' in t or '[' in t))
+
+
+def normalize_args(args):
+    """Names may come unquoted (ha on hanging lamps): the words of one name are joined. Several targets
+    only when every one of them is an entity id."""
+    c = args.cmd
+    if c in ('state', 'scene', 'script', 'device-url', 'history', 'trace'):
+        args.target = ' '.join(args.target)
+    elif c == 'logbook':
+        args.target = ' '.join(args.target) or None
+    elif c == 'find':
+        args.words = ' '.join(args.words)
+    elif c == 'set':
+        args.target = ' '.join(args.target) or None
+    elif c in ('on', 'off', 'toggle'):
+        if len(args.targets) > 1 and not all(_idlike(t) for t in args.targets):
+            args.targets = [' '.join(args.targets)]
+    elif c == 'media':
+        w = args.words
+        args.value = None
+        if len(w) >= 3 and w[-2] == 'volume' and re.fullmatch(r'\d{1,3}', w[-1]):
+            args.action, args.value, w = 'volume', int(w[-1]), w[:-2]
+        elif len(w) >= 2 and w[-1] in MEDIA_ACTIONS and w[-1] != 'volume':
+            args.action, w = w[-1], w[:-1]
+        else:
+            raise Refused('usage: ha media <player> play|pause|stop|next|prev|mute|unmute|volume N')
+        args.player = ' '.join(w)
+    elif c == 'todo':
+        args.text = ' '.join(args.words).strip()
+    elif c == 'call':
+        rest = list(args.rest)
+        args.data = rest.pop() if rest and rest[-1].lstrip().startswith('{') else None
+        args.entity = ' '.join(rest) or None
+    return args
+
+
+CMDS = {'state': cmd_state, 'list': cmd_list, 'find': cmd_find, 'areas': cmd_areas, 'on': cmd_onoff,
+        'off': cmd_onoff, 'toggle': cmd_onoff, 'set': cmd_set, 'media': cmd_media, 'scene': cmd_run,
+        'script': cmd_run, 'call': cmd_call, 'device-url': cmd_device_url, 'todo': cmd_todo,
+        'history': cmd_history, 'logbook': cmd_logbook, 'trace': cmd_trace}
+
+
+def feature_off():
+    """True when the profile switches the home_assistant feature off (features.home_assistant: false); guarded like
+    _profile_url: a copy without bin/lib or a broken profile counts as on."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+        import assistant_profile
+        return not assistant_profile.feature_on('home_assistant')
+    except Exception:
+        return False
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if feature_off():
+        emit('ha: feature home_assistant is off (features.home_assistant in the profile)', err=True)
+        return 3
+    try:
+        normalize_args(args)
+        token_file = os.environ.get('HA_TOKEN_FILE') or DEFAULT_TOKEN_FILE
+        handle = egress_handle(token_file, os.environ.get('HA_URL'))
+        try:
+            token = read_token(token_file)
+        except HAError:
+            if not (handle and _egress.mode(handle) == 'hub'):
+                raise
+            token = None  # hub mode without the local file: REST by handle; traces need the file
+        _SECRETS[:] = [token] if token else []
+        world = World(Client(os.environ.get('HA_URL') or DEFAULT_URL, token, handle=handle))
+        return CMDS[args.cmd](world, args)
+    except Refused as e:
+        emit(f'ha: refused: {e}', err=True)
+        return 2
+    except HAError as e:
+        emit(f'ha: error: {e}', err=True)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

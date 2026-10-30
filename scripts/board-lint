@@ -1,0 +1,781 @@
+#!/usr/local/bin/python3.13 -I
+"""board-lint: token-free staleness check of my board (TODO.md, GOALS.md, PROBLEMS.md, reminders) against FACTS.md's
+done/declined ledger, recent PROACTIVE.md lines and the board's Waiting ages (its feed).
+
+  board-lint [--json] [--strict] [--all]
+                                  open findings, one per line; acked ones are hidden (a count says how many),
+                                  --all shows them too, marked "(acked)" (exit 0; --strict: exit 1 when there are
+                                  open findings)
+  board-lint --beat               ONE line for the heartbeat ("[board-lint] ...") or nothing: only findings that are
+                                  not acked and were not shown in the last 24 h; records what it showed
+  board-lint ack KEY... | all     silence findings in the list and the beat (KEY as listed, or its bare 8-hex
+                                  hash; kept 30 days); unknown keys are named on stderr and exit 1
+  board-lint pitch [--hook]       stdin = an outgoing message (or, with --hook, the PreToolUse JSON of a Telegram
+                                  reply with buttons or a poll): prints hook JSON with additionalContext naming the
+                                  ledger entries it touches (never blocks), and marks the Waiting items it asks
+                                  about as asked: one {"ts", "text"} line each in the board's asked.jsonl queue
+  board-lint handoff [--hook]     short hand-off after a compaction or resume: the ledger's declined/removed items,
+                                  recent done ones, TODO Due / In progress / Waiting titles with ages, lint count
+                                  (--hook: SessionStart JSON on stdin; prints nothing unless it is the workspace
+                                  session: cwd = the workspace, or the transcript lies in the workspace's project
+                                  folder, as the agenda hook checks, since the cwd follows every `cd`)
+Checks:
+  ledger    an open item names a FACTS.md ledger entry: the entry's thing (the words before "(", " — " or ";";
+            several things split on ", ") is covered (its first word plus >= 3/4 of its keywords, at least 2)
+            and the item doesn't carry the entry's date or, for declined/skipped/scratched/removed, that word
+            (positive entries: nor "already"). declined/skipped/scratched/removed/off: any open TODO/GOALS/PROBLEMS item,
+            GOALS "In place", and pending reminders; done/decided/kept: only items that wait on him (TODO
+            Due/Waiting, GOALS [waiting on owner], Next up and the queue)
+  log       an item that waits on him shares >= 2 title keywords (>= 3/4 of them) with a PROACTIVE.md line of the
+            last 3 days that says it happened (deployed, installed, removed, booked, answered, confirmed, ...)
+  age       a TODO Waiting item open >= BOARD_LINT_WAIT_DAYS (4) days that was never marked asked (board feed)
+  relative  an open item says today/tonight/tomorrow without a date; a Waiting item with a bare HH:MM, no date
+  dup       the same title twice in TODO.md; a TODO item whose title is a GOALS [x] step or a solved problem;
+            a GOALS [x] step still named in Next up or the queue
+Fails open in --beat, pitch and handoff: any error prints nothing and exits 0 (one line in the log);
+Env seams (tests): BOARD_LINT_TODO, _GOALS, _PROBLEMS, _FACTS, _PROACTIVE, _REMIND_DB, _BOARD_FEED, _ASKED_QUEUE,
+_STATE, _LOG,
+_NOW ("YYYY-MM-DD HH:MM"), _WAIT_DAYS, _WORKSPACE, _PROJECT_DIR (the workspace's transcript folder), _REPO, _DEPLOYS,
+_CHANGELOG, _SCHEDULES (a file with the schedules output instead of the hub call), _TOOL, _BRAIN_GIT ("off" = mtime),
+_INBOX. Tests: ~/opt/board-lint-tests/run.sh
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser('~')
+ENV = os.environ.get
+WS = ENV('BOARD_LINT_WORKSPACE') or f'{HOME}/workspace'
+TODO = ENV('BOARD_LINT_TODO') or f'{WS}/TODO.md'
+GOALS = ENV('BOARD_LINT_GOALS') or f'{WS}/GOALS.md'
+PROBLEMS = ENV('BOARD_LINT_PROBLEMS') or f'{WS}/PROBLEMS.md'
+FACTS = ENV('BOARD_LINT_FACTS') or f'{WS}/FACTS.md'
+PROACTIVE = ENV('BOARD_LINT_PROACTIVE') or f'{WS}/PROACTIVE.md'
+REMIND_DB = ENV('BOARD_LINT_REMIND_DB') or ENV('REMIND_DB') or f'{HOME}/.local/state/remind/reminders.json'
+BOARD_FEED = ENV('BOARD_LINT_BOARD_FEED') or f'{HOME}/.local/state/board/board.json'   # Waiting created / asked
+ASKED_Q = ENV('BOARD_LINT_ASKED_QUEUE') or f'{HOME}/.local/state/board/asked.jsonl'      # drained by `board`
+STATE = ENV('BOARD_LINT_STATE') or f'{HOME}/.local/state/board-lint/state.json'
+LOG = ENV('BOARD_LINT_LOG') or f'{HOME}/.local/state/board-lint/log'
+# Claude Code's transcript folder for the workspace (every non-alphanumeric character of the path becomes "-")
+PROJECT_DIR = ENV('BOARD_LINT_PROJECT_DIR') or f"{HOME}/.claude/projects/{re.sub(r'[^A-Za-z0-9]', '-', WS)}"
+WAIT_DAYS = int(ENV('BOARD_LINT_WAIT_DAYS') or 4) if str(ENV('BOARD_LINT_WAIT_DAYS') or 4).isdigit() else 4
+RESHOW_H = 24
+KEEP_DAYS = 30
+LOG_DAYS = 3
+BEAT_MAX = 420
+REPO = ENV('BOARD_LINT_REPO') or f'{HOME}/opt/assistant'
+DEPLOYS = ENV('BOARD_LINT_DEPLOYS') or f'{HOME}/.local/state/assistant/deploys.jsonl'
+CHANGELOG = ENV('BOARD_LINT_CHANGELOG') or f'{WS}/CHANGELOG.md'
+SCHEDULES = ENV('BOARD_LINT_SCHEDULES') or ''     # a file with `tool call workflow.schedules {}` output (tests)
+TOOL = ENV('BOARD_LINT_TOOL') or f'{HOME}/bin/tool'
+BRAIN_GIT = ENV('BOARD_LINT_BRAIN_GIT') or f'{HOME}/.brain.git'   # "off": every TODO line dates from the file's mtime
+BRAIN_TREE = ENV('BOARD_LINT_BRAIN_TREE') or HOME
+INBOX = ENV('BOARD_LINT_INBOX') or f'{HOME}/inbox'
+
+NEGATIVE = {'declined', 'skipped', 'scratched', 'removed', 'off'}
+POSITIVE = {'done', 'decided', 'kept'}
+DONE_WORDS = {'deployed', 'added', 'removed', 'deleted', 'installed', 'live', 'done', 'skipped', 'declined',
+              'booked', 'answered', 'confirmed', 'ordered', 'placed', 'paid', 'bought', 'merged', 'shipped', 'fixed',
+              'applied', 'enabled', 'cancelled', 'canceled', 'resolved', 'solved', 'finished', 'completed',
+              'scratched', 'excluded', 'decided', 'kept', 'set', 'off'}
+STRONG_DONE = {'deployed', 'installed', 'removed', 'deleted', 'booked', 'answered', 'confirmed', 'ordered', 'paid',
+               'bought', 'merged', 'shipped', 'cancelled', 'canceled', 'solved', 'resolved', 'finished', 'completed',
+               'skipped', 'declined', 'scratched', 'excluded'}
+ACK_WORD = {'declined': 'declined', 'skipped': 'skipped', 'scratched': 'scratched', 'removed': 'removed'}
+STOP = set('''a an the and or of for to in on at by with from into via per as is are was were be been it its this that
+these those his her him he she they them their our my me i you your we not no yes all any some more most less only also
+then than so but if when while after before once still now new next old up down out over under about again just very
+can could would should will may might must do does did done get got has have had make made use used using need needs
+own same each every both few many much other such what which who whom whose why how where there here one two three
+etc incl e g ie eg vs pm am h min x y n ok via re ask asked asks owner owners item items step steps todo goals note
+notes pitch pitched check checked waiting wait waits open plan planned tonight today tomorrow morgen heute'''.split())
+TIME = re.compile(r'(?<![\d:.])([01]?\d|2[0-3]):([0-5]\d)(?![\d:])')
+DATE_DM = re.compile(r'(?<![\w.])(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?(?![\w]|\.\d)')
+DATE_ISO = re.compile(r'(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)')
+RELATIVE = re.compile(r'\b(today|tonight|tomorrow|heute|morgen|this (?:morning|afternoon|evening))\b', re.I)
+VERSION = re.compile(r'\b\d+(?:\.\d+){2,}\b')
+EMOJI = re.compile('[←-⯿☀-➿\U0001F000-\U0001FAFF️‍]')
+PICTO = re.compile('[\U0001F000-\U0001FAFF\uFE0F\u200d]')   # display: drop pictographs, keep arrows and marks
+LEDGER = re.compile(r'^- (\d{1,2})\.(\d{1,2})\.?\s+([a-z]+(?: call)?):\s*(.+)$')
+
+
+# ------------------------------------------------------------------------------------------------ helpers
+def now_dt():
+    v = ENV('BOARD_LINT_NOW')
+    return datetime.strptime(v, '%Y-%m-%d %H:%M') if v else datetime.now()
+
+
+def read(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+def stem(w):
+    if len(w) > 4 and w.endswith('ies'):
+        return w[:-3] + 'y'
+    if len(w) > 4 and w.endswith(('ches', 'shes', 'sses', 'xes', 'zes')):
+        return w[:-2]
+    if len(w) > 3 and w.endswith('s') and not w.endswith(('ss', 'us', 'is')):
+        return w[:-1]
+    return w
+
+
+def keyword_list(text, drop_done=False):
+    """Significant words in order: lowercase, dates/times removed, versions kept whole, simple plural stemming."""
+    t = EMOJI.sub(' ', str(text))
+    out = []
+    for m in VERSION.finditer(t):
+        out.append((m.start(), m.group(0)))
+    t = VERSION.sub(lambda m: ' ' * len(m.group(0)), t)
+    for rx in (DATE_ISO, DATE_DM, TIME):
+        t = rx.sub(lambda m: ' ' * len(m.group(0)), t)
+    for m in re.finditer(r'[a-z0-9äöüéèà]+', t.lower()):
+        w = m.group(0)
+        if (w.isdigit() and len(w) < 2) or len(w) < 2 or w in STOP:
+            continue
+        w = stem(w)
+        if w in STOP or (drop_done and w in DONE_WORDS):
+            continue
+        out.append((m.start(), w))
+    seen, res = set(), []
+    for _, w in sorted(out):
+        if w not in seen:
+            seen.add(w)
+            res.append(w)
+    return res
+
+
+def keywords(text, drop_done=False):
+    return set(keyword_list(text, drop_done))
+
+
+def covered(thing_kw, text_kw, first=None):
+    """The thing's keywords are covered by the text: its first (naming) word, if given, plus >= 3/4 of them and
+    at least 2 (all of them when fewer)."""
+    n = len(thing_kw)
+    if n == 0 or (first and first not in text_kw):
+        return False
+    hit = len(thing_kw & text_kw)
+    need = n if n <= 2 else max(2, -(-3 * n // 4))
+    return hit >= need
+
+
+def has_date(line):
+    return bool(DATE_DM.search(line) or DATE_ISO.search(line))
+
+
+def norm_title(t):
+    return ' '.join(sorted(keywords(t))) or EMOJI.sub('', t).strip().lower()
+
+
+def short(t, n=48):
+    t = PICTO.sub('', str(t)).strip()
+    return t if len(t) <= n else t[:n - 1].rstrip() + '…'
+
+
+def dm_of(day):
+    return f'{day.day:02d}.{day.month:02d}'
+
+
+def date_tokens(day, month):
+    d, m = int(day), int(month)
+    return {f'{d}.{m}', f'{d:02d}.{m:02d}', f'{d}.{m:02d}', f'{d:02d}.{m}'}
+
+
+def mentions_date(text, day, month):
+    for m in DATE_DM.finditer(text):
+        if int(m.group(1)) == int(day) and int(m.group(2)) == int(month):
+            return True
+    for m in DATE_ISO.finditer(text):
+        if int(m.group(3)) == int(day) and int(m.group(2)) == int(month):
+            return True
+    return False
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, 'a', encoding='utf-8') as f:
+            f.write(f'{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n')
+    except OSError:
+        pass
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or '.', prefix='.board-lint.')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding='utf-8') as f:
+            v = json.load(f)
+        return v if isinstance(v, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+# ------------------------------------------------------------------------------------------------ parsers
+class Item:
+    def __init__(self, src, where, title, text, waits=False, kind='item'):
+        self.src, self.where, self.title, self.text, self.waits, self.kind = src, where, title, text, waits, kind
+
+    def label(self):
+        return f'{self.src} {self.where} "{short(self.title)}"'
+
+
+def bold_title(line):
+    m = re.match(r'-\s+\*\*(.+?)\*\*', line)
+    if m:
+        return m.group(1).strip()
+    body = line[1:].strip()
+    return re.split(r' — | - |: ', body, maxsplit=1)[0].strip()
+
+
+def parse_todo(text):
+    items, sec, cur = [], '', None
+    for line in text.splitlines():
+        if line.startswith('## '):
+            sec, cur = line[3:].strip(), None
+            continue
+        if line.startswith('### '):
+            continue
+        if line.startswith('- ') and sec:
+            cur = Item('TODO', sec, bold_title(line), line,
+                       waits=sec in ('Due', 'Waiting on you'))
+            items.append(cur)
+        elif cur and line.startswith(('  ', '\t')) and line.strip():
+            cur.text += '\n' + line
+        elif not line.strip():
+            cur = None
+    return items
+
+
+def parse_goals(text):
+    """open steps, done steps, Next up entries, queue entries, In place lines."""
+    open_, done, nxt, queue, inplace = [], [], [], [], []
+    goal, in_next = '', False
+    for line in text.splitlines():
+        s = line.strip()
+        if line.startswith('## '):
+            goal, in_next = line[3:].strip(), False
+            continue
+        if s.startswith('**Next up'):
+            in_next = True
+            continue
+        if in_next and re.match(r'^\d+\.\s', s):
+            body = re.sub(r'^\d+\.\s+', '', s)
+            nxt.append(Item('GOALS', 'Next up', re.split(r'[:.(]', body, maxsplit=1)[0].strip(), s, waits=True))
+            continue
+        if s.lower().startswith('unblocked queue'):
+            body = s.split(':', 1)[1] if ':' in s else s
+            for part in body.split('→'):
+                part = part.strip(' .')
+                if part:
+                    queue.append(Item('GOALS', 'queue', part, part, waits=True))
+            in_next = False
+            continue
+        if not s:
+            in_next = False
+            continue
+        m = re.match(r'^- \[( |x|X)\]\s+(.+)$', s)
+        if m:
+            body = m.group(2)
+            title = re.split(r':\s', body, maxsplit=1)[0].strip()
+            where = goal.split('(')[0].strip()
+            it = Item('GOALS', where, title, s, waits='[waiting on owner]' in s)
+            (open_ if m.group(1) == ' ' else done).append(it)
+            continue
+        if s.startswith('In place:'):
+            inplace.append(Item('GOALS', goal.split('(')[0].strip() + ' In place', 'In place', s, kind='inplace'))
+    return open_, done, nxt, queue, inplace
+
+
+def parse_problems(text):
+    open_, solved = [], []
+    for line in text.splitlines():
+        if not line.startswith('- **'):
+            continue
+        title = bold_title(line)
+        rest = line.split('**', 2)[-1][:80].lower()
+        it = Item('PROBLEMS', 'item', title, line)
+        (solved if re.search(r'\b(solved|not a problem)\b', rest) else open_).append(it)
+    return open_, solved
+
+
+def parse_ledger(text):
+    out, on = [], False
+    for line in text.splitlines():
+        if line.startswith('## '):
+            on = 'ledger' in line.lower()
+            continue
+        if not on:
+            continue
+        m = LEDGER.match(line.strip())
+        if not m:
+            continue
+        day, month, verb, rest = m.group(1), m.group(2), m.group(3).lower(), m.group(4)
+        if verb == 'his call':
+            verb = 'decided'
+        if verb not in NEGATIVE | POSITIVE:
+            continue
+        head = re.split(r' \(| — |; ', rest, maxsplit=1)[0]
+        things = [t for t in (p.strip() for p in head.split(', ')) if t]
+        kls = [keyword_list(t, drop_done=True) for t in things]
+        text = re.sub(r'\s+—\s+(\[\[[^\]]*\]\][,; ]*)+$', '', rest.strip())
+        out.append({'day': int(day), 'month': int(month), 'verb': verb, 'text': text,
+                    'line': line.strip()[2:], 'things': [(k[0], set(k)) for k in kls if k]})
+    return out
+
+
+def parse_proactive(text, now):
+    out = []
+    since = (now - timedelta(days=LOG_DAYS)).date()
+    for line in text.splitlines():
+        s = line.lstrip('- ').strip()
+        m = DATE_ISO.match(s)
+        if m:
+            try:
+                d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+            except ValueError:
+                continue
+        else:
+            m = re.match(r'^(\d{1,2})\.(\d{1,2})\b', s)
+            if not m:
+                continue
+            try:
+                d = datetime(now.year, int(m.group(2)), int(m.group(1))).date()
+            except ValueError:
+                continue
+            if d > now.date():
+                d = d.replace(year=d.year - 1)
+        if d < since:
+            continue
+        plain = re.sub(r"\b(?:not|never|no|isn't|wasn't)\s+(?:yet\s+|been\s+|really\s+)?\w+", ' ', s.lower())
+        words = set(re.findall(r'[a-z]+', plain))
+        if words & STRONG_DONE:
+            out.append({'date': d, 'line': s, 'kw': keywords(s)})
+    return out
+
+
+def parse_reminders(now):
+    items = load_json(REMIND_DB, [])
+    if isinstance(items, dict):
+        items = items.get('reminders', [])
+    out = []
+    for r in items if isinstance(items, list) else []:
+        if not isinstance(r, dict):
+            continue
+        at = str(r.get('at', ''))
+        try:
+            when = datetime.strptime(at[:16], '%Y-%m-%d %H:%M')
+        except ValueError:
+            continue
+        if when < now - timedelta(days=1):
+            continue
+        out.append(Item('reminder', at[:16], str(r.get('text', ''))[:60], str(r.get('text', '')), kind='reminder'))
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ checks
+class Finding:
+    def __init__(self, check, item, ref):
+        self.check, self.item, self.ref = check, item, ref
+        h = hashlib.sha1(f'{check}|{norm_title(item.title)}|{item.src}|{ref}'.encode()).hexdigest()[:8]
+        self.key = f'{check}-{h}'
+
+    def line(self):
+        return f'{self.item.label()} — {self.ref}'
+
+    def as_dict(self):
+        return {'key': self.key, 'check': self.check, 'src': self.item.src, 'where': self.item.where,
+                'title': self.item.title, 'ref': self.ref}
+
+
+def ledger_hits(text, ledger, kinds):
+    kw = keywords(text)
+    hits = []
+    for e in ledger:
+        if e['verb'] not in kinds:
+            continue
+        if mentions_date(text, e['day'], e['month']):
+            continue
+        low = text.lower()
+        if e['verb'] in ACK_WORD and ACK_WORD[e['verb']] in low:
+            continue           # the item already says it ("Bill fields from Gmail: declined")
+        if e['verb'] in POSITIVE and 'already' in low:
+            continue           # mentions the done thing on purpose ("the sync already runs")
+        if any(covered(s, kw, first) for first, s in e['things']):
+            hits.append(e)
+    return hits
+
+
+def lint(now=None):
+    now = now or now_dt()
+    todo = parse_todo(read(TODO))
+    g_open, g_done, g_next, g_queue, g_inplace = parse_goals(read(GOALS))
+    p_open, p_solved = parse_problems(read(PROBLEMS))
+    ledger = parse_ledger(read(FACTS))
+    log_lines = parse_proactive(read(PROACTIVE), now)
+    reminders = parse_reminders(now)
+    found, seen = [], set()
+
+    def add(check, item, ref):
+        f = Finding(check, item, ref)
+        if f.key not in seen:
+            seen.add(f.key)
+            found.append(f)
+
+    # ledger
+    for it in todo + g_open + g_next + g_queue + p_open + g_inplace + reminders:
+        kinds = NEGATIVE | POSITIVE if (it.waits and it.kind == 'item') else NEGATIVE
+        for e in ledger_hits(it.text, ledger, kinds):
+            add('ledger', it, f"ledger {e['day']:02d}.{e['month']:02d} {e['verb']}: {short(e['text'], 60)}")
+    # log: waiting items vs recent PROACTIVE lines that say it happened
+    for it in [i for i in todo + g_open + g_next + g_queue if i.waits]:
+        tk = keywords(it.title)
+        if len(tk) < 2:
+            continue
+        for p in log_lines:
+            shared = tk & p['kw']
+            if len(shared) >= 2 and len(shared) >= 0.75 * len(tk) and not mentions_date(it.text, p['date'].day,
+                                                                                         p['date'].month):
+                add('log', it, f"PROACTIVE {dm_of(p['date'])}: {short(p['line'], 60)}")
+                break
+    # age: Waiting items never asked
+    wstate = waiting_state()
+    for it in todo:
+        if it.where != 'Waiting on you':
+            continue
+        v = wstate.get(it.title[:160]) if isinstance(wstate, dict) else None
+        if not isinstance(v, dict) or v.get('asked'):
+            continue
+        try:
+            since = datetime.strptime(str(v.get('since')), '%Y-%m-%d')
+        except ValueError:
+            continue
+        age = (now.date() - since.date()).days
+        if age >= WAIT_DAYS:
+            add('age', it, f'waiting {age} d since {dm_of(since)}, never asked')
+    # relative times
+    for it in todo + g_open + g_next + p_open:
+        first = it.text.splitlines()[0]
+        if RELATIVE.search(first) and not has_date(first):
+            add('relative', it, f'"{RELATIVE.search(first).group(0)}" without a date')
+        elif it.where == 'Waiting on you' and TIME.search(first) and not has_date(first):
+            add('relative', it, f'bare time {TIME.search(first).group(0)} without a date')
+    # dup
+    by_title = {}
+    for it in todo:
+        by_title.setdefault(norm_title(it.title), []).append(it)
+    for k, its in by_title.items():
+        if len(its) > 1 and k:
+            add('dup', its[-1], 'also in TODO ' + ', '.join(i.where for i in its[:-1]))
+    closed = [(g, 'done in GOALS') for g in g_done] + [(p, 'solved in PROBLEMS') for p in p_solved]
+    for it in todo:
+        tk = keywords(it.title)
+        for c, why in closed:
+            ck = keywords(c.title)
+            if len(tk) >= 2 and len(ck) >= 2 and len(tk & ck) >= 0.8 * max(len(tk), len(ck)):
+                add('dup', it, f'{why}: "{short(c.title, 40)}"')
+                break
+    for g in g_done:
+        gk = keywords(g.title)
+        if len(gk) < 2:
+            continue
+        for it in g_next + g_queue:
+            if covered(gk, keywords(it.text)) and not re.search(r'\bdone\b', it.text, re.I):
+                add('dup', it, f'GOALS step done: "{short(g.title, 40)}"')
+    return found
+
+
+# ------------------------------------------------------------------------------------------------ modes
+def acked_keys(now):
+    try:
+        return set(load_state(now)['acked'])
+    except Exception:
+        return set()
+
+
+def open_findings(now):
+    """lint() minus acked findings (the list, the hand-off count)."""
+    acked = acked_keys(now)
+    return [f for f in lint(now) if f.key not in acked]
+
+
+def cmd_list(argv):
+    now = now_dt()
+    found = lint(now)
+    acked = acked_keys(now)
+    show_all = '--all' in argv
+    open_ = [f for f in found if f.key not in acked]
+    shown = found if show_all else open_
+    hidden = len(found) - len(open_)
+    if '--json' in argv:
+        print(json.dumps([dict(f.as_dict(), acked=f.key in acked) for f in shown], ensure_ascii=False, indent=1))
+    else:
+        for f in shown:
+            print(f'{f.key}  {f.line()}' + ('  (acked)' if f.key in acked else ''))
+        if not open_:
+            print('board-lint: clean')
+        if hidden and not show_all:
+            print(f'({hidden} acked finding(s) hidden; `board-lint --all` shows them)')
+    return 1 if (open_ and '--strict' in argv) else 0
+
+
+def load_state(now):
+    st = load_json(STATE, {})
+    st.setdefault('shown', {})
+    st.setdefault('acked', {})
+    cut = (now - timedelta(days=KEEP_DAYS)).isoformat(timespec='minutes')
+    for k in ('shown', 'acked'):
+        st[k] = {a: b for a, b in st[k].items() if isinstance(b, str) and b >= cut}
+    return st
+
+
+def cmd_beat():
+    now = now_dt()
+    found = lint(now)
+    st = load_state(now)
+    again = (now - timedelta(hours=RESHOW_H)).isoformat(timespec='minutes')
+    new = [f for f in found if f.key not in st['acked'] and st['shown'].get(f.key, '') < again]
+    if not new:
+        write_json(STATE, st)
+        return 0
+    for f in new:
+        st['shown'][f.key] = now.isoformat(timespec='minutes')
+    write_json(STATE, st)
+    head = f'[board-lint] {len(new)} stale board item(s): '
+    tail = ' — fix them, or `board-lint ack all` if fine (`board-lint` lists all).'
+    parts, more = [], 0
+    for f in new:
+        p = f.line()
+        if len(head) + sum(len(x) + 2 for x in parts) + len(p) + len(tail) + 12 > BEAT_MAX:
+            more += 1
+            continue
+        parts.append(p)
+    body = '; '.join(parts) + (f'; +{more} more' if more else '')
+    print(head + body + tail)
+    return 0
+
+
+def cmd_ack(argv):
+    now = now_dt()
+    st = load_state(now)
+    current = [f.key for f in lint(now)]
+    if argv[:1] == ['all']:
+        keys, unknown = current, []
+    else:
+        keys, unknown = [], []
+        for a in argv:
+            a = a.strip().rstrip(',')
+            hits = [k for k in current if a and (k == a or k.split('-', 1)[-1] == a)]
+            if hits:
+                keys += [k for k in hits if k not in keys]
+            elif re.fullmatch(r'[a-z]+-[0-9a-f]{8}', a):
+                keys.append(a)        # well-formed but not current (already fixed): ack anyway, harmless
+            else:
+                unknown.append(a)
+    for k in keys:
+        st['acked'][k] = now.isoformat(timespec='minutes')
+    write_json(STATE, st)
+    print(f'acked {len(keys)}' + (f': {" ".join(keys)}' if keys and argv[:1] != ['all'] else ''))
+    if unknown:
+        print(f'board-lint: not a finding key: {" ".join(unknown)} (see `board-lint --all`)', file=sys.stderr)
+        return 1
+    return 0
+
+
+def outgoing(payload):
+    """(text, asks) from a PreToolUse payload of a Telegram reply / send_poll; asks = buttons or a poll."""
+    name = str(payload.get('tool_name', ''))
+    ti = payload.get('tool_input') or {}
+    if not isinstance(ti, dict):
+        return '', False
+    if name.endswith('send_poll'):
+        opts = ti.get('options') or []
+        texts = [str(ti.get('question', ''))] + [str(o.get('text', o)) if isinstance(o, dict) else str(o) for o in opts]
+        return '\n'.join(texts), True
+    if name.endswith('__reply'):
+        btns = []
+
+        def walk(x):
+            if isinstance(x, dict):
+                if 'text' in x:
+                    btns.append(str(x['text']))
+                for v in x.values():
+                    if isinstance(v, (list, dict)):
+                        walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        walk(ti.get('buttons'))
+        return str(ti.get('text', '')) + '\n' + '\n'.join(btns), bool(btns)
+    return '', False
+
+
+def waiting_state():
+    """{title[:160]: {'since': 'YYYY-MM-DD', 'asked': 'YYYY-MM-DD' | None}} of the board feed's Waiting rows
+    (since = the item's created); {} when the feed is missing or broken."""
+    d = load_json(BOARD_FEED, {})
+    out = {}
+    rows = d.get('items') if isinstance(d, dict) else None
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict) or str(r.get('section') or '').lower() != 'waiting on you':
+            continue
+        try:
+            since = datetime.fromtimestamp(float(r['created'])).date().isoformat()
+            asked = datetime.fromtimestamp(float(r['asked'])).date().isoformat() if r.get('asked') else None
+        except (KeyError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        out[str(r.get('title') or '')[:160]] = {'since': since, 'asked': asked}
+    return out
+
+
+def mark_asked(text, now):
+    """The TODO Waiting items this message asks about: one {"ts", "text": title} line each, appended to the board's
+    asked.jsonl (`board` drains it into the store). Hook budget: no lock, no subprocess. Returns their titles."""
+    kw = keywords(text)
+    hit = [t for t in [i.title[:160] for i in parse_todo(read(TODO)) if i.where == 'Waiting on you']
+           if len(keywords(t)) >= 2 and covered(keywords(t), kw)]
+    if hit:
+        os.makedirs(os.path.dirname(ASKED_Q), mode=0o700, exist_ok=True)
+        data = ''.join(json.dumps({'ts': now.timestamp(), 'text': t}, ensure_ascii=False) + '\n' for t in hit)
+        fd = os.open(ASKED_Q, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, data.encode())
+        finally:
+            os.close(fd)
+    return hit
+
+
+def cmd_pitch(argv):
+    raw = sys.stdin.read()
+    if '--hook' in argv:
+        payload = json.loads(raw)
+        text, asks = outgoing(payload)
+        if not asks:
+            return 0
+    else:
+        text, asks = raw, True
+    now = now_dt()
+    hits = ledger_hits(text, parse_ledger(read(FACTS)), NEGATIVE | POSITIVE)
+    marked = mark_asked(text, now) if '--hook' in argv else []
+    if marked:
+        log('pitch: marked asked: ' + '; '.join(short(t, 40) for t in marked))
+    if not hits:
+        return 0
+    lines = '; '.join(f"{e['day']:02d}.{e['month']:02d} {e['verb']}: {short(e['text'], 70)}" for e in hits[:3])
+    ctx = (f'[pitch-check] This message touches the FACTS.md ledger: {lines}. If it re-asks or re-pitches '
+           'something already done or declined, send a one-line correction now; else ignore.')
+    if '--hook' in argv:
+        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': ctx}},
+                         ensure_ascii=False))
+    else:
+        print(ctx)
+    return 0
+
+
+def workspace_session(payload):
+    """cwd = the workspace, or the transcript lies in the workspace's project folder (the agenda hook's check): the
+    session's cwd follows every `cd` in its Bash, so a compaction often reports cwd ~/inbox or ~."""
+    if not isinstance(payload, dict):
+        return False
+    cwd = payload.get('cwd')
+    if isinstance(cwd, str) and cwd and os.path.realpath(cwd) == os.path.realpath(WS):
+        return True
+    tp = payload.get('transcript_path')
+    if not isinstance(tp, str) or not tp:
+        return False
+    return os.path.realpath(os.path.dirname(tp)) == os.path.realpath(PROJECT_DIR)
+
+
+def cmd_handoff(argv):
+    if '--hook' in argv:
+        if not workspace_session(json.loads(sys.stdin.read() or '{}')):
+            return 0
+    now = now_dt()
+    out = ['[handoff] Context was compacted or resumed. Board state from the files (FACTS.md is loaded via CLAUDE.md):']
+    ledger = parse_ledger(read(FACTS))
+    neg = [e for e in ledger if e['verb'] in NEGATIVE]
+    recent = []
+    for e in ledger:
+        if e['verb'] in POSITIVE:
+            try:
+                d = datetime(now.year, e['month'], e['day'])
+            except ValueError:
+                continue
+            if d > now:
+                d = d.replace(year=d.year - 1)
+            if (now - d).days <= 3:
+                recent.append(e)
+    if neg:
+        out.append("Declined / removed (don't re-pitch): " + '; '.join(
+            f"{e['day']:02d}.{e['month']:02d} {short(e['text'], 60)}" for e in neg[:12]))
+    if recent:
+        out.append('Done or decided lately: ' + '; '.join(
+            f"{e['day']:02d}.{e['month']:02d} {e['verb']} {short(e['text'], 50)}" for e in recent[:8]))
+    todo = parse_todo(read(TODO))
+    wstate = waiting_state()
+    for sec in ('Due', 'In progress', 'Waiting on you'):
+        its = [i for i in todo if i.where == sec]
+        if not its:
+            continue
+        parts = []
+        for i in its[:14]:
+            t = short(i.title, 40)
+            v = wstate.get(i.title[:160]) if sec == 'Waiting on you' and isinstance(wstate, dict) else None
+            if isinstance(v, dict) and v.get('since'):
+                try:
+                    age = (now.date() - datetime.strptime(v['since'], '%Y-%m-%d').date()).days
+                    t += f" ({age} d, asked {dm_of(datetime.strptime(v['asked'], '%Y-%m-%d')) if v.get('asked') else 'never'})"
+                except ValueError:
+                    pass
+            parts.append(t)
+        out.append(f'{sec}: ' + '; '.join(parts))
+    try:
+        n = len(open_findings(now))
+        if n:
+            out.append(f'board-lint: {n} stale item(s) (`board-lint`).')
+    except Exception:
+        pass
+    out.append('Before any question, pitch, button or poll: FACTS.md + `recall` + a live read-only check.')
+    print('\n'.join(out)[:3000])
+    return 0
+
+
+def main(argv):
+    if argv[:1] in (['-h'], ['--help'], ['help']):
+        print(__doc__)
+        return 0
+    if argv[:1] == ['--beat']:
+        return cmd_beat()
+    if argv[:1] == ['ack']:
+        return cmd_ack(argv[1:])
+    if argv[:1] == ['pitch']:
+        return cmd_pitch(argv[1:])
+    if argv[:1] == ['handoff']:
+        return cmd_handoff(argv[1:])
+    return cmd_list(argv)
+
+
+if __name__ == '__main__':
+    argv = sys.argv[1:]
+    quiet = argv[:1] in (['--beat'], ['pitch'], ['handoff'])
+    try:
+        sys.exit(main(argv))
+    except Exception as e:   # fail open for the hook modes; loud for the list
+        if quiet:
+            log(f'error in {argv[:1]}: {type(e).__name__}: {e}'[:300])
+            sys.exit(0)
+        raise

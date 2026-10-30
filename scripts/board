@@ -1,0 +1,1639 @@
+#!/usr/bin/python3 -I
+"""board: the board as records in the hub store.
+TODO.md and the dashboard only display them; done-when probes close, move and flag items by themselves (token-free,
+never messages anyone). Every write reads TODO.md first: hand edits are imported, never lost.
+
+  board list [--all] [--json] [--section S]   open items: id, section, flags, probe states, title
+  board show ID [--json]                      one item: line, notes, due, probes, history
+  board add LINE [--section S] [--note TEXT].. [--due WHEN] [--when PROBE].. [--then done|move:SECTION] [--top]
+            [--replace-title RX]              a new item; LINE = the text after "- " ("**Title** — status");
+                                              --replace-title drops the older open items of that section whose
+                                              title matches RX (case-insensitive), in the same commit
+  board asked ID|TEXT [--at YYYY-MM-DD]       mark open "Waiting on you" items as asked (exact id, else a
+                                              case-insensitive title substring); kept in board_meta "asked"
+  board update ID [--line TEXT] [--section S] [--note TEXT].. [--notes-clear] [--due WHEN | --no-due]
+  board probe ID add PROBE [--then done|move:SECTION] | probe ID rm N | probe ID check
+  board check PROBE...                        run one probe now: pass / fail / unknown + why (exit 0 / 1 / 2)
+  board done ID [--why TEXT] | drop ID --why TEXT | reopen ID
+  board eval [--cron] [--force]               the 5-min tick (hub job board-eval): import hand edits, run the due
+                                              probes, close / move / flag, render TODO.md, write the dashboard feed
+  board poke KIND REF... [--hash SHA] [--also SHA]..   an event happened (KIND: landed, live, hub-release, acked,
+                                              approved, fired): evaluate now the items whose probes name a REF
+  board render                                print the store's render (what the next tick writes to TODO.md)
+  board diff [--report PATH]                  TODO.md vs the render, computed flags aside (exit 1 if not clean)
+  board status [--json] | snapshots           last eval, coverage, snapshot count | the newest 30 snapshots
+
+Probes (PROBE = "kind args", split like a shell, never run through one; all read-only):
+  landed BRANCH|SHA        a land of it in deploys.jsonl, a land alias (pre-rebase hash), or the commit is on main
+  hub-release SHA          the newest hub deploy runs SHA or a descendant (deploys.jsonl + git)
+  job-live NAME            the hub schedule of registry job NAME is live and not paused (GET /wf/schedules)
+  file-exists PATH | file-gone PATH
+  approved REF             a hub approval with that ref (or nonce prefix) is approved or used (GET /approvals)
+  event-acked ID           hub ledger event ID is acked (GET /events/ID)
+  reminder-fired ID        `remind list --json` lists reminder ID as fired (pending = fail)
+  cmd-ok ARGV...           exits 0; only allowlisted readers (test, grep, git read verbs, argv prefixes listed in
+                           ~/.config/assistant/board-cmd-allow); 20 s
+  his-answer REF           items only the owner can settle; REF: msg:N (his reply to message N, or a button / poll
+                           answer on it), button:PREFIX (his button press with callback data PREFIX…), approval:REF
+                           (= approved REF), pending[:TOPIC] (not asked yet: unknown). Reads the Telegram inbound
+                           journal's kinds and ids only, never message text; no journal = unknown
+  app-installed [CODE|X.Y.Z] · vault-deployed SHA · calendar-has TEXT DATE · ha-state ENTITY VALUE ·
+  paperless-has QUERY · firefly-imported · mail-has QUERY (counts only): remote checks, each with its own
+                           interval, at most 3 remote ones per tick; a Due/Waiting "Install app X.Y.Z" item
+                           without probes gets app-installed X.Y.Z
+An item is done when all its done-probes pass (closed: PROACTIVE.md line + one ~/inbox/board-*.md note per tick);
+a "move:SECTION" probe moves it once. No probe = "unverified" (shown in Due / In progress / Waiting on you).
+Computed flags (never typed; stripped on import): " [board: overdue | due today | unverified]" at the line end.
+
+TODO.md writes: the renderer owns TODO.md (snapshot before each write, the write only when the file is unchanged
+after it was read, under its TODO lock; a render that would drop half the items is refused).
+Asked: hooks append {"ts": epoch, "text": title} lines to ~/.local/state/board/asked.jsonl; every run drains it
+(same matching as `board asked`) and prunes the entries of closed items. The feed rows carry created and asked.
+State ~/.local/state/board/ (state.json, board.json = the dashboard feed, asked.jsonl, snapshots/, lock). Store: hubd
+/board (hubboard.py, schemas/pg/004_board.sql). Env seams (tests): BOARD_STORE_FILE (a JSON store instead of the hub),
+BOARD_TODO, BOARD_PROACTIVE, BOARD_INBOX, BOARD_STATE, BOARD_TODO_LOCK, BOARD_DEPLOYS,
+BOARD_REPO, BOARD_BIN, BOARD_CMD_ALLOW, BOARD_TG_JOURNAL, BOARD_NOW (epoch or "YYYY-MM-DD HH:MM"), BOARD_TZ.
+Exit: 0 ok · 1 check failed / diff not clean · 2 bad input · 3 store unreachable · 4 refused (sanity, conflict).
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+for _p in (os.path.join(_HERE, 'lib'), os.path.dirname(_HERE)):
+    if os.path.isdir(os.path.join(_p, 'core')):
+        sys.path.insert(0, _p)
+        break
+from core import jsonstate, locks, notes  # noqa: E402
+
+E = os.environ.get
+HOME = os.path.expanduser('~')
+STATE = E('BOARD_STATE') or os.path.join(HOME, '.local/state/board')
+TODO = E('BOARD_TODO') or os.path.join(HOME, 'workspace/TODO.md')
+PROACTIVE = E('BOARD_PROACTIVE') or os.path.join(HOME, 'workspace/PROACTIVE.md')
+INBOX = E('BOARD_INBOX') or os.path.join(HOME, 'inbox')
+TODO_LOCK = E('BOARD_TODO_LOCK') or os.path.join(STATE, 'todo.lock')
+DEPLOYS = E('BOARD_DEPLOYS') or os.path.join(HOME, '.local/state/assistant/deploys.jsonl')
+REPO = E('BOARD_REPO') or os.path.join(HOME, 'opt/assistant')
+BIN = E('BOARD_BIN') or os.path.join(HOME, 'bin')
+CMD_ALLOW_FILE = E('BOARD_CMD_ALLOW') or os.path.join(HOME, '.config/assistant/board-cmd-allow')
+STORE_FILE = E('BOARD_STORE_FILE')
+FEED = os.path.join(STATE, 'board.json')
+SNAPS = os.path.join(STATE, 'snapshots')
+LOCK = os.path.join(STATE, 'lock')
+STATE_JSON = os.path.join(STATE, 'state.json')
+ALIASES = os.path.join(STATE, 'land-aliases.json')
+ASKED_Q = os.path.join(STATE, 'asked.jsonl')
+TG_JOURNAL = E('BOARD_TG_JOURNAL') or os.path.join(HOME, '.claude/channels/telegram/inbound-journal.jsonl')
+ACTIVE = ('due', 'in progress', 'waiting on you')
+WAITING = 'waiting on you'
+TASKS_BEGIN, TASKS_END = '<!-- tasks:begin -->', '<!-- tasks:end -->'
+MARK_RE = re.compile(r'\s*\[board: [^\]]*\]\s*$')
+DONE_WHEN_RE = re.compile(r'^\s+[-*+]\s+done-when:\s*(.+?)\s*$')
+HEX_RE = re.compile(r'^[0-9a-f]{7,40}$')
+KEEP_SNAPS = 300
+REMOTE_MAX = 3
+
+
+def _tz():
+    if E('BOARD_TZ'):
+        return ZoneInfo(E('BOARD_TZ'))
+    try:
+        import assistant_profile  # noqa: PLC0415
+        return assistant_profile.tz()
+    except Exception:  # noqa: BLE001
+        return ZoneInfo('UTC')
+
+
+TZ = _tz()
+
+
+def now_ts() -> float:
+    v = E('BOARD_NOW')
+    if not v:
+        return time.time()
+    try:
+        return float(v)
+    except ValueError:
+        return datetime.strptime(v, '%Y-%m-%d %H:%M').replace(tzinfo=TZ).timestamp()
+
+
+def hm(ts: float) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime('%H:%M %d.%m')
+
+
+def sha(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def read_text(path: str) -> str:
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        return ''
+
+
+def die(msg: str, code: int = 2):
+    print(f'board: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------------------------- store
+
+class StoreDown(Exception):
+    pass
+
+
+class StoreConflict(Exception):
+    pass
+
+
+ROW_KEYS = ('id', 'kind', 'section', 'pos', 'line', 'title', 'due_ts', 'state', 'created', 'updated', 'closed_ts',
+            'closed_by', 'version')
+
+
+def decode(r: dict) -> dict:
+    it = dict(r)
+    for k in ('notes', 'probes'):
+        v = it.get(k)
+        if isinstance(v, str):
+            try:
+                it[k] = json.loads(v or '[]')
+            except ValueError:
+                it[k] = []
+        elif not isinstance(v, list):
+            it[k] = []
+    return it
+
+
+def encode(it: dict) -> dict:
+    u = {k: it.get(k) for k in ROW_KEYS}
+    u['title'] = (u['title'] or '')[:400]
+    u['notes'] = json.dumps(it.get('notes') or [], ensure_ascii=False)
+    u['probes'] = json.dumps(it.get('probes') or [], ensure_ascii=False)
+    return u
+
+
+class HubStore:
+    """The hub's /board routes (the brain's token; HUB_SCHEMA picks a test schema)."""
+
+    def __init__(self):
+        from core import hub  # noqa: PLC0415
+        self.hub = hub
+
+    def _call(self, method: str, path: str, body: dict | None = None) -> dict:
+        h = self.hub
+        try:
+            return h.call(method, path, body, timeout=25.0)
+        except h.Conflict as e:
+            raise StoreConflict(str(e)) from None
+        except h.HubDown as e:
+            raise StoreDown(str(e)) from None
+        except h.Refused as e:
+            raise StoreDown(f'refused {e.args[:2]}') from None
+        except h.HubError as e:  # no token, test mode without HUB_URL
+            raise StoreDown(str(e)) from None
+
+    def load(self, all_rows: bool = False):
+        r = self._call('GET', '/board' + ('?all=1' if all_rows else ''))
+        return [decode(i) for i in r.get('items') or []], dict(r.get('meta') or {})
+
+    def apply(self, upserts: list, meta: dict | None = None, log: list | None = None) -> dict:
+        body = {'rid': self.hub.new_rid(), 'upserts': [encode(u) for u in upserts], 'meta': meta or {},
+                'log': log or []}
+        return self._call('POST', '/board/apply', body)
+
+    def history(self, item: str | None = None, limit: int = 50) -> list:
+        q = f'?limit={int(limit)}' + (f'&item={urllib.parse.quote(item)}' if item else '')
+        return self._call('GET', '/board/log' + q).get('rows') or []
+
+
+class FileStore:
+    """The same semantics in one JSON file (tests, a dry run without the hub)."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def _read(self) -> dict:
+        d = jsonstate.load(self.path, None)
+        return d if isinstance(d, dict) else {'items': {}, 'meta': {}, 'log': []}
+
+    def load(self, all_rows: bool = False):
+        d, cut = self._read(), now_ts() - 7 * 86400
+        rows = [decode(r) for r in d['items'].values()
+                if all_rows or r['state'] == 'open' or (r.get('closed_ts') or 0) >= cut]
+        rows.sort(key=lambda r: (r['pos'], r['id']))
+        return rows, dict(d['meta'])
+
+    def apply(self, upserts: list, meta: dict | None = None, log: list | None = None) -> dict:
+        d, vers = self._read(), {}
+        for it in upserts:
+            u, cur = encode(it), d['items'].get(it['id'])
+            if u['version'] == 0:
+                if cur:
+                    raise StoreConflict(f"{u['id']}: exists")
+            elif not cur or cur['version'] != u['version']:
+                raise StoreConflict(f"{u['id']}: changed since version {u['version']}")
+            u['version'] += 1
+            d['items'][u['id']] = u
+            vers[u['id']] = u['version']
+        d['meta'].update(meta or {})
+        d['log'] = (d['log'] + [dict(e, ts=now_ts()) for e in log or []])[-2000:]
+        jsonstate.save(self.path, d, mode=0o600)
+        return {'versions': vers}
+
+    def history(self, item: str | None = None, limit: int = 50) -> list:
+        rows = [e for e in self._read()['log'] if not item or e.get('item') == item]
+        return [dict(e, by_who=e.get('by')) for e in rows[::-1][:limit]]
+
+
+def get_store():
+    return FileStore(STORE_FILE) if STORE_FILE else HubStore()
+
+
+def commit(store, ups: list, meta: dict | None = None, log: list | None = None) -> None:
+    if not ups and not meta and not log:
+        return
+    vers = store.apply(ups, meta, log).get('versions') or {}
+    for it in ups:
+        if it['id'] in vers:
+            it['version'] = vers[it['id']]
+
+
+# ------------------------------------------------------------------------------------------- parse/render
+
+def title_of(line: str) -> str:
+    m = re.match(r'\s*\*\*(.+?)\*\*', line)
+    t = m.group(1) if m else re.split(r' — | - |: ', line, maxsplit=1)[0]
+    return t.strip()[:300]
+
+
+def norm(t: str) -> str:
+    return ' '.join(re.findall(r'[^\W_]+', t.lower()))
+
+
+def tokens(t: str) -> set:
+    return set(re.findall(r'[^\W_]{3,}', t.lower()))
+
+
+def parse(text: str):
+    """TODO.md -> (header, sections, entries); entry = {section, kind item|raw, line, notes}. Item = a "- " line and
+    its indented lines; raw = everything else, verbatim (blank lines, comments, the whole tasks block)."""
+    lines = text.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
+    i, header = 0, []
+    while i < len(lines) and not lines[i].startswith('## '):
+        header.append(lines[i])
+        i += 1
+    sections, entries = [], []
+    cur = item = raw = None
+    in_tasks = False
+    for ln in lines[i:]:
+        if in_tasks:
+            raw['line'] += '\n' + ln
+            in_tasks = ln.strip() != TASKS_END
+            continue
+        if ln.startswith('## '):
+            cur, item, raw = ln[3:], None, None
+            sections.append(cur)
+            continue
+        if ln.strip() == TASKS_BEGIN:
+            item = None
+            raw = {'section': cur, 'kind': 'raw', 'line': ln, 'notes': []}
+            entries.append(raw)
+            in_tasks = True
+            continue
+        if ln.startswith('- '):
+            item, raw = {'section': cur, 'kind': 'item', 'line': MARK_RE.sub('', ln[2:]), 'notes': []}, None
+            entries.append(item)
+            continue
+        if item is not None and ln[:1] in (' ', '\t') and ln.strip():
+            item['notes'].append(ln)
+            continue
+        item = None
+        if raw is not None:
+            raw['line'] += '\n' + ln
+        else:
+            raw = {'section': cur, 'kind': 'raw', 'line': ln, 'notes': []}
+            entries.append(raw)
+    for e in entries:
+        if e['kind'] == 'raw':
+            raw_end = e['line']
+            e['line'] = raw_end
+    return '\n'.join(header), sections, entries
+
+
+DUE_RES = (
+    re.compile(r'\bdue\s+(?P<H>\d{1,2}):(?P<M>\d{2})\s+(?P<d>\d{1,2})\.(?P<m>\d{1,2})\b'),
+    re.compile(r'^\s*\*\*[^*]+\*\*\s+—\s+(?:due\s+)?(?P<d>\d{1,2})\.(?P<m>\d{1,2})\.?\s+(?P<H>\d{1,2}):(?P<M>\d{2})\b'),
+    re.compile(r'^\s*\*\*[^*]+\*\*\s+—\s+(?:due\s+)?(?P<H>\d{1,2}):(?P<M>\d{2})\s+(?P<d>\d{1,2})\.(?P<m>\d{1,2})\b'),
+)
+
+
+def due_of(line: str, now: float) -> float | None:
+    year = datetime.fromtimestamp(now, TZ).year
+    for rx in DUE_RES:
+        m = rx.search(line)
+        if not m:
+            continue
+        try:
+            dt = datetime(year, int(m['m']), int(m['d']), int(m['H']), int(m['M']), tzinfo=TZ)
+        except ValueError:
+            continue
+        if now - dt.timestamp() > 183 * 86400:
+            dt = dt.replace(year=year + 1)
+        return dt.timestamp()
+    return None
+
+
+def parse_when(s: str, now: float) -> float:
+    s = s.strip()
+    base = datetime.fromtimestamp(now, TZ)
+    for fmt in ('%H:%M %d.%m', '%d.%m %H:%M', '%Y-%m-%d %H:%M', '%d.%m.%Y %H:%M', '%d.%m'):
+        try:
+            dt = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        if '%Y' not in fmt:
+            dt = dt.replace(year=base.year)
+            if fmt == '%d.%m':
+                dt = dt.replace(hour=9)
+            if now - dt.replace(tzinfo=TZ).timestamp() > 183 * 86400:
+                dt = dt.replace(year=base.year + 1)
+        return dt.replace(tzinfo=TZ).timestamp()
+    die(f'--due: "HH:MM DD.MM", "DD.MM HH:MM", "YYYY-MM-DD HH:MM" or "DD.MM" ({s!r})')
+    return 0.0
+
+
+def flags(it: dict, now: float) -> list:
+    out = []
+    d = it.get('due_ts')
+    if d:
+        if now >= d:
+            out.append('overdue')
+        elif datetime.fromtimestamp(d, TZ).date() == datetime.fromtimestamp(now, TZ).date():
+            out.append('due today')
+    if it['kind'] == 'item' and not it.get('probes') and (it['section'] or '').lower() in ACTIVE:
+        out.append('unverified')
+    return out
+
+
+def render(items: list, meta: dict, now: float) -> str:
+    out = meta.get('header', '# TODO').split('\n') if meta.get('header', '# TODO') != '' else []
+    try:
+        secs = list(json.loads(meta.get('sections') or '[]'))
+    except ValueError:
+        secs = []
+    live = sorted((it for it in items if it['state'] == 'open'), key=lambda r: (r['pos'], r['id']))
+    for it in live:
+        if it['section'] not in secs:
+            secs.append(it['section'])
+    for s in secs:
+        out.append('## ' + s)
+        for it in (i for i in live if i['section'] == s):
+            if it['kind'] == 'raw':
+                out.extend(it['line'].split('\n'))
+                continue
+            f = flags(it, now)
+            out.append('- ' + it['line'] + (f" [board: {', '.join(f)}]" if f else ''))
+            out.extend(it.get('notes') or [])
+    return '\n'.join(out) + '\n'
+
+
+def normalized(text: str) -> list:
+    out = []
+    for ln in text.split('\n'):
+        ln = MARK_RE.sub('', ln).rstrip()
+        if ln == '' and (not out or out[-1] == ''):
+            continue
+        out.append(ln)
+    while out and out[-1] == '':
+        out.pop()
+    return out
+
+
+def item_count(text: str) -> int:
+    return sum(1 for e in parse(text)[2] if e['kind'] == 'item')
+
+
+# ------------------------------------------------------------------------------------------------- sync
+
+def probes_from_notes(notes_: list) -> list:
+    out = []
+    for n in notes_:
+        m = DONE_WHEN_RE.match(n)
+        if m:
+            out.append({'spec': m.group(1), 'then': 'done', 'src': 'done-when', 'state': 'pending'})
+    return out
+
+
+def implicit_probes(row: dict) -> list:
+    """A Due / Waiting item titled "Install app X.Y.Z" without probes checks app-installed X.Y.Z."""
+    m = IMPLICIT_APP.search(row.get('title') or '')
+    if row['kind'] != 'item' or row.get('probes') or not m or \
+            (row['section'] or '').lower() not in ('due', 'waiting on you'):
+        return []
+    return [{'spec': f'app-installed {m.group(1)}', 'then': 'done', 'src': 'implicit', 'state': 'pending'}]
+
+
+def merge_done_when(probes: list, notes_: list) -> list:
+    want = [p['spec'] for p in probes_from_notes(notes_)]
+    keep = [p for p in probes if p.get('src') != 'done-when' or p['spec'] in want]
+    have = {p['spec'] for p in keep if p.get('src') == 'done-when'}
+    return keep + [{'spec': s, 'then': 'done', 'src': 'done-when', 'state': 'pending'} for s in want if s not in have]
+
+
+def new_id(taken: set) -> str:
+    while True:
+        i = secrets.token_hex(3)
+        if i not in taken and not i.isdigit():
+            taken.add(i)
+            return i
+
+
+def new_row(e: dict, now: float, taken: set) -> dict:
+    item = e['kind'] == 'item'
+    row = {'id': new_id(taken), 'kind': e['kind'], 'section': e['section'], 'pos': e['pos'], 'line': e['line'],
+            'title': title_of(e['line']) if item else '', 'notes': list(e['notes']),
+            'due_ts': due_of(e['line'], now) if item else None, 'probes': probes_from_notes(e['notes']) if item else [],
+            'state': 'open', 'created': now, 'updated': now, 'closed_ts': None, 'closed_by': None, 'version': 0}
+    row['probes'] = row['probes'] or implicit_probes(row)
+    return row
+
+
+def sync(text: str, items: list, meta: dict, now: float, by: str = 'todo.md'):
+    """TODO.md text -> (upserts, meta changes, log) that make the store's open rows match it. Items match by title,
+    then by word overlap; an item a probe closed in the last 24 h stays closed (a stale copy never revives it)."""
+    header, sections, entries = parse(text)
+    for idx, e in enumerate(entries):
+        e['pos'] = float(idx)
+    open_rows = [it for it in items if it['state'] == 'open']
+    used: set = set()
+    by_title: dict = {}
+    for it in open_rows:
+        if it['kind'] == 'item':
+            by_title.setdefault(norm(it['title']), []).append(it)
+    recent_closed = {norm(it['title']) for it in items if it['state'] == 'done' and it['kind'] == 'item'
+                     and str(it.get('closed_by') or '').startswith('probe')
+                     and now - (it.get('closed_ts') or 0) < 86400}
+    rest = []
+    for e in entries:
+        if e['kind'] != 'item':
+            continue
+        c = [it for it in by_title.get(norm(title_of(e['line'])), []) if it['id'] not in used]
+        if c:
+            e['row'] = c[0]
+            used.add(c[0]['id'])
+        else:
+            rest.append(e)
+    for e in rest:
+        te, best, score = tokens(title_of(e['line']) + ' ' + e['line'][:300]), None, 0.0
+        for it in open_rows:
+            if it['kind'] != 'item' or it['id'] in used:
+                continue
+            ti = tokens(it['title'] + ' ' + it['line'][:300])
+            s = len(te & ti) / max(1, len(te | ti))
+            if s > score:
+                best, score = it, s
+        if best is not None and score >= 0.5:
+            e['row'] = best
+            used.add(best['id'])
+        elif norm(title_of(e['line'])) in recent_closed:
+            e['skip'] = True
+    raws: dict = {}
+    for it in open_rows:
+        if it['kind'] == 'raw':
+            raws.setdefault(it['section'], []).append(it)
+    for e in entries:
+        if e['kind'] == 'raw' and raws.get(e['section']):
+            e['row'] = raws[e['section']].pop(0)
+            used.add(e['row']['id'])
+    ups, log, taken = [], [], {it['id'] for it in items}
+    for e in entries:
+        if e.get('skip'):
+            continue
+        row = e.get('row')
+        if row is None:
+            row = new_row(e, now, taken)
+            ups.append(row)
+            if row['kind'] == 'item':
+                log.append({'item': row['id'], 'op': 'add', 'by': by, 'detail': row['title'][:200]})
+            continue
+        changed = [k for k in ('section', 'pos', 'line', 'notes') if row[k] != e[k]]
+        for k in changed:
+            row[k] = e[k]
+        if row['kind'] == 'item':
+            if 'line' in changed:
+                row['title'] = title_of(row['line'])
+                d = due_of(row['line'], now)
+                if d is not None or row.get('due_src') != 'cli':
+                    row['due_ts'] = d
+            merged = merge_done_when([p for p in row.get('probes') or [] if p.get('src') != 'implicit'], row['notes'])
+            merged = merged or implicit_probes(dict(row, probes=[])) or []
+            if merged != row.get('probes'):
+                row['probes'] = merged
+                changed.append('probes')
+        if changed:
+            row['updated'] = now
+            ups.append(row)
+            if row['kind'] == 'item' and set(changed) - {'pos'}:
+                log.append({'item': row['id'], 'op': 'edit', 'by': by, 'detail': ','.join(changed)})
+    for it in open_rows:
+        if it['id'] not in used:
+            it.update(state='done' if it['kind'] == 'item' else 'dropped', closed_ts=now, closed_by=by, updated=now)
+            ups.append(it)
+            if it['kind'] == 'item':
+                log.append({'item': it['id'], 'op': 'close', 'by': by, 'detail': 'gone from TODO.md'})
+    mch = {}
+    if meta.get('header') != header:
+        mch['header'] = header
+    sj = json.dumps(sections, ensure_ascii=False)
+    if meta.get('sections') != sj:
+        mch['sections'] = sj
+    return ups, mch, log
+
+
+# ------------------------------------------------------------------------------------------------- probes
+
+def _run(argv: list, timeout: float = 20.0):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        return r.returncode, (r.stdout or '') + (r.stderr or '')
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, type(e).__name__
+
+
+def _git(*args: str) -> bool:
+    rc, _ = _run(['git', '-C', REPO, *args], timeout=15)
+    return rc == 0
+
+
+_DEPLOYS: list | None = None
+
+
+def deploy_rows() -> list:
+    global _DEPLOYS
+    if _DEPLOYS is None:
+        _DEPLOYS = []
+        for ln in read_text(DEPLOYS).splitlines()[-5000:]:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(r, dict):
+                _DEPLOYS.append(r)
+    return _DEPLOYS
+
+
+def p_landed(args):
+    ref = args[0]
+    for r in reversed(deploy_rows()):
+        if r.get('op') == 'land' and r.get('ok') and \
+                (r.get('branch') == ref or str(r.get('sha') or '').startswith(ref)):
+            return 'pass', f"landed {str(r.get('sha') or '')[:12]}"
+    al = (jsonstate.load(ALIASES, {}) or {}).get(ref)
+    if al:
+        return 'pass', f'landed as {al[:12]} (pre-rebase {ref[:12]})'
+    if HEX_RE.match(ref):
+        if not _git('cat-file', '-e', ref + '^{commit}'):
+            return 'unknown', 'no such commit here'
+        return ('pass', 'on main') if _git('merge-base', '--is-ancestor', ref, 'main') else ('fail', 'not on main')
+    return 'fail', 'no land record yet'
+
+
+def p_hub_release(args):
+    ref = args[0]
+    rows = [r for r in deploy_rows() if r.get('op') == 'deploy' and r.get('target') == 'hub' and r.get('ok')]
+    if not rows:
+        return 'unknown', 'no hub deploy on record'
+    cur = str(rows[-1].get('sha') or rows[-1].get('release') or '')
+    if cur.startswith(ref) or (_git('cat-file', '-e', ref + '^{commit}')
+                               and _git('merge-base', '--is-ancestor', ref, cur)):
+        return 'pass', f'hub runs {cur[:12]}'
+    return 'fail', f'hub runs {cur[:12]}'
+
+
+def _hub(method: str, path: str) -> dict:
+    from core import hub  # noqa: PLC0415
+    return hub.call(method, path, None, timeout=10.0)
+
+
+def p_job_live(args):
+    rows = _hub('GET', '/wf/schedules').get('rows') or []
+    mine = [r for r in rows if isinstance(r, dict) and args[0] in (r.get('job'), r.get('name'))]
+    if not mine:
+        return 'fail', 'no hub schedule'
+    for r in mine:
+        if r.get('mode') == 'live' and str(r.get('status') or '').upper() != 'PAUSED':
+            return 'pass', 'live on the hub'
+    return 'fail', 'schedule ' + '/'.join(sorted({f"{r.get('mode')} {r.get('status')}" for r in mine}))
+
+
+def p_file_exists(args):
+    return ('pass', 'exists') if os.path.exists(os.path.expanduser(args[0])) else ('fail', 'missing')
+
+
+def p_file_gone(args):
+    return ('fail', 'still there') if os.path.lexists(os.path.expanduser(args[0])) else ('pass', 'gone')
+
+
+def _rows(r) -> list:
+    if isinstance(r, dict):
+        for k in ('rows', 'approvals', 'items', 'value'):
+            if isinstance(r.get(k), list):
+                return r[k]
+    return r if isinstance(r, list) else []
+
+
+def p_approved(args):
+    ref = args[0]
+    rows = [a for a in _rows(_hub('GET', '/approvals?every=1')) if isinstance(a, dict)
+            and (a.get('ref') == ref or str(a.get('nonce') or '').startswith(ref))]
+    for a in rows:
+        if a.get('status') in ('approved', 'used'):
+            return 'pass', f"{a.get('status')} {hm(float(a.get('decided_ts') or 0))}"
+    if not rows:
+        return 'fail', 'no approval yet'
+    return 'fail', 'status ' + '/'.join(sorted({str(a.get('status')) for a in rows}))
+
+
+def p_event_acked(args):
+    if not args[0].isdigit():
+        return 'unknown', 'an event id'
+    r = _hub('GET', f'/events/{args[0]}')
+    row = r.get('event') if isinstance(r.get('event'), dict) else r
+    if row.get('acked_ts') or row.get('status') == 'acked':
+        return 'pass', 'acked'
+    return 'fail', f"status {row.get('status')}"
+
+
+def p_reminder_fired(args):
+    rc, out = _run([os.path.join(BIN, 'remind'), 'list', '--json'], timeout=30)
+    try:
+        d = json.loads(out) if rc == 0 else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return 'unknown', 'remind list failed'
+    def ids(v):
+        return {str(x.get('id')) for x in v if isinstance(x, dict)} if isinstance(v, list) else set()
+    fired = set().union(*[ids(v) for k, v in d.items() if 'fired' in k]) if d else set()
+    if args[0] in fired:
+        return 'pass', 'fired'
+    if args[0] in ids(d.get('items')):
+        return 'fail', 'pending'
+    return 'unknown', 'not pending, not fired in 36 h'
+
+
+_JOURNAL: dict = {}
+
+
+def journal_rows() -> list:
+    """The owner's rows of the Telegram inbound journal, reduced to kind / ts / ids / callback data. Privacy: the
+    journal holds his message text; content and the *_text fields are never read into the result or printed."""
+    st = os.stat(TG_JOURNAL)
+    key = (TG_JOURNAL, st.st_mtime_ns, st.st_size)
+    if _JOURNAL.get('key') == key:
+        return _JOURNAL['rows']
+    rows = []
+    with open(TG_JOURNAL, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(r, dict) or r.get('owner') is not True:
+                continue
+            m = r.get('meta') if isinstance(r.get('meta'), dict) else {}
+            rows.append({'kind': str(r.get('kind') or ''), 'ts': r.get('ts') or r.get('at'),
+                         'mid': str(m.get('message_id') or ''), 'reply_to': str(m.get('reply_to_message_id') or ''),
+                         'cb': str(m.get('callback_data') or '')})
+    _JOURNAL.update(key=key, rows=rows)
+    return rows
+
+
+def _jts(v) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(str(v).replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return None
+
+
+HIS_ANSWER_USE = 'REF: msg:N, button:PREFIX, approval:REF or pending[:TOPIC]'
+TAPS = ('button', 'instant', 'poll_answer')
+
+
+def p_his_answer(args):
+    kind, _, val = args[0].partition(':')
+    if kind == 'pending':
+        return 'unknown', 'not asked yet (link: board probe ID add his-answer msg:N)'
+    if kind == 'approval':
+        return p_approved([val]) if val else ('unknown', HIS_ANSWER_USE)
+    if kind not in ('msg', 'button') or not val or (kind == 'msg' and not val.isdigit()):
+        return 'unknown', HIS_ANSWER_USE
+    try:
+        rows = journal_rows()
+    except OSError:
+        return 'unknown', 'no Telegram inbound journal'
+    for r in rows:
+        if kind == 'msg':
+            hit = r['reply_to'] == val or (r['kind'] in TAPS and r['mid'] == val)
+        else:
+            hit = r['kind'] in TAPS[:2] and r['cb'].startswith(val)
+        if hit:
+            ts = _jts(r['ts'])
+            what = 'reply' if r['kind'] == 'message' else r['kind'].replace('_', ' ')
+            return 'pass', f"his {what}" + (f' {hm(ts)}' if ts else '')
+    return 'fail', 'no answer from him yet'
+
+
+CMD_ALLOW = (('test',), ('[',), ('grep',), ('git', 'merge-base'), ('git', 'rev-parse'), ('git', 'cat-file'),
+             ('git', 'log'), ('git', 'show'), ('git', 'diff'), ('git', 'branch'))
+CMD_DENY = re.compile(r'^(tg|tg-.*|event-card|rm|mv|dd|cp|curl|wget|ssh|unraid-.*|vault|securefill|.*send.*)$')
+
+
+def cmd_allowed(argv: list) -> bool:
+    base = os.path.basename(argv[0])
+    if CMD_DENY.match(base):
+        return False
+    key = [base] + argv[1:]
+    if base == 'git':
+        while len(key) > 2 and key[1] == '-C':
+            key = [key[0]] + key[3:]
+    extra = [tuple(shlex.split(ln)) for ln in read_text(CMD_ALLOW_FILE).splitlines() if ln.strip()
+             and not ln.lstrip().startswith('#')]
+    return any(tuple(key[:len(p)]) == p for p in (*CMD_ALLOW, *extra) if p)
+
+
+def p_cmd_ok(args):
+    if not cmd_allowed(args):
+        return 'unknown', f'{os.path.basename(args[0])}: not on the allowlist (board-cmd-allow)'
+    exe = args[0] if '/' in args[0] else (shutil.which(args[0], path=BIN) or shutil.which(args[0]))
+    if not exe:
+        return 'unknown', f'{args[0]}: not found'
+    rc, out = _run([exe, *args[1:]], timeout=20)
+    if rc is None:
+        return 'unknown', out
+    return ('pass', 'exit 0') if rc == 0 else ('fail', f'exit {rc}')
+
+
+# Remote probes: phone app, vault deploy, calendar, HA, paperless, Firefly, mail (each with its own interval).
+PHONEGW_DB = E('BOARD_PHONEGW_DB') or os.path.join(HOME, '.local/state/claude-hub/phonegw-mirror.db')
+VAULT_REPO = E('BOARD_VAULT_REPO') or os.path.join(HOME, 'opt/claude-vault')
+VERSION_NAME = re.compile(r'^v?\d+\.\d+\.\d+$')
+ENTITY = re.compile(r'^[a-z_]+\.[a-z0-9_]+$')
+IMPLICIT_APP = re.compile(r'\binstall(?:\s+the)?\s+app\s+v?(\d+\.\d+\.\d+)\b', re.I)
+
+
+def tool_json(name: str, args: list, timeout: float = 90):
+    """JSON stdout of a tool in BIN (stderr dropped, no stdin, never a shell)."""
+    try:
+        p = subprocess.run([os.path.join(BIN, name), *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=timeout, text=True, check=False)
+        return json.loads(p.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise RuntimeError(f'{name}: no JSON') from None
+
+
+def _vt(v: str) -> tuple:
+    return tuple(int(x) for x in v.lstrip('v').split('.'))
+
+
+def p_app_installed(args):
+    if args and not (args[0].isdigit() or VERSION_NAME.match(args[0])):
+        return 'unknown', 'app-installed: CODE (a number) or a version X.Y.Z'
+    if not os.path.exists(PHONEGW_DB):
+        return 'unknown', 'no phonegw database'
+    import sqlite3  # noqa: PLC0415
+    con = sqlite3.connect(f'file:{PHONEGW_DB}?mode=ro', uri=True, timeout=5)
+    try:
+        devs = con.execute("SELECT id, app_code FROM devices WHERE status='active'").fetchall()
+        row = con.execute("SELECT v FROM state WHERE device_id='_gw' AND k='app_latest'").fetchone()
+    finally:
+        con.close()
+    try:
+        latest = json.loads(row[0]) or {} if row else {}
+    except ValueError:
+        latest = {}
+    if args and args[0].isdigit():
+        want, label = int(args[0]), f'code {args[0]}'
+    else:
+        lname = str(latest.get('name') or '').lstrip('v')
+        if not str(latest.get('code', '')).isdigit() or (args and not VERSION_NAME.match(lname)):
+            return 'unknown', 'no app_latest on the gateway'
+        if args and _vt(args[0]) > _vt(lname):
+            return 'unknown', f'app {args[0]} is newer than the published {lname}'
+        want, label = int(latest['code']), f"app_latest code {latest['code']}"
+    if not devs:
+        return 'unknown', 'no active device'
+    codes = [int(c or 0) for _, c in devs]
+    return ('fail', f'device code {min(codes)} < {label}') if min(codes) < want else \
+        ('pass', f'device code {min(codes)} >= {label}')
+
+
+def p_vault_deployed(args):
+    if not HEX_RE.match(args[0].lower()):
+        return 'unknown', 'vault-deployed takes one commit SHA (7-40 hex)'
+    ref = args[0].lower()
+    d = tool_json('vault', ['deploy', 'status', '--json'], timeout=60)
+    running = str(((d.get('runner') or {}).get('deployed')) or '').lower()
+    if running.startswith(ref):
+        return 'pass', f'the vault runs {running[:7]}'
+    for r in d.get('requests') or []:
+        if str(r.get('commit') or '').lower().startswith(ref) and r.get('state') == 'deployed':
+            return 'pass', f"deploy request {str(r.get('request_id'))[:8]} deployed"
+    if running and os.path.isdir(VAULT_REPO):
+        rc, _ = _run(['git', '-C', VAULT_REPO, 'merge-base', '--is-ancestor', ref, running], timeout=20)
+        if rc == 0:
+            return 'pass', f'the vault runs {running[:7]}, a descendant'
+    return 'fail', f"the vault runs {running[:7] or '?'}"
+
+
+def p_calendar_has(args):
+    today = datetime.fromtimestamp(now_ts(), TZ).date()
+    s = args[1].strip()
+    m = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', s) or re.match(r'^(\d{1,2})\.(\d{1,2})\.?(?:(\d{2,4}))?$', s)
+    if not m:
+        return 'unknown', f'calendar-has: bad DATE {s!r} (YYYY-MM-DD or DD.MM[.YYYY])'
+    if '-' in s:
+        y, mo, d = int(m[1]), int(m[2]), int(m[3])
+    else:
+        y = int(m[3]) if m[3] else today.year
+        y, mo, d = (y + 2000 if y < 100 else y), int(m[2]), int(m[1])
+    day = datetime(y, mo, d).date()
+    if '-' not in s and not m[3] and day < today - timedelta(days=60):
+        day = day.replace(year=day.year + 1)
+    ahead = (day - today).days
+    if ahead < 0 or ahead > 20:
+        return 'unknown', f'{day.isoformat()} is outside the calendar cache window'
+    evs = tool_json('calcache', ['show', '--days', str(ahead + 1), '--json'], timeout=30)
+    needle = args[0].casefold()
+    for ev in evs if isinstance(evs, list) else []:
+        st, en = str(ev.get('start') or '')[:10], str(ev.get('end') or '')[:10]
+        try:
+            s0 = datetime.fromisoformat(st).date()
+            e0 = datetime.fromisoformat(en).date() if en else s0
+        except ValueError:
+            continue
+        if (s0 == day or (ev.get('all_day') and s0 <= day < e0)) and needle in str(ev.get('title') or '').casefold():
+            return 'pass', f'calendar has it on {day.isoformat()}'
+    return 'fail', f'no matching event on {day.isoformat()}'
+
+
+def p_ha_state(args):
+    if not ENTITY.match(args[0]):
+        return 'unknown', 'ha-state takes ENTITY VALUE'
+    d = tool_json('ha', ['state', args[0], '--json'], timeout=30)
+    st = str(d.get('state') or '') if isinstance(d, dict) else ''
+    if not st:
+        return 'unknown', 'no state'
+    return ('pass' if st.casefold() == args[1].casefold() else 'fail'), f'{args[0]} is {st}'
+
+
+def p_paperless_has(args):
+    d = tool_json('paperless', ['search', *args, '--json', '-n', '1'], timeout=90)
+    n = int(d.get('count') or 0) if isinstance(d, dict) else 0
+    if not n and isinstance(d, dict) and d.get('results'):
+        n = len(d['results'])
+    return ('pass' if n > 0 else 'fail'), f'{n} document(s)'
+
+
+def p_firefly_imported(args):
+    d = tool_json('vault', ['firefly', 'sync-status'], timeout=60)
+    if not isinstance(d, dict):
+        return 'unknown', 'no status'
+    if d.get('last_import'):
+        return 'pass', 'an import ran'
+    files = d.get('files') or {}
+    n = sum(int(v or 0) for v in files.values()) if isinstance(files, dict) else 0
+    return ('pass' if n > 0 else 'fail'), f'{n} export file(s)'
+
+
+def p_mail_has(args):
+    d = tool_json('vault', ['gmail', 'search', ' '.join(args), '-n', '1', '--json', '--no-text'], timeout=120)
+    if not isinstance(d, dict):
+        return 'unknown', 'no result'
+    if d.get('errors'):
+        return 'unknown', 'search error'
+    n = int(d.get('total') or d.get('count') or 0)
+    return ('pass' if n > 0 else 'fail'), f'{n} mail(s)'
+
+
+# name -> (function, minimum seconds between checks, remote (counts against REMOTE_MAX), minimum args)
+PROBES = {
+    'landed': (p_landed, 0, False, 1), 'hub-release': (p_hub_release, 0, False, 1),
+    'job-live': (p_job_live, 240, False, 1), 'file-exists': (p_file_exists, 0, False, 1),
+    'file-gone': (p_file_gone, 0, False, 1), 'approved': (p_approved, 0, False, 1),
+    'event-acked': (p_event_acked, 0, False, 1), 'reminder-fired': (p_reminder_fired, 240, False, 1),
+    'cmd-ok': (p_cmd_ok, 240, False, 1), 'app-installed': (p_app_installed, 0, False, 0),
+    'vault-deployed': (p_vault_deployed, 900, True, 1), 'calendar-has': (p_calendar_has, 0, False, 2),
+    'ha-state': (p_ha_state, 600, True, 2), 'paperless-has': (p_paperless_has, 1800, True, 1),
+    'firefly-imported': (p_firefly_imported, 1800, True, 0), 'mail-has': (p_mail_has, 3600, True, 1),
+    'his-answer': (p_his_answer, 0, False, 1),
+}
+
+
+def probe_split(spec: str):
+    try:
+        parts = shlex.split(spec)
+    except ValueError as e:
+        raise ValueError(f'bad quoting: {e}') from None
+    if not parts or parts[0] not in PROBES:
+        raise ValueError(f"unknown probe {parts[0] if parts else ''!r} (board --help lists them)")
+    if len(parts) - 1 < PROBES[parts[0]][3]:
+        raise ValueError(f'{parts[0]}: needs {PROBES[parts[0]][3]} argument(s)')
+    return parts[0], parts[1:]
+
+
+def check_probe(spec: str):
+    try:
+        kind, args = probe_split(spec)
+        return PROBES[kind][0](args)
+    except ValueError as e:
+        return 'unknown', str(e)
+    except Exception as e:  # noqa: BLE001  (a probe never breaks the tick)
+        return 'unknown', type(e).__name__
+
+
+def ref_hit(spec: str, refs: list) -> bool:
+    try:
+        toks = shlex.split(spec)[1:]
+    except ValueError:
+        return False
+    for t in toks:
+        for r in refs:
+            if r and (t == r or (HEX_RE.match(t) and HEX_RE.match(r) and (t.startswith(r) or r.startswith(t)))):
+                return True
+    return False
+
+
+def end_pos(items: list, section: str, top: bool = False) -> float:
+    ps = [it['pos'] for it in items if it['state'] == 'open' and it['section'] == section]
+    if not ps:
+        return max([it['pos'] for it in items] or [0.0]) + 1.0
+    return (min(ps) - 0.01) if top else (max(ps) + 0.01)
+
+
+def run_probes(items: list, now: float, only_refs: list | None = None, force: bool = False):
+    ups, log, closed, moved, remote_left = [], [], [], [], REMOTE_MAX
+    for it in items:
+        if it['state'] != 'open' or it['kind'] != 'item' or not it.get('probes'):
+            continue
+        if only_refs is not None and not any(ref_hit(p['spec'], only_refs) for p in it['probes']):
+            continue
+        touched = False
+        for p in it['probes']:
+            if p.get('state') == 'applied':
+                continue
+            kind = (p['spec'].split() or [''])[0]
+            spec = PROBES.get(kind)
+            if spec and not (force or only_refs) and p.get('checked') and now - p['checked'] < spec[1]:
+                continue
+            if spec and spec[2]:
+                if remote_left <= 0:
+                    continue
+                remote_left -= 1
+            st, why = check_probe(p['spec'])
+            if (st, why) != (p.get('state'), p.get('why')) or (spec and spec[1]):
+                touched = True
+            p.update(state=st, why=str(why)[:160])
+            if spec and spec[1]:
+                p['checked'] = now
+            if st == 'pass' and not p.get('passed'):
+                p['passed'] = now
+        for p in it['probes']:
+            th = p.get('then') or 'done'
+            if th.startswith('move:') and p.get('state') == 'pass':
+                old, sec = it['section'], th[5:]
+                if sec != old:
+                    it['pos'] = end_pos(items, sec)
+                    it['section'] = sec
+                    moved.append((it, old, p['spec']))
+                    log.append({'item': it['id'], 'op': 'move', 'by': 'probe',
+                                'detail': f"{old} -> {sec}: {p['spec']}"})
+                p['state'] = 'applied'
+                touched = True
+        dones = [p for p in it['probes'] if (p.get('then') or 'done') == 'done']
+        if dones and all(p.get('state') == 'pass' for p in dones):
+            it.update(state='done', closed_ts=now, closed_by=('probe: ' + '; '.join(p['spec'] for p in dones))[:380])
+            closed.append(it)
+            log.append({'item': it['id'], 'op': 'close', 'by': 'probe',
+                        'detail': '; '.join(f"{p['spec']} ({p.get('why')})" for p in dones)[:1500]})
+            touched = True
+        if touched:
+            it['updated'] = now
+            ups.append(it)
+    return ups, log, closed, moved
+
+
+# ----------------------------------------------------------------------------------------------- the tick
+
+def snapshot(text: str) -> str:
+    os.makedirs(SNAPS, mode=0o700, exist_ok=True)
+    name = 'TODO-' + datetime.fromtimestamp(now_ts(), TZ).strftime('%Y%m%d-%H%M%S') + '.md'
+    path = os.path.join(SNAPS, name)
+    n = 1
+    while os.path.exists(path):
+        path = os.path.join(SNAPS, name[:-3] + f'.{n}.md')
+        n += 1
+    jsonstate.write_text(path, text, mode=0o600)
+    snaps = sorted(os.listdir(SNAPS))
+    for old in snaps[:-KEEP_SNAPS]:
+        os.unlink(os.path.join(SNAPS, old))
+    return path
+
+
+def write_todo(new: str, expect: str) -> bool:
+    """TODO.md <- new, only while it still has hash `expect` (else a hand edit landed meanwhile: next tick)."""
+    with locks.hold(TODO_LOCK, wait=20) as fd:
+        if fd is None:
+            return False
+        cur = read_text(TODO)
+        if sha(cur) != expect:
+            return False
+        if cur != new:
+            if cur:
+                snapshot(cur)
+            jsonstate.write_text(TODO, new)
+    return True
+
+
+def coverage(items: list) -> dict:
+    its = [it for it in items if it['state'] == 'open' and it['kind'] == 'item']
+    act = [it for it in its if (it['section'] or '').lower() in ACTIVE]
+    pv = sum(1 for it in its if it.get('probes'))
+    pa = sum(1 for it in act if it.get('probes'))
+    return {'items': len(its), 'verified': pv, 'pct': round(100 * pv / len(its)) if its else 0,
+            'active': len(act), 'active_verified': pa, 'active_pct': round(100 * pa / len(act)) if act else 0}
+
+
+def asked_map(meta: dict) -> dict:
+    try:
+        d = json.loads(meta.get('asked') or '{}')
+    except (TypeError, ValueError):
+        return {}
+    return {str(k): float(v) for k, v in d.items() if isinstance(v, (int, float))} if isinstance(d, dict) else {}
+
+
+def asked_match(items: list, text: str) -> list:
+    """Open "Waiting on you" items for an asked mark: the exact id, else a case-insensitive title substring."""
+    text = (text or '').strip()
+    wait = [it for it in items if it['state'] == 'open' and it['kind'] == 'item'
+            and (it['section'] or '').lower() == WAITING]
+    hit = [it for it in wait if it['id'] == text]
+    return hit or ([it for it in wait if text.lower() in (it['title'] or '').lower()] if text else [])
+
+
+def take_asked_queue() -> list:
+    """The hooks' asked.jsonl as (ts, text, 'hook') triples. The file is moved aside first (appends after that start
+    a new one); asked_queue_done() removes the moved file after the commit, so a failed commit leaves it for the next
+    run."""
+    work = ASKED_Q + '.work'
+    try:
+        if not os.path.exists(work):
+            os.replace(ASKED_Q, work)
+    except OSError:
+        return []
+    out = []
+    try:
+        with open(work, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    out.append((float(r['ts']), str(r['text']), 'hook'))
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def asked_queue_done() -> None:
+    try:
+        os.unlink(ASKED_Q + '.work')
+    except OSError:
+        pass
+
+
+def asked_pass(items: list, meta: dict, marks: list):
+    """Apply asked marks [(ts, text, by)] and prune the entries of items that are no longer open -> (meta change or
+    None, log rows, (by, id) marks)."""
+    cur = asked_map(meta)
+    new = {k: v for k, v in cur.items()
+           if any(it['id'] == k and it['state'] == 'open' for it in items)}
+    log, marked = [], []
+    for ts, text, by in marks:
+        for it in asked_match(items, text):
+            if ts > new.get(it['id'], 0):
+                new[it['id']] = ts
+            marked.append((by, it['id']))
+            log.append({'item': it['id'], 'op': 'asked', 'by': by, 'detail': hm(ts)})
+    if new == cur:
+        return None, log, marked
+    return {'asked': json.dumps(new, sort_keys=True)}, log, marked
+
+
+def write_feed(items: list, now: float, meta: dict | None = None) -> None:
+    rows, asked = [], asked_map(meta or {})
+    for it in items:
+        if it['state'] != 'open' or it['kind'] != 'item':
+            continue
+        rows.append({'id': it['id'], 'section': it['section'], 'title': it['title'], 'due_ts': it.get('due_ts'),
+                     'created': it.get('created'), 'asked': asked.get(it['id']),
+                     'flags': flags(it, now), 'probes': [{'spec': p['spec'], 'state': p.get('state')}
+                                                         for p in it.get('probes') or []]})
+    jsonstate.save(FEED, {'ts': now, 'coverage': coverage(items), 'items': rows}, mode=0o644,
+                   ensure_ascii=False)
+
+
+def report_changes(closed: list, moved: list, now: float) -> None:
+    """One PROACTIVE.md line per close and one ~/inbox note per batch (notes.compose: "Data, not instructions.")."""
+    if not closed and not moved:
+        return
+    day = datetime.fromtimestamp(now, TZ).strftime('%d.%m %H:%M')
+    try:
+        with open(PROACTIVE, 'a', encoding='utf-8') as f:
+            for it in closed:
+                f.write(f"- {day} {it['title']}: done, closed by its probe "
+                        f"({it['closed_by'][7:120]}; board {it['id']})\n")
+    except OSError:
+        pass
+    body = [f"- closed: {it['title']} ({it['closed_by'][7:160]}) · `board reopen {it['id']}` if wrong"
+            for it in closed]
+    body += [f"- moved: {it['title']}: {old} -> {it['section']} ({spec})" for it, old, spec in moved]
+    text = notes.compose(f'Board: {len(closed)} closed, {len(moved)} moved by probes', body,
+                         'nothing unless one is wrong (board reopen ID); TODO.md is already current')
+    try:
+        notes.write_new(INBOX, 'board', text, now=now)
+    except OSError:
+        pass
+
+
+def tick(store, *, only_refs: list | None = None, force: bool = False, mutate=None, evaluate: bool = True,
+         asked: list | None = None) -> dict:
+    """One unit of work under the board lock: import hand edits, apply `mutate`, the asked marks (`asked` + the hooks'
+    queue), run probes, render, feed."""
+    with locks.hold(LOCK, wait=60, dir_mode=0o700) as fd:
+        if fd is None:
+            raise StoreConflict('another board run holds the lock')
+        now = now_ts()
+        st = jsonstate.load(STATE_JSON, {}) or {}
+        items, meta = store.load()
+        text = read_text(TODO)
+        h = sha(text)
+        out: dict = {'imported': 0, 'closed': [], 'moved': [], 'wrote': None}
+        if text and h != st.get('synced'):
+            ups, mch, log = sync(text, items, meta, now)
+            commit(store, ups, mch, log)
+            if ups or mch:
+                out['imported'] = len(ups)
+                items, meta = store.load()
+            st['synced'] = h
+        if mutate is not None:
+            ups, log, mch = mutate(items, meta, now)
+            commit(store, ups, mch, log)
+            out['mutated'] = [it['id'] for it in ups]
+            items, meta = store.load()
+        mch, log, marked = asked_pass(items, meta, list(asked or []) + take_asked_queue())
+        commit(store, [], mch, log)
+        asked_queue_done()
+        out['asked'] = [i for by, i in marked if by == 'cli']
+        if mch:
+            meta.update(mch)
+        if evaluate:
+            ups, log, closed, moved = run_probes(items, now, only_refs, force)
+            commit(store, ups, None, log)
+            out['closed'], out['moved'] = closed, moved
+            if ups:
+                items, meta = store.load()
+        new = render(items, meta, now)
+        had, has = item_count(text), item_count(new)
+        if had >= 10 and has < had // 2:
+            raise StoreConflict(f'render keeps {has} of {had} items: refused (store wrong?)')
+        if new != text:
+            if write_todo(new, h):
+                st['synced'] = sha(new)
+                out['wrote'] = 'TODO.md'
+            else:
+                out['wrote'] = 'skipped: TODO.md changed meanwhile (next tick)'
+        else:
+            st['synced'] = h
+        write_feed(items, now, meta)
+        report_changes(out['closed'], out['moved'], now)
+        st['last_eval'] = now
+        jsonstate.save(STATE_JSON, st, mode=0o600)
+        out['items'] = items
+        return out
+
+
+# ------------------------------------------------------------------------------------------------- commands
+
+def find(items: list, iid: str) -> dict:
+    m = [it for it in items if it['id'] == iid or (len(iid) >= 3 and it['id'].startswith(iid))]
+    if len(m) != 1:
+        die(f'{iid}: {"no such item" if not m else "ambiguous"} (board list)')
+    return m[0]
+
+
+def section_name(meta: dict, s: str) -> str:
+    try:
+        secs = json.loads(meta.get('sections') or '[]')
+    except ValueError:
+        secs = []
+    for x in secs:
+        if x.lower() == s.lower() or x.lower().startswith(s.lower()):
+            return x
+    die(f'section {s!r}: one of {", ".join(secs)}')
+    return s
+
+
+def validate_then(then: str, meta: dict) -> str:
+    if then in ('', 'done'):
+        return 'done'
+    if then.startswith('move:'):
+        return 'move:' + section_name(meta, then[5:])
+    die('--then: done or move:SECTION')
+    return then
+
+
+def set_due_text(line: str, ts: float | None) -> str:
+    line = re.sub(r'\s*—?\s*\bdue\s+\d{1,2}:\d{2}\s+\d{1,2}\.\d{1,2}\b', '', line) if ts is None else line
+    if ts is None:
+        return line
+    phrase = 'due ' + hm(ts)
+    if DUE_RES[0].search(line):
+        return DUE_RES[0].sub(phrase, line, count=1)
+    m = re.match(r'(\s*\*\*[^*]+\*\*)(.*)$', line)
+    return f'{m.group(1)} — {phrase}{m.group(2)}' if m else f'{line} — {phrase}'
+
+
+def run_tick(args, **kw) -> dict:
+    try:
+        return tick(get_store(), **kw)
+    except StoreDown as e:
+        die(f'store unreachable: {e}', 3)
+    except StoreConflict as e:
+        die(f'refused: {e}', 4)
+    return {}
+
+
+def c_eval(args) -> int:
+    out = run_tick(args, force=args.force)
+    if not args.cron or out['closed'] or out['moved'] or out['imported']:
+        print(f"board eval: imported {out['imported']}, closed {len(out['closed'])}, "
+              f"moved {len(out['moved'])}, wrote {out['wrote'] or 'nothing'}")
+    return 0
+
+
+def c_poke(args) -> int:
+    refs = list(args.ref) + ([args.hash] if args.hash else [])
+    if args.kind == 'landed' and args.hash:
+        al = jsonstate.load(ALIASES, {}) or {}
+        for pre in args.also or []:
+            if HEX_RE.match(pre) and pre != args.hash:
+                al[pre] = args.hash
+        al = dict(list(al.items())[-500:])
+        jsonstate.save(ALIASES, al, mode=0o600)
+        refs += list(args.also or [])
+    global _DEPLOYS
+    _DEPLOYS = None
+    out = run_tick(args, only_refs=refs)
+    for it in out['closed']:
+        print(f"board: closed {it['id']} {it['title'][:80]}")
+    return 0
+
+
+def c_list(args) -> int:
+    try:
+        items, meta = get_store().load(all_rows=args.all)
+    except StoreDown as e:
+        die(f'store unreachable: {e}', 3)
+    now = now_ts()
+    rows = [it for it in items if it['kind'] == 'item' and (args.all or it['state'] == 'open')
+            and (not args.section or it['section'].lower().startswith(args.section.lower()))]
+    if args.json:
+        print(json.dumps([{k: it.get(k) for k in ('id', 'section', 'title', 'state', 'due_ts', 'probes')}
+                          | {'flags': flags(it, now)} for it in rows], ensure_ascii=False, indent=1))
+        return 0
+    for it in rows:
+        pr = ' '.join(f"{p['spec'].split()[0]}:{p.get('state', '?')}" for p in it.get('probes') or []) or '-'
+        f = ','.join(flags(it, now))
+        st = '' if it['state'] == 'open' else f" ({it['state']})"
+        print(f"{it['id']}  {it['section'][:12]:<12} {f:<20} {pr[:40]:<40} {it['title'][:70]}{st}")
+    cv = coverage(items)
+    print(f"-- {cv['items']} open items, {cv['verified']} with probes ({cv['pct']} %); "
+          f"Due/In progress/Waiting {cv['active_verified']}/{cv['active']} ({cv['active_pct']} %)")
+    return 0
+
+
+def c_show(args) -> int:
+    store = get_store()
+    try:
+        items, meta = store.load(all_rows=True)
+        it = find(items, args.id)
+        hist = store.history(it['id'], 20)
+    except StoreDown as e:
+        die(f'store unreachable: {e}', 3)
+    if args.json:
+        print(json.dumps({'item': it, 'log': hist}, ensure_ascii=False, indent=1))
+        return 0
+    print(f"{it['id']} [{it['state']}] {it['section']}: - {it['line']}")
+    for n in it.get('notes') or []:
+        print(n)
+    if it.get('due_ts'):
+        print(f"due {hm(it['due_ts'])} {flags(it, now_ts())}")
+    if asked_map(meta).get(it['id']):
+        print(f"asked {hm(asked_map(meta)[it['id']])}")
+    for i, p in enumerate(it.get('probes') or [], 1):
+        print(f"probe {i}: {p['spec']} (then {p.get('then', 'done')}, {p.get('src')}) -> "
+              f"{p.get('state')} {p.get('why') or ''}")
+    for e in hist:
+        who = e.get('by_who') or e.get('by')
+        print(f"  {hm(float(e.get('ts') or 0))} {e.get('op')} by {who}: {e.get('detail', '')[:120]}")
+    return 0
+
+
+def c_add(args) -> int:
+    line = MARK_RE.sub('', args.line.strip())
+    if line.startswith('- '):
+        line = line[2:]
+    for w in args.when or []:
+        try:
+            probe_split(w)
+        except ValueError as e:
+            die(str(e))
+    try:
+        rx = re.compile(args.replace_title, re.I) if args.replace_title else None
+    except re.error as e:
+        die(f'--replace-title: {e}')
+
+    def mutate(items, meta, now):
+        sec = section_name(meta, args.section)
+        then = validate_then(args.then or 'done', meta)
+        ln = set_due_text(line, parse_when(args.due, now)) if args.due else line
+        e = {'section': sec, 'kind': 'item', 'line': ln, 'notes': ['  - ' + n for n in args.note or []],
+             'pos': end_pos(items, sec, top=args.top)}
+        row = new_row(e, now, {it['id'] for it in items})
+        row['probes'] += [{'spec': w, 'then': then, 'src': 'cli', 'state': 'pending'} for w in args.when or []]
+        ups, log = [row], [{'item': row['id'], 'op': 'add', 'by': 'cli', 'detail': row['title'][:200]}]
+        for it in items:
+            if rx and it['state'] == 'open' and it['kind'] == 'item' and it['section'] == sec \
+                    and rx.search(it['title'] or ''):
+                it.update(state='dropped', closed_ts=now, closed_by=f"replaced by {row['id']}", updated=now)
+                ups.append(it)
+                log.append({'item': it['id'], 'op': 'drop', 'by': 'cli', 'detail': f"replaced by {row['id']}"})
+        return ups, log, None
+    out = run_tick(args, mutate=mutate, evaluate=False)
+    new, *gone = out['mutated']
+    print(f"board: added {new}{' (replaced ' + ', '.join(gone) + ')' if gone else ''} "
+          f"({out['wrote'] or 'no file change'})")
+    return 0
+
+
+def c_asked(args) -> int:
+    ts = now_ts()
+    if args.at:
+        try:
+            ts = datetime.strptime(args.at, '%Y-%m-%d').replace(hour=12, tzinfo=TZ).timestamp()
+        except ValueError:
+            die('--at: YYYY-MM-DD')
+    out = run_tick(args, asked=[(ts, args.ref, 'cli')], evaluate=False)
+    print(f"marked {len(out.get('asked') or [])}")
+    return 0
+
+
+def c_update(args) -> int:
+    def mutate(items, meta, now):
+        it = find([i for i in items if i['state'] == 'open'], args.id)
+        if args.line:
+            it['line'] = MARK_RE.sub('', args.line.strip())
+            it['title'] = title_of(it['line'])
+        if args.section:
+            sec = section_name(meta, args.section)
+            if sec != it['section']:
+                it['section'], it['pos'] = sec, end_pos(items, sec)
+        if args.notes_clear:
+            it['notes'] = []
+        it['notes'] = (it.get('notes') or []) + ['  - ' + n for n in args.note or []]
+        if args.due:
+            it['due_ts'] = parse_when(args.due, now)
+            it['line'] = set_due_text(it['line'], it['due_ts'])
+        if args.no_due:
+            it['due_ts'] = None
+            it['line'] = set_due_text(it['line'], None)
+        it['probes'] = merge_done_when(it.get('probes') or [], it['notes'])
+        it['updated'] = now
+        return [it], [{'item': it['id'], 'op': 'edit', 'by': 'cli', 'detail': 'update'}], None
+    out = run_tick(args, mutate=mutate, evaluate=False)
+    print(f"board: updated {args.id} ({out['wrote'] or 'no file change'})")
+    return 0
+
+
+def c_state(args) -> int:
+    def mutate(items, meta, now):
+        it = find(items, args.id)
+        if args.cmd == 'reopen':
+            if it['state'] == 'open':
+                die(f"{it['id']}: already open")
+            it.update(state='open', closed_ts=None, closed_by=None)
+            for p in it.get('probes') or []:
+                p.update(state='pending', checked=0)
+            op = 'reopen'
+        else:
+            if it['state'] != 'open':
+                die(f"{it['id']}: not open")
+            it.update(state='done' if args.cmd == 'done' else 'dropped', closed_ts=now,
+                      closed_by=f"cli: {args.why or args.cmd}"[:380])
+            op = args.cmd
+        it['updated'] = now
+        return [it], [{'item': it['id'], 'op': op, 'by': 'cli', 'detail': (args.why or '')[:500]}], None
+    if args.cmd == 'drop' and not args.why:
+        die('drop needs --why')
+    out = run_tick(args, mutate=mutate, evaluate=False)
+    if args.cmd == 'done':
+        title = next((it['title'] for it in out['items'] if it['id'] in out.get('mutated', [])), args.id)
+        try:
+            with open(PROACTIVE, 'a', encoding='utf-8') as f:
+                f.write(f"- {datetime.fromtimestamp(now_ts(), TZ).strftime('%d.%m %H:%M')} {title}: done"
+                        f"{' (' + args.why + ')' if args.why else ''}\n")
+        except OSError:
+            pass
+    print(f"board: {args.cmd} {args.id} ({out['wrote'] or 'no file change'})")
+    return 0
+
+
+def c_probe(args) -> int:
+    if args.action == 'add':
+        try:
+            probe_split(args.spec or '')
+        except ValueError as e:
+            die(str(e))
+
+    def mutate(items, meta, now):
+        it = find([i for i in items if i['state'] == 'open'], args.id)
+        ps = it.setdefault('probes', [])
+        if args.action == 'add':
+            ps.append({'spec': args.spec, 'then': validate_then(args.then or 'done', meta), 'src': 'cli',
+                       'state': 'pending'})
+        elif args.action == 'rm':
+            try:
+                p = ps.pop(int(args.spec or '0') - 1)
+            except (ValueError, IndexError):
+                die('probe rm N: N as `board show ID` numbers them')
+            if p.get('src') == 'done-when':
+                it['notes'] = [n for n in it['notes'] if (DONE_WHEN_RE.match(n) or [None, None])[1] != p['spec']]
+        it['updated'] = now
+        return [it], [{'item': it['id'], 'op': 'probe-' + args.action, 'by': 'cli', 'detail': args.spec or ''}], None
+    if args.action == 'check':
+        out = run_tick(args, only_refs=[], force=True)
+        items = out['items']
+        it = find(items, args.id)
+        for p in it.get('probes') or []:
+            print(f"{p['spec']}: {check_probe(p['spec'])}")
+        return 0
+    out = run_tick(args, mutate=mutate, evaluate=False)
+    if args.action == 'add':  # check the new probe at once (closes the item when it already passes)
+        run_tick(args, only_refs=shlex.split(args.spec)[1:] or [args.spec], force=True)
+    print(f"board: probe {args.action} on {args.id} ({out['wrote'] or 'no file change'})")
+    return 0
+
+
+def c_check(args) -> int:
+    st, why = check_probe(' '.join(shlex.quote(a) for a in args.probe))
+    print(f'{st}: {why}')
+    return {'pass': 0, 'fail': 1}.get(st, 2)
+
+
+def c_render(args) -> int:
+    try:
+        items, meta = get_store().load()
+    except StoreDown as e:
+        die(f'store unreachable: {e}', 3)
+    sys.stdout.write(render(items, meta, now_ts()))
+    return 0
+
+
+def diff_lines(store) -> list:
+    """TODO.md vs the store's render, computed flags aside (hand edits the next tick imports)."""
+    items, meta = store.load()
+    a, b = normalized(read_text(TODO)), normalized(render(items, meta, now_ts()))
+    return list(difflib.unified_diff(a, b, 'TODO.md', 'board render', lineterm='', n=1))
+
+
+def c_diff(args) -> int:
+    try:
+        d = diff_lines(get_store())
+    except StoreDown as e:
+        die(f'store unreachable: {e}', 3)
+    body = '\n'.join(d) if d else 'clean: the render matches TODO.md (computed [board: ...] flags aside)'
+    if args.report:
+        jsonstate.write_text(args.report, f'# board diff {hm(now_ts())}\n\n```\n{body}\n```\n')
+    print(body[:6000])
+    return 1 if d else 0
+
+
+def c_status(args) -> int:
+    st = jsonstate.load(STATE_JSON, {}) or {}
+    feed = jsonstate.load(FEED, {}) or {}
+    out = {'last_eval': st.get('last_eval'), 'coverage': feed.get('coverage'),
+           'snapshots': len(os.listdir(SNAPS)) if os.path.isdir(SNAPS) else 0}
+    if args.json:
+        print(json.dumps(out, indent=1))
+    else:
+        le = hm(out['last_eval']) if out['last_eval'] else 'never'
+        print(f"board: last eval {le}, coverage {out['coverage']}, {out['snapshots']} snapshots")
+    return 0
+
+
+def c_snapshots(args) -> int:
+    for n in sorted(os.listdir(SNAPS) if os.path.isdir(SNAPS) else [])[-30:]:
+        print(n)
+    return 0
+
+
+def main(argv: list | None = None) -> int:
+    ap = argparse.ArgumentParser(prog='board', description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest='cmd', required=True)
+    p = sp.add_parser('list')
+    p.add_argument('--all', action='store_true')
+    p.add_argument('--json', action='store_true')
+    p.add_argument('--section')
+    p = sp.add_parser('show')
+    p.add_argument('id')
+    p.add_argument('--json', action='store_true')
+    p = sp.add_parser('add')
+    p.add_argument('line')
+    p.add_argument('--section', default='In progress')
+    p.add_argument('--note', action='append')
+    p.add_argument('--due')
+    p.add_argument('--when', action='append')
+    p.add_argument('--then')
+    p.add_argument('--top', action='store_true')
+    p.add_argument('--replace-title')
+    p = sp.add_parser('asked')
+    p.add_argument('ref')
+    p.add_argument('--at')
+    p = sp.add_parser('update')
+    p.add_argument('id')
+    p.add_argument('--line')
+    p.add_argument('--section')
+    p.add_argument('--note', action='append')
+    p.add_argument('--notes-clear', action='store_true')
+    p.add_argument('--due')
+    p.add_argument('--no-due', action='store_true')
+    p = sp.add_parser('probe')
+    p.add_argument('id')
+    p.add_argument('action', choices=('add', 'rm', 'check'))
+    p.add_argument('spec', nargs='?')
+    p.add_argument('--then')
+    p = sp.add_parser('check')
+    p.add_argument('probe', nargs='+')
+    for name in ('done', 'drop', 'reopen'):
+        p = sp.add_parser(name)
+        p.add_argument('id')
+        p.add_argument('--why')
+    p = sp.add_parser('eval')
+    p.add_argument('--cron', action='store_true')
+    p.add_argument('--force', action='store_true')
+    p = sp.add_parser('poke')
+    p.add_argument('kind', choices=('landed', 'live', 'hub-release', 'acked', 'approved', 'fired'))
+    p.add_argument('ref', nargs='*')
+    p.add_argument('--hash')
+    p.add_argument('--also', action='append')
+    sp.add_parser('render')
+    p = sp.add_parser('diff')
+    p.add_argument('--report')
+    p = sp.add_parser('status')
+    p.add_argument('--json', action='store_true')
+    sp.add_parser('snapshots')
+    a = ap.parse_args(argv)
+    fn = {'list': c_list, 'show': c_show, 'add': c_add, 'asked': c_asked, 'update': c_update, 'probe': c_probe,
+          'check': c_check,
+          'done': c_state, 'drop': c_state, 'reopen': c_state, 'eval': c_eval, 'poke': c_poke, 'render': c_render,
+          'diff': c_diff, 'status': c_status, 'snapshots': c_snapshots}[a.cmd]
+    return fn(a)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

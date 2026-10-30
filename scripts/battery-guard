@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""battery-guard: the phone battery warning on event nights (token-free; a sibling of event-card and lastcall).
+
+  battery-guard run [--dry-run] [--now ISO]    cron, every 2 min (odd minutes). Cheap exit (one file read) unless
+                                               event-card's card is live. --dry-run prints the plan and the actions;
+                                               it texts, rings and writes nothing.
+  battery-guard status [--json] [--now ISO]    tonight's card night, the thresholds and what was done
+
+Live: event-card's state.json holds a card (message_id + night key); the night is event-card's (find_nights).
+Battery: `whereabouts ha now --json` (the phone app when <= 30 min fresh, else `vault ha now`; consumer
+"battery-guard", fresh only): battery.level, battery.charging. A charging phone never counts.
+Away: the place is not home, not the home zone, not band near and not the home town; a "home" lastcall calls stale (the
+vault's, begun before the night's outbound leg / event start or from a feed > 90 min old) counts as away.
+Warning: battery <= 20 % and away → ONE plain `tg` text with the way home, once per night (a real alert: any hour,
+not held by the sleep-in guard): the last train home by lastcall's rule (the last connection before the night gap,
+gohome door to door) with its stop, platform, lines and door time, the next one after the gap, and the next connection
+from now when that is an earlier one. A failed send is retried next run (3 tries).
+Call: battery <= 10 %, away and the last train leaving in 5-59 min (the warning goes first, same run) → ONE
+`voice-relay call` with the battery and the minutes in --reason, by lastcall's rules and limits, in lastcall's state
+(its lock held, so they never ring twice): no call when lastcall finished the night (off, answered, home, left, ...),
+rang it already, or any ring of the last 3 h; lastcall's where() must not say home, near home, driving or moving (silent
+for the night) or another town (silent this run). The ring mark goes into lastcall's night record before ringing, so
+lastcall's own 25-min ring sees it and stays silent. Exit 0: done (lastcall's night ends as answered). Exit 4 (busy or
+rate-limited): retried next run. Any other exit: lastcall's ONE text ("I tried to call you"), unless the warning went
+out less than 30 min before; lastcall's own ring at T-25 still goes out (at least 5 min later; the ring mark moves to
+bat_ring_at in its night record).
+Nights without a leg home (no lastcall night): the way home starts at the event's town; the same rules, the record is
+kept in lastcall's state too (its 3-h ring spacing sees it).
+Files: ~/.local/state/battery-guard/ (0700): state.json (per night key: warning time and level, call result; no
+titles), log.
+Env (tests): BATTERY_GUARD_DIR, BATTERY_GUARD_NOW, BATTERY_GUARD_VAULT (place command, or "off"), BATTERY_GUARD_TG (replaces
+`tg`), BATTERY_GUARD_LASTCALL (the lastcall script; it loads event-card through LASTCALL_EVENT_CARD). lastcall's env
+(LASTCALL_DIR, LASTCALL_GOHOME, LASTCALL_VAULT, LASTCALL_CALL_CMD) and event-card's (EVENT_CARD_DIR,
+EVENT_CARD_CALCACHE) apply. A simulated clock or BATTERY_GUARD_DIR = test state: the vault only when set, no real
+text or call, and lastcall's state stays under BATTERY_GUARD_DIR unless LASTCALL_DIR is set.
+Tests ~/opt/battery-guard-tests/run.sh.
+"""
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import shlex
+import shutil
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import jsonstate, locks  # noqa: E402
+import assistant_profile as profile  # noqa: E402
+
+HOME = os.path.expanduser('~')
+TZ = profile.tz()
+DIR = os.environ.get('BATTERY_GUARD_DIR') or os.path.join(HOME, '.local/state/battery-guard')
+STATE_F = os.path.join(DIR, 'state.json')
+TEST_STATE = bool(os.environ.get('BATTERY_GUARD_DIR'))
+EC_STATE = os.path.join(os.environ.get('EVENT_CARD_DIR') or os.path.join(HOME, '.local/state/event-card'),
+                        'state.json')
+WARN_AT, CALL_AT = 20, 10              # battery percent
+CALL_WITHIN = 60                       # the last train leaves in fewer minutes than this: the call
+TEXT_GAP = dt.timedelta(minutes=30)    # an unanswered call texts only when the warning is at least this old
+TRIES = 3                              # failed warning sends before giving up for the night
+LOCK_WAIT = int(os.environ.get('BATTERY_GUARD_LOCK_WAIT') or 20)   # seconds for lastcall's lock (it rings holding it)
+DRY = False
+SIMULATED = False
+LC = None
+
+
+def iso(s):
+    try:
+        t = dt.datetime.fromisoformat(str(s))
+    except (TypeError, ValueError):
+        return None
+    return t.replace(tzinfo=TZ) if t.tzinfo is None else t.astimezone(TZ)
+
+
+def read_json(path, default=None):
+    """Parsed JSON, or default when missing, unreadable or broken (core.jsonstate)."""
+    return jsonstate.load(path, default)
+
+
+def write_json(path, obj):
+    jsonstate.save(path, obj, mode=0o600, dir_mode=0o700, indent=1, ensure_ascii=False)   # atomic (core.jsonstate)
+
+
+def log(msg):
+    if DRY:
+        return
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    with open(os.path.join(DIR, 'log'), 'a') as f:
+        f.write('%s %s\n' % (dt.datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'), msg))
+
+
+def act(msg):
+    if DRY:
+        print('[dry-run] would ' + msg)
+    else:
+        log(msg)
+
+
+def lastcall():
+    """lastcall as a module (its nights, plan, where, ring, message and state); event-card comes with it."""
+    global LC
+    if LC is None:
+        path = os.environ.get('BATTERY_GUARD_LASTCALL') or os.path.join(HOME, 'bin/lastcall')
+        loader = importlib.machinery.SourceFileLoader('lastcall_mod', path)
+        spec = importlib.util.spec_from_loader('lastcall_mod', loader)
+        LC = importlib.util.module_from_spec(spec)
+        loader.exec_module(LC)
+        LC.DRY, LC.SIMULATED = DRY, SIMULATED
+        if TEST_STATE or SIMULATED:
+            LC.TEST_STATE = True                  # no real ring or text from a test
+            if not os.environ.get('LASTCALL_DIR'):
+                LC.DIR = os.path.join(DIR, 'lastcall')
+                LC.STATE_F = os.path.join(LC.DIR, 'state.json')
+    return LC
+
+
+# ------------------------------------------------------------------------------------------------ inputs
+def phone():
+    """`whereabouts ha now --json` (vault schema) or None."""
+    env = os.environ.get('BATTERY_GUARD_VAULT')
+    if env == 'off':
+        return None
+    argv = shlex.split(env) if env else (None if (SIMULATED or TEST_STATE) else [os.path.join(HOME, 'bin/whereabouts')])
+    if not argv:
+        return None
+    try:
+        r = subprocess.run(argv + ['ha', 'now', '--json'], capture_output=True, text=True, timeout=40,
+                           stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, WHEREABOUTS_FOR='battery-guard', WHEREABOUTS_FRESH_ONLY='1'))
+        d = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def battery(d):
+    """(level, charging) or (None, None)."""
+    b = (d or {}).get('battery')
+    if not isinstance(b, dict) or not isinstance(b.get('level'), (int, float)):
+        return None, None
+    return int(b['level']), bool(b.get('charging'))
+
+
+def away(d, n=None, now=None):
+    """n, now: tonight's night; then a stale vault "home" (lastcall's rule) counts as away."""
+    pl = (d or {}).get('place')
+    if not isinstance(pl, dict) or not pl.get('kind'):
+        return False                              # can't say: no warning on a guess
+    lc = lastcall()
+    if pl.get('kind') == 'home' or lc.norm(pl.get('zone')) == 'home':
+        return bool(n and now and lc.stale_home(d, n, now))
+    if pl.get('band') == 'near':
+        return False
+    return not (pl.get('town') and lc.norm(pl['town']) in lc.home_towns())
+
+
+def night_of(key, now):
+    """lastcall's night for this card night, or one built from event-card's (way home from the event's town)."""
+    lc = lastcall()
+    n = next((x for x in lc.nights(now) if x['key'] == key), None)
+    if n:
+        return n
+    ec = lc.event_card()
+    e = next((x for x in ec.find_nights(ec.load_events(), now) if x['key'] == key), None)
+    if not e:
+        return None
+    ev = e['ev']
+    town = str(ev.get('town') or '').strip()
+    if not town:
+        return None
+    outs = [g['_s'] for g in e.get('legs') or [] if g is not e.get('back') and g.get('_s')]
+    return {'key': key, 'title': (ev.get('title') or 'Event').strip(), 'town': town, 'stop': town,
+            'towns': [lc.norm(town)], 'start': ev['_s'], 'end': e['end'], 'leg': None,
+            'out': min(outs) if outs else None}
+
+
+# ------------------------------------------------------------------------------------------------ the warning
+def next_conn(n, now):
+    lc = lastcall()
+    g = lc.gohome(n['stop'], now)
+    for c in (g or {}).get('next') or []:
+        t = lc.iso(c.get('dep'))
+        if t and t >= now - lc.MIN and lc.usable(c):
+            return c
+    return None
+
+
+def warning(level, n, p, nxt, now):
+    lc = lastcall()
+    stop = (p or {}).get('stop') or n['stop']
+    lines = ['🔋 Phone at %d %%. Your way home, in case it dies:' % level]
+    last = (p or {}).get('last') if (p or {}).get('why') == 'ok' else None
+    if last and lc.iso(last['dep']) >= now - lc.MIN:
+        ln = lc.conn_text(last, stop)
+        lines += ['🚆 Last train ' + ln[0]] + ln[1:]
+        a = p.get('after')
+        lines.append('After that: nothing until %s' % lc.hm(lc.iso(a['dep'])) if a else
+                     'After that: nothing until morning')
+        if nxt and nxt.get('dep') != last.get('dep') and lc.iso(nxt['dep']) < lc.iso(last['dep']):
+            lines += ['Next: ' + ' · '.join(lc.conn_text(nxt, stop))]
+    elif nxt:
+        lines.append({'allnight': '🚆 Trains run all night.', 'gone': '🚆 The last train has left.'}
+                     .get((p or {}).get('why'), '🚆 Last train: unknown.'))
+        lines += ['Next: ' + ' · '.join(lc.conn_text(nxt, stop))]
+    else:
+        lines.append('🚆 No connection home found from %s (/gohome).' % stop)
+    return '\n'.join(lines)
+
+
+def tg(msg):
+    env = os.environ.get('BATTERY_GUARD_TG')
+    argv = shlex.split(env) if env else (None if (SIMULATED or TEST_STATE)
+                                         else [shutil.which('tg') or '/usr/local/bin/tg'])
+    if not argv:
+        print('[test state] text not sent:\n' + msg)
+        return True
+    try:
+        return subprocess.run(argv + [msg], capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ------------------------------------------------------------------------------------------------ the call
+def lc_lock():
+    """lastcall's run lock (fd), or None when it stays busy (it may be ringing): try again next run."""
+    lc = lastcall()
+    return locks.acquire(os.path.join(lc.DIR, '.lock'), wait=LOCK_WAIT, poll=1.0, dir_mode=0o700)   # core.locks
+
+
+def maybe_call(rec, n, p, level, lst, now):
+    """One call by lastcall's rules. Sets rec['call'] once the night's call is settled."""
+    lc = lastcall()
+    lrec = lst['nights'].setdefault(n['key'], {})
+    if not p or p.get('why') != 'ok' or not p.get('last'):
+        return
+    dep = lc.iso(p['last']['dep'])
+    left = lc.mins(dep - now)
+    if left >= CALL_WITHIN:
+        return
+    if left < lc.CALL_MIN:
+        rec['call'] = 'too late'
+        return
+    if lrec.get('done'):
+        rec['call'] = 'lastcall done: %s' % lrec['done']
+        return
+    if lrec.get('ring_at'):
+        rec['call'] = 'lastcall rang'
+        return
+    last_ring = max((lc.iso(r.get('ring_at')) for r in lst['nights'].values() if r.get('ring_at')), default=None)
+    if last_ring and now - last_ring < lc.RING_SPACING:
+        rec['call'] = 'rang within 3 h'
+        return
+    w = lc.where(n, now)
+    if w['state'] in ('home', 'left'):
+        rec['call'] = 'no call: %s' % w['why']
+        return
+    if w['state'] == 'elsewhere':
+        act('no call this run (%s)' % w['why'])
+        return
+    reason = 'your phone battery is at %d percent and the last train home leaves in %d minutes' % (level, left)
+    act('ring: voice-relay call --reason "%s" (%s)' % (reason, w['why']))
+    if DRY:
+        print('[dry-run] on no answer: text\n' + lc.message(p, now, 'unanswered'))
+        return
+    lrec.update(seen=now.isoformat(), ring_at=now.isoformat(), rc=None, by='battery-guard', place=w['why'])
+    lc.save_state(lst)                            # the mark first: neither script rings twice, even after a crash
+    rc = lc.ring(reason)
+    lrec['rc'] = rc
+    log('%s: battery %d %%, rang for the %s, exit %s' % (n['key'], level, lc.hm(dep), rc))
+    if rc == 0:
+        lc.finish(lrec, 'answered (battery call)', now)
+        rec['call'] = 'answered'
+    elif rc == 4:
+        lrec.pop('ring_at', None)                 # busy or rate-limited: next run tries again
+        lrec['busy'] = lrec.get('busy', 0) + 1
+    elif rc == -1:
+        lc.finish(lrec, 'calls off (test state)', now)
+        rec['call'] = 'calls off (test state)'
+    else:
+        warned = iso((rec.get('warned') or {}).get('at'))
+        if not warned or now - warned >= TEXT_GAP:
+            lc.send_text(lrec, p, now, 'unanswered' if rc == 3 else 'down')
+        lrec['bat_ring_at'] = lrec.pop('ring_at', None) or now.isoformat()   # lastcall's own ring still goes out
+        lrec['bat_rc'] = rc
+        for k in ('rc', 'by'):
+            lrec.pop(k, None)
+        rec['call'] = 'not answered (exit %s)' % rc
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def get_now(a):
+    global SIMULATED
+    s = getattr(a, 'now', None) or os.environ.get('BATTERY_GUARD_NOW')
+    if s:
+        SIMULATED = True
+        t = iso(s)
+        if not t:
+            sys.exit('battery-guard: bad --now %r (ISO, e.g. 2026-10-22T23:40)' % s)
+        return t
+    return dt.datetime.now(TZ).replace(second=0, microsecond=0)
+
+
+def load_state():
+    st = read_json(STATE_F, {}) or {}
+    st.setdefault('nights', {})
+    return st
+
+
+def save_state(st):
+    if DRY:
+        return
+    st['nights'] = dict(sorted(st['nights'].items(), key=lambda kv: kv[1].get('seen', ''))[-20:])
+    write_json(STATE_F, st)
+
+
+def live_key():
+    ec = read_json(EC_STATE, {}) or {}
+    return ec.get('night') if ec.get('message_id') else None
+
+
+def cmd_run(a):
+    now = get_now(a)
+    key = live_key()
+    if not key:
+        return 0                                  # the cheap exit: no live card
+    st = load_state()
+    rec = st['nights'].setdefault(key, {})
+    rec['seen'] = now.isoformat()
+    if rec.get('warned') and rec.get('call') and not DRY:
+        save_state(st)
+        return 0                                  # both done tonight
+    d = phone()
+    level, charging = battery(d)
+    if DRY:
+        print('[dry-run] %s · night %s · battery %s%s · %s' % (
+            now.strftime('%a %d.%m %H:%M'), key[-10:], '?' if level is None else '%d %%' % level,
+            ' (charging)' if charging else '', 'away' if away(d) else 'not away / unknown'))
+    need_warn = not rec.get('warned') and rec.get('tries', 0) < TRIES
+    need_call = level is not None and level <= CALL_AT and not rec.get('call')
+    if level is None or charging or level > WARN_AT or not (need_warn or need_call or DRY):
+        save_state(st)
+        return 0
+    n = night_of(key, now)
+    if not n or not away(d, n, now):
+        save_state(st)
+        return 0
+    lc = lastcall()
+    fd = None if DRY else lc_lock()
+    if fd is None and not DRY:
+        log('%s: lastcall busy, next run' % key)
+        save_state(st)
+        return 0
+    lst = lc.load_state()
+    lrec = lst['nights'].setdefault(key, {})
+    lrec.setdefault('seen', now.isoformat())
+    p = lc.plan_for(n, now, lrec)
+    if need_warn:
+        msg = warning(level, n, p, next_conn(n, now), now)
+        act('text (warning): ' + msg.replace('\n', ' | '))
+        if DRY:
+            print(msg)
+        elif tg(msg):
+            rec['warned'] = {'at': now.isoformat(), 'level': level}
+        else:
+            rec['tries'] = rec.get('tries', 0) + 1
+            log('%s: warning text failed (%d)' % (key, rec['tries']))
+    if need_call:
+        maybe_call(rec, n, p, level, lst, now)
+    if not DRY:
+        lc.save_state(lst)
+    save_state(st)
+    return 0
+
+
+def cmd_status(a):
+    now = get_now(a)
+    key = live_key()
+    rec = load_state()['nights'].get(key) if key else None
+    out = {'now': now.isoformat(), 'live_night': key, 'warn_at': WARN_AT, 'call_at': CALL_AT,
+           'call_within_min': CALL_WITHIN, 'record': rec}
+    if a.json:
+        print(json.dumps(out, indent=1, ensure_ascii=False))
+        return 0
+    if not key:
+        print('battery-guard: no live event card (warns at <= %d %%, calls at <= %d %% within %d min of the last '
+              'train)' % (WARN_AT, CALL_AT, CALL_WITHIN))
+        return 0
+    rec = rec or {}
+    w = rec.get('warned')
+    print('battery-guard: card live (%s)' % key)
+    print('  warning: %s' % ('sent %s at %d %%' % (iso(w['at']).strftime('%H:%M'), w['level']) if w else
+                             'not sent (warns at <= %d %%, away, not charging)' % WARN_AT))
+    print('  call: %s' % (rec.get('call') or 'none (<= %d %% and the last train within %d min)' % (CALL_AT,
+                                                                                              CALL_WITHIN)))
+    return 0
+
+
+def main(argv):
+    global DRY
+    p = argparse.ArgumentParser(prog='battery-guard', description=__doc__.split('\n')[0])
+    sub = p.add_subparsers(dest='cmd')
+    r = sub.add_parser('run')
+    r.add_argument('--dry-run', action='store_true')
+    r.add_argument('--now')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--now')
+    a = p.parse_args(argv)
+    if not a.cmd:
+        print(__doc__.strip())
+        return 2
+    DRY = bool(getattr(a, 'dry_run', False))
+    if a.cmd == 'status' or DRY:
+        return cmd_status(a) if a.cmd == 'status' else cmd_run(a)
+    if locks.acquire(os.path.join(DIR, '.lock'), wait=0, dir_mode=0o700) is None:   # core.locks; held until exit
+        return 0                                  # another run is busy (or ringing)
+    return cmd_run(a)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

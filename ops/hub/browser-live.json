@@ -1,0 +1,14 @@
+{
+  "hub": {"url": "http://claude-hub:8700", "token_file": "/run/secrets/token_browser"},
+  "display": ":99",
+  "size": "1920x1080",
+  "chrome": "/usr/bin/google-chrome-stable",
+  "profile": "/srv/browser/profile",
+  "cdp_port": 9222,
+  "lang": "de-CH",
+  "svc": {"port": 9223, "bind": "0.0.0.0", "advertise": "claude-hub-browser:9223", "mode": "shadow"},
+  "ctl": {"port": 9224, "bind": "0.0.0.0", "token_file": "/run/secrets/browser_ctl_token"},
+  "view": {"port": 6080, "bind": "0.0.0.0", "vnc_port": 5900, "password_file": "/run/secrets/browser_vnc_pass",
+           "web": "/usr/share/novnc", "max_minutes": 240},
+  "webagent": {"lib": "/srv/webagent/lib", "state": "/srv/webagent/state"}
+}

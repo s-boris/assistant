@@ -1,0 +1,5 @@
+#!/bin/sh
+# phonegw: run the gateway's CLI inside its venv (init|serve|front|public|ping|retention).
+GW="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$GW" || exit 1
+exec "$GW/.venv/bin/python" -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from phonegw.cli import main; sys.exit(main(sys.argv[1:]))' "$GW" "$@"

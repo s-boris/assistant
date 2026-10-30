@@ -1,0 +1,100 @@
+# Starter files that `assistant init` copies into a new user's ~/.claude and ~/workspace.
+#
+# Every entry names the profile feature switches (features.<name> in ~/.config/assistant/profile.json) it needs;
+# an entry is installed only when all of them are on. `core` is always on. A switch the profile leaves out counts
+# as on (an existing install without a `features` section keeps everything); a new instance (no
+# ~/workspace/CLAUDE.md yet) whose profile has no `features` section first gets an explicit one written by init:
+# core and telegram on, every other switch false. Text files may hold profile
+# placeholders such as {{owner.first_name}} or {{locale.tz}}: init fills them from the profile (profile-get keys).
+# Files that already exist are never overwritten without --force.
+
+[features]
+# name = what turning it on brings (docs only; the switches themselves live in the profile)
+core = "the assistant's routine, memory, notes, kb, page watches, research"
+telegram = "the Telegram channel: replies, buttons, polls (buttons and polls need the telegram-plus plugin)"
+hub = "the hub containers: approvals, reminders, workflows, the pinned status board (Unraid only)"
+vault = "a separate privacy vault for mail, chats and documents (not in this repo)"
+home_assistant = "Home Assistant: lights, media players, the shopping list"
+media = "the media stack: Seerr, Radarr, Sonarr, Emby"
+unraid = "an Unraid server: health, capacity, container updates, exposure checks"
+phone = "the phone app gateway"
+voice = "voice calls and voice replies"
+browser = "a headed Chrome for pages WebFetch can't read and for web tasks"
+calendar = "Google Calendar through the claude.ai connector"
+swiss = "Swiss shop price watches (the deals skill and its daily drive-price check)"
+
+[workspace]
+# src (under templates/) = dest (under ~/workspace)
+"workspace/CLAUDE.md" = "CLAUDE.md"
+"workspace/TOOLS.md" = "TOOLS.md"
+"workspace/JOBS.md" = "JOBS.md"
+"workspace/TODO.md" = "TODO.md"
+"workspace/GOALS.md" = "GOALS.md"
+"workspace/PROBLEMS.md" = "PROBLEMS.md"
+"workspace/FACTS.md" = "FACTS.md"
+"workspace/CHANGELOG.md" = "CHANGELOG.md"
+"workspace/PROACTIVE.md" = "PROACTIVE.md"
+
+[links]
+# symlinks under $HOME that init creates when the target exists and the link is missing (never replaced)
+"bin/secretscan" = "secretscan.py"   # memory's fail-closed secret check calls ~/bin/secretscan
+
+[settings]
+# the example settings; hook entries whose command names a file listed under [hooks] keep only when that
+# file's features are on
+src = "claude/settings.example.json"
+dest = ".claude/settings.json"
+
+[hooks]
+# hook file (as the command names it) = features it needs
+"agenda.sh" = ["core"]
+"conduct.py" = ["core"]
+"pitch-check.sh" = ["telegram"]
+"tg-status" = ["telegram"]
+"hub-stamp.py" = ["hub"]
+
+[skills]
+# skill folder under claude/skills/ = features it needs
+kb = ["core"]
+research = ["core"]
+watch = ["core"]
+night-log = ["core"]
+waiting-card = ["core"]
+voice-action = ["telegram"]
+reminders = ["hub"]
+calendar = ["calendar"]
+calendar-gap-pass = ["calendar"]
+home-assistant = ["home_assistant"]
+shopping = ["home_assistant"]
+media-requests = ["media"]
+media-help = ["media"]
+browser = ["browser", "hub"]
+web-agent = ["browser", "hub", "telegram"]
+server-health = ["unraid"]
+unraid-capacity = ["unraid"]
+container-watch = ["unraid"]
+security-watch = ["unraid"]
+deals = ["swiss"]
+
+[agents]
+# agent file under claude/agents/ (without .md) = features it needs
+idea-scan = ["core"]
+self-cleanup = ["core"]
+weekly-digest = ["core"]
+
+[cron]
+# skill or agent = the registry jobs (core/schedules.toml) it relies on. `assistant cron install` schedules each one
+# when the switches that install the skill or agent are on (tests/ops/test_cron.py checks it); none is owner_only.
+watch = ["watch"]
+deals = ["deals-hdd"]
+shopping = ["shop-watch"]
+reminders = ["remind-hub"]
+calendar-gap-pass = ["cue-calendar-gap-pass"]
+media-requests = ["media-ready"]
+server-health = ["unraid-health", "hwtrend", "hddheat"]
+unraid-capacity = ["unraid-capacity-record", "unraid-capacity-forecast"]
+container-watch = ["container-watch"]
+security-watch = ["security-watch"]
+idea-scan = ["cue-idea-scan"]
+self-cleanup = ["cue-self-cleanup"]
+weekly-digest = ["cue-digest"]

@@ -1,0 +1,13 @@
+Synthetic shop pages for the deals tests (invented products, prices, product IDs and sellers; no recorded pages).
+They only mimic the page shapes bin/watch's extract_offers parses, gzipped:
+  alt/  Alternate.ch-style SATA category sorted by price desc (pages 1-4; page 4 has no buyable big drive, so
+        deals stops there), search "IronWolf Pro 24 TB", JSON-LD product page MG10 20 TB
+  mm/   MediaMarkt.ch-style internal HDDs (window.__PRELOADED_STATE__ Apollo state), 3.5", capacity >= 16000 GB,
+        price asc (pages 1-3, maxPage 3)
+  captcha.html  a DataDome-style 403 bot wall (what a bot wall looks like)
+  tutti/  Tutti.ch-style search pages (Next.js __NEXT_DATA__ + /de/vi/ links), one per saved query, plus a
+        Cloudflare-style challenge page and a page without listing data; plain HTML, written by
+        tutti/make_fixtures.py (edit and rerun it). Served by ../fake_tutti_fetch.py in place of ~/bin/tutti-fetch.
+File names are the URL path+query relative to the shop base, percent-quoted (see fixture_server.py).
+Regenerate or extend: edit the generator logic these were made with, gzip into here (gzip -n) and fix the expected
+numbers in run.sh. Never commit pages recorded from the real shops.

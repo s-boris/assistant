@@ -1,0 +1,42 @@
+#!/usr/local/bin/python3.13 -I
+"""memory: FACTS.md facts and ledger lines as rows in mem.db, rendered back byte for byte.
+Full help: `memory --help`; per command `memory decide --help`. Source: ~/opt/assistant (packages/memrows).
+
+  memory show [ID] [--grep TEXT] [--section S]            rows (--grep matches text or an id); ID: row + history
+  memory set --section S "CLAIM" --src owner|live|<who>   a new fact ("CLAIM — SRC, DD.MM")
+  memory supersede ID "NEW TEXT" [--src ..] | --remove    replace a row (old one kept as history) or retire it
+  memory decide VERB "THING" [--details D] [--date DD.MM] a ledger line at the top of the ledger, or as one string:
+  memory decide "21.10 declined: Ryanair flights (never again)"
+  memory status | import | gate | render | core | ledger | switch
+Every write prints the new row id, the FACTS.md line number and text, its place in FACTS-core.md and the diff:
+both files are re-rendered when it returns, so no read-back is needed. Add --dry-run to preview, --json for data.
+
+Finds its libraries next to itself: deployed, ~/bin/lib/{core,memrows}; in the repo, ../core and
+../packages/memrows. $ASSISTANT_LIB (a directory holding core/ and memrows/) overrides both. Stdlib only.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [
+    os.environ.get("ASSISTANT_LIB", ""),
+    os.path.join(_here, "lib"),
+    os.path.join(_here, ".."),
+    os.path.join(_here, "..", "packages"),
+]
+for _pkg in ("core", "memrows"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+if __name__ == "__main__":
+    from memrows import cli
+
+    try:
+        sys.exit(cli.main())
+    except BrokenPipeError:  # a reader that quit early (| head)
+        sys.exit(0)

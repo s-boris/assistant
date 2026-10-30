@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.trip.sites.response.json",
+  "title": "GET /v1/trip/sites: the divelog site list (names + areas, no coordinates), the planned legs by area, the dive count and the last dive day before the flight home (DAN 24 h)",
+  "type": "object",
+  "properties": {
+    "sites": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60
+          },
+          "area": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 60
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "name"
+        ]
+      }
+    },
+    "legs": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "properties": {
+          "area": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "from": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          },
+          "sites": {
+            "type": "array",
+            "maxItems": 40,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "area",
+          "from"
+        ]
+      }
+    },
+    "dives": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 32
+    },
+    "last_dive": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "fly": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "sites",
+    "legs",
+    "dives"
+  ]
+}

@@ -1,0 +1,46 @@
+#!/bin/sh
+# Text the owner on Telegram with inline buttons, from scripts and cron jobs (tg plus a keyboard):
+#   tg-buttons "text" '[[{"text":"Yes","data":"x:yes:1"},{"text":"No","data":"x:no:1"}]]'
+# ROWS_JSON = rows of {text, data} as for the reply tool (callback_data is an alias of data; data <= 64 bytes),
+# or {text, url} for a one-tap link button (https:// only, <= 2048 chars; Telegram opens it, no button event).
+# A press reaches the session as a button event with that callback_data (the plugin marks the message
+# "✓ <label>" and drops the keyboard). Exit 0 = sent; 2 = bad arguments; else not sent (network, Telegram).
+# One sender: while the hub's tg-adapter drains the hub outbox (tg-outbox's gate decides), the card goes into that
+# outbox (`tg-outbox send tg-buttons`) and the adapter sends it, without this script reading the token: urgent by
+# default (never held), TG_SOFT=1
+# = non-urgent (waits in quiet hours and sleep-in); the same text within the dedupe window is skipped. Otherwise, or when
+# the outbox can't take it, the Bot API directly as below. Switch: ~/.config/tg-adapter/direct-tg-buttons (or direct-all).
+# Tests: TG_BUTTONS_ENV (bot token file), TG_BUTTONS_ACCESS (access.json), TG_BUTTONS_API (Bot API base URL); with any
+# of them set the outbox is never used. TG_OUTBOX_BIN, TG_ADAPTER_STATE_DIR (the outbox path).
+set -eu
+[ $# -eq 2 ] || { echo 'usage: tg-buttons TEXT ROWS_JSON' >&2; exit 2; }
+envf=${TG_BUTTONS_ENV:-$HOME/.claude/channels/telegram/.env}
+acc=${TG_BUTTONS_ACCESS:-$HOME/.claude/channels/telegram/access.json}
+api=${TG_BUTTONS_API:-https://api.telegram.org}
+markup=$(printf '%s' "$2" | jq -ce '
+  {inline_keyboard: [.[] | [.[] | if .url != null then {text: .text, url: .url}
+                                  else {text: .text, callback_data: (.data // .callback_data // .text)} end]]}
+  | select(all(.inline_keyboard[][]; (.text | type) == "string" and (.text | length) > 0
+                                    and (if has("url")
+                                         then (.url | type) == "string" and (.url | test("^https://[^\\s]+$"))
+                                              and (.url | length) <= 2048
+                                         else (.callback_data | type) == "string"
+                                              and (.callback_data | utf8bytelength) <= 64 end)))' 2>/dev/null) || {
+  echo 'tg-buttons: bad ROWS_JSON (rows of {text, data} with data at most 64 bytes, or {text, url} with an https url)' >&2; exit 2; }
+ob=${TG_OUTBOX_BIN:-$(dirname "$0")/tg-outbox}
+if [ -z "${TG_BUTTONS_ENV:-}${TG_BUTTONS_ACCESS:-}${TG_BUTTONS_API:-}" ] && [ -x "$ob" ] &&
+   { [ -s "${TG_ADAPTER_STATE_DIR:-$HOME/.local/state/tg-adapter}/live/adapter.pid" ] || [ -n "${HUB_URL:-}" ] ||
+     [ -e "${HUB_TOKEN_FILE:-$HOME/.secrets/hub-token}" ]; }; then
+  rc=0
+  if [ -n "${TG_SOFT:-}" ]; then
+    printf '%s' "$1" | "$ob" send tg-buttons --soft --buttons "$2" >/dev/null || rc=$?
+  else
+    printf '%s' "$1" | "$ob" send tg-buttons --buttons "$2" >/dev/null || rc=$?
+  fi
+  [ "$rc" -eq 75 ] || exit "$rc"
+fi
+. "$envf"
+owner=$(jq -r '.allowFrom[0]' "$acc")
+# the token never reaches argv: curl reads the URL from stdin (printf is a shell builtin)
+printf 'url = "%s/bot%s/sendMessage"\n' "$api" "$TELEGRAM_BOT_TOKEN" |
+  curl -fsS -m 25 -o /dev/null -K - -d chat_id="$owner" --data-urlencode text="$1" --data-urlencode reply_markup="$markup"

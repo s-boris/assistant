@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.trackid.response.json",
+  "title": "POST /v1/trackid result (M3): a match only when trackid is at least medium-sure; push_id + nonce let the app send action verb crate (arg = id)",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "match": {
+      "type": "boolean"
+    },
+    "artist": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200
+    },
+    "confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low",
+        null
+      ]
+    },
+    "id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^tid-[A-Za-z0-9_-]{1,40}$"
+    },
+    "followed": {
+      "type": "boolean"
+    },
+    "push_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "nonce": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{8,32}$"
+    },
+    "ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "match"
+  ]
+}

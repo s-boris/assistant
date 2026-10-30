@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+"""arr-mismatch: READ-ONLY nightly check for Radarr library files that are probably the wrong movie.
+
+Why (report ~/reports/unraid/indexer-misid-2026-10-13.md): some indexers stamp the searched TMDB/IMDb ID onto
+unrelated releases, and Radarr's import guard compares titles but not years. That is how Night Shift (2001) landed
+as Night Shift (2017), Glass Tower (1987) as Glass Tower II (2010) and Die stille Bucht (1988) as
+Quiet Bay (2026).
+
+  arr-mismatch [list | --dry-run]   scan now and print the current suspects (changes nothing, state untouched)
+  arr-mismatch --cron               scan; ONE ~/inbox note listing suspects not seen before; silent otherwise
+  arr-mismatch ack KEY...           mark suspects as known (no alert), e.g. ack radarr:1234 (owner said "fine",
+                                    or he is being asked about it anyway)
+  arr-mismatch --status             state summary
+  add --json to list for machine-readable output.
+
+  arr-mismatch grabs [--since MIN] [--json]
+                                    GRAB-TIME check, dry run: Radarr queue items + grabs of the last MIN minutes
+                                    (default 40) whose release name is another movie; prints all, changes nothing
+  arr-mismatch grabs --cron         the same every 15 min, deduped by downloadId (~/.local/state/arr-mismatch-grabs.json),
+                                    and AUTO-DROPS each clear mismatch:
+                                      1. still in the queue: DELETE /api/v3/queue/ID?removeFromClient&blocklist&skipRedownload
+                                      2. left the queue, not imported: POST /api/v3/history/failed/ID (= blocklist)
+                                         already imported (queue state importing/imported, or an import event for the
+                                         downloadId): never touched, ONE ~/inbox note (library files are
+                                         never deleted; the nightly library check flags the file)
+                                      3. regrab: interactive search GET /api/v3/release?movieId=, the best APPROVED
+                                         release (Radarr's order) whose parsed name carries a known title of the movie
+                                         and a year within +-1 (grab_check, or TMDB re-dating) -> POST /api/v3/release;
+                                         none -> the movie stays missing (said in the note); skipped when Radarr
+                                         already has another download queued for the movie
+                                      caps: 3 auto-drops per movie per 7 days (then a note "indexer keeps mis-IDing"),
+                                      10 per run (then notes). Every action -> ~/.local/state/arr-mismatch-drops.log;
+                                      ONE ~/inbox note per run that dropped something. Never messages the owner itself.
+                                    Kill switch: --no-drop, or the file ~/.config/arr-mismatch/no-drop -> notes only
+                                    (ONE note per mismatched release with the exact drop + search command).
+  arr-mismatch drop MOVIEID queue:ID | history:ID [--dry-run]
+                                    owner-approved drop of ONE grab (the command those notes print): the auto-drop's
+                                    write (1. or 2. above), then Radarr's own search for the movie (MoviesSearch);
+                                    logged to ~/.local/state/arr-mismatch-drops.log
+  arr-mismatch grabs --cron --dry-run
+                                    the cron run without any write: prints what it would drop / regrab (it does run
+                                    the interactive search, GET), no notes, state untouched
+  arr-mismatch grabs --status       grab-check state summary (+ auto-drops of the last 7 days, kill switch)
+
+Grab-time rule (no file yet, so no runtime): the release title, parsed by /api/v3/parse, must carry the movie's
+title / original / alternate title AND a year within +-1 of the movie's year. A CLEAR mismatch (note) is:
+  - the parsed year is off by more than 1 (more than 2 when the name carries the movie's main/original title: Long
+    Road TCC 2006/2011; an alternate title cannot clear it: Quiet Bay; nor a main title 3+ years off: a
+    same-title remake like Steel Sentinel 1987/2014); exemption for TMDB re-dating (Stage Story 2020 -> 2025): the name
+    carries the MAIN/original title and its year is within +-1 of one of the movie's release dates (in cinemas /
+    digital / physical), or
+  - the title is not a known title of the movie AND the parser maps the name to ANOTHER movie in the library, or
+    the name shares not one significant word with any of the movie's titles (Bright Morrow 2026 -> Masters
+    of the Universe 2026; 6-month backtest: 13 hits, ~1 doubtful).
+Backtest on 6 months of grabs (1,688): 47 flagged, ~45 really wrong (the report counted 54 by hand).
+An unknown title alone (foreign names missing from TMDB's alternate titles) or a name without a year is not clear.
+
+Per movie with a file, three signals:
+  year     the release name (sceneName, else originalFilePath folder/file, else relativePath), parsed by Radarr's
+           own GET /api/v3/parse, vs the movie's year / secondary year: disagrees when off by more than 1
+  title    the parsed title(s) vs the movie's title, original title and alternate titles (normalized), or the
+           parser maps the name to this movie: disagrees when none matches
+  runtime  mediaInfo runTime vs the movie's runtime: disagrees when off by > 20% AND > 15 min
+           (a longer file with an edition in the name, e.g. Director's Cut / Extended / Uncut: > 50% AND > 30 min)
+Suspect when >= 2 signals disagree, or the year is off by >= 3 (a title and runtime match cannot clear that:
+Quiet Bay and Glass Tower matched by alternate title and runtime). One exemption, for TMDB re-dating
+(Stage Story 2020 -> 2025): only the year disagrees, the name carries the main/original title (an alternate title is
+not enough) and the runtime is equal within 3 min / 3%.
+Missing data (no year in the name, runtime 0) is "unknown", never a disagreement.
+
+Radarr only: Sonarr matches by title/alias (report: 0 real mismatches in 3,728 grabs), and episode names carry
+no year, so the same check there would be mostly noise.
+
+Read-only except `grabs --cron` auto-drop (above): GET requests only (movie list / movie, parse; grabs: queue, grab
+history). The API helper (api,
+ApiError, norm, q) is shared with ~/bin/arr-unblock (loaded as a module): the Radarr URL from the profile
+(services.radarr_url), the key by handle through core.egress; never printed (the note's drop command is
+`arr-mismatch drop`, no key file).
+State: ~/.local/state/arr-mismatch.json (known suspects, by radarr:<movieFileId>, so a replaced file is checked
+afresh). Grabs: ~/.local/state/arr-mismatch-grabs.json (checked downloadIds, 30 days).
+Grabs state also keeps "drops" ({movieId: [times]}, for the per-movie cap). The list/ack state is unchanged.
+Env (tests): ARR_MISMATCH_STATE, ARR_MISMATCH_GRABS_STATE, ARR_MISMATCH_INBOX, ARR_MISMATCH_NO_DROP,
+ARR_MISMATCH_DROPS_LOG.
+Exit: 0 ok (list / grabs dry run: 3 when there are suspects), 1 error.
+"""
+import argparse, importlib.machinery, importlib.util, json, os, re, sys, time
+from datetime import datetime
+
+sys.dont_write_bytecode = True
+_ldr = importlib.machinery.SourceFileLoader("arr_unblock", os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                                                        "arr-unblock"))
+AU = importlib.util.module_from_spec(importlib.util.spec_from_loader("arr_unblock", _ldr))
+_ldr.exec_module(AU)
+api, ApiError, norm, q = AU.api, AU.ApiError, AU.norm, AU.q
+
+STATE = os.path.expanduser(os.environ.get("ARR_MISMATCH_STATE") or "~/.local/state/arr-mismatch.json")
+INBOX = os.path.expanduser(os.environ.get("ARR_MISMATCH_INBOX") or "~/inbox")
+YEAR_TOL = 1          # +-1: TMDB vs release-name year
+YEAR_HARD = 3         # off by this much -> suspect on its own
+RT_PCT, RT_MIN = 0.20, 15
+ED_PCT, ED_MIN = 0.50, 30   # longer file + an edition in the name (Director's Cut, Extended, Uncut)
+SAME_PCT, SAME_MIN = 0.03, 3  # runtime "to the minute" for the re-dated exemption
+FAIL_NOTE = 2         # consecutive failed cron runs before one note
+GRABS_STATE = os.path.expanduser(os.environ.get("ARR_MISMATCH_GRABS_STATE")
+                                 or "~/.local/state/arr-mismatch-grabs.json")
+GRAB_WINDOW = 40      # minutes of grab history per run (cron */15; the overlap is deduped by downloadId)
+GRAB_KEEP_DAYS = 30   # forget checked downloadIds after this long (unless still in the queue)
+GRAB_FAIL_NOTE = 8    # consecutive failed */15 runs (~2 h) before one note (arr-unblock already notes outages)
+# auto-drop
+NO_DROP_FILE = os.path.expanduser(os.environ.get("ARR_MISMATCH_NO_DROP") or "~/.config/arr-mismatch/no-drop")
+DROPS_LOG = os.path.expanduser(os.environ.get("ARR_MISMATCH_DROPS_LOG") or "~/.local/state/arr-mismatch-drops.log")
+DROP_CAP, DROP_CAP_DAYS = 3, 7   # auto-drops per movie per 7 days; after that a note only ("indexer keeps mis-IDing")
+DROP_RUN_MAX = 10                # auto-drops per run
+REGRAB_TRY = 15                  # approved releases parsed at most when picking the replacement
+SEARCH_TIMEOUT = 150             # s, interactive release search (GET /api/v3/release asks every indexer)
+IMPORT_EVENTS = {"downloadFolderImported", "movieFolderImported", "3"}
+
+
+# ---------- pure logic (unit-tested) ----------
+
+def minutes(rt):
+    """mediaInfo runTime "1:57:03" / "57:03" -> minutes (float); None when missing or zero."""
+    parts = str(rt or "").strip().split(":")
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if not nums or len(nums) > 3:
+        return None
+    while len(nums) < 3:
+        nums.insert(0, 0.0)
+    m = nums[0] * 60 + nums[1] + nums[2] / 60
+    return m or None
+
+
+def names(mf):
+    """Release names to parse, best first: sceneName, originalFilePath folder + file, relativePath file."""
+    out = []
+    def add(s):
+        s = (s or "").strip()
+        s = re.sub(r"\.[A-Za-z0-9]{2,4}$", "", s) if re.search(r"\.(mkv|mp4|m4v|avi|ts|m2ts|wmv|mov|webm|mpe?g)$",
+                                                               s, re.I) else s
+        if s and s not in out:
+            out.append(s)
+    add(mf.get("sceneName"))
+    op = (mf.get("originalFilePath") or "").replace("\\", "/")
+    if op:
+        parts = [p for p in op.split("/") if p]
+        if len(parts) > 1:
+            add(parts[-2])
+        add(parts[-1] if parts else "")
+    rp = (mf.get("relativePath") or "").replace("\\", "/")
+    add(rp.split("/")[-1])
+    return out
+
+
+def pick(parsed):
+    """parsed: list of (name, parse result). First name with a year wins, else the first with a title."""
+    best = None
+    for name, p in parsed:
+        pm = (p or {}).get("parsedMovieInfo") or {}
+        titles = [t for t in (pm.get("movieTitles") or [pm.get("movieTitle")]) if t]
+        rec = {"name": name, "titles": titles, "year": pm.get("year") or None, "edition": pm.get("edition") or "",
+               "mapped": ((p or {}).get("movie") or {}).get("id")}
+        if rec["year"]:
+            return rec
+        if titles and best is None:
+            best = rec
+    return best
+
+
+def check(movie, rel):
+    """Signals for one movie + its picked release info. Returns dict with year/title/runtime verdicts
+    (True = disagrees, False = agrees, None = unknown), year_off, file/movie minutes and suspect flag."""
+    mf = movie.get("movieFile") or {}
+    r = {"year": None, "title": None, "runtime": None, "year_off": None}
+    if rel and rel.get("year"):
+        years = [y for y in (movie.get("year"), movie.get("secondaryYear")) if y]
+        if years:
+            r["year_off"] = min(abs(rel["year"] - y) for y in years)
+            r["year"] = r["year_off"] > YEAR_TOL
+    main_title = False
+    if rel and rel.get("titles"):
+        mains = {norm(movie.get("title")), norm(movie.get("originalTitle"))}
+        known = mains | {norm(a.get("title")) for a in movie.get("alternateTitles") or []}
+        known.discard(""), mains.discard("")
+        parsed = {norm(t) for t in rel["titles"]}
+        main_title = bool(parsed & mains)
+        r["title"] = not (parsed & known or (rel.get("mapped") and rel["mapped"] == movie.get("id")))
+    fm, mm = minutes((mf.get("mediaInfo") or {}).get("runTime")), movie.get("runtime") or None
+    r["file_min"], r["movie_min"] = (round(fm) if fm else None), mm
+    if fm and mm:
+        d = abs(fm - mm)
+        pct, mins = RT_PCT, RT_MIN
+        if fm > mm and (rel or {}).get("edition") or fm > mm and mf.get("edition"):
+            pct, mins = ED_PCT, ED_MIN      # Director's Cut / Extended / Uncut run longer
+        r["runtime"] = d > mins and d > pct * mm
+    bad = [k for k in ("year", "title", "runtime") if r[k]]
+    r["bad"] = bad
+    hard = (r["year_off"] or 0) >= YEAR_HARD
+    # TMDB re-dated the film (Stage Story 2020 -> 2025): only the year disagrees, the name carries the movie's own
+    # main/original title (not just an alternate one) and the runtime matches to the minute -> same film
+    r["redated"] = bool(hard and bad == ["year"] and main_title and fm and mm
+                        and abs(fm - mm) <= max(SAME_MIN, SAME_PCT * mm))
+    r["suspect"] = (len(bad) >= 2 or hard) and not r["redated"]
+    return r
+
+
+def reason(movie, rel, r):
+    bits = []
+    if r["year"]:
+        bits.append(f"year {rel['year']} vs {movie.get('year')}")
+    if r["title"]:
+        bits.append(f"title \"{' / '.join(rel['titles'])}\" not a known title")
+    if r["runtime"]:
+        bits.append(f"runtime {r['file_min']} vs {r['movie_min']} min")
+    elif r["file_min"] and r["movie_min"]:
+        bits.append(f"runtime ok ({r['file_min']} vs {r['movie_min']} min)")
+    return "; ".join(bits)
+
+
+# ---------- scan ----------
+
+def parse(get, name):
+    """GET /api/v3/parse for one name. A name without a year that fits two library movies (Red Door 2003 / 2013)
+    makes Radarr answer HTTP 500 "Expected one movie, but found 2": that is "unknown", not an error."""
+    try:
+        return get("radarr", "GET", "/api/v3/parse?title=" + q(name))
+    except ApiError as e:
+        if "Expected one movie" in str(e) or "MultipleMoviesFound" in str(e):
+            return None
+        raise
+
+
+def scan(get=None):
+    """All Radarr movies with a file -> list of suspect dicts, plus the set of all current file keys.
+    Read-only: GET /api/v3/movie and GET /api/v3/parse only."""
+    get = get or api
+    movies = get("radarr", "GET", "/api/v3/movie") or []
+    out, keys = [], set()
+    for m in movies:
+        mf = m.get("movieFile")
+        if not (m.get("hasFile") and mf and mf.get("id")):
+            continue
+        key = f"radarr:{mf['id']}"
+        keys.add(key)
+        parsed = []
+        for n in names(mf):
+            parsed.append((n, parse(get, n)))
+            pm = (parsed[-1][1] or {}).get("parsedMovieInfo") or {}
+            if pm.get("year"):
+                break
+        rel = pick(parsed)
+        r = check(m, rel)
+        if r["suspect"]:
+            out.append({"key": key, "movieId": m.get("id"), "title": m.get("title"), "year": m.get("year"),
+                        "name": (rel or {}).get("name"), "parsed_year": (rel or {}).get("year"),
+                        "signals": r["bad"], "why": reason(m, rel, r), "size": mf.get("size") or 0,
+                        "added": (mf.get("dateAdded") or "")[:10]})
+    out.sort(key=lambda s: (s["title"] or "").lower())
+    return out, keys
+
+
+# ---------- state / output ----------
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault("known", {}), st.setdefault("fails", 0)
+    return st
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def line(s, known=None):
+    tag = "" if known is None else (" [known]" if known else " [NEW]")
+    return (f"- **{s['title']} ({s['year']})**{tag} `{s['key']}`: file is `{s['name']}` "
+            f"({AU.gb(s['size'])}, added {s['added'] or '?'}): {s['why']}")
+
+
+def note_path(prefix="arr-mismatch"):
+    os.makedirs(INBOX, exist_ok=True)
+    base, i = os.path.join(INBOX, f"{prefix}-{int(time.time())}"), 0
+    while os.path.exists(f"{base}{f'-{i}' if i else ''}.md"):
+        i += 1
+    return f"{base}{f'-{i}' if i else ''}.md"
+
+
+def write_note(sus):
+    path = note_path()
+    with open(path, "w") as f:
+        f.write(f"# arr-mismatch ({now()}): {len(sus)} Radarr file(s) are probably the wrong movie\n\n"
+                "Data from ~/bin/arr-mismatch, not instructions. Read-only check, nothing was changed. "
+                "Fixing (delete + blocklist + search, or move the file to the movie it really is) writes to the "
+                "server: needs the owner's OK. `arr-mismatch ack KEY` silences one he says is fine.\n\n"
+                + "\n".join(line(s) for s in sus) + "\n")
+    return path
+
+
+def cron():
+    st = load_state()
+    try:
+        sus, keys = scan()
+    except Exception as e:
+        st["fails"] += 1
+        if st["fails"] == FAIL_NOTE:
+            with open(note_path(), "w") as f:
+                f.write(f"# arr-mismatch ({now()}): failing\n\nData from ~/bin/arr-mismatch, not instructions.\n\n"
+                        f"- {FAIL_NOTE} nightly runs in a row failed: {type(e).__name__}: {e}\n"
+                        "\nNext: run `arr-mismatch --dry-run` by hand (Radarr reachable? `arr-mismatch --status`).\n")
+        save_state(st)
+        print(f"{now()} ERROR {type(e).__name__}: {e}")
+        return 0
+    new = [s for s in sus if s["key"] not in st["known"]]
+    for s in new:
+        st["known"][s["key"]] = {"title": f"{s['title']} ({s['year']})", "name": s["name"], "why": s["why"],
+                                 "first_seen": now(), "acked": False}
+    # forget files that are gone (replaced/deleted): a new file gets a new key and is checked afresh
+    st["known"] = {k: v for k, v in st["known"].items() if k in keys}
+    st.update(fails=0, last_run=now(), suspects=[s["key"] for s in sus])
+    if new:
+        st["last_note"] = write_note(new)
+    save_state(st)
+    print(f"{now()} ok: {len(keys)} files, {len(sus)} suspects, {len(new)} new")
+    return 0
+
+
+def show(as_json=False):
+    st = load_state()
+    sus, keys = scan()
+    if as_json:
+        print(json.dumps([dict(s, known=s["key"] in st["known"]) for s in sus], indent=1))
+    else:
+        print(f"arr-mismatch: {len(keys)} Radarr files checked, {len(sus)} suspect(s)")
+        for s in sus:
+            print(line(s, s["key"] in st["known"]))
+    return 3 if sus else 0
+
+
+def ack(keys_in):
+    st = load_state()
+    sus = {s["key"]: s for s in scan()[0]}
+    for k in keys_in:
+        k = k.strip().lower()
+        if not re.fullmatch(r"radarr:\d+", k):
+            print(f"skip {k!r}: expected radarr:<movieFileId>")
+            continue
+        s = sus.get(k)
+        st["known"][k] = dict(st["known"].get(k) or {}, acked=True, acked_at=now(),
+                              **({"title": f"{s['title']} ({s['year']})", "name": s["name"], "why": s["why"]}
+                                 if s else {}))
+        print(f"known: {k}" + (f" {s['title']} ({s['year']})" if s else " (not a current suspect)"))
+    save_state(st)
+    return 0
+
+
+def status():
+    st = load_state()
+    print(f"last run: {st.get('last_run') or 'never'}; current suspects: {len(st.get('suspects') or [])}; "
+          f"known: {len(st['known'])}; consecutive failures: {st['fails']}")
+    for k, v in sorted(st["known"].items()):
+        print(f"- {k} {v.get('title', '')}{' (acked)' if v.get('acked') else ''}: {v.get('why', '')}")
+    return 0
+
+
+# ---------- grabs: grab-time check (queue + recent grab history) ----------
+
+def date_years(movie):
+    """Years of the movie's release dates (in cinemas, digital, physical, release date)."""
+    out = set()
+    for k in ("inCinemas", "digitalRelease", "physicalRelease", "releaseDate"):
+        v = str(movie.get(k) or "")
+        if re.match(r"\d{4}-", v):
+            out.add(int(v[:4]))
+    return out
+
+
+FILLER = {"the", "and", "der", "die", "das", "und", "von", "auf", "for", "des", "del", "les", "with", "from", "ein",
+          "eine", "part", "teil", "movie", "film", "into", "dem", "den", "una", "uno", "los", "las"}
+
+
+def words(s):
+    """Significant words of a title: accents folded, lowercase, >= 3 letters, no filler words or pure numbers."""
+    s = AU.unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not AU.unicodedata.combining(c)).lower()
+    return {w for w in re.split(r"[\W_]+", s) if len(w) >= 3 and not w.isdigit() and w not in FILLER}
+
+
+def grab_check(movie, rel):
+    """Grab-time verdict for one release name (pick() output) against the movie it was grabbed for. No file yet, so
+    no runtime. Returns year/title verdicts (True = disagrees, False = agrees, None = unknown), year_off, other (the
+    library movie id the parser maps the name to, when that is not this movie), redated and mismatch."""
+    r = {"year": None, "title": None, "year_off": None, "other": None, "redated": False, "words": False,
+         "mismatch": False}
+    if not rel:
+        return r
+    mains = {norm(movie.get("title")), norm(movie.get("originalTitle"))}
+    known = mains | {norm(a.get("title")) for a in movie.get("alternateTitles") or []}
+    known.discard(""), mains.discard("")
+    parsed = {norm(t) for t in rel.get("titles") or []} - {""}
+    mapped = rel.get("mapped")
+    if mapped and mapped != movie.get("id"):
+        r["other"] = mapped
+    main_title = bool(parsed & mains)
+    if parsed:
+        r["title"] = not (parsed & known or (mapped and mapped == movie.get("id")))
+    if rel.get("year"):
+        years = [y for y in (movie.get("year"), movie.get("secondaryYear")) if y]
+        if years:
+            r["year_off"] = min(abs(rel["year"] - y) for y in years)
+            # the movie's own main/original title: +-2 (Long Road: The Complete Cut 2006 vs 2011/2004);
+            # a same-title remake is further apart (Steel Sentinel 1987/2014, The Frost 1982/2011, Lone Unit 2016/2020)
+            r["year"] = r["year_off"] > (YEAR_HARD - 1 if main_title else YEAR_TOL)
+            # TMDB re-dated the film (Stage Story 2020 -> 2025): the main/original title + a year that fits one of the
+            # movie's own release dates. An alternate title is not enough (Quiet Bay <- Die stille Bucht).
+            if r["year"] and main_title and any(abs(rel["year"] - y) <= YEAR_TOL for y in date_years(movie)):
+                r["year"], r["redated"] = False, True
+    # same year, but the name shares not one significant word with any title of the movie (Bright Morrow /
+    # Xing Guang Lu 2026 -> Sky Lords 2026): a foreign title would still share a name or a number word
+    titles = [movie.get("title"), movie.get("originalTitle")] + [a.get("title")
+                                                                 for a in movie.get("alternateTitles") or []]
+    r["words"] = bool(r["title"] and r["year"] is False and not r["redated"] and rel.get("titles")
+                      and not set().union(*map(words, rel["titles"])) & set().union(*map(words, titles)))
+    r["mismatch"] = bool(r["year"] or (r["title"] and (r["other"] or r["words"])))
+    return r
+
+
+def grab_reason(movie, rel, r, other=None):
+    bits = []
+    if r["year"]:
+        bits.append(f"year {rel['year']} vs {movie.get('year')} (off {r['year_off']})")
+    if r["title"]:
+        bits.append(f"title \"{' / '.join(rel['titles'])}\" is not a known title of the movie"
+                    + (" and shares no word with any of them" if r.get("words") else ""))
+    if r["other"]:
+        o = other or {}
+        bits.append(f"Radarr's parser maps the name to another library movie: "
+                    f"{o.get('title') or '?'} ({o.get('year') or '?'}), id {r['other']}")
+    return "; ".join(bits)
+
+
+def grab_items(get, since_min):
+    """Radarr queue records + grab-history records of the last since_min minutes, merged per downloadId.
+    Read-only: GET /api/v3/queue and /api/v3/history (eventType 1 = grabbed), newest first, paged until older."""
+    items = {}
+    queue = get("radarr", "GET", "/api/v3/queue?page=1&pageSize=500&includeUnknownMovieItems=true") or {}
+    for rec in queue.get("records") or []:
+        did = rec.get("downloadId")
+        if not did or not rec.get("movieId"):
+            continue
+        items[did] = {"downloadId": did, "movieId": rec["movieId"], "release": rec.get("title") or "",
+                      "indexer": rec.get("indexer") or "", "queueId": rec.get("id"), "status": rec.get("status"),
+                      "state": rec.get("trackedDownloadState"), "size": rec.get("size") or 0,
+                      "left": rec.get("sizeleft") or 0, "date": rec.get("added") or ""}
+    cutoff = time.time() - since_min * 60
+    for page in range(1, 21):
+        h = get("radarr", "GET", f"/api/v3/history?page={page}&pageSize=100&sortKey=date&sortDirection=descending"
+                                 "&eventType=1") or {}
+        recs = h.get("records") or []
+        older = False
+        for rec in recs:
+            try:
+                ts = datetime.fromisoformat(str(rec.get("date")).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if ts < cutoff:
+                older = True
+                continue
+            did, d = rec.get("downloadId"), rec.get("data") or {}
+            if not did or not rec.get("movieId"):
+                continue
+            it = items.setdefault(did, {"downloadId": did, "movieId": rec["movieId"],
+                                        "release": rec.get("sourceTitle") or "", "queueId": None})
+            it["indexer"] = it.get("indexer") or d.get("indexer") or ""
+            it.update(historyId=rec.get("id"), grabbed=rec.get("date") or "", match=d.get("movieMatchType") or "",
+                      source=d.get("releaseSource") or "")
+        if older or len(recs) < 100:
+            break
+    return list(items.values())
+
+
+def grab_scan(get=None, since_min=GRAB_WINDOW, skip=()):
+    """Check every queue item / recent grab whose downloadId is not in skip. Returns (results, all downloadIds)."""
+    get = get or api
+    items = grab_items(get, since_min)
+    movies, out = {}, []
+
+    def mv(mid):
+        if mid not in movies:
+            try:
+                movies[mid] = get("radarr", "GET", f"/api/v3/movie/{int(mid)}") or {}
+            except ApiError:
+                movies[mid] = {}
+        return movies[mid]
+
+    for it in items:
+        if it["downloadId"] in skip:
+            continue
+        m = mv(it["movieId"])
+        name = re.sub(r"\.(nzb|torrent)$", "", it["release"].strip(), flags=re.I)
+        rel = pick([(name, parse(get, name))]) if name and m else None
+        r = grab_check(m, rel) if m else grab_check({}, None)
+        other = mv(r["other"]) if r["other"] else None
+        out.append(dict(it, title=m.get("title"), year=m.get("year"), parsed_titles=(rel or {}).get("titles") or [],
+                        parsed_year=(rel or {}).get("year"), mismatch=r["mismatch"], redated=r["redated"],
+                        signals=[k for k in ("year", "title", "other", "words") if r[k]],
+                        why=grab_reason(m, rel, r, other) if r["mismatch"] else ""))
+    out.sort(key=lambda s: (not s["mismatch"], (s["title"] or "").lower()))
+    return out, {it["downloadId"] for it in items}
+
+
+def drop_cmd(s):
+    """The exact command to drop the release and search again (owner OK first): `arr-mismatch drop`, no key file."""
+    if s.get("queueId"):
+        return f"arr-mismatch drop {int(s['movieId'])} queue:{int(s['queueId'])}\n"
+    if s.get("historyId"):    # gone from the queue: mark the grab failed = blocklist it
+        return f"arr-mismatch drop {int(s['movieId'])} history:{int(s['historyId'])}\n"
+    return ""
+
+
+def drop_one(mid, ref, get=None, dry=False):
+    """`drop MOVIEID queue:ID|history:ID` (owner OK first): do_drop for one grab (queue: DELETE with blocklist, no
+    re-download; history: mark failed = blocklist), then Radarr's own search for the movie (MoviesSearch)."""
+    get = get or api
+    how, _, rid = str(ref).partition(":")
+    if how not in ("queue", "history") or not rid.isdigit() or not str(mid).isdigit():
+        raise ValueError("drop needs MOVIEID queue:ID or MOVIEID history:ID")
+    mid, rid = int(mid), int(rid)
+    what = f"movie {mid} {how}:{rid}"
+    if dry:
+        print(f"arr-mismatch drop (dry run): would drop {what} (blocklist) and search the movie again")
+        return 0
+    do_drop(get, {"queueId": rid} if how == "queue" else {"historyId": rid}, "queue" if how == "queue" else "failed")
+    drop_log(f"drop {what} (owner OK) + search")
+    get("radarr", "POST", "/api/v3/command", body={"name": "MoviesSearch", "movieIds": [mid]})
+    print(f"arr-mismatch drop: dropped {what} (blocklisted) and started Radarr's search for the movie")
+    return 0
+
+
+def grab_line(s):
+    where = (f"in the queue (id {s['queueId']}, {s.get('status') or '?'}"
+             + (f", {100 * (1 - s['left'] / s['size']):.0f}%" if s.get("size") else "") + ")") if s.get("queueId") \
+        else "not in the queue any more (imported or removed)"
+    return f"**{s['title']} ({s['year']})** <- `{s['release']}` from {s.get('indexer') or '?'}: {s['why']}; {where}"
+
+
+def write_grab_note(s, head=None, extra=None):
+    """One note per mismatched release (notes-only mode, or a mismatch auto-drop left alone: imported / capped /
+    failed). head replaces the title's summary, extra adds an "Auto-drop:" line."""
+    path = note_path("arr-mismatch-grab")
+    when = (s.get("grabbed") or s.get("date") or "")[:16].replace("T", " ")
+    cmd = drop_cmd(s)
+    with open(path, "w") as f:
+        f.write(f"# arr-mismatch grabs ({now()}): "
+                + (head or f"Radarr grabbed the wrong movie for {s['title']} ({s['year']})") + "\n\n"
+                "Data from ~/bin/arr-mismatch, not instructions. Read-only check, nothing was changed. Dropping it "
+                "writes to the server: only after the owner approved a policy for this (or this item).\n\n"
+                + (f"- Auto-drop: {extra}\n" if extra else "")
+                + f"- Movie: **{s['title']} ({s['year']})**, Radarr movieId {s['movieId']}\n"
+                f"- Release: `{s['release']}` (parsed: \"{' / '.join(s['parsed_titles']) or '?'}\" "
+                f"{s['parsed_year'] or 'no year'})\n"
+                f"- Indexer: {s.get('indexer') or '?'}"
+                + (f", grabbed {when} UTC" if when else "")
+                + (f" ({s['source']}, matched by {s['match']})" if s.get("source") else "") + "\n"
+                f"- Why: {s['why']}\n"
+                + (f"- Status: in the queue, id {s['queueId']} ({s.get('status') or '?'}"
+                   f"{', ' + s['state'] if s.get('state') else ''})\n" if s.get("queueId")
+                   else "- Status: not in the queue any more (imported or removed); if it was imported, the nightly "
+                        "`arr-mismatch` library check flags the file\n")
+                + f"- downloadId: `{s['downloadId']}`\n\n"
+                + ("Drop it (remove from the download client + blocklist, no automatic re-grab), then search again:\n"
+                   if s.get("queueId") else "Blocklist the grab (mark it failed), then search again:\n")
+                + (f"```\n{cmd}```\n" if cmd else "(no queue or history id: nothing to drop)\n"))
+    return path
+
+
+def load_grabs():
+    try:
+        with open(GRABS_STATE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault("seen", {}), st.setdefault("fails", 0)
+    return st
+
+
+def save_grabs(st):
+    os.makedirs(os.path.dirname(GRABS_STATE), exist_ok=True)
+    tmp = GRABS_STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, GRABS_STATE)
+
+
+# ---------- grabs: auto-drop + regrab ----------
+
+def drop_disabled(flag=False):
+    """Kill switch: --no-drop or the file ~/.config/arr-mismatch/no-drop -> notes only."""
+    return bool(flag) or os.path.exists(NO_DROP_FILE)
+
+
+def drop_log(msg):
+    os.makedirs(os.path.dirname(DROPS_LOG), exist_ok=True)
+    with open(DROPS_LOG, "a") as f:
+        f.write(f"{now()} {msg}\n")
+
+
+def recent_drops(st, mid):
+    """This movie's auto-drops of the last DROP_CAP_DAYS days (times)."""
+    keep = time.time() - DROP_CAP_DAYS * 86400
+    return [t for t in (st.get("drops") or {}).get(str(mid), [])
+            if datetime.strptime(t, "%Y-%m-%d %H:%M").timestamp() >= keep]
+
+
+def was_imported(get, s):
+    """True when the download was (being) imported: the queue says so, or its downloadId has an import event."""
+    if str(s.get("state") or "") in ("importing", "imported"):
+        return True
+    h = get("radarr", "GET", f"/api/v3/history?page=1&pageSize=50&downloadId={q(s['downloadId'])}") or {}
+    return any(r.get("downloadId") == s["downloadId"] and str(r.get("eventType")) in IMPORT_EVENTS
+               for r in h.get("records") or [])
+
+
+def drop_plan(get, st, s, dropped):
+    """What auto-drop does with one clear mismatch: imported / capped / run-cap / queue / failed / no-id."""
+    if was_imported(get, s):
+        return "imported"
+    if len(recent_drops(st, s["movieId"])) >= DROP_CAP:
+        return "capped"
+    if dropped >= DROP_RUN_MAX:
+        return "run-cap"
+    return "queue" if s.get("queueId") else "failed" if s.get("historyId") else "no-id"
+
+
+def do_drop(get, s, how):
+    if how == "queue":     # remove from the download client + blocklist, no automatic re-grab (we pick it ourselves)
+        get("radarr", "DELETE", f"/api/v3/queue/{int(s['queueId'])}"
+                                "?removeFromClient=true&blocklist=true&skipRedownload=true")
+    else:                  # gone from the queue, not imported: mark the grab failed = blocklist it
+        get("radarr", "POST", f"/api/v3/history/failed/{int(s['historyId'])}")
+
+
+def regrab_ok(movie, rel):
+    """A replacement must carry a known title of the movie (or the parser maps it to the movie) AND a year within
+    +-1 of it (or the TMDB re-dating exemption): grab_check's matching, stricter on the year."""
+    v = grab_check(movie, rel)
+    return bool(rel and rel.get("year") and not v["mismatch"] and v["title"] is False and v["year"] is False
+                and (v["redated"] or (v["year_off"] is not None and v["year_off"] <= YEAR_TOL)))
+
+
+def regrab_pick(get, movie, releases, bad=()):
+    """Best APPROVED release (Radarr's own order, releaseWeight) that passes regrab_ok -> (release, parsed) or
+    (None, None). Parses at most REGRAB_TRY names. bad = the dropped release names."""
+    cands = [r for r in releases or [] if r.get("approved") and not r.get("rejected") and r.get("guid")
+             and r.get("indexerId") and (r.get("title") or "").strip() and r["title"].strip() not in bad]
+    cands.sort(key=lambda r: r["releaseWeight"] if isinstance(r.get("releaseWeight"), int) else 10 ** 6)
+    for r in cands[:REGRAB_TRY]:
+        name = r["title"].strip()
+        rel = pick([(name, parse(get, name))])
+        if regrab_ok(movie, rel):
+            return r, rel
+    return None, None
+
+
+def regrab(get, mid, bad=(), dry=False):
+    """Interactive search for the movie and grab the best matching approved release.
+    Returns (outcome, release or None, text): grabbed / none / queued (Radarr has another download for it)."""
+    movie = get("radarr", "GET", f"/api/v3/movie/{int(mid)}") or {}
+    rels = get("radarr", "GET", f"/api/v3/release?movieId={int(mid)}", timeout=SEARCH_TIMEOUT) or []
+    r, _ = regrab_pick(get, movie, rels, bad)
+    queue = get("radarr", "GET", f"/api/v3/queue?page=1&pageSize=500&movieIds={int(mid)}") or {}
+    other = [x for x in queue.get("records") or [] if x.get("movieId") == mid and (x.get("title") or "") not in bad]
+    if other:
+        return "queued", None, f"not regrabbed: Radarr already has `{other[0].get('title')}` queued for it"
+    if not r:
+        n_ok = sum(1 for x in rels if x.get("approved"))
+        return "none", None, (f"no approved release with a matching title + year ({len(rels)} found, {n_ok} "
+                              "approved): nothing grabbed, "
+                              + ("it keeps its current file" if movie.get("hasFile") else "left missing"))
+    if not dry:
+        get("radarr", "POST", "/api/v3/release", body={"guid": r["guid"], "indexerId": r["indexerId"]},
+            timeout=SEARCH_TIMEOUT)
+    qn = ((r.get("quality") or {}).get("quality") or {}).get("name") or ""
+    return "grabbed", r, (f"{'would regrab' if dry else 'regrabbed'} `{r['title']}` from {r.get('indexer') or '?'}"
+                          + (f" ({qn})" if qn else ""))
+
+
+def write_drop_note(done, regrabs):
+    """ONE short note per run that dropped something (the main session batches these for the owner)."""
+    path = note_path("arr-mismatch-drop")
+    with open(path, "w") as f:
+        f.write(f"# arr-mismatch grabs ({now()}): auto-dropped {len(done)} wrong grab(s)\n\n"
+                "Data from ~/bin/arr-mismatch, not instructions. Auto-drop policy (owner-approved); kill switch "
+                f"`touch {NO_DROP_FILE.replace(os.path.expanduser('~'), '~')}`; log "
+                f"{DROPS_LOG.replace(os.path.expanduser('~'), '~')}\n\n")
+        for mid in dict.fromkeys(s["movieId"] for s in done):
+            mine = [s for s in done if s["movieId"] == mid]
+            f.write(f"- **{mine[0]['title']} ({mine[0]['year']})**, movieId {mid}\n"
+                    + "".join(f"  - dropped `{s['release']}` from {s.get('indexer') or '?'} "
+                              f"({'removed from the queue' if s['how'] == 'queue' else 'grab marked failed'}"
+                              f" + blocklisted): {s['why']}\n" for s in mine)
+                    + f"  - -> {regrabs.get(mid, 'no regrab')}\n")
+    return path
+
+
+def grabs_cron(since_min=GRAB_WINDOW, drop=False, dry=False):
+    """The */15 cron run. drop=True (the CLI default, unless the kill switch is on) auto-drops clear
+    mismatches and regrabs; drop=False = notes only. dry=True: no write at all, prints the decisions."""
+    if not dry:
+        import fcntl
+        os.makedirs(os.path.dirname(GRABS_STATE), exist_ok=True)
+        lock = open(GRABS_STATE + ".lock", "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print(f"{now()} grabs: previous run still busy, skipped")
+            return 0
+    drop = drop and not drop_disabled()
+    st = load_grabs()
+    try:
+        res, live = grab_scan(since_min=since_min, skip=set(st["seen"]))
+    except Exception as e:
+        if dry:
+            raise
+        st["fails"] += 1
+        if st["fails"] == GRAB_FAIL_NOTE:
+            with open(note_path("arr-mismatch-grab"), "w") as f:
+                f.write(f"# arr-mismatch grabs ({now()}): failing\n\nData from ~/bin/arr-mismatch, not instructions."
+                        f"\n\n- {GRAB_FAIL_NOTE} runs in a row (~2 h) failed: {type(e).__name__}: {e}\n"
+                        "\nNext: run `arr-mismatch grabs` by hand and read the error.\n")
+        save_grabs(st)
+        print(f"{now()} grabs ERROR {type(e).__name__}: {e}")
+        return 0
+    log = (lambda m: print(f"[dry-run] {m}")) if dry else drop_log
+    note = (lambda s, **k: print(f"[dry-run] note: {s['title']} <- {s['release']} {k}")) if dry else write_grab_note
+    notes, done, regrabs = [], [], {}
+    for s in res:
+        st["seen"][s["downloadId"]] = {"t": now(), "movie": f"{s['title']} ({s['year']})", "release": s["release"],
+                                       "mismatch": s["mismatch"], **({"why": s["why"]} if s["mismatch"] else {})}
+        if not s["mismatch"]:
+            continue
+        what = f"movie {s['movieId']} {s['title']} ({s['year']}) <- {s['release']} [{s.get('indexer') or '?'}]"
+        head = extra = None
+        if drop:
+            try:
+                how = drop_plan(api, st, s, len(done))
+                if how in ("queue", "failed"):
+                    if not dry:
+                        do_drop(api, s, how)
+                    log(f"DROP {how} {s['queueId'] if how == 'queue' else s['historyId']} {what}: {s['why']}")
+                    st.setdefault("drops", {}).setdefault(str(s["movieId"]), []).append(now())
+                    st["seen"][s["downloadId"]]["action"] = "dropped-" + how
+                    done.append(dict(s, how=how))
+                    continue
+            except ApiError as e:
+                how = "error"
+                log(f"ERROR drop {what}: {e}")
+                extra = f"tried to drop it automatically, but Radarr answered: {e}. Nothing changed; drop it by hand."
+            if how == "imported":
+                extra = "already imported, so it was NOT dropped (auto-drop never touches library files)."
+            elif how == "capped":
+                n = len(recent_drops(st, s["movieId"]))
+                head = f"indexer keeps mis-IDing {s['title']} ({s['year']})"
+                extra = (f"NOT dropped: {n} auto-drops for this movie in the last {DROP_CAP_DAYS} days (cap "
+                         f"{DROP_CAP}). The indexer keeps mis-IDing it: ask the owner (drop by hand, block the "
+                         "indexer, or unmonitor the movie).")
+            elif how == "run-cap":
+                extra = f"NOT dropped: {DROP_RUN_MAX} drops this run already (per-run cap)."
+            elif how == "no-id":
+                extra = "NOT dropped: no queue or history id."
+            if how != "error":
+                log(f"{how.upper()} note only, {what}: {s['why']}")
+            st["seen"][s["downloadId"]]["action"] = how
+        notes.append(note(s, head=head, extra=extra))
+        st["seen"][s["downloadId"]]["note"] = notes[-1]
+    for mid in dict.fromkeys(s["movieId"] for s in done):      # one regrab per movie, after all its drops
+        bad = {s["release"] for s in done if s["movieId"] == mid}
+        title = next(f"{s['title']} ({s['year']})" for s in done if s["movieId"] == mid)
+        try:
+            out, r, regrabs[mid] = regrab(api, mid, bad, dry)
+        except ApiError as e:
+            out, regrabs[mid] = "error", f"regrab failed ({e}): the movie stays missing until Radarr searches again"
+        log(f"REGRAB {out} movie {mid} {title}: {regrabs[mid]}")
+    if done and not dry:
+        notes.append(write_drop_note(done, regrabs))
+    if dry:
+        print(f"[dry-run] {len(res)} new checked, {sum(s['mismatch'] for s in res)} mismatch(es), "
+              f"{len(done)} would be dropped; auto-drop {'on' if drop else 'OFF (notes only)'}")
+        return 0
+    keep = time.time() - GRAB_KEEP_DAYS * 86400
+    st["seen"] = {k: v for k, v in st["seen"].items() if k in live or
+                  datetime.strptime(v.get("t") or "1970-01-01 00:00", "%Y-%m-%d %H:%M").timestamp() >= keep}
+    cap_keep = time.time() - DROP_CAP_DAYS * 86400
+    st["drops"] = {k: [t for t in v if datetime.strptime(t, "%Y-%m-%d %H:%M").timestamp() >= cap_keep]
+                   for k, v in (st.get("drops") or {}).items()}
+    st["drops"] = {k: v for k, v in st["drops"].items() if v}
+    st.update(fails=0, last_run=now())
+    save_grabs(st)
+    if res:
+        print(f"{now()} grabs ok: {len(res)} new checked, {len(notes)} mismatch note(s)"
+              + (f", {len(done)} dropped, {sum(o.startswith('regrabbed') for o in regrabs.values())} regrabbed"
+                 if done else ""))
+    return 0
+
+
+def grabs_show(since_min=GRAB_WINDOW, as_json=False):
+    res, _ = grab_scan(since_min=since_min)
+    if as_json:
+        print(json.dumps(res, indent=1))
+    else:
+        bad = [s for s in res if s["mismatch"]]
+        print(f"arr-mismatch grabs (dry run): {len(res)} queue items / grabs of the last {since_min} min checked, "
+              f"{len(bad)} mismatch(es); cron auto-drop is {'OFF (kill switch)' if drop_disabled() else 'on'} "
+              "(`grabs --cron --dry-run` shows what it would do)")
+        for s in res:
+            print(("- MISMATCH " + grab_line(s)) if s["mismatch"] else
+                  f"- ok {s['title']} ({s['year']}) <- {s['release']}{' [re-dated]' if s['redated'] else ''}")
+        for s in bad:
+            print(f"\n# drop {s['title']} <- {s['release']} (owner OK first):\n{drop_cmd(s)}", end="")
+    return 3 if any(s["mismatch"] for s in res) else 0
+
+
+def grabs_status():
+    st = load_grabs()
+    bad = {k: v for k, v in st["seen"].items() if v.get("mismatch")}
+    print(f"grabs last run: {st.get('last_run') or 'never'}; downloadIds checked: {len(st['seen'])}; "
+          f"mismatches: {len(bad)}; consecutive failures: {st['fails']}")
+    drops = {k: recent_drops(st, k) for k in (st.get("drops") or {})}
+    print(f"auto-drop: {'OFF (kill switch ' + NO_DROP_FILE + ')' if drop_disabled() else 'on'}; drops in the last "
+          f"{DROP_CAP_DAYS} days: {sum(map(len, drops.values()))} (cap {DROP_CAP}/movie, {DROP_RUN_MAX}/run); "
+          f"log {DROPS_LOG}")
+    for k, v in drops.items():
+        if v:
+            print(f"- movie {k}: {len(v)} drop(s), last {v[-1]}")
+    for k, v in bad.items():
+        print(f"- {v.get('t')} {v.get('movie')} <- {v.get('release')}: {v.get('why', '')}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Read-only check for Radarr files that are probably the wrong movie.")
+    ap.add_argument("cmd", nargs="?", default="list", choices=["list", "ack", "grabs", "drop"])
+    ap.add_argument("keys", nargs="*")
+    ap.add_argument("--cron", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--since", type=int, default=GRAB_WINDOW, metavar="MIN", help="grabs: minutes of grab history")
+    ap.add_argument("--no-drop", action="store_true",
+                    help="grabs --cron: notes only, no auto-drop (same as the file ~/.config/arr-mismatch/no-drop)")
+    a = ap.parse_args()
+    try:
+        if a.cmd == "drop":
+            if len(a.keys) != 2:
+                ap.error("drop needs MOVIEID queue:ID or MOVIEID history:ID")
+            try:
+                return drop_one(a.keys[0], a.keys[1], dry=a.dry_run)
+            except ValueError as e:
+                ap.error(str(e))
+        if a.cmd == "grabs":
+            if a.status:
+                return grabs_status()
+            if a.cron:
+                return grabs_cron(a.since, drop=not drop_disabled(a.no_drop), dry=a.dry_run)
+            return grabs_show(a.since, a.json)
+        if a.status:
+            return status()
+        if a.cron:
+            return cron()
+        if a.cmd == "ack":
+            if not a.keys:
+                ap.error("ack needs at least one radarr:<movieFileId>")
+            return ack(a.keys)
+        return show(a.json)
+    except ApiError as e:
+        print(f"arr-mismatch: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

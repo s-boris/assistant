@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""trip-admin: READ-ONLY pre-trip admin sweep. Lists what falls due around a trip (bills, Swiss deadlines,
+paperless cards with a due date, recurring items) with "before you leave" advice and the latest safe day.
+
+Nothing is changed anywhere: it only reads through the existing tools.
+  bills      `bills list --all --json`: open bills due in the scan window, plus overdue ones
+  deadlines  `deadlines list --all --json` (dated items) and its text "Date unknown" section (profile gaps)
+  paperless  `paperless recent --json` + `paperless get ID --json` cards (tier-1 fields: amount, currency,
+             due date; never content) for recent documents that are not obvious non-bills and not yet a bill
+  recurring  optional ~/.config/trip-admin/recurring.json: [{"title", "every": "monthly:D"|"yearly:MM-DD",
+             "kind": "pay|credit|send|do|check", "paperless": ID (amount from that card), "advice", "note"}]
+  reminders  owner reminders (bill:/deadline:/kk/tax tags) that fire while you are away (~/bin/remind's store)
+  people     "People while away": birthdays and dated occasions from ~/.config/assistant/people-dates.json
+             (0600; a cached export of the Google Calendar BIRTHDAY events plus hand-added rows), and the
+             season dates (1st Advent, Advent calendars 01.12, St. Nicholas 06.12, Christmas Eve 24.12) that
+             fall in the trip or within --people-margin days of it. Per occasion: first name only (plus a
+             last-name initial when two share one), date, and the day to have the gift by (the day itself
+             or the last working day before leaving, whichever is earlier, minus --gift-lead working days)
+             with how many days before departure that is. Never addresses or full names.
+             File: {"updated": "YYYY-MM-DD", "season": ["advent", "advent-calendar", "samichlaus",
+             "christmas"], "people": [{"name", "date": "MM-DD" (every year) | "YYYY-MM-DD" (that day only),
+             "kind": "birthday|anniversary|wedding|occasion", "label": optional text, "source"}]}
+             (a plain list of rows also works; rows with a bad date are skipped and counted).
+
+Usage: trip-admin [--from YYYY-MM-DD --until YYYY-MM-DD] [--before 7] [--after 4] [--json] [--md FILE]
+                  [--no-paperless] [--paperless-days 120] [--max-cards 20]
+                  [--people-margin 3] [--gift-lead 5] [--no-season]
+       trip-admin --import-calendar FILE [FILE ...]
+  --from/--until  the trip (first and last day away); default: "from"/"until"/"name" in the trip file
+                  (~/.config/pretrip-check/trip.json, shared with pretrip-check)
+  --before/--after  days scanned before departure / after return (default 7 / 4)
+  --import-calendar  refresh the people file from saved Google Calendar list_events JSON (the MCP result,
+                  whole or trimmed to eventType/summary/start/recurringEventId): "X's birthday" events become
+                  MM-DD birthday rows, "X's anniversary|wedding" / "Jahrestag|Hochzeit X" events anniversary or
+                  wedding rows; the owner's own "Happy birthday!" is skipped. Replaces the rows with source
+                  "calendar", keeps every other row; prints counts only.
+Latest safe day: the due date minus a lead time in working days (pay 1, credit 2, send 2 for registered
+mail that must arrive, do/check 0), plus a payment term where the rule has one (tax instalments 30 days,
+Serafe 60 days). Anything whose latest day falls before the first working day back becomes "before you
+leave" with the last working day before departure as its latest safe day.
+Env (tests): TRIP_ADMIN_TRIP, TRIP_ADMIN_TODAY, TRIP_ADMIN_BILLS, TRIP_ADMIN_DEADLINES, TRIP_ADMIN_PAPERLESS,
+  TRIP_ADMIN_REMIND_DB, TRIP_ADMIN_RECURRING, TRIP_ADMIN_PEOPLE.
+Exit: 0 nothing to handle before leaving, 1 something to handle (or a source failed), 2 usage error.
+  The people section is informational: it does not change the exit code (a failed people file does).
+Tests: ~/opt/assistant/tests/legacy/trip-admin/run.sh (offline, fake tools).
+"""
+import argparse
+import calendar
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+TRIP = os.environ.get("TRIP_ADMIN_TRIP") or f"{HOME}/.config/pretrip-check/trip.json"
+BILLS = os.environ.get("TRIP_ADMIN_BILLS") or f"{HOME}/bin/bills"
+DEADLINES = os.environ.get("TRIP_ADMIN_DEADLINES") or f"{HOME}/bin/deadlines"
+PAPERLESS = os.environ.get("TRIP_ADMIN_PAPERLESS") or f"{HOME}/bin/paperless"
+REMIND_DB = os.environ.get("TRIP_ADMIN_REMIND_DB") or f"{HOME}/.local/state/remind/reminders.json"
+RECURRING = os.environ.get("TRIP_ADMIN_RECURRING") or f"{HOME}/.config/trip-admin/recurring.json"
+PEOPLE = os.environ.get("TRIP_ADMIN_PEOPLE") or f"{HOME}/.config/assistant/people-dates.json"
+SEASON_KEYS = ("advent", "advent-calendar", "samichlaus", "christmas")
+OCCASION = {"birthday": "birthday", "anniversary": "anniversary", "wedding": "wedding", "occasion": "occasion"}
+WHEN = {"before": "just before you leave", "away": "while you're away", "after": "right after you're back"}
+
+LEAD = {"pay": 1, "credit": 2, "send": 2, "do": 0, "check": 0}
+# Generic rule facts per deadlines id (prefix match): kind of action and payment term in days.
+HINTS = [
+    ("tax-rate-", {"kind": "pay", "term_days": 30,
+                   "note": "30-day payment term; interest is settled with the final bill"}),
+    ("kk-switch", {"kind": "send"}), ("kk-franchise", {"kind": "send"}),
+    ("pillar3a", {"kind": "credit"}),
+    ("serafe", {"kind": "pay", "term_days": 60}),
+    ("dbst", {"kind": "pay", "term_days": 30}),
+]
+NON_BILL_TYPES = {"lohnabrechnung", "lohnausweis", "arbeitsvertrag", "arbeitszeugnis", "payslip",
+                  "kündigung", "quittung", "receipt", "vertrag", "contract", "zertifikat", "certificate"}
+REMINDER_TAGS = ("bill:", "deadline:", "kk", "tax")
+ADVICE = {
+    "pay": "Pay before you leave, or schedule it in eBanking with an execution date on or before {due}.",
+    "credit": "Transfer before you leave so it is credited by {due}.",
+    "send": "Send it before you leave (registered; it must arrive by {due}).",
+    "do": "Do it before you leave.",
+    "check": "Check it before you leave.",
+}
+
+
+# ---------- dates ----------
+def easter(y):
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mo = (h + l - 7 * m + 114) // 31
+    return dt.date(y, mo, (h + l - 7 * m + 114) % 31 + 1)
+
+
+def holidays(y):
+    """Common Swiss public holidays (fixed + Easter-based)."""
+    e = easter(y)
+    days = {dt.date(y, 1, 1), dt.date(y, 1, 2), dt.date(y, 5, 1), dt.date(y, 8, 1),
+            dt.date(y, 12, 25), dt.date(y, 12, 26)}
+    days |= {e - dt.timedelta(2), e + dt.timedelta(1), e + dt.timedelta(39), e + dt.timedelta(50)}
+    return days
+
+
+def workday(d):
+    return d.weekday() < 5 and d not in holidays(d.year)
+
+
+def prev_workday(d):
+    while not workday(d):
+        d -= dt.timedelta(1)
+    return d
+
+
+def next_workday(d):
+    while not workday(d):
+        d += dt.timedelta(1)
+    return d
+
+
+def sub_workdays(d, n):
+    d = prev_workday(d)
+    for _ in range(n):
+        d = prev_workday(d - dt.timedelta(1))
+    return d
+
+
+def day(s):
+    return dt.date.fromisoformat(str(s)[:10])
+
+
+def fmt(d):
+    return f"{d:%a} {d:%d.%m}"
+
+
+def today():
+    t = os.environ.get("TRIP_ADMIN_TODAY")
+    return day(t) if t else dt.date.today()
+
+
+# ---------- sources ----------
+def run(cmd, timeout=120, env=None):
+    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout, env=env)
+    if p.returncode != 0:
+        raise RuntimeError(f"{os.path.basename(cmd[0])} exit {p.returncode}: {(p.stderr or '').strip()[-160:]}")
+    return p.stdout
+
+
+def hint(did):
+    for prefix, h in HINTS:
+        if did.startswith(prefix):
+            return h
+    return {}
+
+
+def from_bills(scan_from, scan_until):
+    out = []
+    bills = json.loads(run([BILLS, "list", "--all", "--json"]) or "[]")
+    linked = {str(b["paperless"]) for b in bills if b.get("paperless")}  # any status: already a bill
+    for b in bills:
+        if b.get("status") != "open" or not b.get("due"):
+            continue
+        due = day(b["due"])
+        if due > scan_until:
+            continue
+        out.append({"source": f"bills #{b.get('id')}", "title": b.get("payee") or "bill", "due": due,
+                    "kind": "pay", "amount": b.get("amount"), "currency": b.get("currency") or "CHF",
+                    "paperless": b.get("paperless")})
+    return out, linked
+
+
+def deadlines_env():
+    """A faked TRIP_ADMIN_TODAY (dry runs) also fakes deadlines' today: its --days window counts from it."""
+    t = os.environ.get("TRIP_ADMIN_TODAY")
+    if not t or os.environ.get("DEADLINES_TODAY") or os.environ.get("DEADLINES_NOW"):
+        return None
+    return dict(os.environ, DEADLINES_TODAY=day(t).isoformat())
+
+
+def from_deadlines(scan_from, scan_until, t0):
+    days = max(1, (scan_until - t0).days + 1)
+    out = []
+    env = deadlines_env()
+    for r in json.loads(run([DEADLINES, "list", "--days", str(days), "--all", "--json"], env=env) or "[]"):
+        due = day(r["due"])
+        if not scan_from <= due <= scan_until:
+            continue
+        h = hint(r["id"])
+        it = {"source": f"deadlines {r['id']}", "title": r["title"], "due": due,
+              "kind": h.get("kind", "do"), "term_days": h.get("term_days", 0), "note": h.get("note", "")}
+        if r.get("covered_by"):
+            it["note"] = (it["note"] + "; " if it["note"] else "") + f"handled by {r['covered_by']}"
+        if not r.get("active", True):
+            it["note"] = (it["note"] + "; " if it["note"] else "") + (r.get("note") or "if applicable")
+        out.append(it)
+    unknown = []
+    sect = False
+    for line in run([DEADLINES, "list", "--days", "1", "--all"], env=env).splitlines():
+        if "Date unknown" in line:
+            sect = True
+            continue
+        m = re.match(r'\s+-\s+(.*?)\s+\[profile "([\w.]+)"\]', line) if sect else None
+        if m:
+            unknown.append({"title": m.group(1), "missing": m.group(2)})
+    return out, unknown
+
+
+def card(pid, cache):
+    if pid not in cache:
+        cache[pid] = json.loads(run([PAPERLESS, "get", str(pid), "--json"], timeout=180) or "{}")
+    return cache[pid]
+
+
+def from_paperless(scan_from, scan_until, t0, linked, max_cards, since_days, cache):
+    docs = json.loads(run([PAPERLESS, "recent", "-n", "200", "--json"]) or "{}").get("results", [])
+    cand = []
+    for d in docs:
+        typ = (d.get("document_type") or "").strip().lower()
+        added = d.get("added") or d.get("created") or ""
+        if typ in NON_BILL_TYPES or str(d.get("id")) in linked:
+            continue
+        if added and day(added) < t0 - dt.timedelta(since_days):
+            continue
+        cand.append(d)
+    out, fetched = [], 0
+    for d in cand[:max_cards]:
+        c = card(d["id"], cache)
+        fetched += 1
+        if not c.get("due_date"):
+            continue
+        due = day(c["due_date"])
+        if not scan_from <= due <= scan_until:
+            continue
+        title = " · ".join(x for x in (c.get("document_type"), c.get("correspondent")) if x) or f"document #{d['id']}"
+        out.append({"source": f"paperless #{d['id']}", "title": title, "due": due, "kind": "pay",
+                    "amount": c.get("amount"), "currency": c.get("currency") or "CHF"})
+    return out, fetched, len(cand)
+
+
+def occurrences(rule, a, b):
+    kind, _, arg = rule.partition(":")
+    out = []
+    if kind == "monthly":
+        y, m = a.year, a.month
+        while dt.date(y, m, 1) <= b:
+            last = calendar.monthrange(y, m)[1]
+            dd = last if arg in ("last", "") else min(int(arg), last)
+            d = dt.date(y, m, dd)
+            if a <= d <= b:
+                out.append(d)
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    elif kind == "yearly":
+        mm, dd = (int(x) for x in arg.split("-"))
+        for y in range(a.year, b.year + 1):
+            d = dt.date(y, mm, min(dd, calendar.monthrange(y, mm)[1]))
+            if a <= d <= b:
+                out.append(d)
+    else:
+        raise ValueError(f"unknown rule {rule!r}")
+    return out
+
+
+def from_recurring(scan_from, scan_until, cache):
+    if not os.path.exists(RECURRING):
+        return []
+    out = []
+    for r in json.load(open(RECURRING)):
+        amount = currency = None
+        if r.get("paperless"):
+            c = card(r["paperless"], cache)
+            amount, currency = c.get("amount"), c.get("currency")
+        for d in occurrences(r["every"], scan_from, scan_until):
+            out.append({"source": "recurring" + (f" (paperless #{r['paperless']})" if r.get("paperless") else ""),
+                        "title": r["title"], "due": d, "kind": r.get("kind", "check"), "amount": amount,
+                        "currency": currency or "CHF", "advice": r.get("advice", ""), "note": r.get("note", "")})
+    return out
+
+
+def from_reminders(start, end):
+    if not os.path.exists(REMIND_DB):
+        return []
+    out = []
+    for r in json.load(open(REMIND_DB)):
+        tag = r.get("tag") or ""
+        if not r.get("owner") or not tag.startswith(REMINDER_TAGS):
+            continue
+        at = dt.datetime.strptime(r["at"][:16], "%Y-%m-%d %H:%M")
+        if start <= at.date() <= end:
+            out.append({"at": at, "text": r.get("text", ""), "tag": tag, "every": r.get("every")})
+    return sorted(out, key=lambda x: x["at"])
+
+
+# ---------- people while away ----------
+def advent1(y):
+    """1st Advent: the fourth Sunday before Christmas Day."""
+    xmas = dt.date(y, 12, 25)
+    return xmas - dt.timedelta(days=xmas.weekday() + 1 + 21)
+
+
+def season(y):
+    return [("advent", advent1(y), "1st Advent"),
+            ("advent-calendar", dt.date(y, 12, 1), "Advent calendars start"),
+            ("samichlaus", dt.date(y, 12, 6), "St. Nicholas (Samichlaus)"),
+            ("christmas", dt.date(y, 12, 24), "Christmas Eve")]
+
+
+def date_hits(spec, a, b):
+    """Days in [a, b] for a people date: "MM-DD" every year (29.02 -> 28.02 in other years), "YYYY-MM-DD" once."""
+    spec = str(spec).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", spec):
+        d = day(spec)
+        return [d] if a <= d <= b else []
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", spec)
+    if not m:
+        raise ValueError(f"bad date {spec!r}")
+    mm, dd = int(m.group(1)), int(m.group(2))
+    if not (1 <= mm <= 12 and 1 <= dd <= calendar.monthrange(2024, mm)[1]):
+        raise ValueError(f"bad date {spec!r}")
+    out = []
+    for y in range(a.year, b.year + 1):
+        d = dt.date(y, mm, min(dd, calendar.monthrange(y, mm)[1]))
+        if a <= d <= b:
+            out.append(d)
+    return out
+
+
+def load_people_file(path):
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return data, list(SEASON_KEYS), None
+    return data.get("people") or [], data.get("season", list(SEASON_KEYS)), data.get("updated")
+
+
+def from_people(frm, until, leave_by, t0, margin, lead, with_season):
+    """Occasions in [frm - margin, until + margin] -> (rows, skipped, updated). Rows carry first names only."""
+    a, b = frm - dt.timedelta(margin), until + dt.timedelta(margin)
+    rows, keys, updated = load_people_file(PEOPLE) if os.path.exists(PEOPLE) else ([], list(SEASON_KEYS), None)
+    out, skipped = [], 0
+    for r in rows:
+        name = " ".join(str(r.get("name") or "").split()) if isinstance(r, dict) else ""
+        try:
+            hits = date_hits(r.get("date"), a, b) if name else None
+        except (ValueError, TypeError):
+            hits = None
+        if hits is None:
+            skipped += 1
+            continue
+        kind = str(r.get("kind") or "birthday").lower()
+        what = str(r.get("label") or OCCASION.get(kind, kind))[:40]
+        out += [{"full": name, "kind": kind, "what": what, "date": d} for d in hits]
+    if with_season:
+        for y in range(a.year, b.year + 1):
+            out += [{"full": "", "kind": "season", "what": t, "date": d}
+                    for k, d, t in season(y) if k in keys and a <= d <= b]
+    parts = {}
+    for it in out:
+        if it["full"]:
+            parts.setdefault(it["full"].split()[0], set()).add(it["full"])
+    for it in out:
+        full = it.pop("full")
+        first = full.split()[0] if full else ""
+        if first and len(parts[first]) > 1 and len(full.split()) > 1:
+            first = f"{first} {full.split()[-1][0]}."
+        d = it["date"]
+        it["name"] = first
+        it["when"] = "before" if d < frm else "away" if d <= until else "after"
+        it["act_by"] = sub_workdays(min(d, leave_by), lead)
+        it["days_before"] = (frm - it["act_by"]).days
+        it["late"] = it["act_by"] < t0
+    out.sort(key=lambda i: (i["date"], i["kind"] == "season", i["name"]))
+    return out, skipped, updated
+
+
+def people_advice(p):
+    by = f"{fmt(p['act_by'])} ({p['days_before']} days before departure)"
+    if p["kind"] == "season":
+        if p["late"]:
+            return "If you give anything: get it now (the usual lead time has passed)."
+        return f"If you give anything: have it by {by}."
+    gift = "Order the gift now (the usual lead time has passed)" if p["late"] else f"Order the gift by {by}"
+    if p["when"] == "before":
+        return f"{gift}; wish in person before you leave."
+    if p["when"] == "away":
+        return f"{gift}; hand it over or have it shipped before you leave, and schedule your wishes for the day."
+    return f"{gift}, or right after you're back; wishes on the day."
+
+
+BDAY_RE = re.compile(r"^(?P<n>.+?)['’]s\s+(?P<k>birthday|anniversary|wedding)$", re.I)
+DE_RE = re.compile(r"^(?P<k>Geburtstag|Jahrestag|Hochzeit)\s+(?:von\s+)?(?P<n>.+)$", re.I)
+DE_KIND = {"geburtstag": "birthday", "jahrestag": "anniversary", "hochzeit": "wedding"}
+
+
+def import_calendar(paths, t0):
+    """Saved Google Calendar list_events JSON -> people rows with source "calendar"; others kept."""
+    found = {}
+    for p in paths:
+        with open(p) as f:
+            data = json.load(f)
+        events = data.get("events", []) if isinstance(data, dict) else data
+        for e in events:
+            s = " ".join(str(e.get("summary") or "").split())
+            start = (e.get("start") or {}).get("date") or (e.get("start") or {}).get("dateTime") or ""
+            m = BDAY_RE.match(s) or DE_RE.match(s)
+            if not (m and start):
+                continue
+            name, kind = m.group("n").strip(), m.group("k").lower()
+            kind = DE_KIND.get(kind, kind)
+            d = day(start)
+            yearly = kind != "wedding" or e.get("recurringEventId") or e.get("recurrence")
+            if kind == "wedding" and yearly:
+                kind = "anniversary"
+            found[(name, kind)] = {"name": name, "date": f"{d:%m-%d}" if yearly else d.isoformat(), "kind": kind,
+                                   "source": "calendar"}
+    rows, keys = [], list(SEASON_KEYS)
+    if os.path.exists(PEOPLE):
+        rows, keys, _ = load_people_file(PEOPLE)
+    kept = [r for r in rows if not (isinstance(r, dict) and r.get("source") == "calendar")]
+    new = sorted(found.values(), key=lambda r: (r["date"][-5:], r["name"]))
+    doc = {"updated": t0.isoformat(), "season": keys, "people": kept + new}
+    os.makedirs(os.path.dirname(PEOPLE) or ".", mode=0o700, exist_ok=True)
+    tmp = f"{PEOPLE}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PEOPLE)
+    return len(new), len(kept)
+
+
+# ---------- advice ----------
+def classify(it, trip_from, trip_until, leave_by, back, t0):
+    due = it["due"]
+    term = it.get("term_days") or 0
+    pay_by = due + dt.timedelta(term)
+    eff = sub_workdays(pay_by, LEAD.get(it["kind"], 0))
+    it["pay_by"] = pay_by
+    dues = fmt(due)
+    if pay_by < t0:
+        it["status"], it["latest"] = "overdue", t0
+        it["advice"] = it.get("advice") or "Overdue: handle it now."
+    elif eff < back:
+        it["status"] = "before"
+        it["latest"] = min(eff, leave_by)
+        it["advice"] = it.get("advice") or ADVICE.get(it["kind"], ADVICE["do"]).format(due=dues)
+    elif due <= trip_until:
+        it["status"], it["latest"] = "can-wait", eff
+        it["advice"] = it.get("advice") or (
+            f"Falls due {dues} while you're away, but you have until {fmt(pay_by)}: "
+            f"before you leave or after you're back.")
+    else:
+        it["status"], it["latest"] = "after", eff
+        it["advice"] = it.get("advice") or f"Due soon after you're back ({dues}): by {fmt(eff)}, or before you leave."
+    return it
+
+
+def amount_txt(it):
+    a = it.get("amount")
+    if a in (None, ""):
+        return ""
+    try:
+        return f"{it.get('currency') or 'CHF'} {float(a):,.2f}".replace(",", "'")
+    except ValueError:
+        return f"{it.get('currency') or 'CHF'} {a}"
+
+
+SECTIONS = [("overdue", "Overdue"), ("before", "Before you leave"),
+            ("can-wait", "Can wait until you're back"), ("after", "Right after you're back")]
+
+
+def render_text(r):
+    L = [f"Trip admin: {r['name']}, {fmt(r['from'])} – {fmt(r['until'])} "
+         f"(leave by {fmt(r['leave_by'])}, back {fmt(r['back'])}); scanned {fmt(r['scan_from'])} – {fmt(r['scan_until'])}"]
+    for key, head in SECTIONS:
+        rows = [i for i in r["items"] if i["status"] == key]
+        if not rows:
+            continue
+        L.append(f"{head}:")
+        for i in rows:
+            amt = amount_txt(i)
+            L.append(f"  • {fmt(i['latest'])}  {i['title']}{' · ' + amt if amt else ''}  (due {fmt(i['due'])}; {i['source']})")
+            L.append(f"      {i['advice']}" + (f" [{i['note']}]" if i.get("note") else ""))
+    if not any(i["status"] in ("overdue", "before") for i in r["items"]):
+        L.append("Nothing to handle before you leave.")
+    if r["unknown"]:
+        L.append("Unknown dates (could fall in the window):")
+        L += [f"  • {u['title']}  [set {u['missing']} in the deadlines profile]" for u in r["unknown"]]
+    if r["reminders"]:
+        L.append("Owner reminders that fire while you're away:")
+        L += [f"  • {x['at']:%a %d.%m %H:%M}  {x['text'][:90]}" for x in r["reminders"]]
+    if r["people"]:
+        L.append(f"People while away ({fmt(r['people_from'])} – {fmt(r['people_until'])}):")
+        for p in r["people"]:
+            who = f"{p['name']} · {p['what']}" if p["name"] else p["what"]
+            L.append(f"  • {fmt(p['date'])}  {who} · {WHEN[p['when']]}")
+            L.append(f"      {people_advice(p)}")
+    L.append("Sources: " + " · ".join(f"{k} {v}" for k, v in r["sources"].items()))
+    return "\n".join(L)
+
+
+def render_people_md(r, head="## People while away"):
+    if not r["people"]:
+        return []
+    L = [head, "", f"Birthdays and occasions {fmt(r['people_from'])} – {fmt(r['people_until'])} "
+         f"(the trip ± {r['people_margin']} days), so wishes and gifts can go out in advance.", "",
+         "| Date | Who | Occasion | When | Have the gift by | Days before departure |", "|---|---|---|---|---|---|"]
+    for p in r["people"]:
+        by = "**now**" if p["late"] else f"**{fmt(p['act_by'])}**"
+        L.append(f"| {fmt(p['date'])} | {p['name'] or '–'} | {p['what']} | {WHEN[p['when']]} | {by} | {p['days_before']} |")
+    return L + ["", f"Have the gift by: the occasion or the last working day before leaving, whichever is earlier, "
+                f"minus {r['gift_lead']} working days to order and receive it. While away: hand it over or have it "
+                f"shipped before you leave, and schedule the wishes for the day.", ""]
+
+
+def render_md(r):
+    L = [f"# Pre-trip admin sweep: {r['name']}", "",
+         f"Away {fmt(r['from'])} – {fmt(r['until'])} {r['until'].year}. Last working day before leaving: "
+         f"**{fmt(r['leave_by'])}**; first working day back: **{fmt(r['back'])}**. "
+         f"Scanned {fmt(r['scan_from'])} – {fmt(r['scan_until'])}.", ""]
+    for key, head in SECTIONS:
+        rows = [i for i in r["items"] if i["status"] == key]
+        if not rows:
+            continue
+        L += [f"## {head}", "", "| Latest safe day | Item | Amount | Due | What to do | Source |",
+              "|---|---|---|---|---|---|"]
+        for i in rows:
+            adv = i["advice"] + (f" ({i['note']})" if i.get("note") else "")
+            L.append(f"| **{fmt(i['latest'])}** | {i['title']} | {amount_txt(i) or '–'} | {fmt(i['due'])} | {adv} | {i['source']} |")
+        L.append("")
+    if not any(i["status"] in ("overdue", "before") for i in r["items"]):
+        L += ["Nothing to handle before you leave.", ""]
+    if r["unknown"]:
+        L += ["## Unknown dates (could fall in the window)", ""]
+        L += [f"- {u['title']} (profile `{u['missing']}` unknown)" for u in r["unknown"]] + [""]
+    if r["reminders"]:
+        L += ["## Owner reminders that fire while away", ""]
+        L += [f"- {x['at']:%a %d.%m %H:%M}: {x['text'][:120]}" for x in r["reminders"]] + [""]
+    L += render_people_md(r)
+    L += ["## Sources", ""] + [f"- {k}: {v}" for k, v in r["sources"].items()]
+    L += ["", "Read-only sweep: amounts only from the bills tracker and paperless tier-1 card fields."]
+    return "\n".join(L) + "\n"
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="trip-admin", description="read-only pre-trip admin sweep")
+    ap.add_argument("--from", dest="frm")
+    ap.add_argument("--until")
+    ap.add_argument("--before", type=int, default=7)
+    ap.add_argument("--after", type=int, default=4)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--md")
+    ap.add_argument("--no-paperless", action="store_true")
+    ap.add_argument("--paperless-days", type=int, default=120)
+    ap.add_argument("--max-cards", type=int, default=20)
+    ap.add_argument("--people-margin", type=int, default=3)
+    ap.add_argument("--gift-lead", type=int, default=5)
+    ap.add_argument("--no-season", action="store_true")
+    ap.add_argument("--import-calendar", nargs="+", metavar="FILE")
+    a = ap.parse_args(argv)
+    if a.import_calendar:
+        try:
+            n, kept = import_calendar(a.import_calendar, today())
+        except (OSError, ValueError, AttributeError, TypeError) as e:
+            print(f"trip-admin: import failed: {str(e)[:160]}", file=sys.stderr)
+            return 1
+        print(f"imported {n} calendar dates, kept {kept} other rows -> {PEOPLE}")
+        return 0
+    if a.people_margin < 0 or a.gift_lead < 0:
+        ap.error("--people-margin and --gift-lead must be >= 0")
+    name = "trip"
+    try:
+        tj = {}
+        if os.path.exists(TRIP):
+            with open(TRIP) as f:
+                tj = json.load(f)
+        if not (a.frm and a.until):
+            if not tj:
+                ap.error(f"no trip file ({TRIP}): give --from and --until")
+            a.frm, a.until = a.frm or tj.get("from"), a.until or tj.get("until")
+        if (a.frm, a.until) == (tj.get("from"), tj.get("until")):
+            name = tj.get("name") or name
+        frm, until = day(a.frm), day(a.until)
+    except (ValueError, TypeError, json.JSONDecodeError) as e:
+        print(f"trip-admin: bad trip dates: {e}", file=sys.stderr)
+        return 2
+    if until < frm:
+        print("trip-admin: --until is before --from", file=sys.stderr)
+        return 2
+    t0 = today()
+    leave_by = prev_workday(frm - dt.timedelta(1))
+    back = next_workday(until + dt.timedelta(1))
+    scan_from = max(t0, frm - dt.timedelta(a.before))
+    scan_until = until + dt.timedelta(a.after)
+    items, sources, unknown, failed, cache = [], {}, [], False, {}
+
+    def src(label, fn):
+        nonlocal failed
+        try:
+            return fn()
+        except Exception as e:  # one broken source must not hide the others
+            failed = True
+            sources[label] = f"FAILED ({str(e)[:120]})"
+            return None
+
+    b, linked = src("bills", lambda: from_bills(scan_from, scan_until)) or (None, set())
+    if b is not None:
+        items += b
+        sources["bills"] = f"ok ({len(b)} open in window or overdue)"
+    d = src("deadlines", lambda: from_deadlines(scan_from, scan_until, t0))
+    if d is not None:
+        items += d[0]
+        unknown = d[1]
+        sources["deadlines"] = f"ok ({len(d[0])} dated, {len(d[1])} unknown date)"
+    if a.no_paperless:
+        sources["paperless"] = "skipped"
+    else:
+        p = src("paperless", lambda: from_paperless(scan_from, scan_until, t0, linked, a.max_cards,
+                                                    a.paperless_days, cache))
+        if p is not None:
+            items += p[0]
+            more = f", {p[2] - p[1]} not checked (--max-cards)" if p[2] > p[1] else ""
+            sources["paperless"] = f"ok ({p[1]} cards checked, {len(p[0])} due in window{more})"
+    rc = src("recurring", lambda: from_recurring(scan_from, scan_until, cache))
+    if rc is not None:
+        items += rc
+        sources["recurring"] = f"ok ({len(rc)})" if os.path.exists(RECURRING) else "none configured"
+    rem = src("reminders", lambda: from_reminders(frm, until)) or []
+    if "reminders" not in sources:
+        sources["reminders"] = f"ok ({len(rem)} fire while away)"
+    pp = src("people", lambda: from_people(frm, until, leave_by, t0, a.people_margin, a.gift_lead,
+                                           not a.no_season))
+    people = []
+    if pp is not None:
+        people, skipped, updated = pp
+        if not os.path.exists(PEOPLE):
+            sources["people"] = f"no people file (season only: {len(people)})"
+        else:
+            sources["people"] = (f"ok ({len(people)} in window" + (f", {skipped} rows skipped" if skipped else "")
+                                 + (f", file updated {updated}" if updated else "") + ")")
+    items = [classify(i, frm, until, leave_by, back, t0) for i in items]
+    items.sort(key=lambda i: (i["latest"], i["due"]))
+    r = {"name": name, "from": frm, "until": until, "leave_by": leave_by, "back": back,
+         "scan_from": scan_from, "scan_until": scan_until, "items": items, "unknown": unknown,
+         "reminders": rem, "people": people, "people_from": frm - dt.timedelta(a.people_margin),
+         "people_until": until + dt.timedelta(a.people_margin), "people_margin": a.people_margin,
+         "gift_lead": a.gift_lead, "sources": sources}
+    if a.md:
+        with open(a.md, "w") as f:
+            f.write(render_md(r))
+    if a.json:
+        print(json.dumps(r, default=lambda o: o.isoformat(), ensure_ascii=False, indent=1))
+    else:
+        print(render_text(r))
+    todo = any(i["status"] in ("overdue", "before") for i in items)
+    return 1 if (todo or failed) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

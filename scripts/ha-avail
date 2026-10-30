@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""ha-avail: read-only availability history of Home Assistant entities (dropouts, durations, times).
+
+  ha-avail [--days N] [--platform P]... [ENTITY ...] [--min-sec S] [--unknown] [--json]
+
+Entities: the ids given plus every registry entity of each --platform (e.g. hue_ble, wled).
+For each: covered window, unavailable episodes (--unknown: 'unknown' counts too) (count, total, longest, start times
+in local time), hour-of-day histogram of episode starts, and groups of episodes that start
+within 2 min of each other on different entities (a shared cause: adapter, host, restart).
+
+Reads only through ha-audit's allowlisted clients (websocket config/entity_registry/list,
+REST GET /api/history/period with minimal_response + no_attributes): no states beyond the
+availability class, no attributes. Output passes ha_privacy.text_gate. Token: ha-audit's.
+"""
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def _load_audit():
+    path = os.environ.get('HA_AUDIT_BIN') or next(
+        (p for p in (os.path.join(HERE, 'ha-audit'), os.path.expanduser('~/bin/ha-audit')) if os.path.exists(p)))
+    loader = importlib.machinery.SourceFileLoader('ha_audit_for_avail', path)
+    spec = importlib.util.spec_from_loader('ha_audit_for_avail', loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True
+    loader.exec_module(mod)
+    return mod
+
+
+for _lib in (os.path.join(HERE, 'lib'), os.path.expanduser('~/bin/lib')):
+    if os.path.exists(os.path.join(_lib, 'ha_privacy.py')):
+        sys.path.insert(0, _lib)
+        break
+import ha_privacy  # noqa: E402
+
+BAD = ('unavailable', 'unknown')
+GROUP_SEC = 120
+
+
+def parse_ts(s):
+    return dt.datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+
+
+def episodes(series, now, bad_states=('unavailable',)):
+    """series: [(state, ts)] sorted -> [(kind, start, end|None)] for runs of bad_states."""
+    out, cur = [], None
+    for state, ts in series:
+        bad = state in bad_states
+        if bad and cur is None:
+            cur = (state, ts)
+        elif not bad and cur is not None:
+            out.append((cur[0], cur[1], ts))
+            cur = None
+    if cur is not None:
+        out.append((cur[0], cur[1], None))
+    return out
+
+
+def analyze(hist, now, min_sec=0, bad_states=('unavailable',)):
+    """hist: {entity_id: [(state, ts)]} -> report dict (no state values beyond the availability class)."""
+    ents, allep = {}, []
+    for eid, ser in sorted(hist.items()):
+        ser = sorted(((s, t) for s, t in ser if t is not None), key=lambda x: x[1])
+        if not ser:
+            continue
+        eps = []
+        for kind, a, b in episodes(ser, now, bad_states):
+            dur = ((b or now) - a).total_seconds()
+            if dur >= min_sec or b is None:
+                eps.append({'kind': kind, 'start': a, 'end': b, 'sec': dur})
+        span = max((now - ser[0][1]).total_seconds(), 1)
+        down = sum(e['sec'] for e in eps)
+        ents[eid] = {'since': ser[0][1], 'span_sec': span, 'rows': len(ser), 'episodes': eps,
+                     'down_sec': down, 'down_pct': round(down / span * 100, 2),
+                     'longest_sec': max((e['sec'] for e in eps), default=0),
+                     'now_bad': ser[-1][0] in bad_states}
+        allep += [(e['start'], eid) for e in eps]
+    allep.sort()
+    hours = [0] * 24
+    for a, _ in allep:
+        hours[a.astimezone().hour] += 1
+    groups, cur = [], []
+    for a, eid in allep:
+        if cur and (a - cur[0][0]).total_seconds() > GROUP_SEC:
+            groups.append(cur)
+            cur = []
+        cur.append((a, eid))
+    if cur:
+        groups.append(cur)
+    shared = [g for g in groups if len({e for _, e in g}) > 1]
+    return {'now': now, 'bad_states': list(bad_states), 'entities': ents, 'hours': hours, 'n_episodes': len(allep),
+            'shared': [{'start': g[0][0], 'entities': sorted({e for _, e in g})} for g in shared]}
+
+
+def fmt_dur(sec):
+    sec = int(round(sec))
+    if sec < 60:
+        return f'{sec} s'
+    if sec < 3600:
+        return f'{sec // 60} min {sec % 60:02d} s' if sec < 600 else f'{sec // 60} min'
+    if sec < 86400:
+        return f'{sec // 3600} h {sec % 3600 // 60:02d} min'
+    return f'{sec / 86400:.1f} d'
+
+
+def lt(t, f='%a %d.%m %H:%M'):
+    return t.astimezone().strftime(f)
+
+
+def render(R, max_eps=12):
+    L = []
+    ents = R['entities']
+    if not ents:
+        return 'ha-avail: no history for the selected entities'
+    total = R['n_episodes']
+    L.append(f"{len(ents)} entities, {total} {'/'.join(R['bad_states'])} episode(s); now {lt(R['now'])}")
+    for eid, e in ents.items():
+        head = (f"{eid}: since {lt(e['since'])} ({fmt_dur(e['span_sec'])}), {len(e['episodes'])} episode(s), "
+                f"down {fmt_dur(e['down_sec'])} ({e['down_pct']} %)")
+        if e['episodes']:
+            head += f", longest {fmt_dur(e['longest_sec'])}"
+        if e['now_bad']:
+            head += ', DOWN NOW'
+        L.append(head)
+        for x in e['episodes'][-max_eps:]:
+            end = lt(x['end'], '%H:%M') if x['end'] else 'still'
+            L.append(f"  {x['kind']:11s} {lt(x['start'])} -> {end}  {fmt_dur(x['sec'])}")
+        if len(e['episodes']) > max_eps:
+            L.append(f"  (+{len(e['episodes']) - max_eps} older)")
+    if total:
+        L.append('starts by hour: ' + ' '.join(f'{h:02d}:{n}' for h, n in enumerate(R['hours']) if n))
+        if R['shared']:
+            L.append(f"{len(R['shared'])} drop(s) shared by several entities within {GROUP_SEC // 60} min:")
+            for g in R['shared'][-8:]:
+                L.append(f"  {lt(g['start'])}: {', '.join(g['entities'])}")
+        else:
+            L.append('no drops shared between entities')
+    return '\n'.join(L)
+
+
+def _jsonable(o):
+    if isinstance(o, dict):
+        return {k: _jsonable(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, dt.datetime):
+        return o.isoformat()
+    return o
+
+
+def fetch(A, rest, ids, start, end, chunk=20):
+    hist = {}
+    for i in range(0, len(ids), chunk):
+        res = rest.get('/api/history/period/' + start.replace(microsecond=0).isoformat(), {
+            'filter_entity_id': ','.join(ids[i:i + chunk]), 'end_time': end.replace(microsecond=0).isoformat(),
+            'minimal_response': '', 'no_attributes': ''})
+        for ser in res or []:
+            if not ser or not isinstance(ser, list) or not ser[0].get('entity_id'):
+                continue
+            eid = ser[0]['entity_id']
+            # keep only the availability class: never real state values
+            hist[eid] = [(x.get('state') if x.get('state') in BAD else 'ok',
+                          parse_ts(x['last_changed']) if x.get('last_changed') else None) for x in ser]
+    return hist
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='Read-only availability history of HA entities.')
+    ap.add_argument('entities', nargs='*')
+    ap.add_argument('--platform', action='append', default=[])
+    ap.add_argument('--days', type=float, default=7)
+    ap.add_argument('--min-sec', type=float, default=0, help='ignore closed episodes shorter than this')
+    ap.add_argument('--unknown', action='store_true', help="count 'unknown' as down too")
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--url')
+    ap.add_argument('--token-file')
+    ap.add_argument('--now', help=argparse.SUPPRESS)
+    a = ap.parse_args(argv)
+    if not a.entities and not a.platform:
+        ap.error('give entity ids and/or --platform')
+    A = _load_audit()
+    url = a.url or os.environ.get('HA_AUDIT_URL', A.DEFAULT_URL)
+    token = A.read_token(a.token_file or os.environ.get('HA_AUDIT_TOKEN_FILE', A.DEFAULT_TOKEN_FILE))
+    now = parse_ts(a.now) if a.now else dt.datetime.now(dt.timezone.utc)
+    ids = list(dict.fromkeys(a.entities))
+    if a.platform:
+        ws = A.WSClient(url, token)
+        try:
+            reg = ws.call('config/entity_registry/list')
+        finally:
+            ws.close()
+        ids += [e['entity_id'] for e in reg if e.get('platform') in a.platform
+                and not e.get('disabled_by') and e['entity_id'] not in ids]
+    bad_ids = [i for i in ids if not A.ENTITY_ID_RE.match(i)]
+    if bad_ids:
+        raise SystemExit(f'ha-avail: not entity ids: {len(bad_ids)}')
+    if not ids:
+        print('ha-avail: no entities matched')
+        return 1
+    rest = A.RestClient(url, token)
+    hist = fetch(A, rest, ids, now - dt.timedelta(days=a.days), now)
+    R = analyze(hist, now, a.min_sec, BAD if a.unknown else ('unavailable',))
+    out = json.dumps(_jsonable(R), indent=1) if a.json else render(R)
+    print(ha_privacy.text_gate(out, secrets=(token,)))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

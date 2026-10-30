@@ -1,0 +1,38 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.rave-radar-releases.schema.json",
+ "title": "rave-radar releases: new releases from his artists (release ids = rr:crate ids)",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "releases",
+  "ids"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.rave-radar-releases"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "releases": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "ids": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  }
+ }
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.probe.json",
+  "title": "latency probe: the app acks at once (envelope ack:true)",
+  "type": "object",
+  "properties": {
+    "probe_id": {
+      "type": "string",
+      "pattern": "^p_[0-9A-HJKMNP-TV-Z]{26}$"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "probe_id"
+  ]
+}

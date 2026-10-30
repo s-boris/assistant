@@ -1,0 +1,939 @@
+#!/usr/bin/env -S python3 -I
+"""push (prototype; only the app route is live): one door for pushes to the owner's phone, routed by level.
+
+  push [send] --level urgent|normal|info --title T --body B [--action LABEL:VERB[:ARG] ...] [--tag X]
+       [--night ring|hold] [--alarm-stream off|on|max] [--private] [--at "YYYY-MM-DD HH:MM"] [--preview] [--json]
+  push flush  [--at ...] [--json]   release held pushes whose time came, and the info batch at its slots
+  push ladder [--at ...] [--json]   urgent pushes not acknowledged within ack_minutes -> the call it WOULD ring
+  push ack KEY [--at ...]           acknowledge an urgent push (stops its ladder); KEY = nonce, tag, or the app's
+                                    push id / nonce
+  push event FILE|- [--at ...] [--json]
+                                    one HA event (mobile_app_notification_action / _cleared) or one app `action`
+                                    body ({push_id, nonce, verb, arg}, bare or as {"t":"action","body":…})
+                                    -> allowed verb and effect
+  push status [--at ...] [--json]   today's urgent count, held, batch, open acks, recent acks, settings
+  push hook                         phonegw's action_hook: one JSON action on stdin {push_id, tag, verb, arg, …};
+                                    a reminder action (arg r:…) runs `remind act VERB ARG`, the rest closes or
+                                    snoozes the matching push like `push event`
+
+Route app (urgent, config "app": on): first `phone push --level urgent … --sticky --ttl APP_TTL --wait 30 --json`
+(the owner's own app over phonegw; the only route this prototype really sends). Exit 0 = the app has it: no HA
+push, no Telegram copy; the ladder waits for his ack (Seen/Done/swipe in the app -> phonegw -> `push event` or
+`push ack`), and an ack already in phone's JSON (`verb`) closes it at once. Any other result (offline 4, no ack 5,
+refused 6, gateway down 7, phone missing) -> the path below runs, with the app's result as a
+note; a late app ack still stops the ladder. Exit 3 from phone (its lock-screen lint) blocks like ours.
+`push ladder` and `push status` first ask `phone pushes --id ID --json` for each open app push: a tapped verb
+(seen/done/open/dismissed/…) closes it there too, so the ladder never rings after he tapped, hook or not.
+Verbs to the app: seen, done, snooze (ARG = remind ID -> "r:ID"), call; telegram -> open.
+
+Levels:
+  urgent  HA Companion push on channel assistant_urgent (importance high, priority high, ttl 0, sticky, public on
+          the lock screen, car_ui while `driving`), up to 3 low-risk action buttons, a Telegram copy for history,
+          then the ack ladder: not acknowledged within ack_minutes (10) -> (app route: `phone ring` first, the
+          in-app CallStyle call) -> `voice-relay call --reason ...`
+          (after an app delivery: the call, then the Telegram text it never got).
+          Cap: urgent_cap distinct tags per owner day (2); over the cap -> Telegram (`tg`) instead.
+          Quiet hours: --night hold (default, config "night") holds it until the quiet window ends; ring sends now.
+          Ignores the sleep-in guard.
+  normal  Telegram via `tg --soft` (the sleep-in guard queues it on a guarded morning); held until the end of
+          quiet hours.
+  info    batched; `push flush` sends one digest via `tg --soft` at the batch_times slots, never in quiet hours.
+Text: everything passes the voice relay's answer filter (~/opt/assistant/adapters/voice/voice_relay/answer_filter.py: the
+llm-local regex pass + links, street addresses, long numbers, amounts; built-in fallback if it can't load).
+For urgent (lock screen) any hit, a 5+ digit run, a title over 40 or a body over 80 characters BLOCKS the push
+(exit 3); normal/info text goes out masked.
+Actions (urgent): VERB = seen (ack, stops the ladder), done (ack; authenticationRequired), snooze (ARG = a remind
+ID -> `remind snooze ID +15m`, else the push comes back in 15 min; authenticationRequired), call (`talk-button`),
+telegram (URI action that opens Telegram, no event). Anything else is refused: real approvals stay on Telegram.
+Action ids are CLAUDE_<VERB>_<nonce>; a nonce works once and only for verbs offered on that push.
+
+DRY RUN: apart from the app route, this prototype never contacts HA, Telegram or the voice relay. It prints the
+exact HA REST call and commands it WOULD run; --live is refused (needs the owner's OK); --preview never runs
+`phone` either. Dry runs keep their own state
+(<state>/dry/state.json) so caps, holds, batches and the ladder can be exercised; --preview writes no state.
+Config ~/.config/push/config.json ($PUSH_CONFIG): notify_service (e.g. notify.mobile_app_<device>), night,
+urgent_cap, daily_cap, quiet ["00:00","08:00"] (his wall clock: `tripclock`, a trip's zone while away), batch_times, ack_minutes, snooze_minutes, alarm_stream,
+click_action, app (on|off), app_wait (s), app_ttl. State: ~/.local/state/push ($PUSH_STATE); the ledger keeps no
+text, only queues and open acks do.
+Env (tests): PUSH_CONFIG, PUSH_STATE, PUSH_TZ, PUSH_FILTER (answer_filter.py path), PUSH_SLEEPIN, PUSH_DRIVING,
+PUSH_PHONE (phone CLI; default ~/bin/phone; with PUSH_STATE set and no PUSH_PHONE the app route is off),
+PUSH_REMIND (remind for `push hook`; default ~/bin/remind; test state without it only prints what it would run).
+Exit: 0 ok, 2 usage/refused (bad verb, --live), 3 text not lock-screen safe. Tests: ~/opt/push-tests/run.sh
+"""
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+for _lib in (os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"), os.path.join(HOME, "bin/lib")):
+    if os.path.isdir(_lib):
+        sys.path.insert(0, _lib)
+        break
+
+CONFIG = os.environ.get("PUSH_CONFIG") or os.path.join(HOME, ".config/push/config.json")
+STATE_ROOT = os.environ.get("PUSH_STATE") or os.path.join(HOME, ".local/state/push")
+FILTER_SRC = os.environ.get("PUSH_FILTER") or os.path.join(HOME, "opt/assistant/adapters/voice/voice_relay/answer_filter.py")
+SLEEPIN = os.environ.get("PUSH_SLEEPIN") or "sleepin"
+DRIVING = os.environ.get("PUSH_DRIVING") or "driving"
+# The app route's CLI. Test state (PUSH_STATE) without PUSH_PHONE never reaches the real phone.
+PHONE = os.environ.get("PUSH_PHONE") or (None if os.environ.get("PUSH_STATE") else os.path.join(HOME, "bin/phone"))
+PHONE_STATUS = {0: "delivered", 2: "usage", 3: "blocked", 4: "offline", 5: "no-ack", 6: "refused", 7: "gateway-down"}
+APP_VERB = {"seen": "seen", "done": "done", "snooze": "snooze", "call": "call", "telegram": "open"}
+PUSH_ROUTES = ("ha", "app")  # routes that count toward urgent_cap / daily_cap
+REMIND = os.environ.get("PUSH_REMIND") or (None if os.environ.get("PUSH_STATE") else os.path.join(HOME, "bin/remind"))
+CLEARED = ("dismiss", "dismissed", "cleared", "swipe")
+
+DEFAULTS = {
+    "notify_service": "",            # personal: only in ~/.config/push/config.json
+    "night": "hold",                 # pending the owner's answer: ring | hold
+    "urgent_cap": 2,
+    "daily_cap": 10,                 # all HA pushes per owner day (urgent is the only HA level so far)
+    "quiet": ["00:00", "08:00"],
+    "batch_times": ["09:00", "13:00", "18:00"],
+    "ack_minutes": 10,
+    "snooze_minutes": 15,
+    "alarm_stream": "off",           # off | on (channel alarm_stream) | max (alarm_stream_max)
+    "click_action": "app://org.telegram.messenger",
+    "channel": "assistant_urgent",
+    "group": "assistant",
+    "app": "on",                     # on | off: try the owner's app (`phone push`) first for urgent
+    "app_wait": 30,                  # seconds `phone push --wait` waits for the device ack
+    "app_ttl": "30m",                # a push queued for an offline phone expires after this
+}
+VERBS = {  # verb -> (needs unlock on the phone, what it does)
+    "seen": (False, "ack: stops the call ladder"),
+    "done": (True, "ack + topic done"),
+    "snooze": (True, "remind snooze ID +Nm, or the push again in N min"),
+    "call": (False, "talk-button: rings him over the Telegram call"),
+    "telegram": (False, "URI action: opens Telegram (no event)"),
+}
+ACTION_RE = re.compile(r"CLAUDE_(SEEN|DONE|SNOOZE|CALL)_([0-9a-f]{8})")
+DIGIT_RUN = re.compile(r"(?<!\d)\d(?:[ '’]?\d){4,}(?!\d)")
+TITLE_MAX, BODY_MAX = 40, 80
+# Fallback lint if the voice relay's filter can't load (a subset of its rules).
+_FALLBACK = [
+    (re.compile(r"(?i)\b(?:https?://|www\.)\S+"), "link"),
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "email"),
+    (re.compile(r"(?i)\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}\s?[A-Z0-9]{1,4}\b"), "iban"),
+    (re.compile(r"(?<![\w])\+?\d[\d ()/-]{8,}\d"), "phone"),
+    (re.compile(r"(?i)\b(?:chf|fr\.|eur|usd|€|\$)\s?\d[\d'’ ]*(?:[.,]\d{1,2})?"), "amount"),
+]
+
+
+class Refused(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- config, time, state
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            cfg.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        raise Refused(f"config {CONFIG} unreadable: {e}")
+    if cfg["night"] not in ("ring", "hold"):
+        raise Refused('config "night" must be ring or hold')
+    if cfg["app"] not in ("on", "off"):
+        raise Refused('config "app" must be on or off')
+    return cfg
+
+
+def tzinfo():
+    name = os.environ.get("PUSH_TZ")
+    if not name:
+        try:
+            import assistant_profile
+            return assistant_profile.tz()
+        except Exception:
+            name = "UTC"
+    from zoneinfo import ZoneInfo
+    return ZoneInfo(name)
+
+
+TZ = tzinfo()
+
+
+def now_at(at):
+    if not at:
+        return dt.datetime.now(TZ)
+    try:
+        return dt.datetime.strptime(at, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        raise Refused('--at takes "YYYY-MM-DD HH:MM"')
+
+
+def _hm(s):
+    h, m = s.split(":")
+    return dt.time(int(h), int(m))
+
+
+def his(now):
+    """now on his wall clock: lib/tripclock's zone (a trip's zone while he is away), else TZ; never fails."""
+    try:
+        import tripclock
+        return now.astimezone(tripclock.zone(now, TZ))
+    except Exception:
+        return now.astimezone(TZ)
+
+
+def in_quiet(cfg, now):
+    now = his(now)
+    a, b, t = _hm(cfg["quiet"][0]), _hm(cfg["quiet"][1]), now.timetz().replace(tzinfo=None)
+    return (a <= t < b) if a < b else (t >= a or t < b)
+
+
+def quiet_end(cfg, now):
+    now = his(now)
+    end, z = _hm(cfg["quiet"][1]), now.tzinfo
+    cand = dt.datetime.combine(now.date(), end, tzinfo=z)
+    return cand if cand > now else dt.datetime.combine(now.date() + dt.timedelta(days=1), end, tzinfo=z)
+
+
+def fmt(t):
+    return t.astimezone(TZ).strftime("%d.%m %H:%M")
+
+
+class State:
+    """<state>/dry/state.json under an flock; preview = never written."""
+
+    def __init__(self, preview=False):
+        self.preview = preview
+        self.dir = os.path.join(STATE_ROOT, "dry")
+        self.path = os.path.join(self.dir, "state.json")
+        self.lock = None
+        self.data = {"pushes": [], "held": [], "batch": [], "open": {}, "closed": [], "last_batch": 0}
+
+    def __enter__(self):
+        if not self.preview:
+            os.makedirs(self.dir, exist_ok=True)
+            self.lock = open(os.path.join(self.dir, ".lock"), "w")
+            fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            with open(self.path) as f:
+                self.data.update(json.load(f))
+        except (FileNotFoundError, ValueError):
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if not self.preview and exc[0] is None:
+            cut = max([p["ts"] for p in self.data["pushes"]] or [0]) - 4 * 86400
+            self.data["pushes"] = [p for p in self.data["pushes"] if p["ts"] >= cut][-500:]
+            self.data["closed"] = self.data["closed"][-200:]
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        if self.lock:
+            self.lock.close()
+
+
+# ---------------------------------------------------------------- text filter (lock-screen safe)
+_filter_mod = None
+
+
+def _filter():
+    global _filter_mod
+    if _filter_mod is None:
+        try:
+            loader = importlib.machinery.SourceFileLoader("push_answer_filter", FILTER_SRC)
+            spec = importlib.util.spec_from_loader("push_answer_filter", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            mod.mask_identifiers  # noqa: B018 (must exist)
+            _filter_mod = mod
+        except Exception:
+            _filter_mod = False
+    return _filter_mod
+
+
+def filter_engine():
+    mod = _filter()
+    if not mod:
+        return "fallback lint"
+    return "voice-relay answer_filter (%s)" % ("llm-local regex pass" if mod.engine() == "llm-local" else "its fallback")
+
+
+def mask(text):
+    """-> (masked text, {category: count}). Same masks the voice relay applies to spoken answers."""
+    mod = _filter()
+    if mod:
+        return mod.mask_identifiers(text, mask_amounts=True)
+    counts = {}
+    for rx, key in _FALLBACK:
+        text, n = rx.subn("[%s]" % key, text)
+        if n:
+            counts[key] = counts.get(key, 0) + n
+    return text, counts
+
+
+def lint(title, body, lockscreen):
+    """-> (title, body, problems, masked_counts). lockscreen=True: problems block the push."""
+    problems, counts = [], {}
+    out = []
+    for part in (title, body):
+        m, c = mask(part)
+        for k, v in c.items():
+            counts[k] = counts.get(k, 0) + v
+        out.append(re.sub(r"\s+", " ", m).strip())
+    if lockscreen:
+        if counts:
+            problems.append("would mask " + ", ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
+        runs = sum(len(DIGIT_RUN.findall(x)) for x in out)
+        if runs:
+            problems.append(f"digit run x{runs}")
+        if len(title) > TITLE_MAX:
+            problems.append(f"title {len(title)} > {TITLE_MAX} chars")
+        if len(body) > BODY_MAX:
+            problems.append(f"body {len(body)} > {BODY_MAX} chars")
+    return out[0], out[1], problems, counts
+
+
+# ---------------------------------------------------------------- probes (read-only)
+def _probe(argv):
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def sleepin_active():
+    return _probe([SLEEPIN, "active"])
+
+
+def is_driving():
+    return _probe([DRIVING])
+
+
+# ---------------------------------------------------------------- payloads
+def parse_actions(specs):
+    acts = []
+    for s in specs or []:
+        label, sep, data = s.partition(":")
+        if not sep or not label.strip() or not data:
+            raise Refused(f"--action {s!r}: use LABEL:VERB[:ARG]")
+        verb, _, arg = data.partition(":")
+        verb = verb.strip().lower()
+        if verb not in VERBS:
+            raise Refused(f"--action verb {verb!r} is not a low-risk verb ({', '.join(VERBS)}); "
+                          "approvals stay on Telegram")
+        acts.append({"label": label.strip()[:24], "verb": verb, "arg": arg.strip()})
+    if len(acts) > 3:
+        raise Refused("at most 3 actions (Android shows 3)")
+    return acts
+
+
+def ha_call(cfg, title, body, tag, nonce, actions, driving, private, alarm):
+    svc = cfg["notify_service"] or "notify.mobile_app_DEVICE"
+    domain, _, name = svc.partition(".")
+    channel = cfg["channel"]
+    if alarm in ("on", "max"):
+        channel = "alarm_stream" if alarm == "on" else "alarm_stream_max"
+    data = {
+        "channel": channel,
+        "importance": "high",
+        "priority": "high",
+        "ttl": 0,
+        "visibility": "private" if private else "public",
+        "tag": tag,
+        "group": cfg["group"],
+        "sticky": "true",
+        "clickAction": cfg["click_action"],
+    }
+    if driving:
+        data["car_ui"] = True
+    ha_actions = []
+    for a in actions:
+        if a["verb"] == "telegram":
+            ha_actions.append({"action": "URI", "title": a["label"], "uri": cfg["click_action"]})
+            continue
+        item = {"action": f"CLAUDE_{a['verb'].upper()}_{nonce}", "title": a["label"]}
+        if VERBS[a["verb"]][0]:
+            item["authenticationRequired"] = True
+        ha_actions.append(item)
+    if ha_actions:
+        data["actions"] = ha_actions
+    return {"method": "POST", "path": f"/api/services/{domain}/{name}",
+            "json": {"title": title, "message": body, "data": data}}
+
+
+def ladder_argv(rec):
+    return ["voice-relay", "call", "--reason",
+            f"Urgent and not acknowledged: {rec['title']}. {rec['body']}".strip()]
+
+
+def ladder_ring_argv(rec):
+    """In-app ring (`phone ring`): the lock screen shows only the urgent title (already linted); Gemini gets it all."""
+    return [PHONE or "phone", "ring", "--reason", f"Urgent and not acknowledged: {rec['title']}. {rec['body']}".strip(),
+            "--show", rec["title"], "--json"]
+
+
+def ladder_would(rec):
+    """What the ladder runs for one open push: after an app delivery the in-app ring first (exit 0 = answered,
+    stop; anything else -> on), then the Telegram call; after an app delivery also the Telegram text."""
+    would = [{"kind": "exec", "argv": ladder_argv(rec)}]
+    if rec.get("route") == "app":
+        would.insert(0, {"kind": "exec", "argv": ladder_ring_argv(rec),
+                         "why": "in-app ring first: exit 0 answered = reached (the call and text wait); 3/4/6 -> on"})
+    if rec.get("route") == "app":
+        would.append({"kind": "exec", "argv": ["tg", f"🚨 {rec['title']}\n{rec['body']}".strip()],
+                      "why": "the app had it, Telegram didn't: the text goes out whatever the call's result"})
+    return would
+
+
+# ---------------------------------------------------------------- app route (`phone push`, live)
+def app_ready(cfg):
+    return cfg["app"] == "on" and bool(PHONE) and (os.sep not in PHONE or os.access(PHONE, os.X_OK))
+
+
+def app_argv(cfg, title, body, tag, actions, private):
+    argv = [PHONE, "push", "--level", "urgent", "--title", title, "--body", body, "--tag", tag]
+    for a in actions:
+        verb, arg = APP_VERB[a["verb"]], a["arg"]
+        if verb == "open":
+            arg = ""
+        elif verb == "snooze" and arg and not arg.startswith("r:"):
+            arg = "r:" + arg            # a remind ID (phonegw/remind act: r:ID)
+        label = a["label"].replace(":", " ").strip() or verb
+        argv += ["--action", f"{label}:{verb}" + (f":{arg}" if arg else "")]
+    if private:
+        argv.append("--private")
+    return argv + ["--sticky", "--ttl", str(cfg["app_ttl"]), "--wait", str(int(cfg["app_wait"])), "--json"]
+
+
+def app_send(argv, wait):
+    """Run `phone push` -> {rc, status, delivered, id, nonce, verb?, detail?}. Never raises."""
+    out = {"rc": None, "status": "unavailable", "delivered": False, "id": "", "nonce": ""}
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=wait + 20)
+    except subprocess.TimeoutExpired:
+        out["status"] = "timeout"
+        return out
+    except (OSError, subprocess.SubprocessError):
+        return out
+    out["rc"], out["status"] = p.returncode, PHONE_STATUS.get(p.returncode, f"exit {p.returncode}")
+    try:
+        js = json.loads(p.stdout) if p.stdout.strip() else {}
+    except ValueError:
+        js = {}
+    js = js if isinstance(js, dict) else {}
+    out["id"] = str(js.get("id") or js.get("push_id") or "")[:64]
+    out["nonce"] = str(js.get("nonce") or "")[:64]
+    act = js.get("action") if isinstance(js.get("action"), dict) else {}
+    verb = str(js.get("verb") or act.get("verb") or "").lower()
+    out["delivered"] = p.returncode == 0 or js.get("delivered") is True or js.get("status") in ("delivered", "acked")
+    if out["delivered"] and verb in ("seen", "done", "open", "dismiss", "cleared"):
+        out["verb"] = verb
+    if p.returncode and p.stderr.strip():
+        out["detail"] = p.stderr.strip().splitlines()[-1][:160]
+    return out
+
+
+def app_tapped(app_id):
+    """The verb he tapped on app push APP_ID (`phone pushes --id`), or "" (none yet / phone unreachable)."""
+    try:
+        p = subprocess.run([PHONE, "pushes", "--id", app_id, "--json"], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=15)
+        rows = json.loads(p.stdout).get("pushes") if p.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return ""
+    row = next((r for r in rows or [] if isinstance(r, dict) and r.get("id") == app_id), None)
+    return str((row or {}).get("verb") or "").lower()
+
+
+def app_sync(cfg, st, now):
+    """Close open app pushes he already tapped (the hook may be off or have failed). -> [results]"""
+    out = []
+    if not app_ready(cfg):
+        return out
+    for nonce, rec in list(st.data["open"].items()):
+        if rec.get("app_id") and not rec["acked"] and nonce in st.data["open"]:
+            verb = app_tapped(rec["app_id"])
+            if verb:
+                out.append(handle_app_action(cfg, st, {"push_id": rec["app_id"], "verb": verb}, now))
+    return out
+
+
+# ---------------------------------------------------------------- routing
+def day_of(ts):
+    return dt.datetime.fromtimestamp(ts, TZ).date()
+
+
+def urgent_today(st, now, tag=None):
+    tags = {p["tag"] for p in st.data["pushes"]
+            if p["level"] == "urgent" and p["route"] in PUSH_ROUTES and day_of(p["ts"]) == now.date()}
+    return len(tags), (tag in tags if tag else False)
+
+
+def ha_today(st, now):
+    return sum(1 for p in st.data["pushes"] if p["route"] in PUSH_ROUTES and day_of(p["ts"]) == now.date())
+
+
+def route(cfg, st, req, now, released=False):
+    """One push request -> decision dict {level, route, status, would: [...], notes: [...]}. Mutates st."""
+    level, notes, would = req["level"], [], []
+    lockscreen = level == "urgent"
+    title, body, problems, counts = lint(req["title"], req["body"], lockscreen)
+    if problems:
+        return {"level": level, "route": "blocked", "status": "blocked", "problems": problems, "would": [],
+                "notes": ["not lock-screen safe: say it without identifiers, amounts, links or long numbers; "
+                          "details go on Telegram"]}
+    if counts:
+        notes.append("masked " + ", ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
+    tag = req.get("tag") or "claude-" + hashlib.sha1(req["title"].encode()).hexdigest()[:8]
+    dec = {"level": level, "tag": tag, "title": title, "body": body, "would": would, "notes": notes}
+    quiet = in_quiet(cfg, now)
+    night = req.get("night") or cfg["night"]
+    entry = {"ts": now.timestamp(), "level": level, "tag": tag}
+
+    def hold(until, why):
+        st.data["held"].append({"release": until.timestamp(), "req": dict(req, title=title, body=body, tag=tag)})
+        dec.update(route="held", status="held", until=fmt(until))
+        notes.append(why)
+        st.data["pushes"].append(dict(entry, route="held"))
+        return dec
+
+    if level == "info":
+        st.data["batch"].append({"ts": now.timestamp(), "title": title, "body": body, "tag": tag})
+        nxt = next_batch_slot(cfg, now)
+        dec.update(route="batch", status="batched", until=fmt(nxt))
+        notes.append(f"batched ({len(st.data['batch'])} waiting); `push flush` sends one digest at {fmt(nxt)}")
+        st.data["pushes"].append(dict(entry, route="batch"))
+        return dec
+
+    if level == "normal":
+        if quiet:
+            return hold(quiet_end(cfg, now), f"quiet hours: held until {fmt(quiet_end(cfg, now))}")
+        text = f"{title}\n{body}" if body else title
+        would.append({"kind": "exec", "argv": ["tg", "--soft", text]})
+        if sleepin_active():
+            notes.append("sleep-in guard holds now: tg --soft queues it until the guard ends")
+        if req.get("actions"):
+            notes.append("actions are for HA pushes only; Telegram buttons stay with tg --buttons")
+        dec.update(route="telegram", status="sent")
+        st.data["pushes"].append(dict(entry, route="telegram"))
+        return dec
+
+    # urgent
+    if quiet and night == "hold":
+        return hold(quiet_end(cfg, now), f"quiet hours, night=hold: held until {fmt(quiet_end(cfg, now))}"
+                                         " (--night ring sends now; his answer pending)")
+    n, same_tag = urgent_today(st, now, tag)
+    if not same_tag and (n >= int(cfg["urgent_cap"]) or ha_today(st, now) >= int(cfg["daily_cap"])):
+        would.append({"kind": "exec", "argv": ["tg", f"🚨 {title}\n{body}".strip()]})
+        dec.update(route="telegram", status="capped")
+        notes.append(f"urgent cap reached ({n}/{cfg['urgent_cap']} today): Telegram instead of a push, no ladder")
+        st.data["pushes"].append(dict(entry, route="telegram-capped"))
+        return dec
+    nonce = secrets.token_hex(4)
+    acts = req.get("actions") or []
+    due = now + dt.timedelta(minutes=int(cfg["ack_minutes"]))
+    rec = {"ts": now.timestamp(), "tag": tag, "title": title, "body": body,
+           "verbs": sorted({a["verb"] for a in acts} | {"seen"}),
+           "args": {a["verb"]: a["arg"] for a in acts if a["arg"]},
+           "acked": False, "laddered": False, "route": "ha"}
+    count_note = (f"urgent {n + (0 if same_tag else 1)}/{cfg['urgent_cap']} today"
+                  + (" (same tag: replaces, not counted again)" if same_tag else ""))
+
+    def open_push():
+        for old_nonce, old in list(st.data["open"].items()):
+            if old["tag"] == tag:  # same topic: the new push replaces it on the phone and restarts the ladder
+                st.data["closed"].append({"nonce": old_nonce, "tag": tag, "route": old.get("route", "ha"),
+                                          "why": "replaced", "ts": now.timestamp()})
+                del st.data["open"][old_nonce]
+        st.data["open"][nonce] = rec
+        notes.append(count_note)
+        if released:
+            notes.append("released from the quiet-hours hold")
+        st.data["pushes"].append(dict(entry, route=rec["route"]))
+
+    # Route app first: the owner's own app over phonegw (live; --preview only shows it).
+    app = None
+    if app_ready(cfg):
+        argv = app_argv(cfg, title, body, tag, acts, req.get("private"))
+        if st.preview:
+            would.append({"kind": "exec", "argv": argv, "why": "app route first (preview: not run)"})
+            notes.append(f"preview: if the app doesn't confirm within {cfg['app_wait']} s, the HA/Telegram path "
+                         "below runs")
+        else:
+            app = app_send(argv, int(cfg["app_wait"]))
+            dec["app"] = {k: v for k, v in app.items() if k != "delivered"}
+            if app["status"] == "blocked":
+                return {"level": level, "route": "blocked", "status": "blocked", "app": dec["app"], "would": [],
+                        "problems": ["phone: blocked by the app's lock-screen lint"],
+                        "notes": ["not lock-screen safe for the app: shorter, no identifiers, amounts or links"]}
+            if app["delivered"]:
+                rec.update(route="app", app_id=app["id"], app_nonce=app["nonce"])
+                dec.update(route="app", status="sent", nonce=nonce, ladder_at=fmt(due),
+                           ladder_argv=ladder_argv(rec))
+                open_push()
+                if app.get("verb"):
+                    ack(st, nonce, now, "app-" + app["verb"])
+                    dec.update(status="acked")
+                    dec.pop("ladder_at")
+                    dec.pop("ladder_argv")
+                    notes.append(f"acked in the app ({app['verb']}) within the wait: ladder stopped")
+                else:
+                    notes.append("delivered to the app: no HA push, no Telegram copy; not acked by "
+                                 f"{fmt(due)} -> the call, then the Telegram text")
+                return dec
+            rec.update(app_id=app["id"], app_nonce=app["nonce"])  # queued pushes can still be acked later
+            notes.append(f"app route: {app['status']}"
+                         + (f" (phone exit {app['rc']})" if app["rc"] is not None else "")
+                         + " -> the HA/Telegram path runs")
+    driving = is_driving()
+    call = ha_call(cfg, title, body, tag, nonce, acts, driving, req.get("private"),
+                   req.get("alarm") or cfg["alarm_stream"])
+    would.append({"kind": "ha_service", **call})
+    would.append({"kind": "exec", "argv": ["tg", f"🚨 {title}\n{body}".strip()], "why": "history copy (silent: needs "
+                  "a tg disable_notification option, not built)"})
+    dec.update(route="app" if st.preview and app_ready(cfg) else "ha", status="sent", nonce=nonce,
+               ladder_at=fmt(due), driving=driving, ladder_argv=ladder_argv(rec))
+    open_push()
+    return dec
+
+
+def next_batch_slot(cfg, now):
+    for d in (0, 1, 2):
+        day = now.date() + dt.timedelta(days=d)
+        for s in sorted(cfg["batch_times"]):
+            t = dt.datetime.combine(day, _hm(s), tzinfo=TZ)
+            if t > now and not in_quiet(cfg, t):
+                return t
+    return quiet_end(cfg, now)
+
+
+def last_batch_slot(cfg, now):
+    best = None
+    for d in (1, 0):
+        day = now.date() - dt.timedelta(days=d)
+        for s in sorted(cfg["batch_times"]):
+            t = dt.datetime.combine(day, _hm(s), tzinfo=TZ)
+            if t <= now:
+                best = t
+    return best
+
+
+def flush(cfg, st, now):
+    out = []
+    due = [h for h in st.data["held"] if h["release"] <= now.timestamp()]
+    st.data["held"] = [h for h in st.data["held"] if h["release"] > now.timestamp()]
+    for h in due:
+        out.append(route(cfg, st, h["req"], now, released=True))
+    slot = last_batch_slot(cfg, now)
+    since = max(st.data.get("last_batch", 0), min([i["ts"] for i in st.data["batch"]] or [0]))
+    if st.data["batch"] and slot and slot.timestamp() > since and not in_quiet(cfg, now):
+        items = st.data["batch"]
+        lines = [f"🗂 {len(items)} update{'s' if len(items) != 1 else ''}"]
+        lines += [f"• {i['title']}" + (f" — {i['body']}" if i["body"] else "") for i in items[-12:]]
+        if len(items) > 12:
+            lines.append(f"(+{len(items) - 12} older)")
+        dec = {"level": "info", "route": "telegram", "status": "sent", "notes": [f"batch slot {fmt(slot)}"],
+               "would": [{"kind": "exec", "argv": ["tg", "--soft", "\n".join(lines)]}]}
+        if sleepin_active():
+            dec["notes"].append("sleep-in guard holds now: tg --soft queues the digest until the guard ends")
+        st.data["batch"], st.data["last_batch"] = [], now.timestamp()
+        out.append(dec)
+    return out
+
+
+def ladder(cfg, st, now):
+    """Urgent pushes not acknowledged within ack_minutes -> the call each WOULD ring (dry run: never rings)."""
+    out = []
+    if not st.preview:
+        app_sync(cfg, st, now)
+    limit = int(cfg["ack_minutes"]) * 60
+    for nonce, rec in st.data["open"].items():
+        if rec["acked"] or rec["laddered"] or now.timestamp() - rec["ts"] < limit:
+            continue
+        rec["laddered"] = True
+        app = rec.get("route") == "app"
+        out.append({"nonce": nonce, "tag": rec["tag"], "since": fmt(dt.datetime.fromtimestamp(rec["ts"], TZ)),
+                    "route": rec.get("route", "ha"), "would": ladder_would(rec),
+                    "notes": ["voice-relay call: exit 0 answered; 3 busy/declined/no answer, 4 rate-limited, 5 "
+                              "failed -> keep the push, " + ("then the Telegram text (the app had it, Telegram "
+                                                            "didn't); the in-app ring (`phone ring`) comes first" if app
+                                                            else "Telegram already has the copy")]})
+    return out
+
+
+def ack(st, key, now, why="ack", via=None):
+    """Close open pushes matching KEY: our nonce, the tag, or the app's push id / nonce."""
+    key = str(key or "")
+    hits = [n for n, r in st.data["open"].items() if key and key in (n, r["tag"], r.get("app_id"), r.get("app_nonce"))]
+    for n in hits:
+        rec = st.data["open"][n]
+        rec["acked"] = True
+        st.data["closed"].append({"nonce": n, "tag": rec["tag"], "route": rec.get("route", "ha"), "why": why,
+                                  "ts": now.timestamp(), **({"via": via} if via else {}),
+                                  **({"app_id": rec["app_id"]} if rec.get("app_id") else {})})
+        del st.data["open"][n]
+    return hits
+
+
+def handle_app_action(cfg, st, body, now):
+    """An app `action` body {push_id, nonce, verb, arg} (phonegw passes it on) -> same verbs as the HA events.
+    Only pushes this tool opened match; reminder pushes (arg r:ID) belong to `remind act`."""
+    verb = str(body.get("verb") or "").lower()
+    keys = [str(body.get(k) or "") for k in ("nonce", "push_id")]
+    hit = next(((n, r) for n, r in st.data["open"].items()
+                if any(k and k in (n, r.get("app_nonce"), r.get("app_id")) for k in keys)), None)
+    if not hit:
+        used = any(k and k in (c["nonce"], c.get("app_id")) for c in st.data["closed"] for k in keys)
+        arg = str(body.get("arg") or "")
+        return {"result": "ignored", "why": "push already closed" if used else (
+            "a reminder push: `remind act VERB ARG`" if arg.startswith("r:") else "not an open push of mine")}
+    nonce, rec = hit
+    if verb in CLEARED:
+        ack(st, nonce, now, "cleared", via="app")
+        return {"result": "ok", "verb": "cleared", "effect": "swiped away = seen: ladder stopped", "would": []}
+    verb = "seen" if verb == "open" else verb
+    if verb not in ("seen", "done", "snooze", "call"):
+        return {"result": "ignored", "why": f"verb {verb!r} is not one of push's"}
+    if verb not in rec["verbs"]:
+        return {"result": "ignored", "why": f"{verb} was not offered on that push"}
+    return apply_verb(cfg, st, nonce, rec, verb, now, "app")
+
+
+def handle_event(cfg, st, ev, now):
+    """HA event or app action -> {result, verb, effect, would}. Unknown, reused or not-offered nonces are ignored
+    (HA events are forgeable by anyone with an HA token, so only low-risk verbs exist and each nonce works once)."""
+    if ev.get("t") == "action" and isinstance(ev.get("body"), dict):
+        return handle_app_action(cfg, st, ev["body"], now)
+    if "verb" in ev and "event_type" not in ev:
+        return handle_app_action(cfg, st, ev, now)
+    etype = ev.get("event_type", "")
+    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+    if etype == "mobile_app_notification_cleared":
+        tag = data.get("tag") or ""
+        hits = [n for n, r in st.data["open"].items() if r["tag"] == tag]
+        if not hits:
+            return {"result": "ignored", "why": "cleared a push that is not open"}
+        ack(st, tag, now, "cleared", via="ha")
+        return {"result": "ok", "verb": "cleared", "effect": "swiped away = seen: ladder stopped", "would": []}
+    if etype != "mobile_app_notification_action":
+        return {"result": "ignored", "why": f"event type {etype!r} is not handled"}
+    m = ACTION_RE.fullmatch(str(data.get("action", "")))
+    if not m:
+        return {"result": "ignored", "why": "not one of my action ids"}
+    verb, nonce = m.group(1).lower(), m.group(2)
+    rec = st.data["open"].get(nonce)
+    if not rec:
+        used = any(c["nonce"] == nonce for c in st.data["closed"])
+        return {"result": "ignored", "why": "nonce already used" if used else "unknown nonce"}
+    if verb not in rec["verbs"]:
+        return {"result": "ignored", "why": f"{verb} was not offered on that push"}
+    return apply_verb(cfg, st, nonce, rec, verb, now, "ha")
+
+
+def apply_verb(cfg, st, nonce, rec, verb, now, via):
+    arg, would = rec["args"].get(verb, ""), []
+    if arg.startswith("r:"):
+        arg = arg[2:]
+    if verb == "call":
+        if rec.get("called"):
+            return {"result": "ignored", "why": "call already used on that push"}
+        rec["acked"] = rec["called"] = True  # he is reachable: no ladder; the push stays open for seen/done
+        return {"result": "ok", "verb": verb, "effect": "rings him now, ladder stopped",
+                "would": [{"kind": "exec", "argv": ["talk-button"]}]}
+    title, body, tag = rec["title"], rec["body"], rec["tag"]
+    ack(st, nonce, now, verb, via=via)
+    if verb == "seen":
+        return {"result": "ok", "verb": verb, "effect": "ack: ladder stopped", "would": []}
+    if verb == "done":
+        return {"result": "ok", "verb": verb, "effect": "ack + topic done", "would": []}
+    mins = int(cfg["snooze_minutes"])
+    if arg:
+        would.append({"kind": "exec", "argv": ["remind", "snooze", arg, f"+{mins}m"]})
+        return {"result": "ok", "verb": verb, "effect": f"reminder {arg} snoozed {mins} min", "would": would}
+    until = now + dt.timedelta(minutes=mins)
+    st.data["held"].append({"release": until.timestamp(), "req": {"level": "urgent", "title": title, "body": body,
+                                                                  "tag": tag, "actions": [], "night": None}})
+    return {"result": "ok", "verb": verb, "effect": f"the push comes back at {fmt(until)} (`push flush`)",
+            "would": []}
+
+
+def hook(cfg, now):
+    """phonegw action_hook: stdin = {push_id, tag, level, verb, arg, at, device_id}. Exit 0 handled or ignored,
+    2 unreadable, else remind's exit code. Prints one JSON line (phonegw discards it; for tests and logs)."""
+    try:
+        ev = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        ev = None
+    if not isinstance(ev, dict) or not ev.get("verb"):
+        print(json.dumps({"result": "ignored", "why": "not an action"}))
+        return 2
+    verb, arg = str(ev.get("verb")).lower(), str(ev.get("arg") or "")
+    if arg.startswith("r:"):                         # a reminder's button (remind's app actions)
+        if ev.get("push_id"):                        # one of my urgent pushes carried it: he saw it, no ladder
+            with State() as st:
+                ack(st, str(ev["push_id"]), now, "app-" + verb, via="app")
+        if verb in CLEARED or verb == "open":
+            print(json.dumps({"result": "ok", "verb": verb, "effect": "reminder push cleared: nothing to change"}))
+            return 0
+        argv = [REMIND, "act", verb, arg] if REMIND else ["remind", "act", verb, arg]
+        if not REMIND:
+            print(json.dumps({"result": "ok", "verb": verb, "would": [{"kind": "exec", "argv": argv}]}))
+            return 0
+        try:
+            p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(json.dumps({"result": "failed", "why": type(e).__name__}))
+            return 1
+        print(json.dumps({"result": "ok" if p.returncode == 0 else "failed", "verb": verb, "rc": p.returncode}))
+        return p.returncode
+    with State() as st:
+        res = handle_app_action(cfg, st, ev, now)
+    print(json.dumps(res, ensure_ascii=False))
+    return 0
+
+
+# ---------------------------------------------------------------- output
+def show(dec, as_json):
+    if as_json:
+        return
+    st = dec.get("status")
+    head = f"route: {dec.get('route')} ({st})" if dec.get("route") else ""
+    if dec.get("until"):
+        head += f" until {dec['until']}"
+    if head:
+        print(head)
+    if dec.get("app"):
+        ap = dec["app"]
+        print(f"app: {ap['status']}" + (f" (phone exit {ap['rc']})" if ap.get("rc") else "")
+              + (f" · push id {ap['id']}" if ap.get("id") else "") + (f" · acked: {ap['verb']}" if ap.get("verb") else ""))
+    for p in dec.get("problems", []):
+        print(f"  BLOCKED: {p}")
+    for w in dec.get("would", []):
+        if w["kind"] == "ha_service":
+            print(f"would {w['method']} <ha_url>{w['path']}")
+            print(json.dumps(w["json"], ensure_ascii=False, indent=2))
+        else:
+            print("would run: " + " ".join(json.dumps(a, ensure_ascii=False) if (" " in a or "\n" in a or not a)
+                                           else a for a in w["argv"]) + (f"   # {w['why']}" if w.get("why") else ""))
+    if dec.get("ladder_at"):
+        print(f"ack ladder: not acknowledged by {dec['ladder_at']} -> `push ladder` would run: "
+              + " ".join(json.dumps(a, ensure_ascii=False) if " " in a else a for a in dec["ladder_argv"]))
+    for n in dec.get("notes", []):
+        print(f"note: {n}")
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd = argv[0] if argv and argv[0] in ("send", "flush", "ladder", "ack", "event", "status", "hook") else "send"
+    if argv and argv[0] == cmd:
+        argv = argv[1:]
+    ap = argparse.ArgumentParser(prog=f"push {cmd}", add_help=False)
+    ap.add_argument("--at")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--live", action="store_true")
+    if cmd == "send":
+        ap.add_argument("--level", required=True, choices=("urgent", "normal", "info"))
+        ap.add_argument("--title", required=True)
+        ap.add_argument("--body", default="")
+        ap.add_argument("--action", action="append", default=[])
+        ap.add_argument("--tag")
+        ap.add_argument("--night", choices=("ring", "hold"))
+        ap.add_argument("--alarm-stream", choices=("off", "on", "max"))
+        ap.add_argument("--private", action="store_true")
+    elif cmd in ("ack", "event"):
+        ap.add_argument("target")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit:
+        return 2
+    try:
+        if a.live:
+            raise Refused("prototype: live sends are off until the owner's OK (HA notify is not on the ha "
+                          "allowlist); dry run only")
+        cfg = load_config()
+        now = now_at(a.at)
+        if cmd == "hook":
+            return hook(cfg, now)
+        if not a.json:
+            live = app_ready(cfg) and cmd in ("send", "flush") and not a.preview
+            print(("push DRY RUN (nothing sent but the app route) · " if live else "push DRY RUN (nothing sent) · ")
+                  + f"{cmd} · {fmt(now)} · filter: {filter_engine()}"
+                  + ("" if cfg["notify_service"] else " · no notify_service in config"))
+        with State(preview=a.preview or (cmd == "status" and not app_ready(cfg))) as st:
+            if cmd == "send":
+                req = {"level": a.level, "title": a.title.strip(), "body": a.body.strip(), "tag": a.tag,
+                       "actions": parse_actions(a.action) if a.level == "urgent" else a.action,
+                       "night": a.night, "alarm": a.alarm_stream, "private": a.private}
+                res = route(cfg, st, req, now)
+                if a.json:
+                    print(json.dumps(dict(res, dry_run=True), ensure_ascii=False, indent=1))
+                show(res, a.json)
+                return 3 if res["status"] == "blocked" else 0
+            if cmd in ("flush", "ladder"):
+                res = flush(cfg, st, now) if cmd == "flush" else ladder(cfg, st, now)
+                if a.json:
+                    print(json.dumps({"dry_run": True, "items": res}, ensure_ascii=False, indent=1))
+                elif not res:
+                    print("nothing due")
+                for r in res:
+                    show(r, a.json)
+                return 0
+            if cmd == "ack":
+                hits = ack(st, a.target, now)
+                print(json.dumps({"acked": hits}) if a.json else (f"acked {len(hits)}" if hits else "nothing open"))
+                return 0 if hits else 1
+            if cmd == "event":
+                try:
+                    raw = sys.stdin.read() if a.target == "-" else open(a.target).read()
+                    ev = json.loads(raw)
+                except (OSError, ValueError) as e:
+                    raise Refused(f"event: unreadable or not JSON ({e.__class__.__name__})")
+                res = handle_event(cfg, st, ev if isinstance(ev, dict) else {}, now)
+                if a.json:
+                    print(json.dumps(dict(res, dry_run=True), ensure_ascii=False, indent=1))
+                else:
+                    print(f"event: {res['result']}" + (f" · {res.get('verb')}: {res['effect']}" if res["result"] == "ok"
+                                                       else f" · {res['why']}"))
+                    show({"would": res.get("would", [])}, False)
+                return 0
+            # status
+            if not a.preview:
+                app_sync(cfg, st, now)
+            n, _ = urgent_today(st, now)
+            info = {"dry_run": True, "urgent_today": n, "urgent_cap": cfg["urgent_cap"], "night": cfg["night"],
+                    "quiet_now": in_quiet(cfg, now), "notify_service_set": bool(cfg["notify_service"]),
+                    "held": [{"level": h["req"]["level"], "tag": h["req"]["tag"],
+                              "release": fmt(dt.datetime.fromtimestamp(h["release"], TZ))} for h in st.data["held"]],
+                    "batch": len(st.data["batch"]),
+                    "app": cfg["app"], "app_cli": app_ready(cfg),
+                    "open_acks": [{"nonce": k, "tag": r["tag"], "route": r.get("route", "ha"), "acked": r["acked"],
+                                   "laddered": r["laddered"],
+                                   "ladder_at": fmt(dt.datetime.fromtimestamp(r["ts"], TZ)
+                                                    + dt.timedelta(minutes=int(cfg["ack_minutes"])))}
+                                  for k, r in st.data["open"].items()],
+                    "recent_acks": [{"nonce": c["nonce"], "tag": c.get("tag"), "route": c.get("route"),
+                                     "why": c["why"], "via": c.get("via"),
+                                     "at": fmt(dt.datetime.fromtimestamp(c["ts"], TZ))}
+                                    for c in st.data["closed"][-5:]]}
+            print(json.dumps(info, ensure_ascii=False, indent=1))
+            return 0
+    except Refused as e:
+        print(f"push: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

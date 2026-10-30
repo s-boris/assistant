@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.ask.json",
+  "title": "gateway asks the phone for a fresh reading. q=now|where|car|battery|...: the app first sends a fresh `state` frame, then `answer` {fresh:true}. q=near: args.place (a fence name) -> answer {inside, band}",
+  "type": "object",
+  "properties": {
+    "q_id": {
+      "type": "string",
+      "pattern": "^q_[A-Za-z0-9]{1,40}$"
+    },
+    "q": {
+      "enum": [
+        "now",
+        "where",
+        "car",
+        "battery",
+        "awake",
+        "alarm",
+        "dnd",
+        "net",
+        "activity",
+        "near"
+      ]
+    },
+    "args": {
+      "type": "object",
+      "properties": {
+        "place": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,23}(:[a-z0-9_-]{1,32})?$"
+        },
+        "r_m": {
+          "type": "integer",
+          "minimum": 50,
+          "maximum": 50000
+        }
+      },
+      "additionalProperties": false
+    },
+    "timeout_s": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "q_id",
+    "q"
+  ]
+}

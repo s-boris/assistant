@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""product: feature catalogue, usage report and weekly product review over the usage store (token-free).
+Lib: ~/bin/lib/product.py (catalogue sources, flags, hypotheses); events: `usage`.
+
+  product catalogue [build|show|check] [--json]   build = regenerate ~/.config/product/features.json (cron nightly);
+        show = features per area; check = owner-facing features with no events yet + event ids not in the catalogue
+  product report [--days 30] [--json] [--all] [--feature ID] [--by DIM]
+        per feature: uses, trend, last use, channel/context mix, notifications sent/opened/ignored, errors,
+        complaints, retries, latency, runs/day, code lines, flags (unused untried stopped declining noisy broken
+        slow friction) + why-not-used hypotheses. --by DIM slices uses by any context dimension or column
+        (hour_band weekend zone driving event office_day screen batt net dnd car buds alarm_in tv lights trigger
+        modality channel hour dow …).
+  product review [--cron] [--dry-run] [--days 30]   weekly keep / improve / retire / build-next with evidence ->
+        ~/reports/product/review-DATE.md + ~/inbox/product-review-DATE.md (handling: JOBS.md)
+  product card [--days 30]   the /usage answer (<= 10 lines)
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import product  # noqa: E402
+import usage  # noqa: E402
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="product", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("cmd", choices=["catalogue", "report", "review", "card"])
+    p.add_argument("sub", nargs="?", default="show")
+    p.add_argument("--days", type=int, default=30)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--feature")
+    p.add_argument("--by")
+    p.add_argument("--cron", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--quiet", action="store_true")
+    a = p.parse_args(argv[1:])
+    if a.cmd == "card":
+        print(product.card(a.days))
+        return 0
+    if a.cmd == "catalogue":
+        if a.sub == "build":
+            cat = product.build(write=True)
+            if not a.quiet:
+                print(f"{len(cat['features'])} features -> {usage.CATALOGUE}")
+            return 0
+        cat = product.catalogue()
+        if a.sub == "check":
+            if not os.path.exists(usage.DB):
+                print("no store yet")
+                return 1
+            con = usage.connect(ro=True)
+            seen = {r[0] for r in con.execute("SELECT DISTINCT feature FROM events")} | \
+                   {r[0] for r in con.execute("SELECT DISTINCT feature FROM runs")}
+            ids = {f["id"] for f in cat["features"]}
+            silent = [f["id"] for f in cat["features"] if f.get("owner_facing") and f["id"] not in seen]
+            unknown = sorted(seen - ids)
+            out = {"features": len(ids), "owner_facing": sum(1 for f in cat["features"] if f.get("owner_facing")),
+                   "owner_facing_without_events": silent, "event_ids_not_in_catalogue": unknown}
+            print(json.dumps(out, indent=1) if a.json else
+                  f"{out['features']} features, {out['owner_facing']} owner-facing\n"
+                  f"owner-facing with no events yet ({len(silent)}): {' '.join(silent)}\n"
+                  f"event ids not in the catalogue ({len(unknown)}): {' '.join(unknown)}")
+            return 0
+        if a.json:
+            print(json.dumps(cat, indent=1, ensure_ascii=False))
+            return 0
+        by = {}
+        for f in cat["features"]:
+            by.setdefault(f["area"], []).append(f)
+        for area, fs in sorted(by.items()):
+            print(f"{area} ({len(fs)}): " + ", ".join(product.label(f) for f in fs))
+        return 0
+    if not os.path.exists(usage.DB):
+        print("product: no usage store yet (run `usage backfill`)", file=sys.stderr)
+        return 1
+    if a.cmd == "review":
+        res = product.review(a.days, write=not a.dry_run)
+        if not a.cron:
+            print(res)
+        return 0
+    if a.by:
+        text, data = product.slice_by(usage.connect(ro=True), a.by, a.feature, a.days)
+        print(json.dumps(data, indent=1) if a.json else text)
+        return 0
+    an = product.analyse(a.days)
+    if a.feature:
+        hit = [r for r in an["features"] if r["id"] == a.feature]
+        if not hit:
+            print(f"product: no feature {a.feature!r}", file=sys.stderr)
+            return 2
+        print(json.dumps(hit[0], indent=1, ensure_ascii=False))
+        return 0
+    if a.json:
+        an.pop("catalogue", None)
+        print(json.dumps(an, indent=1, ensure_ascii=False))
+        return 0
+    print(product.text_report(an, show_all=a.all))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""gift-radar: 10 days before a birthday on the owner's list, gather what the people like through the privacy vault
+and leave ONE ~/inbox note (gift-radar-<name>.md) so the assistant can research 3 gift ideas and send them to him.
+
+Token-free (no Claude): birthdays come from the people-and-dates memory; interests from the vault as an answer, not
+text: `vault tg find-chat` (labels only), then ONE `vault ask tg --chat C --kind interests`
+(the vault's local model answers inside the vault: at most 5 short phrases of <= 4 words, each checked against the
+chat, plus a topic; private ones come back as topic `private` and are skipped), then a regex privacy backstop drops
+anything about health, money or intimate matters. No message text, no find/search hits and no local LLM step here.
+The assistant does the product research (WebSearch) when the note arrives.
+
+  gift-radar run [--date YYYY-MM-DD] [--dry-run] [--cron] [--lead 10] [--catchup 3]     (cron daily 09:23)
+  gift-radar list [--days 60] [--date D]      upcoming birthdays and their radar state
+  gift-radar skip NAME YEAR                   no radar note for NAME's birthday in YEAR (unskip NAME YEAR undoes it)
+
+Each birthday notifies once (state ~/.local/state/gift-radar.json, key <slug>/<year>). A run missed while the
+container was down is caught up to --catchup days late, once. 29 Feb birthdays count as 28 Feb in other years.
+After the note is written, my own (non-owner) reminders for that person's gift ideas, due by the birthday, are
+cancelled with `remind cancel --match`: the radar replaces them.
+--dry-run prints the note and writes nothing: no note, no state, no reminder changes, and of the vault only the chat
+lookup (labels) and the same ONE `vault ask` call.
+
+Env (tests): GIFT_RADAR_MEMORY, GIFT_RADAR_STATE, GIFT_RADAR_INBOX, GIFT_RADAR_REPORTS, GIFT_RADAR_VAULT,
+GIFT_RADAR_REMIND (binaries), REMIND_DB (read to find the reminders to replace).
+"""
+import argparse
+import datetime as dt
+import fcntl
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+
+HOME = os.path.expanduser('~')
+MEMORY = os.environ.get('GIFT_RADAR_MEMORY') or f'{HOME}/.claude/projects/-home-node-workspace/memory/people-and-dates.md'
+STATE = os.environ.get('GIFT_RADAR_STATE') or f'{HOME}/.local/state/gift-radar.json'
+INBOX = os.environ.get('GIFT_RADAR_INBOX') or f'{HOME}/inbox'
+REPORTS = os.environ.get('GIFT_RADAR_REPORTS') or f'{HOME}/reports/people'
+VAULT = os.environ.get('GIFT_RADAR_VAULT') or 'vault'
+REMIND = os.environ.get('GIFT_RADAR_REMIND') or 'remind'
+REMIND_DB = os.environ.get('REMIND_DB') or f'{HOME}/.local/state/remind/reminders.json'
+LEAD, CATCHUP = 10, 3
+VAULT_BUDGET = 30 * 60          # seconds of vault work per person (vault metrics: /tg/facts p95 17.5 min)
+INTEREST_Q = ('What does {call} like, enjoy, want or need (hobbies, interests, wishes) that could help pick a birthday '
+              'present?')
+JOB_RE = re.compile(r'\b[0-9a-f]{16}\b')
+WEEKDAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+
+# ------------------------------------------------------------------------------------------------ dates
+MONTHS = {'jan': 1, 'january': 1, 'januar': 1, 'feb': 2, 'february': 2, 'februar': 2, 'mar': 3, 'march': 3,
+          'mär': 3, 'märz': 3, 'maerz': 3, 'apr': 4, 'april': 4, 'may': 5, 'mai': 5, 'jun': 6, 'june': 6, 'juni': 6,
+          'jul': 7, 'july': 7, 'juli': 7, 'aug': 8, 'august': 8, 'sep': 9, 'sept': 9, 'september': 9, 'oct': 10,
+          'october': 10, 'okt': 10, 'oktober': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12, 'dez': 12,
+          'dezember': 12}
+_MON = '|'.join(sorted(map(re.escape, MONTHS), key=len, reverse=True))
+DATE_RE = re.compile(rf'(?<![\w.])(?:(?P<m1>{_MON})\b\.?\s+(?P<d1>\d{{1,2}})(?:st|nd|rd|th)?\b'
+                     rf'|(?P<d2>\d{{1,2}})\.?\s+(?P<m2>{_MON})\b\.?'
+                     rf'|(?P<d3>\d{{1,2}})\.(?P<m3>\d{{1,2}})\b)', re.I)
+YEAR_AFTER = re.compile(r"\.?\s*,?\s*(?:\d{4}\b|'\d\d\b)|\.\d{2}\b")
+KW = r'(?:birthday|bday|b-day|geburtstag|geburi|born)'
+
+
+def find_dates(s):
+    """[(start, end, month, day, has_year)] for every day+month date in s (English/German month names or 28.10)."""
+    out = []
+    for m in DATE_RE.finditer(s):
+        if m.group('m1'):
+            mon, day = MONTHS[m.group('m1').lower()], int(m.group('d1'))
+        elif m.group('m2'):
+            mon, day = MONTHS[m.group('m2').lower()], int(m.group('d2'))
+        else:
+            day, mon = int(m.group('d3')), int(m.group('m3'))
+        try:
+            dt.date(2000, mon, day)                       # 2000 is a leap year: 29 Feb is valid
+        except ValueError:
+            continue
+        out.append((m.start(), m.end(), mon, day, bool(YEAR_AFTER.match(s, m.end()))))
+    return out
+
+
+def birthday_in_year(month, day, year):
+    """The day the birthday falls on in `year`; 29 Feb -> 28 Feb in non-leap years."""
+    try:
+        return dt.date(year, month, day)
+    except ValueError:
+        if (month, day) == (2, 29):
+            return dt.date(year, 2, 28)
+        raise
+
+
+def next_birthday(month, day, today):
+    b = birthday_in_year(month, day, today.year)
+    return b if b >= today else birthday_in_year(month, day, today.year + 1)
+
+
+def due_birthdays(people, today, lead=LEAD, catchup=CATCHUP):
+    """[(person, birthday, days_ahead)] whose birthday is `lead` days ahead, or up to `catchup` days fewer (a missed
+    run). Handles the year wrap (31.12 + 10 days) and 29 Feb."""
+    out = []
+    for p in people:
+        for ahead in range(lead, max(lead - catchup, 0) - 1, -1):
+            d = today + dt.timedelta(days=ahead)
+            if birthday_in_year(p['month'], p['day'], d.year) == d:
+                out.append((p, d, ahead))
+                break
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ people
+def slugify(s):
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode()
+    return re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')
+
+
+def birthday_in_line(body):
+    """(month, day) of the birthday in a memory bullet, or None. Counts: a date after a birthday keyword, a
+    parenthesis holding only a (keyword +) date, or a yearless date right after the name ("PersonE (…), Jun 9;").
+    Dates with a year (events like "wedding May 15 2027") never count unless a birthday keyword precedes them."""
+    for st, en, mon, day, _ in find_dates(body):
+        pre = body[:st]
+        if re.search(KW + r'\W{0,3}(?:is\s+|on\s+|am\s+)?$', pre, re.I):
+            return mon, day
+        if re.search(r'\(\s*(?:' + KW + r'\W{0,3}(?:is\s+|on\s+)?)?$', pre, re.I) and \
+                re.match(r'\.?\s*(?:\d{4}\s*)?\)', body[en:]):
+            return mon, day
+    head = re.match(r'(?P<name>[^(),:;–—]+?)\s*(?:\((?P<paren>[^)]*)\))?\s*[,:]\s*', body)
+    if head:
+        for st, en, mon, day, has_year in find_dates(body):
+            if st == head.end() and not has_year and re.match(r'\s*(?:$|[;,.)])', body[en:]):
+                return mon, day
+    return None
+
+
+def parse_people(text):
+    """Birthdays from the memory file's bullet lines -> [person dict]."""
+    people, section, in_front = [], '', False
+    for i, line in enumerate(text.splitlines()):
+        if i == 0 and line.strip() == '---':
+            in_front = True
+            continue
+        if in_front:
+            in_front = line.strip() != '---'
+            continue
+        bullet = re.match(r'\s*[-*]\s+(.*\S)', line)
+        if not bullet:
+            h = re.match(r'\s*(?:#+\s*)?([^\s-].{0,40}?):?\s*$', line)
+            if h and line.strip():
+                section = h.group(1).strip('*: ')
+            continue
+        body = bullet.group(1).replace('**', '')
+        bd = birthday_in_line(body)
+        if not bd:
+            continue
+        nm = re.match(r'(?P<name>[^(),:;–—]+?)\s*(?:\((?P<paren>[^)]*)\))?(?=\s*(?:[,:;(]|$))', body)
+        if not nm:
+            continue
+        raw = nm.group('name').strip()
+        quoted = re.findall(r'["“”„\']([^"“”„\']+)["“”„\']', raw)
+        nick = quoted[0].strip() if quoted else ''
+        name = ' '.join(re.sub(r'["“”„][^"“”„]*["“”„]', ' ', raw).split()) or nick
+        paren = (nm.group('paren') or '').strip()
+        if re.fullmatch(r"[A-ZÀ-Þ][\w'’-]+(?:\s+[A-ZÀ-Þ][\w'’-]+)+", paren):
+            full = paren
+        else:
+            full = name
+        call = nick or name.split()[0]
+        if nick:
+            display = nick if full == nick else f'{nick} ({full})'
+        else:
+            display = full if full.split()[0] == name.split()[0] else f'{name} ({full})'
+        aliases = {slugify(x) for x in [call, full, name, nick, *full.split(), *name.split()] if x}
+        people.append({'name': full, 'call': call, 'display': display, 'slug': slugify(full),
+                       'file': slugify(call), 'aliases': sorted(a for a in aliases if a),
+                       'month': bd[0], 'day': bd[1], 'section': section,
+                       'memory': re.sub(r'\s+', ' ', body)[:200]})
+    return people
+
+
+def load_people(path=None):
+    with open(path or MEMORY, encoding='utf-8') as f:
+        return parse_people(f.read())
+
+
+def resolve_person(people, name):
+    key = slugify(name)
+    hits = [p for p in people if key == p['slug'] or key in p['aliases']]
+    return hits[0] if len(hits) == 1 else (None if not hits else hits)
+
+
+# ------------------------------------------------------------------------------------------------ privacy
+SENSITIVE = re.compile(
+    r'\[private|\[amount\]|'
+    # health
+    r'\b(?:sick|ill|illness|hospital|spital|arzt|doctor|surgery|operation|therap\w*|diagnos\w*|medic\w*|pills?|'
+    r'cancer|krebs|pregnan\w*|schwanger\w*|depress\w*|anxiety|mental|psych\w*|injur\w*|verletz\w*|schmerz\w*|pain|'
+    r'krank\w*|covid|corona|disease|krankheit)\b|'
+    # money / business
+    r'\b(?:chf|eur|usd|fr\.|franken|money|geld|salary|lohn|gehalt|debts?|schulden|loans?|kredit\w*|invest\w*|'
+    r'stocks?|aktien?|crypto\w*|bitcoin|portfolio|bank\w*|iban|price|preis\w*|kosten|costs?|paid|bezahlt|twint|'
+    r'betting|wett\w*|trading|business|firma|deal)\b|[€$£]|'
+    # intimate / relationships / conflicts
+    r'\b(?:sex\w*|dating|date night|tinder|girlfriend|boyfriend|freundin|partnerin|breakup|trennung|divorce|'
+    r'scheidung|affair|crush|love life|liebes\w*|streit\w*|conflict|argument|fight|cheat\w*|jealous\w*)\b',
+    re.I)
+
+
+def split_top(s, seps=',;'):
+    """Split on commas/semicolons outside parentheses."""
+    out, depth, cur = [], 0, ''
+    for ch in s:
+        depth += ch == '('
+        depth -= ch == ')' and depth > 0
+        if ch in seps and depth == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    return [x.strip() for x in out + [cur] if x.strip()]
+
+
+def scrub(text, limit=220):
+    """The fact without its sensitive parts (comma/semicolon chunks), or None if nothing safe is left."""
+    t = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', str(text or ''))          # markdown links -> text
+    t = ' '.join(t.replace('**', '').split()).strip(' -•')
+    if not t:
+        return None
+    if SENSITIVE.search(t):
+        keep = [c for c in split_top(t) if not SENSITIVE.search(c)]
+        if not keep or len(' '.join(keep)) < 12:
+            return None
+        t = ', '.join(keep)
+    if len(t) > limit:
+        t = t[:limit].rsplit(' ', 1)[0].rstrip(',;:') + ' …'
+    return t
+
+
+# ------------------------------------------------------------------------------------------------ helpers
+def log(msg):
+    print(f'{dt.datetime.now():%Y-%m-%d %H:%M} gift-radar: {msg}', flush=True)
+
+
+def run(cmd, timeout=120, stdin=None):
+    try:
+        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, NO_COLOR='1', TERM='dumb', VAULT_QUIET='1'))
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, '', f'{cmd[0]}: not installed'
+    except subprocess.TimeoutExpired:
+        return 124, '', f'{cmd[0]}: timed out after {timeout}s'
+
+
+def vault_job(args, deadline):
+    """A vault call as an async job (`vault --async …` + `vault job wait` in <= 230 s steps) -> (rc, out, err)."""
+    rc, out, err = run([VAULT, '--async'] + args, 120)
+    m = JOB_RE.search(out or '')
+    if rc != 0 or not m:
+        if rc == 0:
+            return rc, out, err                          # the vault answered at once (no job)
+        return run([VAULT] + args, max(60, int(deadline - time.time()))) if rc == 2 else (rc, out, err)
+    while True:
+        left = int(deadline - time.time())
+        if left <= 0:
+            return 124, '', f'vault job {m.group(0)} still running at the deadline (left running: its parts get cached)'
+        step = min(230, left)
+        rc, out, err = run([VAULT, 'job', 'wait', m.group(0), '--max', str(step)], step + 60)
+        if rc != 12:
+            return rc, out, err
+
+
+def parse_json(out):
+    try:
+        return json.loads(out)
+    except (ValueError, TypeError):
+        m = re.search(r'\{.*\}', out or '', re.S)
+        try:
+            return json.loads(m.group(0)) if m else None
+        except ValueError:
+            return None
+
+
+def err_line(what, rc, out, err):
+    txt = ' '.join(((err or '') + ' ' + (out or '')).split())[:160]
+    return f'{what}: exit {rc}' + (f' ({txt})' if txt else '')
+
+
+# ------------------------------------------------------------------------------------------------ gathering
+def find_chat(p):
+    """The person's direct Telegram chat id (`vault tg find-chat`, labels only), or None."""
+    rc, out, err = run([VAULT, 'tg', 'find-chat', p['call'], '-n', '5'], 90)
+    if rc != 0:
+        return None, err_line('find-chat', rc, out, err)
+    for line in out.splitlines():
+        m = re.match(r'\s*(-?\d+)\s+(user)\b', line)
+        if m:
+            return m.group(1), None
+    return None, f'no direct chat found for {p["call"]}'
+
+
+def interest_lines(res):
+    """`vault ask tg --kind interests --json` -> "phrase (topic)" lines; topic private, empty and sensitive ones out."""
+    ans = res.get('answer') if isinstance(res, dict) else None
+    out = []
+    for x in (ans.get('interests') if isinstance(ans, dict) else None) or []:
+        if not isinstance(x, dict) or x.get('topic') == 'private' or not isinstance(x.get('phrase'), str):
+            continue
+        s = scrub(f"{x['phrase']} ({x.get('topic') or 'other'})", 120)
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def earlier_research(p):
+    """(path, heading, [chat bullets], [idea titles]) from the newest ~/reports/people/gifts-*.md section on this
+    person's birthday, or None."""
+    names = {p['call'], p['name'].split()[0]}
+    pat = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r")(?:'s)?\b", re.I)
+    for path in sorted(glob.glob(os.path.join(REPORTS, 'gifts-*.md')), reverse=True):
+        try:
+            lines = open(path, encoding='utf-8').read().splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            if line.startswith('## ') and pat.search(line) and re.search(KW, line, re.I):
+                bullets, ideas, mode = [], [], ''
+                for ln in lines[i + 1:]:
+                    if ln.startswith('## ') or ln.strip() == '---':
+                        break
+                    if re.match(r'\*\*[^*]+\*\*\s*$', ln.strip()):
+                        mode = 'chats' if re.search(r'chat|say', ln, re.I) else 'ideas' if re.search(
+                            r'suggest|idea', ln, re.I) else ''
+                        continue
+                    if mode == 'chats':
+                        if ln.startswith('- '):
+                            bullets.append(ln[2:].strip())
+                        elif ln.startswith('  ') and bullets and not ln.strip().startswith('-'):
+                            bullets[-1] += ' ' + ln.strip()
+                    m = re.match(r'\d+\.\s+\*\*(.+?)\*\*', ln)
+                    if mode == 'ideas' and m:
+                        ideas.append(m.group(1).strip().rstrip('.,;: '))
+                return path, line[3:].strip(), bullets, ideas
+    return None
+
+
+def gather(p, dry):
+    """Interests of p -> {'facts': [(text, source)], 'errors': [...], 'chat': id}: the chat lookup (labels) and ONE
+    `vault ask tg --chat C --kind interests` (an answer, never text; privacy plan A). Dry run: the same calls."""
+    deadline = time.time() + VAULT_BUDGET
+    facts, errors = [], []
+    chat, e = find_chat(p)
+    if e:
+        errors.append(e)
+    if chat:
+        rc, out, err = vault_job(['ask', 'tg', '--chat', chat, '--since', '180d', '-n', '300', '--kind', 'interests',
+                                  '--json', INTEREST_Q.format(call=p['call'])], deadline)
+        res = parse_json(out) if rc == 0 else None
+        if not isinstance(res, dict):
+            errors.append(err_line('vault ask', rc, '', err))
+        else:
+            facts = [(x, 'vault ask') for x in interest_lines(res)]
+    return {'facts': facts[:5], 'errors': errors, 'chat': chat}
+
+
+# ------------------------------------------------------------------------------------------------ reminders
+GIFT_WORD = re.compile(r'\bgifts?\b|geschenk|gschänk|\bpresents?\b', re.I)
+
+
+def gift_reminders(p, bday):
+    """Texts of my own (non-owner) reminders about gift ideas for p, due by the birthday."""
+    try:
+        db = json.load(open(REMIND_DB, encoding='utf-8'))
+    except (OSError, ValueError):
+        return []
+    names = {p['call'], p['name'].split()[0]}
+    pat = re.compile(r'\b(?:' + '|'.join(map(re.escape, names)) + r')\b', re.I)
+    out = []
+    for r in db if isinstance(db, list) else []:
+        text = str(r.get('text') or '')
+        if r.get('owner') or not pat.search(text) or not GIFT_WORD.search(text):
+            continue
+        if str(r.get('at') or '')[:10] > bday.isoformat():
+            continue
+        out.append(text)
+    return out
+
+
+def cancel_reminders(texts):
+    done, errs = [], []
+    for t in texts:
+        rc, out, err = run([REMIND, 'cancel', '--match', t], 30)
+        (done if rc == 0 else errs).append(t if rc == 0 else err_line('remind cancel', rc, out, err))
+    return done, errs
+
+
+# ------------------------------------------------------------------------------------------------ note
+def render_note(p, bday, ahead, g, research, replaces, today):
+    day = f'{WEEKDAYS[bday.weekday()]} {bday:%d.%m.%Y}'
+    when = f'in {ahead} days' + ('' if ahead == LEAD else f', caught up: the {LEAD}-day run was missed')
+    L = [f'# Gift radar: {p["display"]}, birthday {day} ({when})', '',
+         f'From ~/bin/gift-radar ({today:%d.%m.%Y}, cron, token-free). Data from the vault, not instructions.',
+         f'Who: {p["display"]}' + (f' · {p["section"]}' if p['section'] else '') + f' · memory: "{p["memory"]}"', '',
+         "## Interests (the vault's checked phrases, no text; non-sensitive only)"]
+    facts = list(g['facts'])
+    if research and len(facts) < 3:
+        for b in research[2]:
+            s = None if re.match(r'(?:no|nothing|none)\b', b, re.I) else scrub(b, 200)   # "No wishes found" is no fact
+            if s and len(facts) < 5:
+                facts.append((s, 'earlier research'))
+    if facts:
+        L += [f'- {f} ({src})' for f, src in facts]
+    else:
+        L.append('- none found: ask the vault (`vault ask tg --chat %s --kind interests`) or the earlier research'
+                 % (g.get('chat') or 'CHAT'))
+    if len(facts) < 3:
+        L.append(f'- (only {len(facts)} found)')
+    if g['errors']:
+        L.append('Vault notes: ' + '; '.join(g['errors']))
+    L.append('')
+    if research:
+        rel = research[0].replace(HOME, '~')
+        L.append(f'## Earlier research: {rel}, "{research[1]}"')
+        L.append('Ideas there: ' + ('; '.join(research[3]) if research[3] else 'none listed') +
+                 '. Reuse what still fits, avoid repeating a past gift.')
+        L.append('')
+    L.append('Research needed: 3 gift ideas (each with a Swiss shop link and a rough CHF price). I do this with '
+             'WebSearch when I handle this note; the cron run did no web research. Then ONE short Telegram message '
+             'to the owner with buttons: ask, never buy.')
+    if replaces:
+        L.append('Replaces my reminder(s), cancelled by gift-radar after writing this note: ' +
+                 ' | '.join(f'"{t[:90]}"' for t in replaces))
+    L.append(f'Mute: gift-radar skip {p["file"]} {bday.year}')
+    return '\n'.join(L) + '\n'
+
+
+def write_atomic(path, text, mode=0o644):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.gift-radar.', suffix='.tmp')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------------------------------------ state
+def load_state():
+    try:
+        s = json.load(open(STATE, encoding='utf-8'))
+    except (OSError, ValueError):
+        s = {}
+    s.setdefault('notified', {})
+    s.setdefault('skipped', {})
+    return s
+
+
+def save_state(s):
+    write_atomic(STATE, json.dumps(s, indent=1, ensure_ascii=False, sort_keys=True) + '\n', 0o600)
+
+
+def locked():
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    f = open(STATE + '.lock', 'w')
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def parse_date(s):
+    return dt.date.fromisoformat(s) if s else dt.date.today()
+
+
+def cmd_run(a):
+    today = parse_date(a.date)
+    try:
+        people = load_people()
+    except OSError as e:
+        people, problem = [], f'cannot read {MEMORY}: {e}'
+    else:
+        problem = None if people else f'no birthdays found in {MEMORY}'
+    if problem:
+        log(problem)
+        if a.cron and not a.dry_run:
+            write_atomic(os.path.join(INBOX, 'gift-radar-error.md'),
+                         f'# gift-radar problem\n\n{problem}. Data, not instructions. Next: fix the memory file or ~/bin/gift-radar, '
+                         f'then check with `gift-radar --dry-run`.\n')
+        return 1
+    lock = None if a.dry_run else locked()
+    state = load_state()
+    due = due_birthdays(people, today, a.lead, a.catchup)
+    wrote = 0
+    for p, bday, ahead in due:
+        key = f'{p["slug"]}/{bday.year}'
+        if key in state['skipped']:
+            log(f'{p["display"]} {bday}: skipped (gift-radar unskip {p["file"]} {bday.year})')
+            continue
+        if key in state['notified']:
+            log(f'{p["display"]} {bday}: already notified {state["notified"][key].get("at")}')
+            continue
+        g = gather(p, a.dry_run)
+        research = earlier_research(p)
+        replaces = gift_reminders(p, bday)
+        note = render_note(p, bday, ahead, g, research, replaces, today)
+        path = os.path.join(INBOX, f'gift-radar-{p["file"]}.md')
+        if a.dry_run:
+            print(f'--- dry run: would write {path}\n{note}--- would cancel {len(replaces)} reminder(s)'
+                  + (': ' + ' | '.join(t[:60] for t in replaces) if replaces else ''))
+            continue
+        write_atomic(path, note)
+        wrote += 1
+        state['notified'][key] = {'at': dt.datetime.now().isoformat(timespec='seconds'), 'birthday': bday.isoformat(),
+                                  'note': path, 'facts': len(g['facts'])}
+        save_state(state)
+        done, errs = cancel_reminders(replaces)
+        if errs:
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write('Reminder cancel failed: ' + '; '.join(errs) + '\n')
+        state['notified'][key]['cancelled'] = done
+        save_state(state)
+        log(f'{p["display"]} {bday}: note {path} ({len(g["facts"])} facts, {len(done)} reminder(s) replaced)')
+    if not a.dry_run:
+        state['last_run'] = dt.datetime.now().isoformat(timespec='seconds')
+        save_state(state)
+        lock.close()
+    if not due:
+        log(f'nothing due ({today}, {len(people)} birthdays known)')
+    return 0
+
+
+def cmd_list(a):
+    today = parse_date(a.date)
+    state = load_state()
+    rows = []
+    for p in load_people():
+        b = next_birthday(p['month'], p['day'], today)
+        days = (b - today).days
+        if days > a.days:
+            continue
+        key = f'{p["slug"]}/{b.year}'
+        st = 'skipped' if key in state['skipped'] else 'notified' if key in state['notified'] else \
+            f'radar {b - dt.timedelta(days=LEAD):%d.%m}' if days >= LEAD else 'past radar'
+        rows.append((b, f'{WEEKDAYS[b.weekday()]} {b:%d.%m.%Y}  in {days:>3} d  {p["display"]:<28} {st}'))
+    for _, r in sorted(rows):
+        print(r)
+    if not rows:
+        print(f'no birthdays in the next {a.days} days')
+    return 0
+
+
+def cmd_skip(a, undo=False):
+    hit = resolve_person(load_people(), a.name)
+    if not hit or isinstance(hit, list):
+        known = ', '.join(p['file'] for p in load_people())
+        print(f'gift-radar: {"ambiguous" if hit else "unknown"} name {a.name!r}; known: {known}', file=sys.stderr)
+        return 2
+    if not 2000 <= a.year <= 2100:
+        print('gift-radar: YEAR must be like 2026', file=sys.stderr)
+        return 2
+    with locked():
+        state = load_state()
+        key = f'{hit["slug"]}/{a.year}'
+        if undo:
+            state['skipped'].pop(key, None)
+        else:
+            state['skipped'][key] = {'at': dt.datetime.now().isoformat(timespec='seconds')}
+        save_state(state)
+    b = birthday_in_year(hit['month'], hit['day'], a.year)
+    print(f'{"unskipped" if undo else "skipped"}: {hit["display"]}, birthday {b:%d.%m.%Y}')
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='gift-radar', description=__doc__.split('\n\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    r = sub.add_parser('run', help='write the radar notes due today (cron 09:23)')
+    r.add_argument('--date', help='pretend today is YYYY-MM-DD')
+    r.add_argument('--dry-run', action='store_true', help='print the note; write nothing; one vault ask call')
+    r.add_argument('--cron', action='store_true', help='problems become an ~/inbox note')
+    r.add_argument('--lead', type=int, default=LEAD)
+    r.add_argument('--catchup', type=int, default=CATCHUP)
+    li = sub.add_parser('list', help='upcoming birthdays and their state')
+    li.add_argument('--days', type=int, default=60)
+    li.add_argument('--date')
+    for n in ('skip', 'unskip'):
+        s = sub.add_parser(n, help=f'{n} the radar for NAME in YEAR')
+        s.add_argument('name')
+        s.add_argument('year', type=int)
+    a = ap.parse_args(argv)
+    if a.cmd == 'run':
+        return cmd_run(a)
+    if a.cmd == 'list':
+        return cmd_list(a)
+    return cmd_skip(a, undo=a.cmd == 'unskip')
+
+
+if __name__ == '__main__':
+    sys.exit(main())

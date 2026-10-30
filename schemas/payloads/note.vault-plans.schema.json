@@ -1,0 +1,75 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.vault-plans.schema.json",
+ "title": "plans-watch: one note per batch of dated plans; keys = plans-watch ack keys (no plan text)",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "keys",
+  "new",
+  "again",
+  "cancelled"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.vault-plans"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "keys": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "pattern": "^[0-9a-f]{6,16}$"
+   }
+  },
+  "cancelled_keys": {
+   "type": "array",
+   "items": {
+    "type": "string",
+    "pattern": "^[0-9a-f]{6,16}$"
+   }
+  },
+  "new": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "again": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "updated": {
+   "type": "integer",
+   "minimum": 1,
+   "description": "plans listed again because their chat changed time, place or people"
+  },
+  "cancelled": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "cats": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "integer",
+    "minimum": 0
+   }
+  },
+  "first_date": {
+   "type": [
+    "string",
+    "null"
+   ],
+   "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+  }
+ }
+}

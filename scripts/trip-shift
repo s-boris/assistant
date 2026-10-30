@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""trip-shift: owner reminders that would ring at night in a trip's time zone, and shifted times for them.
+
+  trip-shift [--from YYYY-MM-DD --to YYYY-MM-DD --tz ZONE] [--quiet START-END] [--morning] [--json] [--apply]
+
+Dry run by default: lists the owner reminders (`remind --owner`) due inside the trip window (home calendar,
+dates inclusive) whose time lands in the quiet hours of the trip zone (default 0-8, i.e. 00:00-08:00 there),
+and proposes a new time for each:
+  default    the same clock time, but in the trip zone (22:30 set at home rings at 22:30 there);
+             when that clock time is itself in the quiet hours, the end of the quiet hours there
+  --morning  always the end of the quiet hours in the trip zone (e.g. 08:00 there)
+Recurring reminders with occurrences in the quiet hours are listed but never changed (shift them by hand:
+`remind skip N` or cancel + re-add). Reminders already due are left alone.
+--apply: moves the one-off ones in place with remind's own `remind snooze ID "YYYY-MM-DD HH:MM"`: only the
+time changes, so every flag the reminder carries (--call, tag, owner) is kept, and its ID too. Reminders
+without an ID get one from remind first (any remind command assigns them).
+
+Trips: --from/--to/--tz, else every current or upcoming trip in the config "trips" list
+([{"from", "to", "tz"}], "tz" per trip or top-level), from $TRIP_SHIFT_CONFIG or ~/.config/cat-corner/config.json.
+Reads the reminder store read-only ($REMIND_DB, default ~/.local/state/remind/reminders.json); writes only
+through `remind` ($REMIND_BIN, default ~/bin/remind). Home zone: $OWNER_TZ, else the profile's locale.tz.
+Env (tests): REMIND_DB, REMIND_BIN, REMIND_NOW (as remind: "YYYY-MM-DD HH:MM" home wall time), TRIP_SHIFT_CONFIG,
+OWNER_TZ. Exit: 0 ok (also when nothing needs a shift), 1 an --apply step failed, 2 usage / bad config.
+"""
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(HERE, 'lib'), os.path.join(HOME, 'bin', 'lib')):
+    if os.path.exists(os.path.join(_lib, 'assistant_profile.py')):
+        sys.path.insert(0, _lib)
+        break
+DB = os.environ.get('REMIND_DB') or os.path.join(HOME, '.local/state/remind/reminders.json')
+REMIND = os.environ.get('REMIND_BIN') or next(
+    (p for p in (os.path.join(HERE, 'remind'), os.path.join(HOME, 'bin', 'remind')) if os.path.exists(p)), 'remind')
+CONFIG = os.environ.get('TRIP_SHIFT_CONFIG') or os.path.join(HOME, '.config/cat-corner/config.json')
+FMT = '%Y-%m-%d %H:%M'
+DAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+
+
+def home_tz():
+    if os.environ.get('OWNER_TZ'):
+        return ZoneInfo(os.environ['OWNER_TZ'])
+    try:
+        import assistant_profile
+        return assistant_profile.tz()
+    except Exception:
+        return ZoneInfo('UTC')
+
+
+def now_home(tz):
+    fake = os.environ.get('REMIND_NOW')
+    if fake and not fake.startswith('@'):
+        return dt.datetime.strptime(fake, FMT)
+    ts = float(fake[1:]) if fake else time.time()
+    return dt.datetime.fromtimestamp(ts, tz).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def remind_mod():
+    """remind's own recurrence helpers (succ, describe), loaded from the script."""
+    loader = importlib.machinery.SourceFileLoader('remind_for_trip_shift', REMIND)
+    spec = importlib.util.spec_from_loader('remind_for_trip_shift', loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True
+    loader.exec_module(mod)
+    return mod
+
+
+def zone(name):
+    try:
+        return ZoneInfo(str(name)) if name else None
+    except Exception:
+        return None
+
+
+def load_trips(a, today):
+    if a.frm or a.to or a.tz:
+        if not (a.frm and a.to and a.tz):
+            raise SystemExit('trip-shift: --from, --to and --tz go together')
+        raw, top = [{'from': a.frm, 'to': a.to, 'tz': a.tz}], None
+    else:
+        try:
+            with open(CONFIG) as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            cfg = {}
+        cfg = cfg if isinstance(cfg, dict) else {}
+        raw, top = cfg.get('trips') or [], cfg.get('tz')
+    out = []
+    for t in raw:
+        try:
+            f, to = dt.date.fromisoformat(str(t['from'])), dt.date.fromisoformat(str(t['to']))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        z = zone(t.get('tz') or top)
+        if z is None:
+            if a.frm:
+                raise SystemExit(f'trip-shift: unknown time zone {a.tz!r}')
+            continue
+        if to >= f and to >= today:
+            out.append({'from': f, 'to': to, 'tz': z, 'tz_name': str(t.get('tz') or top)})
+    return sorted(out, key=lambda x: x['from'])
+
+
+def in_quiet(h, q):
+    a, b = q
+    return (a <= h < b) if a <= b else (h >= a or h < b)
+
+
+def quiet_end(local, q):
+    """The end of the quiet stretch that holds `local` (naive trip-zone wall time)."""
+    end = local.replace(hour=q[1], minute=0)
+    return end if end > local else end + dt.timedelta(days=1)
+
+
+def to_home(naive_trip, trip, tz):
+    return naive_trip.replace(tzinfo=trip['tz']).astimezone(tz).replace(tzinfo=None)
+
+
+def to_trip(naive_home, trip, tz):
+    return naive_home.replace(tzinfo=tz).astimezone(trip['tz']).replace(tzinfo=None)
+
+
+def propose(at, trip, tz, q, morning):
+    """(new home wall time, how) for a home wall time that rings in the quiet hours there."""
+    there = to_trip(at, trip, tz)
+    if not morning and not in_quiet(at.hour, q):
+        return to_home(at, trip, tz), 'same clock time there'
+    return to_home(quiet_end(there, q), trip, tz), 'end of the quiet hours there'
+
+
+def fmt(t):
+    return f"{DAYS[t.weekday()]} {t:%d.%m %H:%M}"
+
+
+def scan(items, trips, tz, q, morning, now, R):
+    """[{trip, oneoff: [...], recurring: [...], total}] for every trip."""
+    res = []
+    for trip in trips:
+        lo, hi = dt.datetime.combine(trip['from'], dt.time(0)), dt.datetime.combine(trip['to'], dt.time(23, 59))
+        lo = max(lo, now + dt.timedelta(minutes=1))
+        oneoff, rec, total = [], [], 0
+        for r in items:
+            if not r.get('owner'):
+                continue
+            at = dt.datetime.strptime(r['at'], FMT)
+            if r.get('every'):
+                until = dt.date.fromisoformat(r['until']) if r.get('until') else None
+                occ, s = [], at
+                for _ in range(1000):
+                    if s > hi or (until and s.date() > until):
+                        break
+                    if s >= lo:
+                        occ.append(s)
+                    s = R.succ(r['every'], s)
+                total += len(occ)
+                night = [s for s in occ if in_quiet(to_trip(s, trip, tz).hour, q)]
+                if night:
+                    rec.append({'text': r['text'], 'every': R.describe(r['every']), 'tag': r.get('tag'),
+                                'at': at, 'night': night, 'there': to_trip(night[0], trip, tz)})
+                continue
+            if not lo <= at <= hi:
+                continue
+            total += 1
+            there = to_trip(at, trip, tz)
+            if not in_quiet(there.hour, q):
+                continue
+            new, how = propose(at, trip, tz, q, morning)
+            oneoff.append({'id': r.get('id'), 'text': r['text'], 'tag': r.get('tag'), 'call': bool(r.get('call')), 'at': at, 'there': there, 'new': new,
+                           'new_there': to_trip(new, trip, tz), 'how': how, 'past': new <= now})
+        res.append({'trip': trip, 'oneoff': oneoff, 'recurring': rec, 'total': total})
+    return res
+
+
+def run(args):
+    r = subprocess.run([REMIND] + args, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def apply_one(p):
+    """Move one pending one-off in place: `remind snooze ID WHEN` changes only its time, so every flag it carries
+    (call, tag, owner, ...) and its ID stay. Checked against the store afterwards."""
+    i = p.get('id')
+    if not i:
+        return False, 'reminder has no ID yet: run `remind list --ids`, then trip-shift again'
+    want = f"{p['new']:{FMT}}"
+    rc, out, err = run(['snooze', i, want])
+    if rc != 0:
+        return False, f'snooze failed (exit {rc}): {err or out}'
+    try:
+        with open(DB) as f:
+            cur = next((r for r in json.load(f) if r.get('id') == i), None)
+    except (OSError, ValueError):
+        cur = None
+    if cur is None or cur.get('at') != want:
+        return False, f'remind said "{out}" but the store does not show {i} at {want}'
+    return True, f"moved {i} to {want}" + (' (📞 call kept)' if cur.get('call') else '') \
+        + (f" (tag {cur['tag']} kept)" if cur.get('tag') else '')
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='trip-shift', description='Shift owner reminders out of the night of a trip.')
+    ap.add_argument('--from', dest='frm')
+    ap.add_argument('--to')
+    ap.add_argument('--tz')
+    ap.add_argument('--quiet', default='0-8', help='quiet hours in the trip zone, START-END (default 0-8)')
+    ap.add_argument('--morning', action='store_true')
+    ap.add_argument('--apply', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    try:
+        q = tuple(int(x) for x in a.quiet.split('-'))
+        if len(q) != 2 or not all(0 <= x <= 23 for x in q) or q[0] == q[1]:
+            raise ValueError
+    except ValueError:
+        ap.error('--quiet takes START-END hours, e.g. 0-8 or 22-7')
+    tz = home_tz()
+    now = now_home(tz)
+    try:
+        trips = load_trips(a, now.date())
+    except SystemExit as e:
+        print(e, file=sys.stderr)
+        return 2
+    try:
+        with open(DB) as f:
+            items = json.load(f)
+    except FileNotFoundError:
+        items = []
+    except (OSError, ValueError) as e:
+        print(f'trip-shift: reminder store unreadable ({type(e).__name__})', file=sys.stderr)
+        return 2
+    if a.apply and any(r.get('owner') and not r.get('id') for r in items):
+        run(['list'])                      # any remind command gives entries from before IDs one, saved at once
+        try:
+            with open(DB) as f:
+                items = json.load(f)
+        except (OSError, ValueError):
+            pass
+    R = remind_mod()
+    res = scan(items, trips, tz, q, a.morning, now, R)
+    if a.json:
+        print(json.dumps([{**x, 'trip': {'from': x['trip']['from'], 'to': x['trip']['to'], 'tz': x['trip']['tz_name']}}
+                          for x in res], default=lambda o: o.isoformat() if hasattr(o, 'isoformat') else str(o),
+                         indent=1, ensure_ascii=False))
+        if not a.apply:
+            return 0
+    out, rc = [], 0
+    if not trips:
+        out.append('No current or upcoming trip (config "trips" or --from/--to/--tz).')
+    for x in res:
+        t = x['trip']
+        off = t['tz'].utcoffset(dt.datetime.combine(t['from'], dt.time(12))) - \
+            tz.utcoffset(dt.datetime.combine(t['from'], dt.time(12)))
+        h = off.total_seconds() / 3600
+        out.append(f"Trip {t['from']:%d.%m}–{t['to']:%d.%m} · {t['tz_name']} ({h:+g} h vs home) · "
+                   f"quiet {q[0]:02d}:00–{q[1]:02d}:00 there")
+        n = len(x['oneoff']) + len(x['recurring'])
+        out.append(f"Owner reminders in the window: {x['total']} · ringing in the quiet hours there: {n}")
+        for i, p in enumerate(x['oneoff'], 1):
+            tag = f"  [tag {p['tag']}]" if p.get('tag') else ''
+            tag += '  [📞 call]' if p.get('call') else ''
+            out.append(f"{i:>2}. {fmt(p['at'])} home = {fmt(p['there'])} there  \"{p['text']}\"{tag}")
+            if p['past']:
+                out.append('    → no shift: the proposed time is already past')
+                continue
+            out.append(f"    → {fmt(p['new'])} home = {fmt(p['new_there'])} there ({p['how']})")
+            if a.apply:
+                ok, msg = apply_one(p)
+                out.append(('    applied: ' if ok else '    NOT applied: ') + msg)
+                rc = rc if ok else 1
+        for p in x['recurring']:
+            tag = f"  [tag {p['tag']}]" if p.get('tag') else ''
+            out.append(f"  recurring \"{p['text']}\" (every {p['every']}){tag}: {len(p['night'])} in the window "
+                       f"ring at night there (first {fmt(p['night'][0])} home = {fmt(p['there'])} there); "
+                       'not changed, shift by hand')
+    if trips and not a.apply and any(x['oneoff'] for x in res):
+        out.append('Dry run: nothing changed. --apply moves the one-off ones in place (tags and calls kept).')
+    elif trips and not any(x['oneoff'] or x['recurring'] for x in res):
+        out.append('Nothing to shift.')
+    if not a.json:
+        print('\n'.join(out))
+    elif a.apply:
+        print('\n'.join(out), file=sys.stderr)
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())

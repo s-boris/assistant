@@ -1,0 +1,755 @@
+#!/usr/bin/env -S python3 -I
+"""scraper-canary run [--json] [--quiet] | status [--json] | help
+Weekly live check that the HTML/PDF/JSON parsers of the scraping tools still understand their sources. Each source is
+checked through the tool's OWN fetch and parse functions (imported from ~/bin, so politeness comes with them: honest
+User-Agent, robots.txt, host gaps, response caches), and gets one status:
+  OK              fetched, and the key fields come out non-empty and plausibly typed
+  FORMAT-CHANGED  the fetch worked but the parser found nothing usable (layout/API changed)
+  DOWN            the fetch failed (network, HTTP error, refused by robots.txt or bot protection, stale copy only)
+  SKIP            nothing to check (no config, nothing watched)
+  ERROR           the canary's adapter itself broke (the tool's code changed): treated like FORMAT-CHANGED
+Sources:
+  trip-conditions  Open-Meteo forecast / marine / archive, NOAA Coral Reef Watch station, GOV.UK travel advice, the
+                   marine bulletin (page -> PDF -> parser; today's, else yesterday's), for the first trip in its config
+                   (advisory "seen" state is kept apart, so the canary never eats a "changed" signal)
+  deals            Alternate / MediaMarkt listing adapters: read from deals' own daily snapshot when it is < 36 h old
+                   (deals refetches at most every 6 h), else one live fetch with 1 page per shop into a temp state dir
+  rave-radar       every enabled venue / festival source (its cache window applies), and the Deezer albums API for
+                   one mapped artist
+  ai-releases      every feed, HN, GitHub releases, HF trending + 2 HF orgs, the model pages (no LLM judge, no state)
+  kk-compare       Aug-Oct only (BAG publication season), else SKIP: the first 4 KB of the BAG premium CSV (BAG ignores
+                   Range, so the stream is closed after 4 KB; never a full download) with kk-compare's URL and User-Agent:
+                   header + Geschäftsjahr column, Content-Length 5-200 MB, next year's data by October (in Aug/Sep this
+                   year's is still OK); once next year is out, the first bytes of its priminfo praemienregionen xlsx
+  deadlines        every official source URL in deadlines' data (~/.config/deadlines/ch-<canton>.json), deduped, robots.txt
+                   respected: HEAD (a small GET when HEAD is refused or fails); OK = 2xx/3xx landing on the same site,
+                   DOWN = 4xx/5xx/DNS, FORMAT-CHANGED = redirected off-site or to the home page, or an HTML page that
+                   used to show one of the entry's key phrases (a source's 'expect' list or the entry's yearly
+                   'amounts' numbers; only phrases the config names) now shows none (state deadlines-seen.json)
+Inbox: ONE ~/inbox/scraper-canary-YYYY-MM-DD.md only when a source is FORMAT-CHANGED / ERROR or has been DOWN on two
+weekly runs in a row (>= 7 days); silent otherwise. Exit: 0 ran (whatever the results), 2 usage or lock busy.
+State ~/.local/state/scraper-canary/ (state.json, canary.log, trip-state/). Tests: ~/opt/assistant/tests/legacy/scraper-canary/run.sh.
+Env (tests): SCRAPER_CANARY_BIN (tools dir), SCRAPER_CANARY_STATE, SCRAPER_CANARY_INBOX, SCRAPER_CANARY_TODAY
+(YYYY-MM-DD), SCRAPER_CANARY_TOOLS (comma list), SCRAPER_CANARY_GAP (s between requests to one host), plus each tool's
+own fixture/config env (DEADLINES_DATA, TRIP_CONDITIONS_FIXTURES, DEALS_STATE_DIR, RAVE_RADAR_FIXTURES,
+AI_RELEASES_FIXTURES, ...); SCRAPER_CANARY_KK_FIXTURES = dir of fake downloads (<name> = first bytes,
+<name>.size = Content-Length; missing = DOWN); SCRAPER_CANARY_DEADLINES_FIXTURES = JSON {url: {status, final,
+ctype, body} | {error}} (robots.txt URLs included; a missing URL = DNS error).
+"""
+import datetime as dt
+import fcntl
+import importlib.machinery
+import importlib.util
+import csv
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import urllib.robotparser
+
+HOME = os.path.expanduser('~')
+BIN = os.environ.get('SCRAPER_CANARY_BIN') or os.path.dirname(os.path.realpath(__file__))
+STATE_DIR = os.environ.get('SCRAPER_CANARY_STATE') or os.path.join(HOME, '.local/state/scraper-canary')
+INBOX = os.environ.get('SCRAPER_CANARY_INBOX') or os.path.join(HOME, 'inbox')
+STATE_F = os.path.join(STATE_DIR, 'state.json')
+LOG_F = os.path.join(STATE_DIR, 'canary.log')
+GAP = float(os.environ.get('SCRAPER_CANARY_GAP', '2'))
+OK, FMT, DOWN, SKIP, ERROR = 'OK', 'FORMAT-CHANGED', 'DOWN', 'SKIP', 'ERROR'
+DOWN_DAYS = 7                      # DOWN on two weekly runs in a row
+DEALS_MAX_AGE = 36 * 3600
+DOWN_RX = re.compile(r'fetch failed|no response|stale copy|HTTP \d|URLError|timed? ?out|Timeout|refused|robots|'
+                     r'CAPTCHA|bot check|Connection|SSL|offline|no fixture|gaierror|Errno', re.I)
+DATE_RX = re.compile(r'^\d{4}-\d{2}-\d{2}')
+KK_FIX = os.environ.get('SCRAPER_CANARY_KK_FIXTURES')
+KK_HEAD = 4096                     # bytes read from each BAG / priminfo file
+KK_MONTHS = (8, 9, 10)             # BAG publishes next year's premiums at the end of September
+KK_CSV_SIZE = (5_000_000, 200_000_000)
+KK_XLSX_SIZE = (50_000, 20_000_000)
+
+
+class Bad(Exception):
+    """The body was fetched but does not hold what the parser needs."""
+
+
+def today():
+    v = os.environ.get('SCRAPER_CANARY_TODAY')
+    return dt.date.fromisoformat(v) if v else dt.date.today()
+
+
+def short(e, n=140):
+    s = str(e) or type(e).__name__
+    return ' '.join(s.split())[:n]
+
+
+def log(msg):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_F, 'a', encoding='utf-8') as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except OSError:
+        pass
+
+
+def load_tool(name, env=None):
+    """Import ~/bin/<name> as a module (its main() is guarded), after setting the env it reads at import time."""
+    for k, v in (env or {}).items():
+        os.environ[k] = v
+    path = os.path.join(BIN, name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'{path} missing')
+    mod = 'canary_' + re.sub(r'\W', '_', name)
+    ld = importlib.machinery.SourceFileLoader(mod, path)
+    spec = importlib.util.spec_from_loader(mod, ld)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[mod] = m
+    ld.exec_module(m)
+    return m
+
+
+_last = {}
+
+
+def gap(url):
+    h = urllib.parse.urlsplit(url).hostname or ''
+    w = _last.get(h, 0) + GAP - time.time()
+    if w > 0:
+        time.sleep(w)
+    _last[h] = time.time()
+
+
+def R(tool, source, status, detail='', n=None):
+    return {'tool': tool, 'source': source, 'status': status, 'detail': short(detail), 'n': n}
+
+
+def probe(out, tool, source, fetch, parse):
+    """fetch() -> body (an exception = DOWN); parse(body) -> (count, detail) (Bad/any exception or count 0 = FORMAT)."""
+    try:
+        body = fetch()
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 - every fetch failure is DOWN
+        out.append(R(tool, source, DOWN, e))
+        return
+    try:
+        n, detail = parse(body)
+    except Exception as e:  # noqa: BLE001 - a body the parser can't read is a format change
+        out.append(R(tool, source, FMT, f'{type(e).__name__}: {short(e)}' if not isinstance(e, Bad) else e))
+        return
+    out.append(R(tool, source, OK if n else FMT, detail if n else (detail or 'parsed 0 items'), n))
+
+
+def numeric(vals):
+    return [v for v in vals or [] if isinstance(v, (int, float)) and not isinstance(v, bool)]
+
+
+# ------------------------------------------------------------------------------------------------ trip-conditions
+def check_trip(out):
+    tool = 'trip-conditions'
+    T = load_tool(tool, {'TRIP_CONDITIONS_STATE': os.path.join(STATE_DIR, 'trip-state')})
+    try:
+        trips = T.load_config()
+    except T.UsageError as e:
+        out.append(R(tool, '*', SKIP, e))
+        return
+    key = next(iter(trips))
+    trip = T.check_trip(key, trips[key])
+    legs, tzq = trip['legs'], trip.get('tz') or 'UTC'
+    day = T.now_in(trip['_tz']).date()
+
+    def from_record(name, src, ok_n, detail):
+        rec = src.get(name) or {'ok': False, 'note': 'no result'}
+        note = rec.get('note') or ''
+        if not rec['ok']:
+            return R(tool, name, DOWN if DOWN_RX.search(note) else FMT, note)
+        if note and 'stale copy' in note:
+            return R(tool, name, DOWN, note)
+        return R(tool, name, OK if ok_n else FMT, detail if ok_n else f'{detail}: no usable values', ok_n)
+
+    def om(name, url, kind, field, min_days):
+        src = {}
+        data = T.source_json(src, name, url, kind, False)
+        n = 0
+        if data is not None:
+            locs = T.per_location(data, len(legs))
+            if locs is None:
+                T.record(src, name, False, 'unexpected response shape')
+            else:
+                rows = T.by_date(locs[0].get('daily'))
+                n = len(numeric(r.get(field) for r in rows.values()))
+                n = n if n >= min_days else 0
+        out.append(from_record(name, src, n, f'{n} days of {field}'))
+
+    om('forecast', T.om_url(T.FORECAST_URL, legs, 'lat', 'lon', {
+        'daily': T.DAILY, 'wind_speed_unit': 'kn', 'timezone': tzq, 'forecast_days': T.FORECAST_DAYS, 'past_days': 2}),
+       'forecast', 'temperature_2m_max', 7)
+    om('marine', T.om_url(T.MARINE_URL, legs, 'sea_lat', 'sea_lon', {
+        'daily': T.MARINE_DAILY, 'hourly': 'sea_surface_temperature,sea_level_height_msl', 'timezone': tzq,
+        'forecast_days': T.MARINE_DAYS}), 'marine', 'wave_height_max', 3)
+    a0 = T.shift_year(legs[0]['_from'], -1)
+    om('archive', T.om_url(T.ARCHIVE_URL, legs, 'lat', 'lon', {
+        'start_date': a0.isoformat(), 'end_date': (a0 + dt.timedelta(days=6)).isoformat(),
+        'daily': 'temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max',
+        'wind_speed_unit': 'kn', 'timezone': tzq}), 'archive', 'temperature_2m_max', 5)
+
+    if (trip.get('reef') or {}).get('crw_station'):
+        src = {}
+        r = T.reef(src, trip, False)
+        ok = r is not None and DATE_RX.match(r.get('date') or '') and isinstance(r.get('sst_c'), float)
+        out.append(from_record('reef', src, 1 if ok else 0, f"SST row {r['date']}" if ok else 'reef row'))
+    else:
+        out.append(R(tool, 'reef', SKIP, 'no crw_station in the config'))
+
+    if (trip.get('advisory') or {}).get('govuk'):
+        src = {}
+        a = T.advisory(src, trip, False, day)
+        g = a.get('govuk') or {}
+        ok = bool(g.get('updated') and DATE_RX.match(g['updated']))
+        out.append(from_record('advice', src, 1 if ok else 0, f"updated {g.get('updated')}" if ok else 'advice'))
+    else:
+        out.append(R(tool, 'advice', SKIP, 'no GOV.UK slug in the config'))
+
+    b = trip.get('bulletin')
+    if isinstance(b, dict):
+        name = b.get('label') or 'bulletin'
+        res = None
+        for d in (day, day - dt.timedelta(days=1)):          # today's may not be out yet at night
+            src = {}
+            got = T.bulletin(src, trip, False, d)
+            note = (src.get(name) or {}).get('note') or ''
+            if got is not None:
+                res = R(tool, 'bulletin', OK, f"issued {got.get('date')}", 1)
+            elif 'latest is from' in note:
+                res = R(tool, 'bulletin', OK, note.replace('bulletin unavailable ', ''), 1)
+            elif DOWN_RX.search(note) or 'pdftotext' in note:
+                res = R(tool, 'bulletin', DOWN, note)
+                continue
+            else:
+                res = R(tool, 'bulletin', FMT, note)
+            break
+        out.append(res)
+
+
+# ------------------------------------------------------------------------------------------------ deals
+def deals_rows(tool, snap, how):
+    rows = []
+    for key, s in sorted((snap.get('sources') or {}).items()):
+        err, n = s.get('error'), s.get('n') or 0
+        if err:
+            st = FMT if 'no products parsed' in err or 'layout' in err else DOWN
+            rows.append(R(tool, s.get('label') or key, st, err, n))
+        elif not s.get('pages'):
+            rows.append(R(tool, s.get('label') or key, DOWN, 'no page fetched'))
+        elif n == 0:
+            rows.append(R(tool, s.get('label') or key, FMT, 'pages fetched but 0 drives parsed'))
+        else:
+            rows.append(R(tool, s.get('label') or key, OK, f'{n} drives, {s.get("pages")} pages ({how})', n))
+    return rows
+
+
+def check_deals(out):
+    tool = 'deals'
+    state_dir = os.environ.get('DEALS_STATE_DIR') or os.path.join(HOME, '.local/state/deals')
+    try:
+        with open(os.path.join(state_dir, 'hdd-latest.json'), encoding='utf-8') as f:
+            snap = json.load(f)
+    except (OSError, ValueError):
+        snap = None
+    if snap and time.time() - float(snap.get('ts') or 0) < DEALS_MAX_AGE and snap.get('sources'):
+        age = (time.time() - float(snap['ts'])) / 3600
+        out.extend(deals_rows(tool, snap, f'daily fetch {age:.0f} h ago'))
+        return
+    with tempfile.TemporaryDirectory(prefix='scraper-canary-deals-') as tmp:
+        D = load_tool(tool, {'DEALS_STATE_DIR': tmp})       # history and latest go to the temp dir only
+        D.MAX_PAGES = 1
+        snap = D.fetch_all(D.FETCH_MIN_TB)
+    out.extend(deals_rows(tool, snap, 'live, 1 page'))
+
+
+# ------------------------------------------------------------------------------------------------ rave-radar
+def check_rave(out):
+    tool = 'rave-radar'
+    RR = load_tool(tool)
+    try:
+        cfg = RR.load_config()
+    except SystemExit:
+        out.append(R(tool, '*', SKIP, 'no config'))
+        return
+    artists = (RR.load_artists() or {}).get('artists') or [{'name': 'zz canary probe', 'aliases': []}]
+    matcher, F, ref = RR.Matcher(artists), RR.Fetcher(), RR.today()
+    places, max_age = cfg.get('places') or {}, float(cfg.get('cache_hours', 20)) * 3600
+    for src in cfg['sources']:
+        if src.get('disabled'):
+            continue
+        kind = src.get('kind', 'html')
+
+        def parse(body, src=src, kind=kind):
+            if kind not in RR.PARSERS:
+                raise Bad(f'unknown kind {kind}')
+            evs = RR.PARSERS[kind](src, body, matcher, ref, places)   # raises when the structure is gone
+            bad = [e for e in evs if not isinstance(e.get('artist'), str)]
+            if bad:
+                raise Bad('events without an artist')
+            return 1, f'structure found, {len(evs)} matches'
+        probe(out, tool, src['id'], lambda src=src: F.get(src['url'], max_age), parse)
+    # Deezer releases API, one mapped artist
+    try:
+        with open(RR.REL_F, encoding='utf-8') as f:
+            amap = (json.load(f) or {}).get('map') or {}
+    except (OSError, ValueError):
+        amap = {}
+    aid = next((v.get('id') for v in amap.values() if isinstance(v, dict) and v.get('id') and v.get('status') == 'ok'),
+               None)
+    if not aid:
+        out.append(R(tool, 'deezer', SKIP, 'no mapped artist yet'))
+        return
+    F.api_hosts.add(RR.host_of(RR.DEEZER_API))
+    rows = []
+
+    def fetch():
+        try:
+            rows.extend(RR.artist_albums(F, aid))
+        except RR.FetchError as e:
+            if str(e).startswith('Deezer: not JSON'):
+                return e
+            raise
+        return None
+
+    def parse(err):
+        if err:
+            raise Bad(err)
+        good = [a for a in rows if isinstance(a.get('title'), str) and DATE_RX.match(str(a.get('release_date') or ''))]
+        return len(good), f'{len(good)} releases with title + date'
+    probe(out, tool, 'deezer', fetch, parse)
+
+
+# ------------------------------------------------------------------------------------------------ ai-releases
+def check_ai(out):
+    tool = 'ai-releases'
+    A = load_tool(tool)
+    s = A.load_state()                        # read only: robots cache + hosts; never saved
+    hf_orgs = 0
+    srcs = [x for x in A.SOURCES if not A.ONLY or x['name'] in A.ONLY]
+    for src in srcs:
+        kind = src['kind']
+        if kind == 'hf-org':
+            hf_orgs += 1
+            if hf_orgs > 2:                   # same endpoint + parser for every org: two are enough
+                continue
+        sp = dict(src)
+        if kind == 'hn':
+            since = int(time.time() - 2 * 86400)
+            sp['_url'] = (f"{src['url']}?tags=story&hitsPerPage=300&numericFilters="
+                          f"created_at_i%3E{since},points%3E%3D{A.HN_POINTS}")
+        else:
+            sp['_url'] = src['url']
+
+        def fetch(sp=sp):
+            if not A.FIXTURES:
+                gap(sp['_url'])
+            body = A.fetch_body(sp, s, cond=False)
+            if body is None:
+                raise RuntimeError('304 without a body')
+            return body
+
+        def parse(body, sp=sp, kind=kind):
+            if kind == 'page':
+                lines = A.page_lines(body, sp['url'].endswith('.md'))[0]
+                return len(lines), f'{len(lines)} model lines'
+            if kind == 'gh-release':
+                rel = [r for r in json.loads(body) if isinstance(r, dict) and r.get('tag_name')]
+                return len(rel), f'{len(rel)} releases'
+            items = {'feed': A.items_feed, 'hn': A.items_hn, 'hf-org': A.items_hf,
+                     'hf-trending': A.items_hf}[kind](sp, body)
+            good = [i for i in items if isinstance(i.get('title'), str) and i['title'].strip() and i.get('id')]
+            return len(good), f'{len(good)} items'
+        probe(out, tool, src['name'], fetch, parse)
+
+
+# ------------------------------------------------------------------------------------------------ kk-compare
+def head_bytes(url, ua, name, n=KK_HEAD):
+    """(first n bytes, total size), then close: the BAG server ignores Range and would send the whole file."""
+    if KK_FIX is not None:
+        p = os.path.join(KK_FIX, name)
+        if not os.path.exists(p):
+            raise RuntimeError(f'no fixture {name}')
+        with open(p, 'rb') as f:
+            body = f.read(n)
+        try:
+            with open(p + '.size') as f:
+                return body, int(f.read().strip())
+        except FileNotFoundError:
+            return body, os.path.getsize(p)
+    gap(url)
+    req = urllib.request.Request(url, headers={'User-Agent': ua, 'Range': f'bytes=0-{n - 1}'})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = r.read(n)
+        total = (r.headers.get('Content-Range') or '').rpartition('/')[2]
+        size = int(total) if total.isdigit() else int(r.headers.get('Content-Length') or 0)
+    return body, size
+
+
+def check_kk(out):
+    tool = 'kk-compare'
+    day = today()
+    if day.month not in KK_MONTHS:
+        out.append(R(tool, '*', SKIP, 'outside the Aug-Oct publication season'))
+        return
+    K = load_tool(tool)
+    nxt = day.year + 1
+    url, magic = K.FILES['praemien_ch.csv']
+    seen = {}
+    try:                                       # kk-compare's own cache, read only (it refreshes after 30 days)
+        cached = f', kk cache {K.data_year(os.path.join(K.DATA, "praemien_ch.csv"))}'
+    except Exception:  # noqa: BLE001 - no or unreadable cache: just no hint
+        cached = ''
+
+    def parse_csv(got):
+        body, size = got
+        text = body.decode('utf-8-sig', errors='replace')
+        lines = text.splitlines()
+        if not lines or magic not in lines[0]:
+            raise Bad(f'header changed (starts {text[:30]!r})')
+        hdr = next(csv.reader([lines[0]]))
+        if 'Geschäftsjahr' not in hdr or 'Prämie' not in hdr:
+            raise Bad('Geschäftsjahr / Prämie column missing')
+        if len(lines) < 2:
+            raise Bad('no data row')
+        row = next(csv.reader([lines[1]]))
+        year = int(row[hdr.index('Geschäftsjahr')])
+        seen['year'] = year
+        if not KK_CSV_SIZE[0] <= size <= KK_CSV_SIZE[1]:
+            raise Bad(f'implausible size {size} bytes')
+        mb = f'{size / 1e6:.1f} MB'
+        if year == nxt:
+            return 1, f'{nxt} premiums ({mb}{cached})'
+        if year == day.year and day.month < 10:
+            return 1, f'still {year} ({mb}{cached}); {nxt} due end of September'
+        raise Bad(f'dataset holds {year}, not {nxt}, in October (moved or renamed?)')
+    probe(out, tool, 'premiums', lambda: head_bytes(url, K.UA, 'praemien_ch.csv'), parse_csv)
+
+    if seen.get('year') != nxt:
+        out.append(R(tool, 'regions', SKIP, f'waits for the {nxt} premiums'))
+        return
+    name = f'praemienregionen-{nxt}.xlsx'
+
+    def parse_xlsx(got):
+        body, size = got
+        if not body.startswith(b'PK'):
+            raise Bad(f'not an xlsx (starts {body[:16]!r})')
+        if not KK_XLSX_SIZE[0] <= size <= KK_XLSX_SIZE[1]:
+            raise Bad(f'implausible size {size} bytes')
+        return 1, f'{name} ({size // 1000} KB)'
+    probe(out, tool, 'regions', lambda: head_bytes(K.REGIONS_URL.format(year=nxt), K.UA, name), parse_xlsx)
+
+
+# ------------------------------------------------------------------------------------------------ deadlines
+DL_FIX = os.environ.get('SCRAPER_CANARY_DEADLINES_FIXTURES')   # JSON {url: {status, final, ctype, body} | {error}}
+DL_UA = 'scraper-canary/1.0 (weekly link check of official sources for a personal deadline list; honours robots.txt)'
+DL_UA_TOKEN = 'scraper-canary'
+DL_BODY = 1_000_000                # bytes read when a page's key phrases are checked
+DL_SMALL = 16_384                  # bytes read by the GET fallback when HEAD is refused
+DL_SEEN_F = os.path.join(STATE_DIR, 'deadlines-seen.json')
+_dl_robots = {}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def dl_http(method, url, n=0):
+    """(status, final_url, content_type, body[:n]); network/DNS errors raise. Redirects are followed (max 10)."""
+    if DL_FIX is not None:
+        with open(DL_FIX, encoding='utf-8') as f:
+            fx = json.load(f).get(url)
+        if fx is None and url.endswith('/robots.txt'):
+            return 404, url, 'text/plain', b''
+        if fx is None:
+            raise urllib.error.URLError('no fixture (DNS)')
+        if fx.get('error'):
+            raise urllib.error.URLError(fx['error'])
+        return fx.get('status', 200), fx.get('final', url), fx.get('ctype', 'text/html'), fx.get('body', '').encode()[:n]
+    gap(url)
+    req = urllib.request.Request(url, method=method, headers={'User-Agent': DL_UA, 'Accept': '*/*'})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.status, r.geturl(), r.headers.get('Content-Type') or '', r.read(n) if n else b''
+    except urllib.error.HTTPError as e:
+        return e.code, e.geturl() or url, e.headers.get('Content-Type') or '', b''
+
+
+def dl_site(host):
+    return '.'.join((host or '').lower().split('.')[-2:])
+
+
+def dl_robots_ok(url):
+    """None if robots.txt allows the URL for us; 'DOWN: ...' if it can't be read (5xx/network); a refusal text."""
+    p = urllib.parse.urlsplit(url)
+    host = p.netloc.lower()
+    if host not in _dl_robots:
+        try:
+            st, _, _, body = dl_http('GET', f'{p.scheme}://{p.netloc}/robots.txt', 200_000)
+            _dl_robots[host] = (st, body.decode('utf-8', 'replace') if st == 200 else '')
+        except Exception as e:  # noqa: BLE001
+            _dl_robots[host] = (None, short(e))
+    st, text = _dl_robots[host]
+    if st is None or st >= 500:
+        return f'DOWN: robots.txt unreachable ({text if st is None else f"HTTP {st}"})'
+    if st in (401, 403):
+        return f'refused: robots.txt HTTP {st}'
+    if st != 200 or not text.strip():
+        return None
+    try:
+        allowed = load_tool('watch').robots_allowed(text, DL_UA_TOKEN, url)
+    except Exception:  # noqa: BLE001 - watch's parser unavailable: stdlib one
+        rp = urllib.robotparser.RobotFileParser()
+        rp.parse(text.splitlines())
+        allowed = rp.can_fetch(DL_UA_TOKEN, url)
+    return None if allowed else f'refused: robots.txt disallows {p.path or "/"}'
+
+
+def dl_phrases(entry, src):
+    """Key phrases the config itself names: the source's optional 'expect' list, plus the entry's yearly 'amounts'
+    (the number, in any Swiss spelling: 7'258 / 7’258 / 7 258 / 7,258 / 7258). Never derived from anything else."""
+    out = {}
+    for ph in src.get('expect') or []:
+        if isinstance(ph, str) and ph.strip():
+            out[ph] = re.compile(re.escape(' '.join(ph.split())).replace(r'\ ', r'\s+'), re.I)
+    for v in (entry.get('amounts') or {}).values():
+        digits = re.sub(r'[^\d]', '', str(v).split('.')[0]) if re.search(r'\d', str(v)) else ''
+        if len(digits) >= 3:
+            g = digits[:-3] + ('[\'’   ,.]?' if len(digits) > 3 else '') + digits[-3:]
+            out[digits] = re.compile(rf'(?<![\d.,]){g}(?![\d])')
+    return out
+
+
+def dl_name(url, n=80):
+    """Stable, unique-enough source name: host + path (+ query), long paths keep their distinctive tail."""
+    p = urllib.parse.urlsplit(url)
+    path = p.path + (f'?{p.query}' if p.query else '')
+    return p.netloc + path if len(p.netloc + path) <= n else p.netloc + '/…' + path[-(n - len(p.netloc) - 2):]
+
+
+def dl_text(body):
+    import html as _html
+    t = body.decode('utf-8', 'replace')
+    t = re.sub(r'(?is)<(script|style)\b.*?</\1>', ' ', t)
+    return ' '.join(_html.unescape(re.sub(r'<[^>]+>', ' ', t)).split())
+
+
+def check_deadlines(out):
+    tool = 'deadlines'
+    D = load_tool(tool)
+    data = D.load_json(D.DATA, None) if hasattr(D, 'load_json') else None
+    if not data or not data.get('deadlines'):
+        out.append(R(tool, '*', SKIP, f'no deadline data ({os.path.basename(D.DATA)})'))
+        return
+    urls = {}                                     # url -> {'ids': [...], 'phr': {name: rx}}
+    for e in data['deadlines']:
+        for s in e.get('sources') or []:
+            u = s.get('url') or ''
+            if not u.startswith(('http://', 'https://')):
+                continue
+            d = urls.setdefault(u, {'ids': [], 'phr': {}})
+            if e.get('id') not in d['ids']:
+                d['ids'].append(e.get('id'))
+            d['phr'].update(dl_phrases(e, s))
+    try:
+        with open(DL_SEEN_F, encoding='utf-8') as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        seen = {}
+    for u, d in urls.items():
+        p = urllib.parse.urlsplit(u)
+        name = dl_name(u)
+        ids = ','.join(i for i in d['ids'] if i)
+        rb = dl_robots_ok(u)
+        if rb:
+            out.append(R(tool, name, DOWN if rb.startswith('DOWN') else SKIP, f'[{ids}] {rb}'))
+            continue
+        want = bool(d['phr'])
+        try:
+            st, final, ctype, body = (0, u, '', b'')
+            if not want:
+                st, final, ctype, body = dl_http('HEAD', u)
+            if want or st in (403, 405, 501) or st >= 400:     # HEAD refused or failing: one small GET decides
+                st, final, ctype, body = dl_http('GET', u, DL_BODY if want else DL_SMALL)
+        except Exception as e:  # noqa: BLE001 - DNS, refused, timeout
+            out.append(R(tool, name, DOWN, f'[{ids}] {type(e).__name__}: {short(e)}'))
+            continue
+        if st >= 400:
+            out.append(R(tool, name, DOWN, f'[{ids}] HTTP {st}'))
+            continue
+        fp = urllib.parse.urlsplit(final)
+        if dl_site(fp.hostname) != dl_site(p.hostname):
+            out.append(R(tool, name, FMT, f'[{ids}] redirected off-site to {fp.netloc}{fp.path}'[:140]))
+            continue
+        if final != u and fp.path.strip('/') in ('', 'de', 'fr', 'it', 'en', 'de/home', 'home') \
+                and p.path.strip('/') not in ('', 'de', 'fr', 'it', 'en'):
+            out.append(R(tool, name, FMT, f'[{ids}] redirected to the home page {fp.netloc}{fp.path}'))
+            continue
+        moved = f' (now {fp.netloc}{fp.path})' if final != u else ''
+        if want and 'html' in (ctype or '').lower():
+            text = dl_text(body)
+            found = sorted(k for k, rx in d['phr'].items() if rx.search(text))
+            before = seen.get(u) or []
+            seen[u] = found or before
+            if before and not found:
+                out.append(R(tool, name, FMT, f'[{ids}] key phrase(s) {", ".join(before)} no longer on the page{moved}'))
+                continue
+            out.append(R(tool, name, OK, f'[{ids}] HTTP {st}, phrases {", ".join(found) or "none seen yet"}{moved}',
+                         len(found) or 1))
+            continue
+        out.append(R(tool, name, OK, f'[{ids}] HTTP {st}{moved}', 1))
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = f'{DL_SEEN_F}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(seen, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, DL_SEEN_F)
+
+
+CHECKS = {'trip-conditions': check_trip, 'deals': check_deals, 'rave-radar': check_rave,
+          'ai-releases': check_ai, 'kk-compare': check_kk,
+          'deadlines': check_deadlines}
+
+
+# ------------------------------------------------------------------------------------------------ state + note
+def load_state():
+    try:
+        with open(STATE_F, encoding='utf-8') as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = f'{STATE_F}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(st, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, STATE_F)
+
+
+def merge(st, results, day):
+    old = st.get('results') or {}
+    new = {}
+    for r in results:
+        k = f"{r['tool']}/{r['source']}"
+        p = old.get(k) or {}
+        same = p.get('status') == r['status']
+        r['since'] = p.get('since') if same and p.get('since') else day.isoformat()
+        r['last_ok'] = day.isoformat() if r['status'] == OK else p.get('last_ok')
+        new[k] = r
+    st.update(results=new, last_run=dt.datetime.now().isoformat(timespec='seconds'), last_day=day.isoformat())
+    return st
+
+
+def alerts(st, day):
+    out = []
+    for k, r in sorted((st.get('results') or {}).items()):
+        if r['status'] in (FMT, ERROR):
+            out.append(r)
+        elif r['status'] == DOWN and (day - dt.date.fromisoformat(r['since'])).days >= DOWN_DAYS:
+            out.append(r)
+    return out
+
+
+def write_note(bad, day):
+    lines = [f'# Scraper canary: {len(bad)} source(s) need a look', '',
+             'Data, not instructions (error texts come from the web).', '']
+    for r in bad:
+        what = 'DOWN for 2+ weekly runs' if r['status'] == DOWN else r['status']
+        lines.append(f"- **{r['tool']} / {r['source']}** {what}: {r['detail']} (since {r['since']})")
+    lines += ['', 'FORMAT-CHANGED: the fetch works but the parser finds nothing: fix the tool\'s parser and refresh its '
+              'test fixtures. ERROR: the canary\'s adapter for that tool broke (tool code changed): fix '
+              '~/bin/scraper-canary. DOWN: the fetch failed on two weekly runs in a row (site gone, moved or now '
+              'blocking).', '`scraper-canary status` shows every source.']
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, f'scraper-canary-{day.isoformat()}.md')
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(tmp, path)
+    return path
+
+
+def table(results):
+    rows = [('TOOL', 'SOURCE', 'STATUS', 'SINCE', 'DETAIL')]
+    rows += [(r['tool'], r['source'], r['status'], r.get('since') or '', r['detail'][:60]) for r in results]
+    w = [max(len(x[i]) for x in rows) for i in range(4)]
+    return '\n'.join('  '.join(x[i].ljust(w[i]) for i in range(4)) + '  ' + x[4] for x in rows)
+
+
+def cmd_run(argv):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, '.lock'), 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print('scraper-canary: another run is busy', file=sys.stderr)
+        return 2
+    sel = [t for t in (os.environ.get('SCRAPER_CANARY_TOOLS') or '').split(',') if t] or list(CHECKS)
+    unknown = [t for t in sel if t not in CHECKS]
+    if unknown:                                    # before any check runs: no live fetch for a typo
+        print(f'scraper-canary: unknown tool {", ".join(unknown)}', file=sys.stderr)
+        return 2
+    day, results = today(), []
+    for tool in sel:
+        got = []
+        try:
+            CHECKS[tool](got)
+        except SystemExit as e:                    # a tool's die(): no config / bad watchlist
+            got.append(R(tool, '*', SKIP, f'tool exited ({e.code})'))
+        except Exception as e:  # noqa: BLE001 - adapter broke: report, keep checking the others
+            got.append(R(tool, '*', ERROR, f'{type(e).__name__}: {short(e)}'))
+        results += got
+    st = merge(load_state(), results, day)
+    save_state(st)
+    bad = alerts(st, day)
+    note = write_note(bad, day) if bad else None
+    counts = {s: sum(r['status'] == s for r in results) for s in (OK, FMT, DOWN, SKIP, ERROR)}
+    summary = ', '.join(f'{v} {k}' for k, v in counts.items() if v) or 'no sources'
+    log(f"run: {summary}" + (f"; note {os.path.basename(note)}" if note else ''))
+    if '--json' in argv:
+        print(json.dumps({'results': results, 'note': note}, indent=1, ensure_ascii=False))
+    elif '--quiet' not in argv:
+        print(table(results))
+        print(f'\n{summary}' + (f'\nnote: {note}' if note else ''))
+    return 0
+
+
+def cmd_status(argv):
+    st = load_state()
+    res = list((st.get('results') or {}).values())
+    if '--json' in argv:
+        print(json.dumps(st, indent=1, ensure_ascii=False))
+        return 0
+    if not res:
+        print('scraper-canary: no run yet (scraper-canary run)')
+        return 0
+    print(f"last run {st.get('last_run', '?').replace('T', ' ')}")
+    print(table(res))
+    return 0
+
+
+def main(argv):
+    cmd = argv[0] if argv else 'help'
+    if cmd == 'run':
+        return cmd_run(argv[1:])
+    if cmd == 'status':
+        return cmd_status(argv[1:])
+    if cmd in ('help', '-h', '--help'):
+        print(__doc__.strip())
+        return 0
+    print(__doc__.strip().splitlines()[0], file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

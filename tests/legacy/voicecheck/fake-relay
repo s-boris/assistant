@@ -1,0 +1,9 @@
+#!/bin/sh
+# Fake voice-relay for voicecheck tests: answers from files in $VC_FAKE; logs argv to calls.log.
+echo "$*" >> "$VC_FAKE/calls.log"
+f() { [ -f "$VC_FAKE/$1" ] && cat "$VC_FAKE/$1"; }
+case "$1" in
+  status) [ -f "$VC_FAKE/relay-down" ] && { echo "relay down" >&2; exit 2; }; f status.json ;;
+  fastlane) f fastlane.json ;;
+  *) exit 2 ;;
+esac

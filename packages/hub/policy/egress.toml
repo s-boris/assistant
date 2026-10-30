@@ -1,0 +1,163 @@
+# The hub egress injector's bindings (read by app/hubpolicy_egress.py). PROTECTED: this file ships
+# as app/policy/egress.toml (hubverify: app/policy/*), so any change, a new path or a mode flip included, loads only
+# after the owner's ✅ on the protected digest. hubkit.release carries it only with EGRESS_IN_RELEASE.
+#
+# One binding per handle: the brain writes "hub:secret:<handle>" into one of the binding's slots and the hub swaps in
+# the value of `secret` (a file in the hub's secrets folder; `field` = a dotted JSON field of it) only toward
+# `endpoint`. No host or address lives here:
+#   "@endpoints:NAME"  a line of the owner-pasted egress.endpoints file in the hub's secrets folder
+#   "@field:DOTTED"    a URL inside the binding's own secret file
+#   a literal URL      docker names of the hub stack and the vault only
+# Rules list what the brain's tools call (seeded from their code; audit mode logs every miss as would_deny, the call
+# still goes out). Path patterns: "*" = within one segment, "**" = anything. `query` = the values a parameter may take
+# when it is present.
+# Enforce, per binding, after the audit log shows no unexpected would_deny for a normal week. Media deletions are never in a rule: a DELETE of a movie, series or file stays denied.
+
+version = 1
+
+[defaults]
+mode = "audit"
+timeout = 30
+max_response = 8388608
+
+# Home Assistant REST (the `ha` CLI and the ha.* tools). Its WebSocket API does not fit an HTTP injector (runbook).
+[bindings.ha]
+secret = "ha_token"
+endpoint = "@endpoints:ha"
+inject = [{ in = "header", name = "Authorization", format = "Bearer {}" }]
+rules = [
+  { methods = ["GET"], paths = ["/api/", "/api/config", "/api/states", "/api/states/*", "/api/services",
+    "/api/history/period", "/api/history/period/**", "/api/logbook", "/api/logbook/**", "/api/config/script/config/*"] },
+  { methods = ["POST"], paths = ["/api/services/*/*", "/api/template"] },
+]
+
+# The media stack: one key file (media.json: {service: {url, key}}), one binding per service.
+[bindings.radarr]
+secret = "media.json"
+field = "radarr.key"
+endpoint = "@field:radarr.url"
+inject = [{ in = "header", name = "X-Api-Key" }]
+# GET /api/v3/movie (the whole library, no server-side paging; ~14 MiB for ~2400 movies) is read up to 32 MiB and
+# answered in JSON-array pages of at most max_response (core.egress joins them); every other answer stays <= 8 MiB.
+max_upstream = 33554432
+rules = [
+  { methods = ["GET"], paths = ["/api/v3/**"] },
+  { methods = ["POST"], paths = ["/api/v3/command", "/api/v3/movie", "/api/v3/release", "/api/v3/parse",
+    "/api/v3/manualimport", "/api/v3/history/failed/*"] },
+  { methods = ["PUT"], paths = ["/api/v3/movie/*", "/api/v3/movie/editor"] },
+  { methods = ["DELETE"], paths = ["/api/v3/queue/*"] },
+]
+
+[bindings.sonarr]
+secret = "media.json"
+field = "sonarr.key"
+endpoint = "@field:sonarr.url"
+inject = [{ in = "header", name = "X-Api-Key" }]
+rules = [
+  { methods = ["GET"], paths = ["/api/v3/**"] },
+  { methods = ["POST"], paths = ["/api/v3/command", "/api/v3/series", "/api/v3/release", "/api/v3/parse",
+    "/api/v3/manualimport", "/api/v3/history/failed/*"] },
+  { methods = ["PUT"], paths = ["/api/v3/series/*", "/api/v3/episode/monitor", "/api/v3/episode/*"] },
+  { methods = ["DELETE"], paths = ["/api/v3/queue/*"] },
+]
+
+[bindings.seerr]
+secret = "media.json"
+field = "seerr.key"
+endpoint = "@field:seerr.url"
+inject = [{ in = "header", name = "X-Api-Key" }]
+rules = [
+  { methods = ["GET"], paths = ["/api/v1/**"] },
+  { methods = ["POST"], paths = ["/api/v1/request", "/api/v1/request/*/*"] },
+]
+
+[bindings.emby]
+secret = "media.json"
+field = "emby.key"
+endpoint = "@field:emby.url"
+inject = [{ in = "header", name = "X-Emby-Token" }, { in = "query", name = "api_key" }]
+rules = [
+  { methods = ["GET"], paths = ["/**"] },
+  { methods = ["POST"], paths = ["/Sessions/**", "/emby/Sessions/**"] },
+]
+
+[bindings.bazarr]
+secret = "media.json"
+field = "bazarr.key"
+endpoint = "@field:bazarr.url"
+inject = [{ in = "header", name = "X-API-KEY" }, { in = "query", name = "apikey" }]
+rules = [
+  { methods = ["GET"], paths = ["/api/**"] },
+]
+
+[bindings.sabnzbd]
+secret = "media.json"
+field = "sabnzbd.key"
+endpoint = "@field:sabnzbd.url"
+inject = [{ in = "query", name = "apikey" }]
+
+[[bindings.sabnzbd.rules]]
+methods = ["GET"]
+paths = ["/api", "/sabnzbd/api"]
+query = { mode = ["queue", "history", "version", "fullstatus", "server_stats", "warnings", "status"] }
+
+[bindings.tracearr]
+secret = "tracearr_key"
+endpoint = "@endpoints:tracearr"
+inject = [{ in = "header", name = "Authorization", format = "Bearer {}" }]
+rules = [
+  { methods = ["GET"], paths = ["/api/v2/public/**"] },
+]
+
+# The privacy vault's client token: the vault applies its own policy behind it (his ✅ for text, raw files, fill
+# sessions, secret rotation and deploys). The routes of the `vault` CLI (and the cron jobs on it: vault-events,
+# plans-watch, ...) and of securefill (/fill/**). Long answers (an LLM queue, a release poll) wait at most `timeout`
+# here: longer ones go as jobs (POST /jobs, GET /jobs/{id}).
+[bindings.vault]
+secret = "vault_token"
+endpoint = "http://claude-vault:8300"
+inject = [{ in = "header", name = "Authorization", format = "Bearer {}" }]
+timeout = 120
+rules = [
+  { methods = ["GET"], paths = ["/health", "/status", "/metrics", "/audit", "/alerts", "/events", "/events/rules",
+    "/inbox", "/index/status", "/jobs", "/jobs/*", "/people", "/raw/pending", "/secrets", "/deploy/status",
+    "/plans", "/gmail/**", "/tg/**", "/ha/**", "/paperless/meta", "/finance/status", "/finance/rules",
+    "/firefly/status", "/fill/fields"] },
+  { methods = ["POST"], paths = ["/answer", "/find", "/llm/run", "/jobs", "/jobs/*/cancel", "/alerts/ack",
+    "/events/retriage", "/events/rules", "/inbox/digest", "/index/rebuild", "/raw/request", "/raw/release",
+    "/media/**", "/paperless/**", "/people/**", "/gmail/**", "/tg/**", "/ha/**", "/plans", "/plans/**",
+    "/finance/check", "/finance/rules", "/firefly/merchants", "/firefly/summary", "/secrets/*", "/deploy/request",
+    "/fill/**"] },
+]
+
+# The gym tail domain (Open Training API). Reads: `gym sync`. Writes: `gym plan push` (one routine named and marked
+# by the tool; its PlanWriter refuses an id it did not create or find under that routine, the hub can't check ids).
+[bindings.gym]
+secret = "gym_token"
+endpoint = "@endpoints:gym"
+inject = [{ in = "header", name = "Authorization", format = "Bearer {}" }]
+timeout = 60
+rules = [
+  { methods = ["GET"], paths = ["/api/v2/**"] },
+  { methods = ["POST"], paths = ["/api/v2/user/routines", "/api/v2/routines/*/days", "/api/v2/days/*/day_exercises"] },
+  { methods = ["PATCH", "DELETE"], paths = ["/api/v2/routines/*", "/api/v2/days/*", "/api/v2/day_exercises/*"] },
+]
+
+# The phone CLI's token for the phone gateway's internal API (claude-hub-phone).
+[bindings.phone]
+secret = "phone_cli_token"
+endpoint = "http://claude-hub-phone:8796"
+inject = [{ in = "header", name = "Authorization", format = "Bearer {}" }]
+rules = [
+  { methods = ["GET"], paths = ["/**"] },
+  { methods = ["POST"], paths = ["/**"] },
+]
+
+# The dashboard's login gate probe (flowd probe).
+[bindings.dash]
+secret = "dash_basicauth"
+endpoint = "@endpoints:dash"
+inject = [{ in = "basic" }]
+rules = [
+  { methods = ["GET"], paths = ["/live/health"] },
+]

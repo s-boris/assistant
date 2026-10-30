@@ -1,0 +1,1789 @@
+#!/usr/local/bin/python3.13 -I
+"""traces: per-turn and per-subagent traces of my Claude Code session: latency, model, tokens, API-equivalent cost,
+tool calls by tool, errors (tool errors, hook blocks), what triggered the turn, outcome. Token-free, local only.
+
+  traces ingest [--since-days 14] [--quiet]   (cron */5) incremental: main transcripts by byte offset, subagent
+                                    transcripts (+ .meta.json) when they change; .jsonl -> .jsonl.gz moves are followed
+  traces report [--days 3] [--json]           daily totals, cost by trigger, top cost drivers, slowest turns, owner
+                                    reply latency, error rates, agents by cost, API latency per model
+  traces brief [--hours 24]                   the /traces answer (<= 8 lines)
+  traces agents [--since "YYYY-MM-DD[ HH:MM]"] [--until ...] [--top 20] [--json]   subagent runs by cost
+  traces dash-json [--days 7]                 the dashboard block (numbers, categories, agent titles; no message text)
+  traces crosscheck [--days 3]                daily totals next to ccusage's (npx ccusage, pinned) and Claude Code's
+                                    own cost from OTel when present
+  traces otel serve|up|status|env [--port 4318]   local OTLP/HTTP-JSON receiver for Claude Code's native telemetry
+                                    (127.0.0.1 only; keeps whitelisted numeric/category attributes, never prompt or
+                                    tool text); `env` prints the variables that switch a session's export on. It also
+                                    forwards spans to Phoenix (below); `otel status` shows the forwarder
+  traces phoenix status [--hours 24] [--json]   Phoenix (the hub's trace store): health, retention, traces, the
+                                    forwarder's counters, attribute keys kept out, owner turns with a joined trace
+  traces phoenix trace ID|last [--limit 80] [--json]   one trace as a span tree (names, durations, tools, models,
+                                    gateway codes; never content)
+  traces phoenix slow [--hours 24] [--top 8] [--json]   slowest traces with their slowest tools
+  traces phoenix joined [--days 1] [--json]   owner turns (traces.db) with a Claude Code trace in Phoenix, gateway
+                                    calls inside those traces
+
+Phoenix forwarding: the receiver passes every span batch through core.otlp's allowlist (ids, names, times, status
+codes, numbers, token-shaped categories; never prompts, responses, tool input/output, paths, commands, error or
+status messages, span events, user/account ids) and posts protobuf to $TRACES_PHOENIX_URL (default the hub's
+claude-hub-phoenix:6006, project "brain"; ~/.config/traces/phoenix.json {"url", "project"} overrides). Counters and
+the kept-out key names: ~/.local/state/traces/phoenix.json. Rollback: touch ~/.config/traces/phoenix-off (no
+restart); traces.db stays the fallback for every report.
+
+What is stored (~/.local/state/traces/traces.db, 0600): ids, timestamps, model, effort, token counts, cost, tool names
+with counts, error categories (e.g. Bash:exit_code, Bash:hook:vault-guard), trigger kind (owner / heartbeat / inbox /
+agent / system), the owner channel and start kind (text, tap, voice_note, ...), outcome, and the Agent tool's short
+description for subagent runs. Never message text, tool input or tool output.
+Turn = Claude Code's turnPosition.turnIndex (prompts that join a running turn stay in it) up to its turn_duration
+record. Cost = list price per API call (llm_prices: cache writes 5 min/1 h, fast mode, Haiku long-prompt tier),
+counted once per message id. Agents inherit the trigger of the turn that launched them (nested: the parent's).
+Env (tests): TRACES_PROJECT, TRACES_STATE_DIR, TRACES_NOW (epoch or "YYYY-MM-DD HH:MM" local), TRACES_CCUSAGE,
+TRACES_CONFIG_DIR, TRACES_PHOENIX_URL, TRACES_PHOENIX_PROJECT, TRACES_GATEWAY_DB.
+"""
+import argparse, fcntl, gzip, json, os, re, signal, socket, sqlite3, statistics, subprocess, sys, time
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser('~')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+if os.environ.get('ASSISTANT_LIB'):  # a dir holding core/ (tests, a repo checkout)
+    sys.path.insert(0, os.environ['ASSISTANT_LIB'])
+import llm_prices  # noqa: E402
+try:
+    import assistant_profile  # noqa: E402
+    TZ = assistant_profile.tz()
+except Exception:  # pragma: no cover
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo('UTC')
+
+PROJECT = os.environ.get('TRACES_PROJECT') or os.path.join(HOME, '.claude/projects/-home-node-workspace')
+STATE_DIR = os.environ.get('TRACES_STATE_DIR') or os.path.join(HOME, '.local/state/traces')
+DB = os.path.join(STATE_DIR, 'traces.db')
+LOCK = os.path.join(STATE_DIR, 'ingest.lock')
+CCUSAGE = os.environ.get('TRACES_CCUSAGE') or 'ccusage@20.0.37'
+OTEL_PORT = 4318
+SCHEMA_V = 1
+RUNNING_MIN = 15          # an agent transcript that grew within this many minutes counts as running
+KEEP_CALLS_DAYS = 30
+AGENT_ID_RE = re.compile(r'^a[0-9a-f]{16}$')
+TAG_RE = re.compile(r'<channel\s([^>]*)>(.*?)(?:</channel>|$)', re.S)
+ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+NOTES_RE = re.compile(r'(\d+) new note')
+TID_RE = re.compile(r'<task-id>([A-Za-z0-9_-]+)</task-id>')
+TUID_RE = re.compile(r'<tool-use-id>([A-Za-z0-9_-]+)</tool-use-id>')
+STATUS_RE = re.compile(r'<status>([a-z_]+)</status>')
+NUSAGE_RE = {k: re.compile(r'<%s>(\d+)</%s>' % (k, k)) for k in ('subagent_tokens', 'total_tokens', 'tool_uses',
+                                                                    'duration_ms')}
+SEND_TOOLS = {'telegram.reply', 'telegram.send_poll', 'telegram.send_location',
+              # the hub's MCP senders, as SEND_BASH's CLIs (voice-reply, voice-relay call, phone chat|push)
+              'hub.voice_reply', 'hub.voice_call', 'hub.phone_chat', 'hub.phone_push'}
+REACT_TOOLS = {'telegram.react'}
+SEND_BASH = re.compile(r'(?<![\w./-])(voice-reply|voice-say|voice-relay\s+call|phone\s+(?:chat|push|ring)|tg-soft|tg)'
+                       r'(?=\s)')
+FINAL_STOPS = {'end_turn', 'stop_sequence', 'refusal'}
+ERR_RULES = [
+    ('hook', re.compile(r'^\s*(?:PreToolUse|PostToolUse|UserPromptSubmit|Stop|SubagentStop)[:\w]* hook error:\s*'
+                        r'([A-Za-z][\w.-]*)')),
+    ('hook:other', re.compile(r'\bhook\b.{0,40}\b(?:blocked|error)', re.I)),
+    ('interrupted', re.compile(r'^\s*\[(?:Tool call|Request) interrupted')),
+    ('agent_limit', re.compile(r'Concurrent subagent limit')),
+    ('edit_mismatch', re.compile(r'String to replace not found|Found \d+ matches of the string', re.I)),
+    ('invalid_input', re.compile(r'InputValidationError|Invalid tool parameters|validation error', re.I)),
+    ('stale_read', re.compile(r'(?:has been modified since|must Read the file|read it first)', re.I)),
+    ('timeout', re.compile(r'timed out|timeout', re.I)),
+    ('exit_code', re.compile(r'^\s*Exit code \d+')),
+    ('not_found', re.compile(r'does not exist|No such file|ENOENT|not found', re.I)),
+    ('denied', re.compile(r'permission|denied|not allowed|refused', re.I)),
+]
+TURN_COLS = ('id', 'session', 'turn_index', 'start_ts', 'end_ts', 'dur_ms', 'trigger', 'channel', 'start_kind',
+             'prompts', 'model', 'effort', 'api_calls', 'api_ms', 'api_max_ms', 'input', 'output', 'cache_read',
+             'cache_w5', 'cache_w1h', 'cost', 'tools', 'tool_counts', 'errors', 'error_counts', 'hook_blocks',
+             'agents_launched', 'first_reply_ms', 'outcome', 'is_open')
+AGENT_COLS = ('id', 'session', 'parent', 'depth', 'tool_use_id', 'description', 'agent_type', 'effort', 'model',
+              'start_ts', 'end_ts', 'dur_ms', 'api_calls', 'api_ms', 'api_max_ms', 'input', 'output', 'cache_read',
+              'cache_w5', 'cache_w1h', 'cost', 'tools', 'tool_counts', 'errors', 'error_counts', 'hook_blocks',
+              'agents_launched', 'last_kind', 'file_status', 'mtime', 'path')
+
+
+# ------------------------------------------------------------------------------------------------- basics
+def now_ts():
+    v = os.environ.get('TRACES_NOW')
+    if not v:
+        return time.time()
+    try:
+        return float(v)
+    except ValueError:
+        return parse_when(v)
+
+
+def parse_when(v):
+    """'YYYY-MM-DD HH:MM' (also with a T) or a bare 'YYYY-MM-DD' (= 00:00), local time -> epoch. A bare date
+    crashed `traces agents --since` with ValueError until 29.10."""
+    v = str(v).strip().replace('T', ' ')
+    for f in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(v, f).replace(tzinfo=TZ).timestamp()
+        except ValueError:
+            pass
+    raise SystemExit("traces: bad time %r (want 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD')" % v)
+
+
+def iso_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s).replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return None
+
+
+def local(ts, fmt='%d.%m %H:%M'):
+    return datetime.fromtimestamp(ts, TZ).strftime(fmt) if ts else '?'
+
+
+def fmt_ms(ms):
+    if ms is None:
+        return '?'
+    s = ms / 1000
+    if s < 90:
+        return '%d s' % round(s)
+    if s < 5400:
+        return '%.1f min' % (s / 60) if s < 600 else '%d min' % round(s / 60)
+    return '%.1f h' % (s / 3600)
+
+
+def usd(x):
+    x = x or 0
+    return '$%.2f' % x if x < 10 else '$%s' % format(round(x), ',')
+
+
+def tok(n):
+    n = n or 0
+    if n >= 1e9:
+        return '%.2fB' % (n / 1e9)
+    if n >= 1e6:
+        return '%.1fM' % (n / 1e6)
+    if n >= 1e3:
+        return '%.0fk' % (n / 1e3)
+    return str(int(n))
+
+
+def pct(vals, p):
+    vals = sorted(v for v in vals if v is not None)
+    if not vals:
+        return None
+    k = (len(vals) - 1) * p / 100
+    lo, hi = int(k), min(int(k) + 1, len(vals) - 1)
+    return vals[lo] + (vals[hi] - vals[lo]) * (k - lo)
+
+
+def short_tool(name):
+    name = str(name or '?')
+    if name.startswith('mcp__'):
+        parts = name.split('__')
+        server, tool = (parts[1] if len(parts) > 2 else 'mcp').lower(), parts[-1]
+        if 'telegram' in server:
+            server = 'telegram'
+        elif server.startswith('claude_ai_'):
+            server = server[len('claude_ai_'):].replace('google_calendar', 'calendar').replace('claude_docs', 'docs')
+        if server == 'browser' and tool.startswith('browser_'):
+            tool = tool[len('browser_'):]
+        return ('%s.%s' % (server, tool))[:48]
+    return name[:48]
+
+
+def err_category(text):
+    t = (text or '')[:600]
+    for cat, rx in ERR_RULES:
+        m = rx.search(t)
+        if m:
+            if cat == 'hook':
+                return 'hook:' + m.group(1).lower()[:24]
+            return cat
+    return 'other'
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict) and b.get('type') == 'text':
+                out.append(b.get('text') or '')
+        return '\n'.join(out)
+    return ''
+
+
+def bounded(d, keep=400):
+    if len(d) > keep * 2:
+        for k in list(d)[:len(d) - keep]:
+            del d[k]
+
+
+def log_usage(feature, **kw):
+    try:
+        import usage
+        usage.log(feature, **kw)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------------------------------------- store
+def connect(path=None, ro=False):
+    path = path or DB
+    if ro:
+        con = sqlite3.connect('file:%s?mode=ro' % path, uri=True, timeout=10)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        new = not os.path.exists(path)
+        con = sqlite3.connect(path, timeout=30)
+        if new:
+            os.chmod(path, 0o600)
+        con.execute('PRAGMA journal_mode=WAL')
+        init(con)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init(con):
+    con.executescript('''
+    CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS files(key TEXT PRIMARY KEY, kind TEXT, path TEXT, size INTEGER, mtime REAL,
+        offset INTEGER, state TEXT);
+    CREATE TABLE IF NOT EXISTS turns(id TEXT PRIMARY KEY, session TEXT, turn_index INTEGER, start_ts REAL, end_ts REAL,
+        dur_ms INTEGER, trigger TEXT, channel TEXT, start_kind TEXT, prompts INTEGER, model TEXT, effort TEXT,
+        api_calls INTEGER, api_ms INTEGER, api_max_ms INTEGER, input INTEGER, output INTEGER, cache_read INTEGER,
+        cache_w5 INTEGER, cache_w1h INTEGER, cost REAL, tools INTEGER, tool_counts TEXT, errors INTEGER,
+        error_counts TEXT, hook_blocks INTEGER, agents_launched INTEGER, first_reply_ms INTEGER, outcome TEXT,
+        is_open INTEGER);
+    CREATE INDEX IF NOT EXISTS turns_ts ON turns(start_ts);
+    CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY, session TEXT, parent TEXT, depth INTEGER, tool_use_id TEXT,
+        description TEXT, agent_type TEXT, effort TEXT, model TEXT, start_ts REAL, end_ts REAL, dur_ms INTEGER,
+        api_calls INTEGER, api_ms INTEGER, api_max_ms INTEGER, input INTEGER, output INTEGER, cache_read INTEGER,
+        cache_w5 INTEGER, cache_w1h INTEGER, cost REAL, tools INTEGER, tool_counts TEXT, errors INTEGER,
+        error_counts TEXT, hook_blocks INTEGER, agents_launched INTEGER, last_kind TEXT, file_status TEXT,
+        mtime REAL, path TEXT);
+    CREATE INDEX IF NOT EXISTS agents_ts ON agents(start_ts);
+    CREATE TABLE IF NOT EXISTS launches(tool_use_id TEXT PRIMARY KEY, turn_id TEXT, agent_parent TEXT, ts REAL);
+    CREATE TABLE IF NOT EXISTS notifs(task_id TEXT, tool_use_id TEXT, ts REAL, status TEXT, kind TEXT, tokens INTEGER,
+        tool_uses INTEGER, ms INTEGER, PRIMARY KEY(task_id, ts));
+    CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, ts REAL, scope TEXT, ref TEXT, model TEXT, ms INTEGER,
+        tokens INTEGER, cost REAL, stop TEXT);
+    CREATE INDEX IF NOT EXISTS calls_ts ON calls(ts);
+    CREATE TABLE IF NOT EXISTS otel(ts REAL, kind TEXT, name TEXT, session TEXT, prompt_id TEXT, agent_id TEXT,
+        agent_name TEXT, model TEXT, tool TEXT, ok INTEGER, ms INTEGER, ttft_ms INTEGER, cost REAL, input INTEGER,
+        output INTEGER, cache_read INTEGER, cache_write INTEGER, query_source TEXT, err TEXT);
+    CREATE INDEX IF NOT EXISTS otel_ts ON otel(ts);
+    ''')
+    con.execute("INSERT OR IGNORE INTO meta VALUES('schema', ?)", (str(SCHEMA_V),))
+    con.commit()
+
+
+# ------------------------------------------------------------------------------------------------- accumulators
+def new_acc(**kw):
+    a = dict(start_ts=None, end_ts=None, models={}, effort=None, api_calls=0, api_ms=0, api_max_ms=0, input=0,
+             output=0, cache_read=0, cache_w5=0, cache_w1h=0, cost=0.0, tools=0, tool_counts={}, errors=0,
+             error_counts={}, hook_blocks=0, agents_launched=0, sent_ts=None, reacted=False, interrupted=False,
+             api_errors=0, last_kind=None)
+    a.update(kw)
+    return a
+
+
+class Parser:
+    """Shared record handling. kind 'main' segments turns; kind 'agent' accumulates one run."""
+
+    def __init__(self, con, kind, key, state):
+        self.con, self.kind, self.key = con, kind, key
+        st = state or {}
+        self.seen = st.get('seen') or {}          # message id -> [req_ts, ms]
+        self.reqs = st.get('reqs') or {}          # api-request uuid -> ts
+        self.tools = st.get('tools') or {}        # tool_use id -> short tool name
+        self.acc = st.get('acc')                  # main: the open turn (or None); agent: the run
+        self.session = st.get('session')
+        if kind == 'agent' and self.acc is None:
+            self.acc = new_acc()
+        self.closed = []                          # main: finished turns this pass
+
+    def state(self):
+        for d in (self.seen, self.reqs, self.tools):
+            bounded(d)
+        return {'seen': self.seen, 'reqs': self.reqs, 'tools': self.tools, 'acc': self.acc, 'session': self.session}
+
+    # -- turns (main only)
+    def open_turn(self, d, ts, trig):
+        if self.acc is not None:
+            self.close_turn(None, None)          # no turn_duration: ends at its last activity, not at this prompt
+        tp = d.get('turnPosition') if isinstance(d.get('turnPosition'), dict) else {}
+        trigger, channel, start_kind = trig
+        self.acc = new_acc(id='%s:%s' % ((d.get('sessionId') or self.key)[:8], (d.get('uuid') or str(ts))[:13]),
+                           session=d.get('sessionId') or self.key, turn_index=tp.get('turnIndex'), start_ts=ts,
+                           trigger=trigger, channel=channel, start_kind=start_kind, prompts=1)
+
+    def close_turn(self, dur_ms, ts):
+        a = self.acc
+        if a is None:
+            return
+        a['end_ts'] = ts if ts else a.get('end_ts') or a['start_ts']
+        # span from the first prompt to the turn_duration record (or the last activity): Claude Code's own durationMs
+        # counts from when a queued notification was created, hours too long for agent-completion turns
+        a['dur_ms'] = int(((a['end_ts'] or a['start_ts']) - a['start_ts']) * 1000) if a['start_ts'] else None
+        a['cc_dur_ms'] = dur_ms
+        a['closed_by'] = 'turn_duration' if dur_ms is not None else 'next_prompt'
+        self.closed.append(a)
+        self.acc = None
+
+    def ensure_turn(self, d, ts):
+        if self.kind == 'main' and self.acc is None:
+            self.open_turn(d, ts, ('system', None, 'untracked'))
+
+    # -- records
+    def feed(self, d):
+        t = d.get('type')
+        ts = iso_ts(d.get('timestamp'))
+        if self.session is None and d.get('sessionId'):
+            self.session = d.get('sessionId')
+        if t == 'api-request':
+            if d.get('id') and ts:
+                self.reqs[d['id']] = ts
+            return
+        if t == 'attachment':
+            s = json.dumps(d.get('attachment'), ensure_ascii=False)
+            if '<task-notification>' in s:
+                self.record_notification(s.replace('\\n', '\n'), ts)
+            return
+        if t == 'assistant':
+            if self.kind == 'main' and d.get('isSidechain'):
+                return
+            self.on_assistant(d, ts)
+        elif t == 'user':
+            if self.kind == 'main' and d.get('isSidechain'):
+                return
+            self.on_user(d, ts)
+        elif t == 'system':
+            st = d.get('subtype')
+            if self.kind == 'main' and st == 'turn_duration':
+                if self.acc is not None:
+                    self.close_turn(d.get('durationMs'), ts)
+            elif st == 'api_error' and self.acc is not None:
+                self.acc['api_errors'] += 1
+                self.add_err('api', 'api_error')
+            elif st == 'stop_hook_summary' and self.acc is not None and d.get('hookErrors'):
+                self.add_err('Stop', 'hook_error', len(d.get('hookErrors') or []))
+
+    def touch(self, ts):
+        a = self.acc
+        if a is not None and ts:
+            if a['start_ts'] is None:
+                a['start_ts'] = ts
+            a['end_ts'] = max(a['end_ts'] or ts, ts)
+
+    def add_err(self, tool, cat, n=1):
+        a = self.acc
+        k = '%s:%s' % (tool, cat)
+        a['errors'] += n
+        a['error_counts'][k] = a['error_counts'].get(k, 0) + n
+        if cat.startswith('hook:'):
+            a['hook_blocks'] += n
+
+    def on_assistant(self, d, ts):
+        m = d.get('message') or {}
+        self.ensure_turn(d, ts)
+        a = self.acc
+        self.touch(ts)
+        model = m.get('model') or ''
+        mid = m.get('id') or d.get('requestId') or d.get('uuid')
+        u = m.get('usage')
+        content = m.get('content') if isinstance(m.get('content'), list) else []
+        if model == '<synthetic>':
+            if text_of(content).lstrip().startswith('API Error'):
+                a['api_errors'] += 1
+                self.add_err('api', 'api_error')
+        elif u and mid:
+            # blocks of one message repeat its usage; early blocks carry partial counts (stop_reason None), the last
+            # one the final usage: count the message once and grow it to its largest usage (delta, so a message split
+            # across two ingest passes stays right)
+            req_ts = self.reqs.get(d.get('requestRef') or '')
+            ms = int((ts - req_ts) * 1000) if (req_ts and ts and ts >= req_ts) else None
+            usd_, t = llm_prices.usage_cost(model, u)
+            prev = self.seen.get(mid)
+            if prev is None:
+                a['api_calls'] += 1
+                a['models'][model] = a['models'].get(model, 0) + 1
+                old_t, old_usd, old_ms = {}, 0.0, None
+            else:
+                old_ms = prev[1]
+                old_t, old_usd = (prev[2] if len(prev) > 2 else {}), (prev[3] if len(prev) > 3 else 0.0)
+            grow = sum(t.values()) > sum(old_t.values()) if old_t else True
+            if grow:
+                for k, v in t.items():
+                    a[k] += v - old_t.get(k, 0)
+                a['cost'] += usd_ - old_usd
+            else:
+                t, usd_ = old_t, old_usd
+            if ms is not None and (old_ms is None or ms > old_ms):
+                a['api_ms'] += ms - (old_ms or 0)
+                a['api_max_ms'] = max(a['api_max_ms'], ms)
+            else:
+                ms = old_ms
+            if d.get('effort'):
+                a['effort'] = d.get('effort')
+            self.seen[mid] = [req_ts, ms, t, usd_]
+            self.con.execute('INSERT OR REPLACE INTO calls VALUES(?,?,?,?,?,?,?,?,?)',
+                             (mid, ts, self.kind, a.get('id') or self.key, model, ms, sum(t.values()), usd_,
+                              m.get('stop_reason')))
+        has_tool = False
+        for b in content:
+            if not isinstance(b, dict) or b.get('type') != 'tool_use':
+                continue
+            has_tool = True
+            name = short_tool(b.get('name'))
+            if b.get('id'):
+                self.tools[b['id']] = name
+            a['tools'] += 1
+            a['tool_counts'][name] = a['tool_counts'].get(name, 0) + 1
+            inp = b.get('input') if isinstance(b.get('input'), dict) else {}
+            if name in ('Agent', 'Task'):
+                a['agents_launched'] += 1
+                self.con.execute('INSERT OR REPLACE INTO launches VALUES(?,?,?,?)',
+                                 (b.get('id'), a.get('id') if self.kind == 'main' else None,
+                                  self.key if self.kind == 'agent' else None, ts))
+            if name in SEND_TOOLS or (name == 'Bash' and SEND_BASH.search(str(inp.get('command') or '')[:4000])):
+                if a['sent_ts'] is None:
+                    a['sent_ts'] = ts
+            elif name in REACT_TOOLS:
+                a['reacted'] = True
+        if model != '<synthetic>':
+            a['last_kind'] = 'tool_use' if has_tool else ('final' if m.get('stop_reason') in FINAL_STOPS else
+                                                          'assistant')
+
+    def on_user(self, d, ts):
+        m = d.get('message') or {}
+        c = m.get('content')
+        results = [b for b in c if isinstance(b, dict) and b.get('type') == 'tool_result'] if isinstance(c, list) else []
+        if results:
+            self.ensure_turn(d, ts)
+            self.touch(ts)
+            for b in results:
+                if b.get('is_error'):
+                    tool = self.tools.get(b.get('tool_use_id') or '', '?')
+                    self.add_err(tool, err_category(text_of(b.get('content')) if not isinstance(b.get('content'), str)
+                                                    else b.get('content')))
+            self.acc['last_kind'] = 'tool_result'
+            return
+        text = text_of(c)
+        if text.lstrip().startswith('[Request interrupted'):
+            self.ensure_turn(d, ts)
+            self.acc['interrupted'] = True
+            self.acc['last_kind'] = 'interrupted'
+            self.touch(ts)
+            return
+        if self.kind == 'agent':
+            self.touch(ts)
+            if self.acc['last_kind'] is None:
+                self.acc['last_kind'] = 'user'
+            return
+        if d.get('isCompactSummary') or text.lstrip().startswith('This session is being continued'):
+            self.ensure_turn(d, ts)
+            self.touch(ts)
+            return
+        o = d.get('origin')
+        kind_o = o.get('kind') if isinstance(o, dict) else None
+        tp = d.get('turnPosition') if isinstance(d.get('turnPosition'), dict) else None
+        is_prompt = bool(tp) or kind_o in ('channel', 'human', 'task-notification', 'plugin') or \
+            d.get('promptSource') in ('typed', 'system') or '[heartbeat]' in text[:200]
+        if kind_o == 'task-notification' or '<task-notification>' in text[:300]:
+            self.record_notification(text, ts)
+        if not is_prompt or (d.get('isMeta') and kind_o not in ('channel',) and not tp):
+            self.touch(ts)
+            return
+        trig = classify_prompt(d, text)
+        a = self.acc
+        same = a is not None and tp is not None and a.get('turn_index') is not None and \
+            tp.get('turnIndex') == a.get('turn_index')
+        if same:
+            a['prompts'] = (a.get('prompts') or 1) + 1
+            self.touch(ts)
+        else:
+            self.open_turn(d, ts, trig)
+            self.touch(ts)
+
+    def record_notification(self, text, ts):
+        tid = TID_RE.search(text)
+        if not tid:
+            return
+        st = STATUS_RE.search(text)
+        nums = {}
+        for k, rx in NUSAGE_RE.items():
+            mm = rx.search(text)
+            nums[k] = int(mm.group(1)) if mm else None
+        tu = TUID_RE.search(text)
+        kind = 'agent' if AGENT_ID_RE.match(tid.group(1)) else 'shell'
+        self.con.execute('INSERT OR REPLACE INTO notifs VALUES(?,?,?,?,?,?,?,?)',
+                         (tid.group(1), tu.group(1) if tu else None, ts, st.group(1) if st else None, kind,
+                          nums['subagent_tokens'] or nums['total_tokens'], nums['tool_uses'], nums['duration_ms']))
+
+
+def classify_prompt(d, text):
+    """(trigger, channel, start_kind) of a prompt record: structure only, the text itself is never kept."""
+    o = d.get('origin')
+    k = o.get('kind') if isinstance(o, dict) else None
+    to = d.get('turnOrigin')
+    head = text.lstrip()[:600]
+    if '[heartbeat]' in head[:300] or k == 'plugin' or to == 'system' and 'heartbeat' in head[:120]:
+        if 'Just restarted' in head:
+            return 'system', None, 'restart'
+        m = NOTES_RE.search(head)
+        return ('inbox', None, 'notes') if (m and int(m.group(1)) > 0) else ('heartbeat', None, 'idle')
+    if k == 'task-notification' or to == 'task_notification' or '<task-notification>' in head[:300]:
+        tid, st = TID_RE.search(text), STATUS_RE.search(text)
+        kind = 'agent' if (tid and AGENT_ID_RE.match(tid.group(1))) else 'shell'
+        return 'agent', kind, '%s_%s' % (kind, st.group(1) if st else 'note')
+    if k == 'channel' or '<channel source=' in head[:300]:
+        m = TAG_RE.search(text[:4000])
+        attrs = dict(ATTR_RE.findall(m.group(1))) if m else {}
+        body = (m.group(2) if m else '').lstrip()
+        via = attrs.get('via')
+        ch = 'voice' if via == 'voice' else 'app' if via == 'app' else 'telegram'
+        et = attrs.get('event_type')
+        if et:
+            sk = {'button': 'tap', 'reaction': 'reaction', 'poll_answer': 'poll', 'stop': 'stop'}.get(et, et[:16])
+        elif attrs.get('handled') or body.startswith('/'):
+            sk = 'command'
+        elif ch in ('voice', 'app'):
+            sk = 'voice_call' if ch == 'voice' else 'app_chat'
+        elif attrs.get('transcript'):
+            sk = 'voice_note'
+        elif attrs.get('image_path'):
+            sk = 'photo'
+        elif attrs.get('attachment_file_id') or attrs.get('attachment_kind'):
+            sk = 'file'
+        else:
+            sk = 'text'
+        return 'owner', ch, sk
+    if k == 'human' or to == 'human' or d.get('promptSource') == 'typed':
+        return 'owner', 'terminal', 'text'
+    if to == 'peer':
+        return 'owner', 'remote', 'text'
+    return 'system', None, 'other'
+
+
+# ------------------------------------------------------------------------------------------------- ingest
+def iter_lines(path, offset):
+    """(line bytes, end offset) for complete lines from offset; a partial last line is left for the next pass."""
+    if path.endswith('.gz'):
+        with gzip.open(path, 'rb') as f:
+            pos = 0
+            for line in f:
+                pos += len(line)
+                if line.endswith(b'\n'):
+                    yield line, pos
+        return
+    with open(path, 'rb') as f:
+        f.seek(offset)
+        pos = offset
+        for line in f:
+            if not line.endswith(b'\n'):
+                return
+            pos += len(line)
+            yield line, pos
+
+
+SKIP_TYPES = (b'"api-request-blob"', b'"file-history-snapshot"', b'"file-history-delta"')
+WANT = (b'"assistant"', b'"user"', b'"system"', b'"api-request"', b'<task-notification>')
+
+
+def parse_file(con, kind, key, path, offset, state):
+    p = Parser(con, kind, key, state)
+    end = offset
+    for line, pos in iter_lines(path, offset):
+        end = pos
+        head = line[:400]
+        if any(s in head for s in SKIP_TYPES) or not any(w in line for w in WANT):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            p.feed(d)
+    return p, end
+
+
+def turn_row(a, is_open):
+    models = a.get('models') or {}
+    model = max(models, key=models.get) if models else None
+    if is_open:
+        outcome = 'running'
+    elif a.get('interrupted'):
+        outcome = 'interrupted'
+    elif a.get('sent_ts'):
+        outcome = 'replied'
+    elif a.get('reacted'):
+        outcome = 'reacted'
+    elif a.get('agents_launched'):
+        outcome = 'delegated'
+    elif a.get('api_errors') and not a.get('tools'):
+        outcome = 'api_error'
+    elif not a.get('api_calls'):
+        outcome = 'empty'
+    else:
+        outcome = 'silent'
+    first = int((a['sent_ts'] - a['start_ts']) * 1000) if (a.get('sent_ts') and a.get('start_ts')) else None
+    dur = a.get('dur_ms')
+    if is_open and a.get('start_ts'):
+        dur = int(((a.get('end_ts') or a['start_ts']) - a['start_ts']) * 1000)
+    return dict(id=a['id'], session=a.get('session'), turn_index=a.get('turn_index'), start_ts=a.get('start_ts'),
+                end_ts=a.get('end_ts'), dur_ms=dur, trigger=a.get('trigger'), channel=a.get('channel'),
+                start_kind=a.get('start_kind'), prompts=a.get('prompts') or 1, model=model, effort=a.get('effort'),
+                api_calls=a['api_calls'], api_ms=a['api_ms'], api_max_ms=a['api_max_ms'], input=a['input'],
+                output=a['output'], cache_read=a['cache_read'], cache_w5=a['cache_w5'], cache_w1h=a['cache_w1h'],
+                cost=round(a['cost'], 6), tools=a['tools'], tool_counts=json.dumps(a['tool_counts'], sort_keys=True),
+                errors=a['errors'], error_counts=json.dumps(a['error_counts'], sort_keys=True),
+                hook_blocks=a['hook_blocks'], agents_launched=a['agents_launched'], first_reply_ms=first,
+                outcome=outcome, is_open=1 if is_open else 0)
+
+
+def upsert(con, table, cols, row):
+    con.execute('INSERT OR REPLACE INTO %s(%s) VALUES(%s)' % (table, ','.join(cols), ','.join('?' * len(cols))),
+                [row.get(c) for c in cols])
+
+
+def ingest_main(con, path, quiet):
+    key = 'main:' + os.path.basename(path)[:-6]
+    try:
+        stt = os.stat(path)
+    except OSError:
+        return 0
+    r = con.execute('SELECT * FROM files WHERE key=?', (key,)).fetchone()
+    offset, state = 0, None
+    if r and r['size'] is not None and stt.st_size >= r['offset']:
+        offset, state = r['offset'], json.loads(r['state'] or 'null')
+        if stt.st_size == r['size'] and stt.st_mtime == r['mtime']:
+            return 0
+    p, end = parse_file(con, 'main', os.path.basename(path)[:-6], path, offset, state)
+    for a in p.closed:
+        upsert(con, 'turns', TURN_COLS, turn_row(a, False))
+    if p.acc is not None:
+        upsert(con, 'turns', TURN_COLS, turn_row(p.acc, True))
+    con.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)',
+                (key, 'main', path, stt.st_size, stt.st_mtime, end, json.dumps(p.state(), separators=(',', ':'))))
+    con.commit()
+    return len(p.closed)
+
+
+def agent_meta(path):
+    base = re.sub(r'\.jsonl(\.gz)?$', '', path)
+    try:
+        with open(base + '.meta.json') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def ingest_agent(con, path, now, since_ts):
+    aid = re.sub(r'\.jsonl(\.gz)?$', '', os.path.basename(path))[len('agent-'):]
+    key = 'agent:' + aid
+    try:
+        stt = os.stat(path)
+    except OSError:
+        return 0
+    r = con.execute('SELECT * FROM files WHERE key=?', (key,)).fetchone()
+    if r is None and stt.st_mtime < since_ts:
+        return 0
+    offset, state = 0, None
+    if r is not None:
+        if r['path'] == path and r['size'] == stt.st_size and r['mtime'] == stt.st_mtime:
+            return 0
+        if r['path'] != path:
+            st0 = json.loads(r['state'] or 'null') or {}
+            if (st0.get('acc') or {}).get('last_kind') == 'final' and path.endswith('.gz'):
+                con.execute('UPDATE files SET path=?, size=?, mtime=? WHERE key=?', (path, stt.st_size, stt.st_mtime,
+                                                                                     key))
+                con.execute('UPDATE agents SET path=? WHERE id=?', (path, aid))
+                con.commit()
+                return 0
+        elif not path.endswith('.gz') and stt.st_size >= (r['offset'] or 0):
+            offset, state = r['offset'], json.loads(r['state'] or 'null')
+    if offset == 0:
+        con.execute('DELETE FROM calls WHERE scope="agent" AND ref=?', (aid,))
+    p, end = parse_file(con, 'agent', aid, path, offset, state)
+    a = p.acc
+    meta = agent_meta(path)
+    models = a.get('models') or {}
+    running = (now - stt.st_mtime) < RUNNING_MIN * 60 and a.get('last_kind') != 'final'
+    session = os.path.basename(os.path.dirname(os.path.dirname(path)))
+    row = dict(id=aid, session=session, parent=meta.get('parentAgentId') or '', depth=meta.get('spawnDepth') or 1,
+               tool_use_id=meta.get('toolUseId'), description=str(meta.get('description') or '')[:80],
+               agent_type=str(meta.get('agentType') or '')[:40], effort=meta.get('effort') or a.get('effort'),
+               model=(max(models, key=models.get) if models else meta.get('model')), start_ts=a.get('start_ts'),
+               end_ts=a.get('end_ts'),
+               dur_ms=int((a['end_ts'] - a['start_ts']) * 1000) if a.get('end_ts') and a.get('start_ts') else None,
+               api_calls=a['api_calls'], api_ms=a['api_ms'], api_max_ms=a['api_max_ms'], input=a['input'],
+               output=a['output'], cache_read=a['cache_read'], cache_w5=a['cache_w5'], cache_w1h=a['cache_w1h'],
+               cost=round(a['cost'], 6), tools=a['tools'], tool_counts=json.dumps(a['tool_counts'], sort_keys=True),
+               errors=a['errors'], error_counts=json.dumps(a['error_counts'], sort_keys=True),
+               hook_blocks=a['hook_blocks'], agents_launched=a['agents_launched'], last_kind=a.get('last_kind'),
+               file_status='running' if running else ('final' if a.get('last_kind') == 'final' else
+                                                      'interrupted' if a.get('interrupted') else 'quiet'),
+               mtime=stt.st_mtime, path=path)
+    upsert(con, 'agents', AGENT_COLS, row)
+    con.execute('INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)',
+                (key, 'agent', path, stt.st_size, stt.st_mtime, end, json.dumps(p.state(), separators=(',', ':'))))
+    con.commit()
+    return 1
+
+
+def cmd_ingest(args):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lf = open(LOCK, 'w')
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    t0 = time.time()
+    now = now_ts()
+    con = connect()
+    since_ts = now - args.since_days * 86400
+    turns = agents = 0
+    try:
+        names = sorted(os.listdir(PROJECT))
+    except OSError:
+        names = []
+    for n in names:
+        p = os.path.join(PROJECT, n)
+        if n.endswith('.jsonl') and os.path.isfile(p):
+            try:
+                if os.path.getmtime(p) >= since_ts or con.execute('SELECT 1 FROM files WHERE key=?',
+                                                                  ('main:' + n[:-6],)).fetchone():
+                    turns += ingest_main(con, p, args.quiet)
+            except OSError:
+                pass
+        sub = os.path.join(p, 'subagents')
+        if os.path.isdir(sub):
+            try:
+                files = os.listdir(sub)
+            except OSError:
+                files = []
+            for fn in files:
+                if fn.startswith('agent-') and (fn.endswith('.jsonl') or fn.endswith('.jsonl.gz')):
+                    if fn.endswith('.gz') and fn[:-3] in files:
+                        continue
+                    agents += ingest_agent(con, os.path.join(sub, fn), now, since_ts)
+    con.execute('DELETE FROM calls WHERE ts < ?', (now - KEEP_CALLS_DAYS * 86400,))
+    con.execute("INSERT OR REPLACE INTO meta VALUES('last_ingest', ?)", (str(now),))
+    con.commit()
+    if not args.quiet:
+        print('traces: %d turns closed, %d agent files read in %.1f s' % (turns, agents, time.time() - t0))
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------- queries
+def open_ro():
+    if not os.path.exists(DB):
+        print('traces: no data yet (run `traces ingest`)', file=sys.stderr)
+        sys.exit(2)
+    return connect(ro=True)
+
+
+def agent_rows(con, t0, t1):
+    """Agent runs overlapping [t0, t1) with status (notification beats file state) and inherited trigger."""
+    rows = [dict(r) for r in con.execute('SELECT * FROM agents WHERE COALESCE(end_ts, start_ts) >= ? AND '
+                                          'start_ts < ?', (t0, t1))]
+    notes = {}
+    for r in con.execute('SELECT task_id, status, tokens, tool_uses, ms, ts FROM notifs WHERE kind="agent" '
+                         'ORDER BY ts'):
+        notes[r['task_id']] = dict(r)
+    launches = {r['tool_use_id']: dict(r) for r in con.execute('SELECT * FROM launches')}
+    trig = {}
+    for r in rows:
+        n = notes.get(r['id'])
+        st = {'completed': 'done', 'failed': 'failed', 'killed': 'killed', 'stopped': 'stopped'}.get(
+            (n or {}).get('status')) if n else None
+        if st and n and r.get('end_ts') and r['end_ts'] > (n.get('ts') or 0) + 60 and r['file_status'] == 'running':
+            st = None           # resumed after its notification
+        r['status'] = st or {'final': 'done', 'running': 'running', 'interrupted': 'interrupted'}.get(
+            r['file_status'], 'stalled')
+        r['notif_tokens'] = (n or {}).get('tokens')
+        L = launches.get(r.get('tool_use_id') or '')
+        r['turn_id'] = (L or {}).get('turn_id')
+        r['parent_agent'] = r.get('parent') or (L or {}).get('agent_parent')
+    by_id = {r['id']: r for r in rows}
+    turn_trig = {}
+    ids = [r['turn_id'] for r in rows if r.get('turn_id')]
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for t in con.execute('SELECT id, trigger, start_kind FROM turns WHERE id IN (%s)' % ','.join('?' * len(chunk)),
+                             chunk):
+            turn_trig[t['id']] = (t['trigger'], t['start_kind'])
+
+    def trigger_of(r, depth=0):
+        if r['id'] in trig:
+            return trig[r['id']]
+        res = turn_trig.get(r.get('turn_id') or '')
+        if not res and r.get('parent_agent') and depth < 5:
+            par = by_id.get(r['parent_agent'])
+            if par is None:
+                pr = con.execute('SELECT * FROM agents WHERE id=?', (r['parent_agent'],)).fetchone()
+                par = dict(pr) if pr else None
+                if par is not None:
+                    L = launches.get(par.get('tool_use_id') or '')
+                    par['turn_id'] = (L or {}).get('turn_id')
+                    par['parent_agent'] = par.get('parent') or (L or {}).get('agent_parent')
+            if par is not None:
+                res = trigger_of(par, depth + 1)
+        trig[r['id']] = res or ('unknown', None)
+        return trig[r['id']]
+    for r in rows:
+        r['trigger'], r['trigger_kind'] = trigger_of(r)
+    return rows
+
+
+def window(days=None, hours=None):
+    t1 = now_ts()
+    return t1 - (hours * 3600 if hours else days * 86400), t1
+
+
+def turns_in(con, t0, t1):
+    return [dict(r) for r in con.execute('SELECT * FROM turns WHERE start_ts >= ? AND start_ts < ? ORDER BY start_ts',
+                                         (t0, t1))]
+
+
+def merge_counts(rows, field):
+    out = {}
+    for r in rows:
+        for k, v in json.loads(r.get(field) or '{}').items():
+            out[k] = out.get(k, 0) + v
+    return out
+
+
+BAD_AGENT = ('failed', 'killed', 'stopped', 'interrupted', 'stalled')
+
+
+def summarize(con, t0, t1):
+    T = turns_in(con, t0, t1)
+    A = [a for a in agent_rows(con, t0, t1) if (a.get('start_ts') or 0) >= t0]
+    tot_main = sum(t['cost'] or 0 for t in T)
+    tot_agents = sum(a['cost'] or 0 for a in A)
+    by_trig = {}
+    for t in T:
+        b = by_trig.setdefault(t['trigger'] or 'unknown', {'turns': 0, 'main_cost': 0.0, 'agent_cost': 0.0, 'agents': 0})
+        b['turns'] += 1
+        b['main_cost'] += t['cost'] or 0
+    for a in A:
+        b = by_trig.setdefault(a['trigger'] or 'unknown', {'turns': 0, 'main_cost': 0.0, 'agent_cost': 0.0, 'agents': 0})
+        b['agents'] += 1
+        b['agent_cost'] += a['cost'] or 0
+    owner = [t for t in T if t['trigger'] == 'owner' and not t['is_open']]
+    closed = [t for t in T if not t['is_open']]
+    tools = sum(t['tools'] or 0 for t in T) + sum(a['tools'] or 0 for a in A)
+    errors = sum(t['errors'] or 0 for t in T) + sum(a['errors'] or 0 for a in A)
+    errc = merge_counts(T + A, 'error_counts')
+    ended = [a for a in A if a['status'] not in ('running',)]
+    bad = [a for a in ended if a['status'] in BAD_AGENT]
+    daily, replies = {}, {}
+
+    def day_of(ts):   # per local day; errors, tool calls, hook blocks and bad agent ends feed the dashboard's week trend
+        return daily.setdefault(local(ts, '%Y-%m-%d'), {'turns': 0, 'agents': 0, 'main_cost': 0.0, 'agent_cost': 0.0,
+                                                        'tokens': 0, 'tools': 0, 'errors': 0, 'hook_blocks': 0,
+                                                        'agents_bad': 0})
+
+    def count_into(d, r):
+        d['tools'] += r['tools'] or 0
+        d['errors'] += r['errors'] or 0
+        d['hook_blocks'] += sum(v for k, v in json.loads(r.get('error_counts') or '{}').items() if ':hook:' in k)
+
+    for t in T:
+        d = day_of(t['start_ts'])
+        d['turns'] += 1
+        d['main_cost'] += t['cost'] or 0
+        d['tokens'] += sum(t[k] or 0 for k in ('input', 'output', 'cache_read', 'cache_w5', 'cache_w1h'))
+        count_into(d, t)
+        if t['trigger'] == 'owner' and not t['is_open']:
+            replies.setdefault(local(t['start_ts'], '%Y-%m-%d'), []).append(t['first_reply_ms'])
+    for a in A:
+        d = day_of(a['start_ts'])
+        d['agents'] += 1
+        d['agent_cost'] += a['cost'] or 0
+        d['tokens'] += sum(a[k] or 0 for k in ('input', 'output', 'cache_read', 'cache_w5', 'cache_w1h'))
+        count_into(d, a)
+        d['agents_bad'] += a['status'] in BAD_AGENT
+    for k, d in daily.items():
+        ms = [v for v in replies.get(k, []) if v is not None]
+        d.update(replies=len(ms), reply_p50=pct(ms, 50), reply_p95=pct(ms, 95))
+    lat = {}
+    for r in con.execute('SELECT model, ms FROM calls WHERE ts >= ? AND ts < ? AND ms IS NOT NULL', (t0, t1)):
+        lat.setdefault(r['model'], []).append(r['ms'])
+    return dict(
+        t0=t0, t1=t1, turns=T, agents=A, main_cost=tot_main, agent_cost=tot_agents, total_cost=tot_main + tot_agents,
+        by_trigger=by_trig, daily=dict(sorted(daily.items())),
+        owner_first_p50=pct([t['first_reply_ms'] for t in owner], 50),
+        owner_first_p95=pct([t['first_reply_ms'] for t in owner], 95),
+        owner_dur_p50=pct([t['dur_ms'] for t in owner], 50), owner_dur_p95=pct([t['dur_ms'] for t in owner], 95),
+        owner_turns=len(owner), turn_dur_p50=pct([t['dur_ms'] for t in closed], 50),
+        turn_dur_p95=pct([t['dur_ms'] for t in closed], 95),
+        tools=tools, errors=errors, error_rate=(errors / tools if tools else 0.0), error_counts=errc,
+        hook_blocks=sum(v for k, v in errc.items() if ':hook:' in k),
+        agents_ended=len(ended), agents_bad=len(bad),
+        bad_by_status={s: sum(1 for a in bad if a['status'] == s) for s in sorted({a['status'] for a in bad})},
+        latency={m: {'n': len(v), 'p50': pct(v, 50), 'p95': pct(v, 95)} for m, v in lat.items() if m},
+        tool_counts=merge_counts(T + A, 'tool_counts'))
+
+
+def otel_summary(con, t0, t1):
+    try:
+        r = con.execute('SELECT COUNT(*) n, SUM(CASE WHEN name LIKE "%api_request" THEN cost END) cost, '
+                        'MIN(ts) first FROM otel WHERE ts >= ? AND ts < ?', (t0, t1)).fetchone()
+        return dict(r) if r and r['n'] else None
+    except sqlite3.Error:
+        return None
+
+
+# ------------------------------------------------------------------------------------------------- report
+def cmd_report(args):
+    con = open_ro()
+    t0, t1 = window(days=args.days)
+    S = summarize(con, t0, t1)
+    if args.json:
+        out = {k: v for k, v in S.items() if k not in ('turns', 'agents')}
+        out['top_agents'] = [{k: a.get(k) for k in ('id', 'description', 'effort', 'status', 'dur_ms', 'cost', 'trigger',
+                                                    'start_ts', 'tools', 'errors')}
+                             for a in sorted(S['agents'], key=lambda a: -(a['cost'] or 0))[:15]]
+        out['slow_turns'] = [{k: t.get(k) for k in ('id', 'trigger', 'start_kind', 'start_ts', 'dur_ms', 'tools',
+                                                    'api_calls', 'cost', 'outcome')}
+                             for t in sorted(S['turns'], key=lambda t: -(t['dur_ms'] or 0))[:10]]
+        print(json.dumps(out, indent=1, default=str))
+        return 0
+    L = ['Traces %s → %s (API-equivalent list prices; Claude Code helper calls such as compaction and titles are '
+         'not in transcripts)' % (local(t0), local(t1)), '']
+    L.append('Daily totals')
+    L.append('  %-10s %6s %6s %10s %10s %10s %8s' % ('day', 'turns', 'agents', 'main', 'agents', 'total', 'tokens'))
+    for d, v in S['daily'].items():
+        L.append('  %-10s %6d %6d %10s %10s %10s %8s' % (d, v['turns'], v['agents'], usd(v['main_cost']),
+                                                       usd(v['agent_cost']), usd(v['main_cost'] + v['agent_cost']),
+                                                       tok(v['tokens'])))
+    L.append('  total %s · main %s · agents %s (%d runs)' % (usd(S['total_cost']), usd(S['main_cost']),
+                                                           usd(S['agent_cost']), len(S['agents'])))
+    L += ['', 'Cost by trigger (agents count toward the turn that launched them)']
+    for k, v in sorted(S['by_trigger'].items(), key=lambda kv: -(kv[1]['main_cost'] + kv[1]['agent_cost'])):
+        L.append('  %-10s %10s  (%d turns %s · %d agent runs %s)' % (k, usd(v['main_cost'] + v['agent_cost']), v['turns'],
+                                                                     usd(v['main_cost']), v['agents'],
+                                                                     usd(v['agent_cost'])))
+    L += ['', 'Agents by cost']
+    for a in sorted(S['agents'], key=lambda a: -(a['cost'] or 0))[:12]:
+        L.append('  %9s  %-42s %-6s %-11s %8s  %s' % (usd(a['cost']), (a['description'] or a['id'])[:42],
+                                                    (a['effort'] or '')[:6], a['status'], fmt_ms(a['dur_ms']),
+                                                    local(a['start_ts'])))
+    L += ['', 'Top cost turns (main session)']
+    for t in sorted(S['turns'], key=lambda t: -(t['cost'] or 0))[:6]:
+        L.append('  %9s  %s  %-9s %-14s %8s  %3d calls %3d tools  %s' % (
+            usd(t['cost']), local(t['start_ts']), t['trigger'], t['start_kind'] or '', fmt_ms(t['dur_ms']),
+            t['api_calls'], t['tools'], t['outcome']))
+    L += ['', 'Slowest turns']
+    for t in sorted(S['turns'], key=lambda t: -(t['dur_ms'] or 0))[:6]:
+        L.append('  %8s  %s  %-9s %-14s %3d tools  %9s  %s' % (fmt_ms(t['dur_ms']), local(t['start_ts']), t['trigger'],
+                                                             t['start_kind'] or '', t['tools'], usd(t['cost']),
+                                                             t['outcome']))
+    L += ['', 'Latency',
+          '  owner turns %d: first reply p50 %s · p95 %s; turn p50 %s · p95 %s' % (
+              S['owner_turns'], fmt_ms(S['owner_first_p50']), fmt_ms(S['owner_first_p95']),
+              fmt_ms(S['owner_dur_p50']), fmt_ms(S['owner_dur_p95'])),
+          '  all turns: p50 %s · p95 %s' % (fmt_ms(S['turn_dur_p50']), fmt_ms(S['turn_dur_p95']))]
+    for m, v in sorted(S['latency'].items(), key=lambda kv: -kv[1]['n']):
+        L.append('  API %-18s %6d calls  p50 %s  p95 %s' % (m[:18], v['n'], fmt_ms(v['p50']), fmt_ms(v['p95'])))
+    L += ['', 'Errors',
+          '  %d of %d tool calls (%.1f %%) · hook blocks %d · agent runs ended badly %d of %d %s' % (
+              S['errors'], S['tools'], 100 * S['error_rate'], S['hook_blocks'], S['agents_bad'], S['agents_ended'],
+              json.dumps(S['bad_by_status']) if S['bad_by_status'] else '')]
+    for k, v in sorted(S['error_counts'].items(), key=lambda kv: -kv[1])[:10]:
+        L.append('  %5d  %s' % (v, k))
+    o = otel_summary(con, t0, t1)
+    if o:
+        L += ['', 'OTel (Claude Code\'s own numbers since %s): %d events, api cost %s' % (local(o['first']), o['n'],
+                                                                                        usd(o['cost']))]
+    print('\n'.join(L))
+    log_usage('bin.traces', kind='invoke', channel='cli', attrs={'verb': 'report'})
+    return 0
+
+
+def brief_lines(con, hours=24):
+    t0, t1 = window(hours=hours)
+    S = summarize(con, t0, t1)
+    w0, _ = window(days=7)
+    S7 = summarize(con, w0, t1)
+    bt = S['by_trigger']
+    cnt = lambda k: bt.get(k, {}).get('turns', 0)  # noqa: E731
+    top = sorted(S['agents'], key=lambda a: -(a['cost'] or 0))[:2]
+    L = ['📈 Traces · last %d h' % hours,
+         '💵 %s API-equiv · main %s · agents %s (%d runs)' % (usd(S['total_cost']), usd(S['main_cost']),
+                                                              usd(S['agent_cost']), len(S['agents'])),
+         '⏱ Your turns: reply p50 %s · p95 %s (%d turns)' % (fmt_ms(S['owner_first_p50']),
+                                                            fmt_ms(S['owner_first_p95']), S['owner_turns']),
+         '🔁 Turns %d: you %d · heartbeat %d · inbox %d · agents %d' % (len(S['turns']), cnt('owner'), cnt('heartbeat'),
+                                                                      cnt('inbox'), cnt('agent')),
+         '🧰 %s tool calls · %.1f %% errors · %d hook blocks · %d runs failed' % (
+             format(S['tools'], ','), 100 * S['error_rate'], S['hook_blocks'], S['agents_bad'])]
+    if top:
+        L.append('🏆 ' + ' · '.join('%s %s' % ((a['description'] or a['id'])[:28], usd(a['cost'])) for a in top))
+    slow = max(S['turns'], key=lambda t: t['dur_ms'] or 0, default=None)
+    if slow:
+        L.append('🐢 Slowest turn %s (%s, %s)' % (fmt_ms(slow['dur_ms']), slow['trigger'], local(slow['start_ts'],
+                                                                                             '%H:%M')))
+    L.append('📅 7 days: %s · %d agent runs' % (usd(S7['total_cost']), len(S7['agents'])))
+    return L[:8]
+
+
+def cmd_brief(args):
+    con = open_ro()
+    print('\n'.join(brief_lines(con, args.hours)))
+    log_usage('tg.traces' if args.instant else 'bin.traces', kind='invoke', channel='telegram' if args.instant else 'cli',
+              attrs={'verb': 'brief'})
+    return 0
+
+
+def cmd_agents(args):
+    con = open_ro()
+    t1 = now_ts() if not args.until else parse_when(args.until)
+    t0 = parse_when(args.since) if args.since else t1 - 86400
+    A = [a for a in agent_rows(con, t0, t1) if (a.get('start_ts') or 0) >= t0]
+    A.sort(key=lambda a: -(a['cost'] or 0))
+    if args.json:
+        print(json.dumps([{k: a.get(k) for k in ('id', 'description', 'agent_type', 'effort', 'model', 'status',
+                                                 'start_ts', 'end_ts', 'dur_ms', 'cost', 'api_calls', 'tools', 'errors',
+                                                 'notif_tokens', 'trigger', 'trigger_kind', 'parent_agent')}
+                          for a in A[:args.top]],
+                         indent=1))
+        return 0
+    tot = sum(a['cost'] or 0 for a in A)
+    print('%d agent runs %s → %s: %s' % (len(A), local(t0), local(t1), usd(tot)))
+    for a in A[:args.top]:
+        print('  %9s  %-44s %-6s %-11s %8s  %s' % (usd(a['cost']), (a['description'] or a['id'])[:44],
+                                                 (a['effort'] or '')[:6], a['status'], fmt_ms(a['dur_ms']),
+                                                 local(a['start_ts'])))
+    return 0
+
+
+def ms_or_none(v):
+    return None if v is None else round(v)
+
+
+def dash_block(con, days=7):
+    t0, t1 = window(days=days)
+    S = summarize(con, t0, t1)
+    d1, _ = window(hours=24)
+    S1 = summarize(con, d1, t1)
+    agents = sorted(S['agents'], key=lambda a: -(a['cost'] or 0))
+    return {
+        'window_days': days, 'generated': t1,
+        'tiles': {'cost_24h': round(S1['total_cost'], 2), 'cost_7d': round(S['total_cost'], 2),
+                  'owner_reply_p50_ms': S1['owner_first_p50'], 'owner_reply_p95_ms': S1['owner_first_p95'],
+                  'error_rate_24h': round(S1['error_rate'], 4), 'hook_blocks_24h': S1['hook_blocks'],
+                  'agents_24h': len(S1['agents']), 'agents_bad_24h': S1['agents_bad'], 'turns_24h': len(S1['turns'])},
+        'daily': [{'day': d, 'main': round(v['main_cost'], 2), 'agents': round(v['agent_cost'], 2), 'turns': v['turns'],
+                   'runs': v['agents'], 'replies': v['replies'], 'reply_p50_ms': ms_or_none(v['reply_p50']),
+                   'reply_p95_ms': ms_or_none(v['reply_p95']), 'tools': v['tools'], 'errors': v['errors'],
+                   'hook_blocks': v['hook_blocks'], 'agents_bad': v['agents_bad']} for d, v in S['daily'].items()],
+        'by_trigger': [{'trigger': k, 'cost': round(v['main_cost'] + v['agent_cost'], 2), 'turns': v['turns'],
+                        'runs': v['agents']} for k, v in sorted(S['by_trigger'].items(),
+                                                                key=lambda kv: -(kv[1]['main_cost'] + kv[1]['agent_cost']))],
+        'agents': [{'description': a['description'] or a['id'], 'effort': a['effort'], 'status': a['status'],
+                    'dur_ms': a['dur_ms'], 'cost': round(a['cost'] or 0, 2), 'start': local(a['start_ts']),
+                    'trigger': a['trigger']} for a in agents[:10]],
+        'slow': [{'start': local(t['start_ts']), 'trigger': t['trigger'], 'kind': t['start_kind'], 'dur_ms': t['dur_ms'],
+                  'tools': t['tools'], 'cost': round(t['cost'] or 0, 2), 'outcome': t['outcome']}
+                 for t in sorted(S['turns'], key=lambda t: -(t['dur_ms'] or 0))[:6]],
+        'errors': {'tools': S['tools'], 'errors': S['errors'], 'rate': round(S['error_rate'], 4),
+                   'hook_blocks': S['hook_blocks'], 'agents_bad': S['agents_bad'], 'agents_ended': S['agents_ended'],
+                   'top': [[k, v] for k, v in sorted(S['error_counts'].items(), key=lambda kv: -kv[1])[:8]]},
+        'latency': {'owner_reply_p50_ms': S['owner_first_p50'], 'owner_reply_p95_ms': S['owner_first_p95'],
+                    'turn_p50_ms': S['turn_dur_p50'], 'turn_p95_ms': S['turn_dur_p95'],
+                    'api': [{'model': m, 'n': v['n'], 'p50_ms': v['p50'], 'p95_ms': v['p95']}
+                            for m, v in sorted(S['latency'].items(), key=lambda kv: -kv[1]['n'])[:4]]},
+        'otel': otel_summary(con, t0, t1),
+        'prices_checked': llm_prices.PRICES_CHECKED,
+    }
+
+
+def cmd_dash_json(args):
+    con = open_ro()
+    print(json.dumps(dash_block(con, args.days), ensure_ascii=False, separators=(',', ':'), default=str))
+    return 0
+
+
+def cmd_crosscheck(args):
+    con = open_ro()
+    t0, t1 = window(days=args.days)
+    S = summarize(con, t0, t1)
+    since = local(t0, '%Y%m%d')
+    cc = {}
+    try:
+        p = subprocess.run(['npx', '-y', CCUSAGE, 'daily', '--json', '--since', since], capture_output=True,
+                           text=True, timeout=240, cwd=os.path.join(HOME, 'jobs') if os.path.isdir(
+                               os.path.join(HOME, 'jobs')) else HOME)
+        for r in json.loads(p.stdout or '{}').get('daily', []):
+            cc[r.get('date') or r.get('period')] = r.get('totalCost') or 0
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        print('ccusage unavailable: %s' % type(e).__name__)
+    print('%-10s %10s %10s %8s' % ('day', 'traces', 'ccusage', 'diff'))
+    for d, v in S['daily'].items():
+        mine = v['main_cost'] + v['agent_cost']
+        o = cc.get(d)
+        print('%-10s %10s %10s %8s' % (d, usd(mine), usd(o) if o is not None else '-',
+                                       ('%+.0f %%' % (100 * (mine - o) / o)) if o else '-'))
+    print('Differences: traces prices 1-hour cache writes at 2x input (ccusage: the 5-minute 1.25x rate) and reads '
+          'gzipped subagent transcripts, which ccusage skips; days are local and counted by turn/run start.')
+    o = otel_summary(con, t0, t1)
+    if o:
+        print('OTel api_request cost since %s: %s' % (local(o['first']), usd(o['cost'])))
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------- OTel receiver
+OTEL_KEEP = {'event.name', 'session.id', 'prompt.id', 'agent_id', 'agent.name', 'model', 'tool_name',
+             'tool_name_safe', 'success', 'duration_ms', 'ttft_ms', 'cost_usd', 'input_tokens', 'output_tokens',
+             'cache_read_tokens', 'cache_creation_tokens', 'query_source', 'query_source_safe', 'error_type',
+             'error_class', 'status_code', 'interaction.duration_ms'}
+
+
+def _attr_val(v):
+    if not isinstance(v, dict):
+        return v
+    for k in ('stringValue', 'intValue', 'doubleValue', 'boolValue'):
+        if k in v:
+            x = v[k]
+            if k == 'intValue':
+                try:
+                    return int(x)
+                except (TypeError, ValueError):
+                    return None
+            return x
+    return None
+
+
+def _attrs(lst):
+    out = {}
+    for kv in lst or []:
+        if isinstance(kv, dict) and kv.get('key') in OTEL_KEEP:
+            out[kv['key']] = _attr_val(kv.get('value'))
+    return out
+
+
+def _num(x, cast=float):
+    try:
+        return cast(x) if x is not None and x != '' else None
+    except (TypeError, ValueError):
+        return None
+
+
+def otel_rows(path, body):
+    """Rows for the otel table from one OTLP/HTTP-JSON payload (whitelisted attributes only)."""
+    rows = []
+    if path.endswith('/v1/logs'):
+        for rl in body.get('resourceLogs') or []:
+            res = _attrs((rl.get('resource') or {}).get('attributes'))
+            for sl in rl.get('scopeLogs') or []:
+                for lr in sl.get('logRecords') or []:
+                    a = dict(res, **_attrs(lr.get('attributes')))
+                    name = a.get('event.name') or (_attr_val(lr.get('body')) if isinstance(lr.get('body'), dict)
+                                                   else None) or 'log'
+                    ts = (_num(lr.get('timeUnixNano'), int) or _num(lr.get('observedTimeUnixNano'), int) or 0) / 1e9
+                    rows.append(('event', str(name)[:60], ts, a))
+    elif path.endswith('/v1/traces'):
+        for rs in body.get('resourceSpans') or []:
+            res = _attrs((rs.get('resource') or {}).get('attributes'))
+            for ss in rs.get('scopeSpans') or []:
+                for sp in ss.get('spans') or []:
+                    a = dict(res, **_attrs(sp.get('attributes')))
+                    st, en = _num(sp.get('startTimeUnixNano'), int), _num(sp.get('endTimeUnixNano'), int)
+                    if a.get('duration_ms') is None and st and en:
+                        a['duration_ms'] = int((en - st) / 1e6)
+                    rows.append(('span', str(sp.get('name') or 'span')[:60], (st or 0) / 1e9, a))
+    out = []
+    for kind, name, ts, a in rows:
+        ok = a.get('success')
+        out.append((ts or time.time(), kind, name, a.get('session.id'), a.get('prompt.id'), a.get('agent_id'),
+                    a.get('agent.name'), a.get('model'), a.get('tool_name_safe') or a.get('tool_name'),
+                    None if ok is None else (1 if str(ok).lower() == 'true' or ok is True else 0),
+                    _num(a.get('duration_ms') or a.get('interaction.duration_ms'), int), _num(a.get('ttft_ms'), int),
+                    _num(a.get('cost_usd')), _num(a.get('input_tokens'), int), _num(a.get('output_tokens'), int),
+                    _num(a.get('cache_read_tokens'), int), _num(a.get('cache_creation_tokens'), int),
+                    a.get('query_source') or a.get('query_source_safe'),
+                    (str(a.get('error_type') or a.get('error_class') or a.get('status_code') or '') or None)))
+    return out
+
+
+def cmd_otel(args):
+    port = args.port
+    if args.action == 'env':
+        print('\n'.join(['CLAUDE_CODE_ENABLE_TELEMETRY=1', 'OTEL_METRICS_EXPORTER=none', 'OTEL_LOGS_EXPORTER=otlp',
+                         'OTEL_EXPORTER_OTLP_PROTOCOL=http/json',
+                         'OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:%d' % port,
+                         '# optional beta spans (agent_id, ttft per call, tool spans):',
+                         'CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1', 'OTEL_TRACES_EXPORTER=otlp',
+                         '# keep unset: OTEL_LOG_USER_PROMPTS, OTEL_LOG_ASSISTANT_RESPONSES, OTEL_LOG_TOOL_DETAILS, '
+                         'OTEL_LOG_TOOL_CONTENT, OTEL_LOG_RAW_API_BODIES']))
+        return 0
+    if args.action == 'status':
+        up = port_open(port)
+        print('receiver %s on 127.0.0.1:%d' % ('up' if up else 'down', port))
+        f = fwd_state()
+        if f:
+            print('  Phoenix forwarder%s: %d spans in, %d forwarded, %d lost since %s%s (`traces phoenix status`)' % (
+                ' OFF' if os.path.exists(PHOENIX_OFF) else '', f['received'], f['forwarded'], f['lost'],
+                local(f['since']), ', last error %s' % f['last_err'] if f.get('last_err') else ''))
+        if os.path.exists(DB):
+            con = connect(ro=True)
+            t0, t1 = window(hours=24)
+            for r in con.execute('SELECT kind, name, COUNT(*) n, MAX(ts) last FROM otel WHERE ts >= ? GROUP BY kind, '
+                                 'name ORDER BY n DESC LIMIT 12', (t0,)):
+                print('  %-5s %-36s %6d  last %s' % (r['kind'], r['name'], r['n'], local(r['last'])))
+        return 0
+    if args.action == 'up':
+        if port_open(port):
+            return 0
+        os.makedirs(STATE_DIR, exist_ok=True)
+        log = open(os.path.join(STATE_DIR, 'otel.log'), 'a')
+        subprocess.Popen([sys.executable, '-I', os.path.realpath(__file__), 'otel', 'serve', '--port', str(port)],
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True,
+                         env=dict(os.environ))
+        for _ in range(30):
+            if port_open(port):
+                return 0
+            time.sleep(0.1)
+        print('traces otel: receiver did not come up on %d' % port, file=sys.stderr)
+        return 1
+    return serve(port)
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def serve(port):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    con_path = DB
+    connect(con_path).close()
+    otlp = otlp_lib()
+    url, project = phoenix_cfg()
+    fwd = Forwarder(otlp, url, project) if otlp else None
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length') or 0)
+            if n > 20_000_000:
+                self.send_response(413)
+                self.end_headers()
+                return
+            raw = self.rfile.read(n)
+            if 'json' not in (self.headers.get('Content-Type') or ''):
+                self.send_response(415)
+                self.end_headers()
+                return
+            if self.path.endswith('/v1/metrics'):
+                rows = []
+            else:
+                try:
+                    body = json.loads(raw or b'{}')
+                    rows = otel_rows(self.path, body)
+                except ValueError:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                if fwd and self.path.endswith('/v1/traces'):
+                    try:
+                        fwd.offer(body)
+                    except Exception:
+                        pass
+            if rows:
+                try:
+                    c = sqlite3.connect(con_path, timeout=30)
+                    c.executemany('INSERT INTO otel VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
+                    c.execute('DELETE FROM otel WHERE ts < ?', (time.time() - 90 * 86400,))
+                    c.commit()
+                    c.close()
+                except sqlite3.Error:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+            body = b'{}'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(('127.0.0.1', port), H)
+
+    def stop(*a):
+        if fwd:
+            fwd.save(force=True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    srv.serve_forever()
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------- Phoenix
+CONFIG_DIR = os.environ.get('TRACES_CONFIG_DIR') or os.path.join(HOME, '.config/traces')
+PHOENIX_OFF = os.path.join(CONFIG_DIR, 'phoenix-off')
+PHOENIX_STATE = os.path.join(STATE_DIR, 'phoenix.json')
+PHOENIX_DEFAULT = 'http://claude-hub-phoenix:6006'
+PHOENIX_PROJECT = 'brain'
+HEX32 = re.compile(r'^[0-9a-f]{32}$')
+
+
+def phoenix_cfg():
+    """(url, project): $TRACES_PHOENIX_URL / $TRACES_PHOENIX_PROJECT, else ~/.config/traces/phoenix.json
+    {"url", "project"}, else the hub's container name and project "brain"."""
+    cfg = {}
+    try:
+        with open(os.path.join(CONFIG_DIR, 'phoenix.json')) as f:
+            cfg = json.load(f) or {}
+    except (OSError, ValueError):
+        pass
+    url = os.environ.get('TRACES_PHOENIX_URL') or cfg.get('url') or PHOENIX_DEFAULT
+    return url.rstrip('/'), os.environ.get('TRACES_PHOENIX_PROJECT') or cfg.get('project') or PHOENIX_PROJECT
+
+
+def otlp_lib():
+    """core.otlp (the allowlist + protobuf encoder, ~/bin/lib/core); None when it is missing: no forwarding."""
+    try:
+        from core import otlp
+        return otlp
+    except Exception:
+        return None
+
+
+class Forwarder:
+    """Spans from the receiver -> core.otlp.sanitize (allowlist) -> Phoenix's OTLP/HTTP protobuf endpoint, batched
+    in a thread. Never blocks the receiver: a full queue or a Phoenix outage loses spans (counted in phoenix.json);
+    traces.db is unaffected. ~/.config/traces/phoenix-off stops it without a restart (the rollback)."""
+    MAX_KEYS = 400
+
+    def __init__(self, otlp, url, project, state_path=None, off_path=None):
+        import queue
+        import threading
+        self.otlp, self.url, self.project = otlp, url, project
+        self.state_path, self.off_path = state_path or PHOENIX_STATE, off_path or PHOENIX_OFF
+        self.q = queue.Queue(maxsize=500)
+        self.Empty, self.Full = queue.Empty, queue.Full
+        self.lock = threading.Lock()
+        self.st = {'since': time.time(), 'url': url, 'project': project, 'received': 0, 'forwarded': 0, 'lost': 0,
+                   'off': 0, 'posts': 0, 'failures': 0, 'last_ok': None, 'last_err': None, 'last_err_ts': None,
+                   'dropped_keys': {}}
+        self.saved = 0.0
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def offer(self, body):
+        batches, dropped = self.otlp.sanitize(body)
+        n = self.otlp.count(batches)
+        with self.lock:
+            self.st['received'] += n
+            dk = self.st['dropped_keys']
+            for k, v in dropped.items():
+                if k in dk or len(dk) < self.MAX_KEYS:
+                    dk[k] = dk.get(k, 0) + v
+            if os.path.exists(self.off_path):
+                self.st['off'] += n
+                return
+        if n:
+            try:
+                self.q.put_nowait(batches)
+            except self.Full:
+                with self.lock:
+                    self.st['lost'] += n
+
+    def post(self, body):
+        from core import http as corehttp
+        with corehttp.open(self.url + '/v1/traces', data=body, method='POST',
+                           headers={'Content-Type': 'application/x-protobuf'}, timeout=10) as r:
+            r.read()
+
+    def run(self):
+        import urllib.error
+        while True:
+            try:
+                batches = list(self.q.get(timeout=5))
+            except self.Empty:
+                self.save()
+                continue
+            end = time.time() + 1.0
+            while self.otlp.count(batches) < 1000 and time.time() < end:
+                try:
+                    batches += self.q.get(timeout=max(0.05, end - time.time()))
+                except self.Empty:
+                    break
+            n = self.otlp.count(batches)
+            body = self.otlp.encode(batches, {'openinference.project.name': self.project})
+            err = None
+            for wait in (0, 1, 3):
+                time.sleep(wait)
+                try:
+                    self.post(body)
+                    err = None
+                    break
+                except urllib.error.HTTPError as e:
+                    err = 'HTTP %d' % e.code
+                    if e.code < 500 and e.code != 429:
+                        break
+                except Exception as e:
+                    err = type(e).__name__
+            with self.lock:
+                self.st['posts'] += 1
+                if err:
+                    self.st['failures'] += 1
+                    self.st['lost'] += n
+                    self.st['last_err'], self.st['last_err_ts'] = err, time.time()
+                else:
+                    self.st['forwarded'] += n
+                    self.st['last_ok'] = time.time()
+            self.save()
+
+    def save(self, force=False):
+        if not force and time.time() - self.saved < 10:
+            return
+        self.saved = time.time()
+        with self.lock:
+            data = json.dumps(self.st)
+        tmp = self.state_path + '.tmp'
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                f.write(data)
+            os.replace(tmp, self.state_path)
+        except OSError:
+            pass
+
+
+def fwd_state():
+    try:
+        with open(PHOENIX_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def ph_req(path, params=None, body=None, timeout=20):
+    import urllib.parse
+    from core import http as corehttp
+    url, _ = phoenix_cfg()
+    q = urllib.parse.urlencode(params or {}, doseq=True)
+    with corehttp.open(url + path + ('?' + q if q else ''),
+                       data=json.dumps(body).encode() if body is not None else None,
+                       headers={'Content-Type': 'application/json'} if body is not None else None,
+                       timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw) if raw[:1] in (b'{', b'[') else raw.decode('utf-8', 'replace')
+
+
+def ph_iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def ph_ts(s):
+    try:
+        return datetime.fromisoformat(str(s).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def ph_all(path, params, cap=20000):
+    """Every page of a Phoenix list endpoint (cursor), at most `cap` rows."""
+    out, cursor = [], None
+    while len(out) < cap:
+        p = dict(params, limit=1000)
+        if cursor:
+            p['cursor'] = cursor
+        d = ph_req(path, p)
+        out += d.get('data') or []
+        cursor = d.get('next_cursor')
+        if not cursor:
+            break
+    return out
+
+
+def attr(a, key):
+    """A span attribute from Phoenix's JSON, flat ("llm.model_name") or nested ({"llm": {"model_name"}})."""
+    if not isinstance(a, dict):
+        return None
+    if key in a:
+        return a[key]
+    cur = a
+    for part in key.split('.'):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def span_row(s):
+    a = s.get('attributes') or {}
+    st, en = ph_ts(s.get('start_time')), ph_ts(s.get('end_time'))
+    return {'span_id': (s.get('context') or {}).get('span_id'), 'trace_id': (s.get('context') or {}).get('trace_id'),
+            'parent_id': s.get('parent_id'), 'name': s.get('name'), 'kind': s.get('span_kind'),
+            'status': s.get('status_code'), 'start': st, 'ms': int((en - st) * 1000) if st and en else None,
+            'tool': attr(a, 'tool.name') or attr(a, 'tool_name'), 'model': attr(a, 'llm.model_name'),
+            'agent_id': attr(a, 'agent_id'), 'session': attr(a, 'session.id'),
+            'tokens': attr(a, 'llm.token_count.total'), 'gateway_code': attr(a, 'gateway.code'),
+            'surface': attr(a, 'gateway.surface')}
+
+
+def trace_spans(project, tid):
+    return [span_row(s) for s in ph_all('/v1/projects/%s/spans' % project, {'trace_id': [tid], 'sort': 'start_time',
+                                                                             'order': 'asc'}, cap=5000)]
+
+
+def trace_summary(rows):
+    names = {}
+    for r in rows:
+        names[r['name']] = names.get(r['name'], 0) + 1
+    roots = [r for r in rows if not r['parent_id']]
+    root = min(roots, key=lambda r: r['start'] or 0) if roots else (rows[0] if rows else {})
+    starts = [r['start'] for r in rows if r['start']]
+    ends = [r['start'] + r['ms'] / 1000 for r in rows if r['start'] and r['ms'] is not None]
+    tools = sorted([r for r in rows if r['tool'] and r['ms'] is not None], key=lambda r: -r['ms'])[:3]
+    gw = [r for r in rows if (r['name'] or '').startswith('gateway.')]
+    return {'trace_id': root.get('trace_id'), 'root': root.get('name'), 'session': root.get('session'),
+            'start': min(starts) if starts else None,
+            'ms': int((max(ends) - min(starts)) * 1000) if starts and ends else None, 'spans': len(rows),
+            'llm_calls': names.get('claude_code.llm_request', 0), 'tool_calls': names.get('claude_code.tool', 0),
+            'agents': len({r['agent_id'] for r in rows if r['agent_id']}), 'gateway_calls': len(gw),
+            'gateway_errors': sum(1 for r in gw if r['gateway_code'] not in (None, 'ok')),
+            'errors': sum(1 for r in rows if r['status'] == 'ERROR'),
+            'tokens': sum(r['tokens'] or 0 for r in rows),
+            'slowest_tools': [{'tool': r['tool'], 'ms': r['ms']} for r in tools]}
+
+
+def retention(project):
+    q = ('{ projectTraceRetentionPolicies { edges { node { name cronExpression rule { __typename '
+         '... on TraceRetentionRuleMaxDays { maxDays } ... on TraceRetentionRuleMaxCount { maxCount } '
+         '... on TraceRetentionRuleMaxDaysOrCount { maxDays maxCount } } projects { edges { node { name } } } } } } }')
+    d = ph_req('/graphql', body={'query': q})
+    default = None
+    for e in ((d.get('data') or {}).get('projectTraceRetentionPolicies') or {}).get('edges') or []:
+        n = e['node']
+        names = [p['node']['name'] for p in (n.get('projects') or {}).get('edges') or []]
+        r = {'policy': n['name'], 'max_days': (n.get('rule') or {}).get('maxDays'),
+             'max_count': (n.get('rule') or {}).get('maxCount'), 'sweep': n.get('cronExpression')}
+        if project in names:
+            return r
+        if n['name'] == 'Default':
+            default = dict(r, implicit=True)
+    return default
+
+
+def joined(con, project, t0, t1):
+    """Turns of traces.db in [t0, t1) that have a Claude Code trace in Phoenix (an interaction span of the same
+    session starting inside the turn), his and all, and the gateway calls (gateway.db) whose trace id is such a
+    trace. The window starts no earlier than Phoenix's first span (turns before the forwarding cannot be traced)."""
+    first = ph_req('/v1/projects/%s/spans' % project, {'sort': 'start_time', 'order': 'asc', 'limit': 1})
+    first_ts = ph_ts(((first.get('data') or [{}])[0]).get('start_time'))
+    if first_ts:
+        t0 = max(t0, first_ts)
+    turns = [dict(r) for r in con.execute(
+        "SELECT id, session, start_ts, end_ts, trigger FROM turns WHERE start_ts >= ? AND start_ts < ? "
+        "AND (is_open = 0 OR is_open IS NULL)", (t0, t1))]
+    inter = [span_row(s) for s in ph_all('/v1/projects/%s/spans' % project, {
+        'name': ['claude_code.interaction'], 'start_time': ph_iso(t0 - 600), 'end_time': ph_iso(t1 + 600)})]
+    by_sess = {}
+    for r in inter:
+        by_sess.setdefault(r['session'], []).append(r)
+    hit = hit_all = owner = 0
+    for t in turns:
+        end = (t['end_ts'] or t['start_ts'] + 900) + 5
+        m = [r for r in by_sess.get(t['session'], []) if r['start'] and t['start_ts'] - 5 <= r['start'] <= end]
+        owner += t['trigger'] == 'owner'
+        hit += bool(m) and t['trigger'] == 'owner'
+        hit_all += bool(m)
+    gw_total = gw_joined = 0
+    gdb = os.environ.get('TRACES_GATEWAY_DB') or os.path.join(HOME, '.local/state/tools/gateway.db')
+    if os.path.exists(gdb):
+        try:
+            g = sqlite3.connect('file:%s?mode=ro' % gdb, uri=True, timeout=5)
+            calls = [r[0] for r in g.execute('SELECT trace FROM calls WHERE ts >= ? AND ts < ?', (t0, t1))]
+            g.close()
+            cc = {r['trace_id'] for r in inter}  # a trace with any Claude Code span counts (its turn may still run)
+            todo = sorted({c for c in calls if c and c not in cc})
+            for i in range(0, len(todo), 40):
+                cc.update(span_row(s)['trace_id'] for s in ph_all('/v1/projects/%s/spans' % project, {
+                    'trace_id': todo[i:i + 40], 'name': ['claude_code.tool.execution', 'claude_code.llm_request']},
+                    cap=4000))
+            gw_total = len(calls)
+            gw_joined = sum(1 for c in calls if c in cc)
+        except sqlite3.Error:
+            pass
+    return {'owner_turns': owner, 'owner_turns_traced': hit, 'share': round(hit / owner, 3) if owner else None,
+            'turns': len(turns), 'turns_traced': hit_all, 'share_all': round(hit_all / len(turns), 3) if turns else None,
+            'interactions': len(inter), 'gateway_calls': gw_total, 'gateway_calls_in_cc_traces': gw_joined,
+            'since': t0}
+
+
+def cmd_phoenix(args):
+    url, project = phoenix_cfg()
+    as_json = getattr(args, 'json', False)
+    try:
+        if args.action == 'status':
+            out = {'url': url, 'project': project, 'forwarder': fwd_state(), 'off': os.path.exists(PHOENIX_OFF),
+                   'core_otlp': otlp_lib() is not None}
+            out['health'] = str(ph_req('/healthz', timeout=5)).strip()[:20]
+            projs = {p['name']: p['id'] for p in ph_req('/v1/projects').get('data') or []}
+            out['project_exists'] = project in projs
+            out['retention'] = retention(project)
+            if project in projs:
+                t0, t1 = window(hours=args.hours)
+                tr = ph_req('/v1/projects/%s/traces' % project, {'start_time': ph_iso(t0), 'limit': 1000})
+                out['traces'] = len(tr.get('data') or [])
+                out['traces_capped'] = bool(tr.get('next_cursor'))
+                if os.path.exists(DB):
+                    out['joined'] = joined(connect(ro=True), project, t0, t1)
+            if as_json:
+                print(json.dumps(out, indent=1))
+                return 0
+            f = out['forwarder'] or {}
+            L = ['Phoenix %s · project %s · health %s%s' % (url, project, out['health'] or '?',
+                                                             ' · FORWARDER OFF (phoenix-off)' if out['off'] else '')]
+            if f:
+                L.append('forwarder since %s: %d spans in, %d forwarded, %d lost, %d off · %d posts, %d failed%s' % (
+                    local(f['since']), f['received'], f['forwarded'], f['lost'], f['off'], f['posts'], f['failures'],
+                    ' · last error %s %s' % (f['last_err'], local(f['last_err_ts'])) if f.get('last_err') else ''))
+            else:
+                L.append('forwarder: no state yet (receiver not restarted since the Phoenix build?)')
+            r = out['retention'] or {}
+            L.append('retention: %s policy, %s days (sweep "%s")%s' % (
+                r.get('policy', '?'), r.get('max_days', '?'), r.get('sweep', '?'),
+                ' (project not created yet: default applies)' if r.get('implicit') else ''))
+            if 'traces' in out:
+                L.append('traces in %d h: %d%s' % (args.hours, out['traces'], '+' if out['traces_capped'] else ''))
+            j = out.get('joined')
+            if j:
+                L.append('since %s: his turns traced %d of %d%s · all turns %d of %d · gateway calls inside Claude Code '
+                         'traces %d of %d' % (local(j['since']), j['owner_turns_traced'], j['owner_turns'],
+                                              ' (%.0f %%)' % (100 * j['share']) if j['share'] is not None else '',
+                                              j['turns_traced'], j['turns'], j['gateway_calls_in_cc_traces'],
+                                              j['gateway_calls']))
+            dk = sorted((f.get('dropped_keys') or {}).items(), key=lambda kv: -kv[1])
+            if dk:
+                L.append('kept out (attribute keys, never values): ' + ', '.join('%s %d' % kv for kv in dk[:12]))
+            print('\n'.join(L))
+            return 0
+        if args.action == 'trace':
+            tid = (args.id or '').lower()
+            if tid == 'last':
+                t0, t1 = window(hours=args.hours)
+                inter = ph_req('/v1/projects/%s/spans' % project, {'name': ['claude_code.interaction'],
+                                                                   'start_time': ph_iso(t0), 'limit': 1})
+                tid = ((inter.get('data') or [{}])[0].get('context') or {}).get('trace_id') or ''
+            if not HEX32.match(tid):
+                print('traces phoenix trace: give a 32-hex trace id or "last"', file=sys.stderr)
+                return 2
+            rows = trace_spans(project, tid)
+            if not rows:
+                print('traces phoenix trace: no spans for %s' % tid, file=sys.stderr)
+                return 3
+            if as_json:
+                print(json.dumps({'summary': trace_summary(rows), 'spans': rows[:args.limit]}, indent=1))
+                return 0
+            kids = {}
+            for r in rows:
+                kids.setdefault(r['parent_id'], []).append(r)
+            ids = {r['span_id'] for r in rows}
+            L, s = [], trace_summary(rows)
+            L.append('trace %s · %s · %s · %d spans (%d LLM, %d tools, %d gateway, %d agents)' % (
+                tid, local(s['start'] or 0), fmt_ms(s['ms']), s['spans'], s['llm_calls'], s['tool_calls'],
+                s['gateway_calls'], s['agents']))
+
+            def walk(r, depth):
+                if len(L) > args.limit:
+                    return
+                extra = ' '.join(x for x in (r['tool'] or '', r['model'] or '', 'agent %s' % r['agent_id']
+                                             if r['agent_id'] and depth <= 2 else '',
+                                             r['gateway_code'] or '', 'ERROR' if r['status'] == 'ERROR' else '') if x)
+                L.append('%s%-28s %8s  %s' % ('  ' * depth, (r['name'] or '')[:28], fmt_ms(r['ms']), extra))
+                for c in kids.get(r['span_id'], []):
+                    walk(c, depth + 1)
+            for r in [r for r in rows if not r['parent_id'] or r['parent_id'] not in ids]:
+                walk(r, 0)
+            print('\n'.join(L[:args.limit + 1]))
+            return 0
+        if args.action == 'slow':
+            t0, t1 = window(hours=args.hours)
+            tr = ph_req('/v1/projects/%s/traces' % project, {'start_time': ph_iso(t0), 'sort': 'latency_ms',
+                                                             'order': 'desc', 'limit': args.top})
+            out = [trace_summary(trace_spans(project, t['trace_id'])) for t in tr.get('data') or []]
+            if as_json:
+                print(json.dumps(out, indent=1))
+                return 0
+            L = ['Slowest traces in %d h (Phoenix):' % args.hours]
+            for s in out:
+                L.append('  %s %8s  %-24s %4d spans %3d LLM %3d tools %2d gw  %s' % (
+                    local(s['start'] or 0), fmt_ms(s['ms']), (s['root'] or '')[:24], s['spans'], s['llm_calls'],
+                    s['tool_calls'], s['gateway_calls'], s['trace_id']))
+                if s['slowest_tools']:
+                    L.append('      slowest: ' + ', '.join('%s %s' % (x['tool'], fmt_ms(x['ms']))
+                                                         for x in s['slowest_tools']))
+            print('\n'.join(L))
+            return 0
+        if args.action == 'joined':
+            t0, t1 = window(days=args.days)
+            j = joined(open_ro(), project, t0, t1)
+            print(json.dumps(j, indent=1) if as_json else
+                  'since %s: his turns traced %d of %d%s · all turns %d of %d · gateway calls inside Claude Code '
+                  'traces %d of %d' % (local(j['since']), j['owner_turns_traced'], j['owner_turns'],
+                                       ' (%.0f %%)' % (100 * j['share']) if j['share'] is not None else '',
+                                       j['turns_traced'], j['turns'], j['gateway_calls_in_cc_traces'],
+                                       j['gateway_calls']))
+            return 0
+    except (OSError, ValueError, ImportError) as e:
+        print('traces phoenix: Phoenix unreachable or odd answer (%s); traces.db still has everything: '
+              '`traces report`' % type(e).__name__, file=sys.stderr)
+        return 4
+    return 2
+
+
+# ------------------------------------------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='traces', description=__doc__.split('\n')[0])
+    sp = ap.add_subparsers(dest='cmd', required=True)
+    p = sp.add_parser('ingest')
+    p.add_argument('--since-days', type=float, default=14)
+    p.add_argument('--quiet', action='store_true')
+    p = sp.add_parser('report')
+    p.add_argument('--days', type=float, default=3)
+    p.add_argument('--json', action='store_true')
+    p = sp.add_parser('brief')
+    p.add_argument('--hours', type=int, default=24)
+    p.add_argument('--instant', action='store_true', help='called by the /traces instant command (usage logging)')
+    p = sp.add_parser('agents')
+    p.add_argument('--since')
+    p.add_argument('--until')
+    p.add_argument('--top', type=int, default=20)
+    p.add_argument('--json', action='store_true')
+    p = sp.add_parser('dash-json')
+    p.add_argument('--days', type=int, default=7)
+    p = sp.add_parser('crosscheck')
+    p.add_argument('--days', type=float, default=3)
+    p = sp.add_parser('otel')
+    p.add_argument('action', choices=['serve', 'up', 'status', 'env'])
+    p.add_argument('--port', type=int, default=OTEL_PORT)
+    p = sp.add_parser('phoenix')
+    p.add_argument('action', choices=['status', 'trace', 'slow', 'joined'])
+    p.add_argument('id', nargs='?')
+    p.add_argument('--hours', type=int, default=24)
+    p.add_argument('--days', type=float, default=1)
+    p.add_argument('--top', type=int, default=8)
+    p.add_argument('--limit', type=int, default=80)
+    p.add_argument('--json', action='store_true')
+    args = ap.parse_args(argv)
+    return {'ingest': cmd_ingest, 'report': cmd_report, 'brief': cmd_brief, 'agents': cmd_agents,
+            'dash-json': cmd_dash_json, 'crosscheck': cmd_crosscheck, 'otel': cmd_otel,
+            'phoenix': cmd_phoenix}[args.cmd](args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

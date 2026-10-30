@@ -1,0 +1,69 @@
+
+=====UC meta
+now=@NOW@
+host=Homesrv
+=====UC var
+version="7.1.4"
+NAME="Homesrv"
+mdState="STARTED"
+fsState="Started"
+=====UC disks
+["parity"]
+name="parity"
+type="Parity"
+status="DISK_OK"
+fsMountpoint=""
+["disk1"]
+name="disk1"
+type="Data"
+status="DISK_OK"
+fsMountpoint="/mnt/disk1"
+fsType="xfs"
+["disk2"]
+name="disk2"
+type="Data"
+status="DISK_OK"
+fsMountpoint="/mnt/disk2"
+fsType="xfs"
+["disk3"]
+name="disk3"
+type="Data"
+status="DISK_NP_DSBL"
+fsMountpoint="/mnt/disk3"
+fsSize="1000000"
+fsFree="400000"
+fsUsed="600000"
+["cache"]
+name="cache"
+type="Cache"
+status="DISK_OK"
+fsMountpoint="/mnt/cache"
+fsType="btrfs"
+["flash"]
+name="flash"
+type="Flash"
+fsMountpoint="/boot"
+=====UC shares
+["media"]
+name="media"
+allocator="highwater"
+floor="100000000"
+include=""
+exclude=""
+["appdata"]
+name="appdata"
+allocator="highwater"
+floor="0"
+=====UC mounts
+/dev/md1p1 /mnt/disk1 xfs
+/dev/md2p1 /mnt/disk2 xfs
+/dev/nvme0n1p1 /mnt/cache btrfs
+shfs /mnt/user fuse.shfs
+/dev/loop2 /var/lib/docker btrfs
+=====UC df
+Filesystem     Type  1-blocks       Used           Available     Capacity Mounted on
+/dev/md1p1     xfs   18000000000000 12000000000000 6000000000000 67%      /mnt/disk1
+/dev/md2p1     xfs   18000000000000 17000000000000 1000000000000 95%      /mnt/disk2
+/dev/nvme0n1p1 btrfs 1000000000000  400000000000   600000000000  40%      /mnt/cache
+/dev/loop2     btrfs 100000000000   30000000000    70000000000   30%      /var/lib/docker
+=====UC end

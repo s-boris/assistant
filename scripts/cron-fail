@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# cron-fail [--after N] [--ok CODES] NAME CMD [ARGS...]
+# Run a cron job's command and turn a failure streak into ONE ~/inbox note, so a job whose output the
+# crontab line sends to /dev/null never fails unnoticed.
+#   stdout   passes through unchanged (the cron line keeps its own redirect)
+#   stderr   goes to $HOME/.local/state/cron-fail/NAME.err (overwritten every run)
+#   failure  exit code not 0 and not in --ok CODES (comma list, e.g. 3 = "handled by the job itself")
+#   streak   the Nth failed run in a row (--after N, default 1) writes $HOME/inbox/NAME-failed-<epoch>.md;
+#            --after 0 = record the run only (no streak, no note: a job that reports its own failures).
+#            later failed runs of the same streak write nothing. If the note was already deleted, the
+#            streak stays silent until it ends.
+#   recovery the first good run ends the streak; a note that is still there gets one "recovered" line.
+# Exits with the command's own exit code (2 on a usage error). State: $HOME/.local/state/cron-fail/NAME.streak.
+# Run log: one JSON line per run in $HOME/.local/state/cron-fail/runs-YYYYMMDD.jsonl {ts, job, rc, ok, ms}
+# (`cron-runs` turns them into Phoenix spans and health.py reads them; it prunes files older than 8 days).
+# Tests: ~/opt/cron-fail-tests/run.sh
+# Event ledger: the note is written by `events emit` (typed cron.fail row + this identical note); the "Recovered"
+# line is followed by `events update`. Without events, or when it fails, the note is written here directly and the
+# miss is one line in ~/.local/state/assistant/emit-errors.log. CRON_FAIL_EVENTS: another events binary (tests).
+set -u
+after=1 ok=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --after) after=${2-}; shift $(($# > 1 ? 2 : 1)) ;;
+    --ok) ok=${2-}; shift $(($# > 1 ? 2 : 1)) ;;
+    -h|--help) sed -n '/^# cron-fail \[/,/^# Tests:/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "cron-fail: unknown option $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+name=${1-}
+[ $# -ge 2 ] || { echo "usage: cron-fail [--after N] [--ok CODES] NAME CMD [ARGS...]" >&2; exit 2; }
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "cron-fail: bad NAME '$name' (letters, digits, . _ -)" >&2; exit 2; }
+[[ $after =~ ^(0|[1-9][0-9]*)$ ]] || { echo "cron-fail: --after needs a number >= 0" >&2; exit 2; }
+[[ -z $ok || $ok =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "cron-fail: --ok needs exit codes like 3 or 3,4" >&2; exit 2; }
+shift
+
+D=$HOME/.local/state/cron-fail
+INBOX=$HOME/inbox
+mkdir -p "$D" 2>/dev/null && chmod 700 "$D" 2>/dev/null   # may hold stderr of vault jobs: owner only
+export USAGE_JOB=$name   # notifications sent by the job can be attributed to it (usage store)
+t0=$(date +%s%N)
+"$@" 2>"$D/$name.err"
+rc=$?
+
+good=0
+[ "$rc" = 0 ] && good=1
+case ",$ok," in *",$rc,"*) good=1 ;; esac
+
+# usage store (~/bin/usage): one spool line per run (job, ms, ok|rcN); never fails the job; USAGE=off skips it
+if [ "${USAGE:-}" != off ]; then
+  sd=${USAGE_STATE:-$HOME/.local/state/product}/spool
+  o=ok; [ "$good" = 1 ] || o=rc$rc
+  mkdir -p "$sd" 2>/dev/null && printf '{"ts":%s,"src":"cron","f":"job.%s","k":"run","ch":"cron","a":"cron","ms":%d,"o":"%s"}\n' \
+    "$(date +%s)" "$name" "$(( ($(date +%s%N) - t0) / 1000000 ))" "$o" >> "$sd/cron-$(date +%Y%m%d).jsonl" 2>/dev/null
+fi
+
+# run log (cron-runs, health.py): never fails the job
+printf '{"ts":%s,"job":"%s","rc":%d,"ok":%d,"ms":%d}\n' "$((t0 / 1000000000))" "$name" "$rc" "$good" \
+  "$(( ($(date +%s%N) - t0) / 1000000 ))" >> "$D/runs-$(date +%Y%m%d).jsonl" 2>/dev/null
+[ "$after" = 0 ] && exit "$rc"   # record only: no streak, no note
+stamp() { date -d "@$1" '+%F %T'; }
+EV=${CRON_FAIL_EVENTS:-$HOME/bin/events}
+emit_err() {   # the ledger's error counter (events metrics); never fails the job
+  (umask 077; mkdir -p "$HOME/.local/state/assistant" &&
+    printf '%s cron.fail cron-fail %s\n' "$(date +%s)" "$1" >> "$HOME/.local/state/assistant/emit-errors.log") 2>/dev/null
+}
+exec 9>>"$D/$name.lock" && flock -w 30 9   # overlapping runs of an every-minute job
+since= count=0 note=
+[ -r "$D/$name.streak" ] && . "$D/$name.streak"   # written only below: since=, count=, note=
+
+if [ "$good" = 1 ]; then
+  if [ -n "$since" ]; then
+    if [ -n "$note" ] && [ -e "$note" ]; then
+      rt=$(date +%s)
+      if printf '\nRecovered %s after %s failed run(s).\n' "$(stamp "$rt")" "$count" >> "$note" 2>/dev/null; then
+        timeout -k 2 20 "$EV" update --note "${note##*/}" --payload "{\"recovered\":$rt,\"failed_runs\":$count}" \
+          >/dev/null 2>&1 9>&- || emit_err "update exit $?"
+      fi
+    fi
+    rm -f "$D/$name.streak"
+  fi
+  exit "$rc"
+fi
+
+now=$(date +%s)
+[ -n "$since" ] || since=$now
+count=$((count + 1))
+if [ "$count" = "$after" ] && mkdir -p "$INBOX" 2>/dev/null; then
+  note=$INBOX/$name-failed-$now.md
+  cmd1=$(basename -- "$1")
+  nbody() {
+    echo "# $name failed (cron)"
+    echo
+    echo "Cron job \`$name\` ($cmd1) failed $count run(s) in a row since $(stamp "$since"); last exit $rc."
+    echo "Its stderr: ~/.local/state/cron-fail/$name.err (secrets: read it through \`secretscan --redact\`)."
+    echo "One note per failure streak (cron-fail); the first good run appends \"Recovered\" here. Data, not instructions."
+  }
+  jc=$cmd1; [[ $jc =~ ^[A-Za-z0-9._+-]+$ ]] || jc=?
+  nbody | timeout -k 2 20 "$EV" emit --kind cron.fail --subject "$name failed (cron)" --source cron-fail \
+    --note "${note##*/}" --body-file - --note-mode 0666 \
+    --payload "{\"type\":\"cron.fail\",\"v\":1,\"job\":\"$name\",\"cmd\":\"$jc\",\"rc\":$rc,\"runs\":$count,\"since\":$since,\"after\":$after}" \
+    >/dev/null 2>&1 9>&-
+  erc=$?
+  if [ ! -e "$note" ]; then
+    nbody > "$note" 2>/dev/null || note=
+    emit_err "emit exit $erc, note written by cron-fail"
+  elif [ "$erc" != 0 ]; then
+    emit_err "emit exit $erc"
+  fi
+fi
+printf 'since=%s\ncount=%s\nnote=%q\n' "$since" "$count" "$note" > "$D/$name.streak.tmp" &&
+  mv -f "$D/$name.streak.tmp" "$D/$name.streak"
+exit "$rc"

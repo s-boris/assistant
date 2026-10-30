@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""night-log: what I did overnight, as a phone-sized card (token-free).
+
+  night-log [--since "YYYY-MM-DD HH:MM"] [--until "YYYY-MM-DD HH:MM"] [--json] [--max 10]
+        Default window = the last night, 22:00 -> 09:00 home time (before 22:00: last night, cut at now; from
+        22:00: tonight so far). Sources, all my own words: the brain repo's "before X" / "after X" commits
+        (started / finished changes to my setup; auto-snapshots skipped) and the subagents I launched (their short
+        Agent descriptions in the newest session transcript's tail). No message text, no vault output.
+The /night instant command prints it as is; the night-log skill sends it when he asks by text and seeds the
+morning report.
+Env: NIGHTLOG_BRAIN_GIT (~/.brain.git), NIGHTLOG_TRANSCRIPTS (dir of session *.jsonl), NIGHTLOG_NOW (epoch),
+NIGHTLOG_TAIL_MB (48).
+Exit: 0 (an empty night is an answer too), 2 usage.
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser("~")
+GIT = os.environ.get("NIGHTLOG_BRAIN_GIT") or os.path.join(HOME, ".brain.git")
+TX = os.environ.get("NIGHTLOG_TRANSCRIPTS") or os.path.join(HOME, ".claude/projects/-home-node-workspace")
+TAIL = int(float(os.environ.get("NIGHTLOG_TAIL_MB") or 48) * (1 << 20))
+
+
+def now():
+    return float(os.environ.get("NIGHTLOG_NOW") or time.time())
+
+
+def window(t):
+    d = datetime.fromtimestamp(t)
+    if d.hour >= 22:
+        start = d.replace(hour=22, minute=0, second=0, microsecond=0)
+        return start.timestamp(), t
+    start = (d - timedelta(days=1)).replace(hour=22, minute=0, second=0, microsecond=0)
+    end = d.replace(hour=9, minute=0, second=0, microsecond=0)
+    return start.timestamp(), min(t, end.timestamp())
+
+
+def clip(s, n=70):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n - 1].rstrip() + "…"
+
+
+def brain(t0, t1):
+    """[(ts, 'done'|'start', text)] from before/after commits; a 'before X' followed by 'after X' is one done."""
+    try:
+        r = subprocess.run(["git", "--git-dir", GIT, "log", f"--since=@{int(t0)}", f"--until=@{int(t1)}",
+                            "--format=%ct%x09%s"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    rows = []
+    for line in r.stdout.splitlines():
+        ts, _, subj = line.partition("\t")
+        m = re.match(r"^(before|after)\s+(.+)$", subj.strip(), re.I)
+        if m and ts.isdigit():
+            rows.append((float(ts), m.group(1).lower(), m.group(2)))
+    rows.sort()
+    out, done_keys = [], set()
+
+    def key(s):
+        return re.split(r"[\s(:,;]+", s.lower().strip(), maxsplit=2)[:2]
+
+    for ts, kind, what in rows:
+        if kind == "after":
+            out.append((ts, "done", what))
+            done_keys.add(tuple(key(what)))
+    for ts, kind, what in rows:
+        if kind == "before" and tuple(key(what)) not in done_keys:
+            out.append((ts, "start", what))
+    return out
+
+
+def agents(t0, t1):
+    files = sorted(glob.glob(os.path.join(TX, "*.jsonl")), key=lambda p: os.path.getmtime(p))
+    if not files:
+        return []
+    out = []
+    path = files[-1]
+    with open(path, "rb") as f:
+        size = os.path.getsize(path)
+        f.seek(max(0, size - TAIL))
+        data = f.read()
+    for raw in data.split(b"\n"):
+        if b'"name":"Agent"' not in raw:
+            continue
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            continue
+        if e.get("isSidechain"):
+            continue
+        try:
+            ts = datetime.fromisoformat(str(e.get("timestamp")).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if not t0 <= ts <= t1:
+            continue
+        for b in (e.get("message") or {}).get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") == "Agent":
+                desc = (b.get("input") or {}).get("description")
+                if desc:
+                    out.append((ts, "agent", str(desc)))
+    return out
+
+
+def card(items, t0, t1, mx=10):
+    n = {k: sum(1 for i in items if i[1] == k) for k in ("done", "start", "agent")}
+    head = (f"🌙 {datetime.fromtimestamp(t0):%H:%M}–{datetime.fromtimestamp(t1):%H:%M}: "
+            f"{n['done']} finished, {n['start']} started, {n['agent']} helpers")
+    if not items:
+        return [f"🌙 {datetime.fromtimestamp(t0):%H:%M}–{datetime.fromtimestamp(t1):%H:%M}: nothing logged"]
+    pick = sorted(items, key=lambda i: ({"done": 0, "agent": 1, "start": 2}[i[1]], i[0]))[:mx]
+    icon = {"done": "✓", "start": "…", "agent": "▶"}
+    lines = [head] + [f"{datetime.fromtimestamp(ts):%H:%M} {icon[k]} {clip(w)}" for ts, k, w in sorted(pick)]
+    if len(items) > mx:
+        lines.append(f"+{len(items) - mx} more")
+    return lines
+
+
+def _when(s):
+    return datetime.strptime(s, "%Y-%m-%d %H:%M").timestamp()
+
+
+def main(argv):
+    t0, t1 = window(now())
+    mx = 10
+    try:
+        if "--since" in argv:
+            t0 = _when(argv[argv.index("--since") + 1])
+        if "--until" in argv:
+            t1 = _when(argv[argv.index("--until") + 1])
+        if "--max" in argv:
+            mx = max(1, int(argv[argv.index("--max") + 1]))
+    except (IndexError, ValueError):
+        print('usage: night-log [--since "YYYY-MM-DD HH:MM"] [--until ...] [--json] [--max N]', file=sys.stderr)
+        return 2
+    items = sorted(brain(t0, t1) + agents(t0, t1))
+    if "--json" in argv:
+        print(json.dumps({"since": t0, "until": t1, "items": [{"ts": ts, "kind": k, "text": w}
+                                                               for ts, k, w in items]}, ensure_ascii=False))
+    else:
+        print("\n".join(card(items, t0, t1, mx)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

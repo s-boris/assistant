@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""rsync stand-in for hosts without rsync (the CI runner; digest.sh puts it on PATH only then): the one call media's
+digest publish makes to a local folder, `rsync -rlt --delete --timeout=N --chmod=F644,D755 SRC/ DEST/`.
+DEST becomes a copy of SRC (--delete: nothing else stays), files 0644, folders 0755."""
+
+import os
+import shutil
+import sys
+
+args = [a for a in sys.argv[1:] if not a.startswith("-")]
+if len(args) != 2 or ":" in args[1]:
+    sys.exit("rsync stand-in: only SRC/ DEST/ between local folders")
+src, dest = args
+shutil.rmtree(dest, ignore_errors=True)
+shutil.copytree(src, dest, symlinks=True)
+for dp, _dns, fns in os.walk(dest):
+    os.chmod(dp, 0o755)
+    for fn in fns:
+        if not os.path.islink(os.path.join(dp, fn)):
+            os.chmod(os.path.join(dp, fn), 0o644)

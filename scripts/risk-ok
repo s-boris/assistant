@@ -1,0 +1,7 @@
+#!/bin/sh
+# risk-ok: one-time owner-OK codes for commands the risk-check hook blocked, plus check/list/log/revoke.
+#   risk-ok HASH "his OK, quoted + time"   then rerun the exact command as: RISK_OK=<code> <command>
+#   risk-ok check [--no-llm] "COMMAND"     dry run (nothing logged)
+# Logic and docs: ~/.claude/hooks/risk_check.py. Main session only, after his yes on Telegram.
+[ $# -eq 0 ] && set -- help
+exec /usr/bin/python3 -I /home/node/.claude/hooks/risk_check.py "$@"

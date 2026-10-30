@@ -1,0 +1,218 @@
+{
+ "openapi": "3.0.4",
+ "info": {
+  "title": "Radarr",
+  "version": "3.0.0"
+ },
+ "paths": {
+  "/api/v3/movie": {
+   "get": {
+    "parameters": [
+     {
+      "name": "tmdbId",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/movie/{id}": {
+   "get": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/queue": {
+   "get": {
+    "parameters": [
+     {
+      "name": "page",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "pageSize",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "includeMovie",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/queue/{id}": {
+   "delete": {
+    "parameters": [
+     {
+      "name": "removeFromClient",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "blocklist",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "skipRedownload",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/parse": {
+   "get": {
+    "parameters": [
+     {
+      "name": "title",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/release": {
+   "get": {
+    "parameters": [
+     {
+      "name": "movieId",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   },
+   "post": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/command": {
+   "get": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   },
+   "post": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/health": {
+   "get": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  }
+ }
+}

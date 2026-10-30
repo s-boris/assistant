@@ -1,0 +1,151 @@
+#!/usr/local/bin/python3.13 -I
+"""memory2: auto-learned facts + contradiction review on top of FACTS.md and auto-memory (token-free, local only).
+
+  memory2 sync                      mirror FACTS.md + memory files into the store (cron with extract)
+  memory2 extract [--llm] [--cron] [--backfill MB] [--dry-run] [--limit N]
+                                    stage candidates from new owner turns; --llm = normalize + judge with the local
+                                    Qwen3.5-4B (llama-server per batch, nice 19); --dry-run prints, writes nothing
+  memory2 review [--json]           the open queue (auto-accepted, pending, conflict)
+  memory2 accept|reject ID          resolve one item (accept = active in the store; FACTS.md untouched)
+  memory2 promote ID [--section S | --ledger 'verb: thing (details)'] [--text T]
+                                    write it into FACTS.md (one inserted line; existing lines verified intact)
+  memory2 digest [--cron]           short queue summary; --cron: ONE ~/inbox/memory2-review-DATE.md a day when new
+  memory2 search "text" [-k 5] [--json] [--all]   fact retrieval as the hook does it (--all: no relevance floor)
+  memory2 stats [--json]            store, queue, hook latency (p50/p95), embedding server
+  memory2 hook on|off|status|test "text"          kill switch for the UserPromptSubmit hook (file switch)
+  memory2 embedd up|down|status     the shared EmbeddingGemma server on 127.0.0.1:8786 (cron keeps it up)
+State ~/.local/state/memory2 (mem.db, candidates.jsonl, hook.log; 0600). Library ~/bin/lib/memory2.py,
+hook ~/.claude/hooks/memory-recall.sh -> ~/bin/lib/memory2_core.py. Tests ~/opt/assistant/tests/legacy/memory2/run.sh.
+"""
+import argparse
+import io
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import memory2 as m  # noqa: E402
+import memory2_core as core  # noqa: E402
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="memory2", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["sync", "extract", "review", "accept", "reject", "promote", "digest", "search",
+                                    "stats", "hook", "embedd"])
+    ap.add_argument("arg", nargs="?")
+    ap.add_argument("arg2", nargs="?")
+    ap.add_argument("--llm", action="store_true")
+    ap.add_argument("--cron", action="store_true")
+    ap.add_argument("--backfill", type=float, default=0, metavar="MB")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("-k", type=int, default=5)
+    ap.add_argument("--section")
+    ap.add_argument("--ledger")
+    ap.add_argument("--text")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "hook":
+        sub = a.arg or "status"
+        if sub == "off":
+            os.makedirs(core.CONF, mode=0o700, exist_ok=True)
+            open(core.OFF_FILE, "w").close()
+            print("memory2 hook: off")
+        elif sub == "on":
+            if os.path.exists(core.OFF_FILE):
+                os.remove(core.OFF_FILE)
+            print("memory2 hook: on")
+        elif sub == "test":
+            payload = json.dumps({"prompt": a.arg2 or "", "cwd": os.environ.get("MEMORY2_HOOK_CWD") or core.WORKSPACE,
+                                  "hook_event_name": "UserPromptSubmit"})
+            out = io.StringIO()
+            t0 = time.time()
+            core.hook_main(io.StringIO(payload), out)
+            ms = (time.time() - t0) * 1000
+            txt = out.getvalue()
+            ctx = json.loads(txt)["hookSpecificOutput"]["additionalContext"] if txt else "(nothing injected)"
+            print(ctx)
+            print("(%.0f ms)" % ms)
+        else:
+            print("memory2 hook: %s" % ("off (file switch)" if os.path.exists(core.OFF_FILE) else "on"))
+        return 0
+    if a.cmd == "embedd":
+        return m.embedd(a.arg or "status", quiet=a.quiet)
+
+    con = core.connect()
+    if a.cmd == "sync":
+        m.sync(con, quiet=a.quiet)
+        return 0
+    if a.cmd == "extract":
+        fd = m.lock()
+        if fd is None:
+            return 0 if a.cron else 75
+        try:
+            if a.cron or not a.dry_run:
+                m.sync(con, quiet=True)
+            st, cands = m.extract(con, use_llm=a.llm, backfill_bytes=int(a.backfill * 1024 * 1024), dry=a.dry_run,
+                                  limit=a.limit, quiet=a.quiet or a.cron)
+            if a.dry_run:
+                for c in cands:
+                    print("%-10s %.2f %-28s %s" % (c["kind"], c["conf"], ",".join(c["cues"])[:28], c["text"][:170]))
+                print(json.dumps(st))
+        except Exception as e:
+            if a.cron:   # cron-fail turns a failure streak into one inbox note
+                print("memory2 extract: %s: %s" % (type(e).__name__, str(e)[:300]), file=sys.stderr)
+                return 1
+            raise
+        finally:
+            os.close(fd)
+        return 0
+    if a.cmd == "review":
+        items = m.open_reviews(con)
+        if a.json:
+            print(json.dumps(items, ensure_ascii=False, default=str))
+        elif not items:
+            print("memory2: review queue empty")
+        for r in ([] if a.json else items):
+            print(m.fmt_review(r))
+        return 0
+    if a.cmd in ("accept", "reject"):
+        if not a.arg:
+            ap.error("ID needed")
+        m.resolve(con, a.arg, "accepted" if a.cmd == "accept" else "rejected")
+        print("memory2: %s %s" % (a.arg, "accepted" if a.cmd == "accept" else "rejected"))
+        return 0
+    if a.cmd == "promote":
+        if not a.arg:
+            ap.error("ID needed")
+        m.promote(con, a.arg, section=a.section, ledger=a.ledger, text=a.text)
+        return 0
+    if a.cmd == "digest":
+        try:
+            return 0 if m.digest(con, cron=a.cron) >= 0 else 1
+        except Exception as e:
+            if a.cron:
+                print("memory2 digest: %s: %s" % (type(e).__name__, str(e)[:300]), file=sys.stderr)
+                return 1
+            raise
+    if a.cmd == "search":
+        q = a.arg or ""
+        hits = core.search(con, q, k=a.k, qvec=m.qvec(q), floor=not a.all)
+        if a.json:
+            print(json.dumps([dict(r, score=round(s, 4)) for s, r in hits], ensure_ascii=False))
+            return 0
+        terms = core.terms_of(q)
+        for s, r in hits:
+            print("%.3f cos %.2f [%s] %s (%s)" % (s, r["cos"], core.label(r), core.focus(r["text"], terms, 160),
+                                                  r["source"]))
+        return 0 if hits else 1
+    if a.cmd == "stats":
+        st = m.stats(con)
+        print(json.dumps(st, indent=None if a.json else 1, ensure_ascii=False))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

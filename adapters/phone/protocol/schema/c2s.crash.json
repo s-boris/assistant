@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.crash.json",
+  "title": "crash report: exception class + location only, no message text",
+  "type": "object",
+  "properties": {
+    "exc": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.$]{1,160}$"
+    },
+    "where": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.$-]{1,80}(:[0-9]{1,6})?$"
+    },
+    "app": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 24
+    },
+    "at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "exc",
+    "app"
+  ]
+}

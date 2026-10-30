@@ -1,0 +1,60 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/cron.fail.schema.json",
+ "title": "cron-fail: one note per failure streak; `events update` adds recovered + failed_runs",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "job",
+  "rc",
+  "runs",
+  "since"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "cron.fail"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "job": {
+   "type": "string",
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+  },
+  "cmd": {
+   "type": "string"
+  },
+  "rc": {
+   "type": "integer"
+  },
+  "runs": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "since": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "after": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "recovered": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "failed_runs": {
+   "type": "integer",
+   "minimum": 0
+  }
+ }
+}

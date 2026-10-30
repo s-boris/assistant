@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://assistant.invalid/schemas/event.schema.json",
+  "title": "An event row as `events show --json` / `events list --json` print it (schemas/events.sql)",
+  "type": "object",
+  "required": ["id", "ts", "source", "kind", "subject", "next", "payload", "labels", "delivery", "status"],
+  "properties": {
+    "id": {"type": "integer", "minimum": 1},
+    "ts": {"type": "number"},
+    "source": {"type": "string", "minLength": 1},
+    "kind": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+    "subject": {"type": "string", "maxLength": 500},
+    "next": {"type": "string", "maxLength": 500},
+    "payload": {"type": "object"},
+    "labels": {"type": "array", "items": {"type": "string"}},
+    "delivery": {"enum": ["now", "beat", "digest", "mute"]},
+    "trace_id": {"type": ["string", "null"]},
+    "idem_key": {"type": ["string", "null"]},
+    "note_path": {"type": ["string", "null"]},
+    "status": {"enum": ["new", "listed", "acked", "dismissed", "gone"]},
+    "updated_ts": {"type": ["number", "null"]},
+    "first_beat": {"type": ["integer", "null"]},
+    "first_listed_ts": {"type": ["number", "null"]},
+    "acked_ts": {"type": ["number", "null"]},
+    "ack_by": {"type": ["string", "null"]},
+    "ack_note": {"type": ["string", "null"]},
+    "note_present": {"type": "boolean"},
+    "body": {"type": "string"}
+  }
+}

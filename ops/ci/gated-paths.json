@@ -1,0 +1,9 @@
+{
+ "_doc": "Repo paths whose lands the eval gate enforces in ci-gate mode enforce-gated (fnmatch globs on repo-relative paths, '*' crosses '/'). Read from main at land time, so a branch can't loosen its own gate; this file is gated itself.",
+ "prompts": ["adapters/*/prompts/*", "*/prompts/*", "*.prompt.md", "hooks/agenda.sh"],
+ "skills": ["skills/*", "*/skills/*", "*SKILL.md"],
+ "tools": ["packages/tools/*", "schemas/tools.toml", "schemas/tools.typed.json"],
+ "reflexes": ["packages/loop/reflex.py", "scripts/reflex", "*/reflexes/*"],
+ "workflows": ["packages/hub/hubwf.py", "packages/hub/hubwfapi.py", "packages/hubkit/wf.py", "packages/tools/domains/workflow.py", "core/watchjobs.py", "core/schedules.toml", "scripts/eventwf", "*/workflows/*"],
+ "gate": ["ops/ci/gated-paths.json"]
+}

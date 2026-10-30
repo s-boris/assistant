@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# transcript-compact: gzip Claude Code subagent transcripts older than N days (default 3).
+# Subagent transcripts (<project>/<session>/subagents/*.jsonl) are the bulk of the project folder.
+# recall indexes only the top-level session .jsonl files and agent-watch reads only recent subagent
+# files, so compressing old ones loses nothing; `zcat` reads them. Never deletes or overwrites anything.
+# Usage: transcript-compact [--days N] [--dry-run]
+set -euo pipefail
+days=3 dry=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --days) days=${2-}; shift $(($# > 1 ? 2 : 1)) ;;
+    --dry-run|-n) dry=1; shift ;;
+    -h|--help) grep -v '^# managed: ' "$0" | sed -n '2,6p' | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "transcript-compact: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[[ $days =~ ^[0-9]+$ ]] || { echo "transcript-compact: --days needs a number" >&2; exit 2; }
+root="$HOME/.claude/projects"
+[ -d "$root" ] || exit 0
+n=0 before=0 after=0 skipped=0 failed=0
+while IFS= read -r -d '' f; do
+  s=$(stat -c %s "$f")
+  if [ -e "$f.gz" ]; then   # an older compressed copy: keep both as they are
+    echo "transcript-compact: skipped $f (a .gz of the same name exists)" >&2; skipped=$((skipped+1)); continue
+  fi
+  if [ "$dry" = 1 ]; then n=$((n+1)); before=$((before+s)); continue; fi
+  if ! gzip -9 -- "$f"; then   # gzip names the reason (e.g. hard links) and leaves the file as it was
+    failed=$((failed+1)); continue
+  fi
+  n=$((n+1)); before=$((before+s)); after=$((after+$(stat -c %s "$f.gz")))
+done < <(find "$root" -path '*/subagents/*' -type f -name '*.jsonl' -mmin +"$((days * 1440))" -print0)
+if [ "$dry" = 1 ]; then
+  echo "would compress $n file(s), $((before/1000000)) MB"
+else
+  echo "compressed $n file(s): $((before/1000000)) MB -> $((after/1000000)) MB"
+fi
+[ "$skipped" = 0 ] || echo "transcript-compact: $skipped skipped" >&2
+[ "$failed" = 0 ] || { echo "transcript-compact: $failed failed" >&2; exit 1; }

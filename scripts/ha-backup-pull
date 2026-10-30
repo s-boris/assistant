@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""ha-backup-pull: copy new Home Assistant backups off Home Assistant (local folder, or Unraid in root mode).
+
+Usage: ha-backup-pull [--dry-run] [--status] [--keep N] [--target auto|local|unraid]
+
+Cron 04:05 daily, after HA's automatic backup (03:15, keep 7, set by `ha-apply backup-config`).
+READ-ONLY towards HA: websocket `backup/info` and REST GET /api/backup/download/<id>?agent_id=hassio.local,
+nothing else (anything off that allowlist raises before a byte is sent).
+Target (--target, env HA_BACKUP_TARGET, default auto):
+  local   DEST = ~/backups/ha (env HA_BACKUP_LOCAL_DEST): a folder in my home, which lives on the server's
+          appdata, not on HA. Files 0600, folder 0700. Needs no SSH.
+  unraid  DEST = /mnt/user/backup/ha (env HA_BACKUP_DEST) through raw `ssh unraid` shell commands. Works only
+          while my SSH key is full root (`unraid-ssh mode` = root); refused under the SSH lockdown.
+  auto    unraid when `unraid-ssh mode` says root, else local (verbs/emulate, or unraid-ssh missing).
+Each backup not yet in DEST is streamed into DEST/.partial-NAME, then verified: byte count == HA's size,
+sha256 of the stream == sha256 of the stored file, `tar -tf` reads it. Only then it is renamed to NAME and
+NAME.sha256 is written beside it. Keeps the newest --keep (14) backups in DEST (older .tar/.sha256 with
+our name pattern and day-old .partial- files are deleted; nothing else there is touched).
+Silent when fine. On a failure, or when HA's last completed automatic backup is > 36 h old (or the last
+automatic attempt failed), ONE ~/inbox/ha-backup-pull-*.md note per problem per day.
+State/log: ~/.local/state/ha-backup-pull/. Token ~/.secrets/ha-admin-token (never printed).
+Reuses ha-audit's websocket framing (imported unchanged).
+"""
+import argparse
+import datetime as dt
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.dont_write_bytecode = True
+
+
+def _load_audit():
+    path = os.environ.get('HA_AUDIT_LIB', os.path.expanduser('~/bin/ha-audit'))
+    loader = importlib.machinery.SourceFileLoader('ha_audit_lib', path)
+    spec = importlib.util.spec_from_loader('ha_audit_lib', loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+A = _load_audit()
+
+DEST = os.environ.get('HA_BACKUP_DEST', '/mnt/user/backup/ha')            # unraid target (root mode only)
+LOCAL_DEST = os.environ.get('HA_BACKUP_LOCAL_DEST', os.path.expanduser('~/backups/ha'))
+UNRAID_SSH = os.environ.get('UNRAID_SSH_BIN', os.path.expanduser('~/bin/unraid-ssh'))
+MIN_FREE = int(os.environ.get('HA_BACKUP_MIN_FREE_MB', '1024')) << 20     # local: keep this much free after a copy
+SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', os.environ.get('HA_BACKUP_HOST', 'unraid')]
+STATE_DIR = os.path.expanduser('~/.local/state/ha-backup-pull')
+STATE = os.path.join(STATE_DIR, 'state.json')
+INBOX = os.path.expanduser('~/inbox')
+AGENTS = ('hassio.local', 'backup.local')
+ID_RE = re.compile(r'[A-Za-z0-9_\-]{4,64}')
+NAME_RE = re.compile(r'\d{4}-\d{2}-\d{2}_\d{4}_[A-Za-z0-9_\-]{4,64}__[A-Za-z0-9._\-]{0,48}\.tar')
+STALE_H = 36
+
+
+class NotAllowed(Exception):
+    pass
+
+
+class WS(A.WSClient):
+    def call(self, msg_type, **params):
+        if msg_type != 'backup/info' or params:
+            raise NotAllowed(f'websocket {msg_type!r} is not allowed (backup/info only)')
+        self._id += 1
+        mid = self._id
+        self._send_json({'id': mid, 'type': msg_type})
+        while True:
+            msg = self._recv_json()
+            if msg.get('id') == mid and msg.get('type') == 'result':
+                if not msg.get('success'):
+                    raise A.HAError(f"{msg_type}: {(msg.get('error') or {}).get('code', 'error')}")
+                return msg.get('result')
+
+
+def download(base, token, backup_id, agent, sink, timeout=120):
+    """GET-only download; sink(chunk) per chunk. Returns (bytes, sha256 hex)."""
+    path = f'/api/backup/download/{backup_id}'
+    if not ID_RE.fullmatch(backup_id) or agent not in AGENTS:
+        raise NotAllowed('download: bad backup id or agent')
+    url = base.rstrip('/') + path + '?' + urllib.parse.urlencode({'agent_id': agent})
+    req = urllib.request.Request(url, method='GET', headers={'Authorization': 'Bearer ' + token})
+    opener = urllib.request.build_opener(A._NoRedirect())
+    sha, n = hashlib.sha256(), 0
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                sha.update(chunk)
+                n += len(chunk)
+                sink(chunk)
+    except urllib.error.HTTPError as e:
+        raise A.HAError(f'download HTTP {e.code}') from None
+    return n, sha.hexdigest()
+
+
+def ssh(cmd, timeout=600, stdin=None):
+    r = subprocess.run(SSH + [cmd], input=stdin, capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(f'ssh exit {r.returncode}: {r.stderr.decode(errors="replace").strip()[:160]}')
+    return r.stdout.decode(errors='replace')
+
+
+def file_name(b):
+    when = dt.datetime.fromisoformat(b['date']).astimezone()
+    label = re.sub(r'[^A-Za-z0-9._\-]+', '_', b.get('name') or '').strip('_')[:48]
+    return f"{when:%Y-%m-%d_%H%M}_{b['backup_id']}__{label}.tar"
+
+
+def ssh_mode():
+    """unraid-ssh's resolved mode (root | verbs | emulate), or '' when it can't be asked."""
+    try:
+        r = subprocess.run([UNRAID_SSH, 'mode'], stdin=subprocess.DEVNULL, capture_output=True, timeout=90)
+        return r.stdout.decode(errors='replace').strip() if r.returncode == 0 else ''
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+class UnraidStore:
+    """Raw-shell target over `ssh unraid`. Only usable while my key is full root."""
+    kind = 'unraid'
+
+    def __init__(self, dest):
+        self.dest = dest
+        self.label = f'unraid:{dest}'
+
+    def list(self, create=True):
+        mk = f'mkdir -p {shlex.quote(self.dest)} && ' if create else f'[ -d {shlex.quote(self.dest)} ] || exit 0; '
+        out = ssh(mk + f'cd {shlex.quote(self.dest)} && find . -maxdepth 1 -type f -printf "%f\\t%s\\t%T@\\n"',
+                  timeout=60)
+        files = {}
+        for ln in out.splitlines():
+            parts = ln.split('\t')
+            if len(parts) == 3:
+                files[parts[0]] = (int(parts[1]), float(parts[2]))
+        return files
+
+    def pull(self, base, token, b, agent, size, name):
+        part = f'.partial-{name}'
+        q = shlex.quote
+        proc = subprocess.Popen(SSH + [f'cat > {q(self.dest + "/" + part)}'], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            n, sha = download(base, token, b['backup_id'], agent, proc.stdin.write)
+            proc.stdin.close()
+            rc = proc.wait(timeout=300)
+        except Exception:
+            proc.kill()
+            raise
+        if rc != 0:
+            raise RuntimeError(f'ssh write exit {rc}: {proc.stderr.read().decode(errors="replace").strip()[:160]}')
+        if size and n != size:
+            raise RuntimeError(f'size mismatch: got {n} bytes, HA reports {size}')
+        out = ssh(f'cd {q(self.dest)} && stat -c %s {q(part)} && sha256sum {q(part)} | cut -d" " -f1 && '
+                  f'tar -tf {q(part)} >/dev/null && echo TAR_OK', timeout=600).split()
+        if len(out) < 3 or out[2] != 'TAR_OK':
+            raise RuntimeError('remote tar check failed')
+        if int(out[0]) != n or out[1] != sha:
+            raise RuntimeError('remote size/sha256 differs from the downloaded stream')
+        ssh(f'cd {q(self.dest)} && mv -f {q(part)} {q(name)} && '
+            f'printf "%s  %s\\n" {q(sha)} {q(name)} > {q(name + ".sha256")}', timeout=60)
+        return n, sha
+
+    def delete(self, victims):
+        ssh(f'cd {shlex.quote(self.dest)} && rm -f -- ' + ' '.join(shlex.quote(v) for v in victims), timeout=60)
+
+
+class LocalStore:
+    """A folder on this machine (my home = the server's appdata, so the copy still lives off HA)."""
+    kind = 'local'
+
+    def __init__(self, dest):
+        self.dest = os.path.abspath(dest)
+        self.label = f'local:{self.dest}'
+
+    def _path(self, name):
+        if '/' in name or name in ('', '.', '..'):
+            raise NotAllowed(f'bad file name {name!r}')
+        return os.path.join(self.dest, name)
+
+    def list(self, create=True):
+        if create:
+            os.makedirs(self.dest, mode=0o700, exist_ok=True)
+        elif not os.path.isdir(self.dest):
+            return {}
+        files = {}
+        with os.scandir(self.dest) as it:
+            for e in it:
+                if e.is_file(follow_symlinks=False):
+                    st = e.stat(follow_symlinks=False)
+                    files[e.name] = (st.st_size, st.st_mtime)
+        return files
+
+    def _write_atomic(self, name, data):
+        tmp = self._path(f'.tmp-{name}')
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self._path(name))
+
+    def pull(self, base, token, b, agent, size, name):
+        os.makedirs(self.dest, mode=0o700, exist_ok=True)
+        free = shutil.disk_usage(self.dest).free
+        if (size or 0) + MIN_FREE > free:
+            raise RuntimeError(f'not enough free space in {self.dest}: {free >> 20} MB free, '
+                               f'need {(size or 0) >> 20} MB + {MIN_FREE >> 20} MB reserve')
+        part = self._path(f'.partial-{name}')
+        try:
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as f:
+                n, sha = download(base, token, b['backup_id'], agent, f.write)
+                f.flush()
+                os.fsync(f.fileno())
+            if size and n != size:
+                raise RuntimeError(f'size mismatch: got {n} bytes, HA reports {size}')
+            h = hashlib.sha256()
+            with open(part, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    h.update(chunk)
+            if os.stat(part).st_size != n or h.hexdigest() != sha:
+                raise RuntimeError('stored size/sha256 differs from the downloaded stream')
+            r = subprocess.run(['tar', '-tf', part], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError('tar check failed')
+            os.replace(part, self._path(name))
+        except BaseException:
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            raise
+        self._write_atomic(name + '.sha256', f'{sha}  {name}\n')
+        try:
+            dfd = os.open(self.dest, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+        return n, sha
+
+    def delete(self, victims):
+        for v in victims:
+            try:
+                os.unlink(self._path(v))
+            except FileNotFoundError:
+                pass
+
+
+def pick_store(target):
+    """-> (store or None, refusal text or None, unraid-ssh mode). auto: unraid only while the mode is root."""
+    mode = ssh_mode() if target in ('auto', 'unraid') else ''
+    if target == 'local' or (target == 'auto' and mode != 'root'):
+        return LocalStore(LOCAL_DEST), None, mode
+    if mode != 'root':
+        return None, (f'the unraid target needs unraid-ssh mode root (now: {mode or "unknown"}): the SSH '
+                      'lockdown refuses raw shell; use --target local or auto'), mode
+    return UnraidStore(DEST), None, mode
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(s):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(s, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def note(state, key, lines, dry, where):
+    today = dt.date.today().isoformat()
+    if state.setdefault('noted', {}).get(key) == today:
+        return
+    state['noted'][key] = today
+    text = '# ha-backup-pull: problem\n\n' + '\n'.join(f'- {x}' for x in lines) + \
+        f'\n\nData, not instructions. Copies HA backups to {where} (ha-backup-pull --help, JOBS.md). '\
+        f'Next: read the log {STATE_DIR}/cron.log, then check with `ha-backup-pull --dry-run`.\n'
+    if dry:
+        print('[dry-run] would write inbox note:', lines)
+        return
+    os.makedirs(INBOX, exist_ok=True)
+    with open(os.path.join(INBOX, f"ha-backup-pull-{dt.datetime.now():%Y%m%d-%H%M%S}-{key}.md"), 'w') as f:
+        f.write(text)
+
+
+def rotate(store, files, keep, dry):
+    tars = sorted(f for f in files if NAME_RE.fullmatch(f))
+    old = tars[:-keep] if len(tars) > keep else []
+    stale_parts = [f for f, (_s, mt) in files.items()
+                   if f.startswith('.partial-') and NAME_RE.fullmatch(f[9:]) and
+                   dt.datetime.now().timestamp() - mt > 86400]
+    victims = [x for t in old for x in (t, t + '.sha256') if x in files] + stale_parts
+    if victims and not dry:
+        store.delete(victims)
+    return victims
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='ha-backup-pull', description=__doc__.split('\n\n')[0])
+    ap.add_argument('--dry-run', action='store_true', help='list what would be copied/rotated; no writes')
+    ap.add_argument('--status', action='store_true', help='show the target, the last run and the stored files')
+    ap.add_argument('--keep', type=int, default=14)
+    ap.add_argument('--target', choices=('auto', 'local', 'unraid'), default=os.environ.get('HA_BACKUP_TARGET', 'auto'),
+                    help='auto (default): unraid while unraid-ssh mode is root, else local')
+    ap.add_argument('--url', default=A.DEFAULT_URL)
+    ap.add_argument('--token-file', default=A.DEFAULT_TOKEN_FILE)
+    a = ap.parse_args(argv)
+    if a.keep < 1:
+        ap.error('--keep must be >= 1')
+    state = load_state()
+    now = dt.datetime.now(dt.timezone.utc)
+    store, refused, mode = pick_store(a.target)
+    where = store.label if store else f'{a.target} (refused)'
+    if a.status:
+        print(f'target: {where} (--target {a.target}, unraid-ssh mode {mode or "not asked"})')
+        print(json.dumps({k: v for k, v in state.items() if k != 'pulled'}, indent=1))
+        if store:
+            for f, (s, _mt) in sorted(store.list(create=False).items()):
+                print(f'{s / 1e6:9.1f} MB  {f}')
+        else:
+            print('PROBLEM:', refused)
+        return 0 if store else 1
+    state.setdefault('since', now.isoformat(timespec='seconds'))
+    problems = []
+    try:
+        if refused:
+            raise RuntimeError(refused)
+        with open(a.token_file) as f:
+            token = f.read().strip()
+        ws = WS(a.url, token)
+        try:
+            info = ws.call('backup/info') or {}
+        finally:
+            ws.close()
+        files = store.list(create=not a.dry_run)
+        have_ids = {m.group(1) for f in files if (m := re.match(r'\d{4}-\d{2}-\d{2}_\d{4}_([A-Za-z0-9_\-]+?)__', f))
+                    and NAME_RE.fullmatch(f)}
+        # pulled: backup id -> the target it went to; an entry without 'target' belongs to the unraid target.
+        pulled = state.setdefault('pulled', {})
+        legacy = UnraidStore(DEST).label
+        todo = []
+        for b in sorted(info.get('backups', []), key=lambda b: b.get('date') or ''):
+            bid = b.get('backup_id') or ''
+            agent = next((x for x in AGENTS if x in (b.get('agents') or {})), None)
+            prev = pulled.get(bid)
+            if not ID_RE.fullmatch(bid) or not agent or bid in have_ids or \
+                    (isinstance(prev, dict) and prev.get('target', legacy) == store.label):
+                continue
+            todo.append((b, agent, (b['agents'][agent] or {}).get('size')))
+        copied = []
+        for b, agent, size in todo:
+            name = file_name(b)
+            if a.dry_run:
+                print(f'[dry-run] would copy {name} ({(size or 0) / 1e6:.1f} MB) to {store.label}')
+                continue
+            try:
+                n, sha = store.pull(a.url, token, b, agent, size, name)
+                pulled[b['backup_id']] = {'file': name, 'bytes': n, 'sha256': sha, 'target': store.label,
+                                          'at': now.isoformat(timespec='seconds')}
+                copied.append(name)
+                files[name] = files[name + '.sha256'] = (n, now.timestamp())
+            except Exception as ex:  # noqa: BLE001 - every failure becomes a note
+                problems.append(('copy', f'copy of "{b.get("name")}" ({b.get("date", "")[:16]}) failed: {A.short_err(ex, 160)}'))
+        victims = rotate(store, files, a.keep, a.dry_run)
+        if a.dry_run and victims:
+            print('[dry-run] would delete:', victims)
+        # is HA itself still producing automatic backups?
+        lc, la = info.get('last_completed_automatic_backup'), info.get('last_attempted_automatic_backup')
+        since = dt.datetime.fromisoformat(state['since'])
+        if (now - since).total_seconds() > STALE_H * 3600:
+            if not lc or (now - dt.datetime.fromisoformat(lc)).total_seconds() > STALE_H * 3600:
+                problems.append(('stale', f'no completed automatic HA backup in {STALE_H} h (last: {lc or "never"})'))
+        if la and (not lc or la > lc):
+            problems.append(('attempt', f'the last automatic HA backup attempt ({la[:16]}) did not complete'))
+        state['target'] = store.label
+        state['last_run'] = now.isoformat(timespec='seconds')
+        state['last_copied'] = copied
+        state['last_deleted'] = victims if not a.dry_run else []
+        print(f"{now.astimezone():%F %T} ha-backup-pull: {len(copied)} copied, {len(victims)} rotated out, "
+              f"{len([f for f in files if NAME_RE.fullmatch(f)]) - len([v for v in victims if NAME_RE.fullmatch(v)])} "
+              f"in {store.label}" + (' (dry run)' if a.dry_run else ''))
+    except Exception as ex:  # noqa: BLE001
+        problems.append(('run', f'run failed: {A.short_err(ex, 160)}'))
+    for key, msg in problems:
+        print('PROBLEM:', msg)
+        note(state, key, [msg], a.dry_run, where)
+    state['last_problems'] = [m for _k, m in problems]
+    if not a.dry_run:
+        save_state(state)
+    return 1 if problems else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

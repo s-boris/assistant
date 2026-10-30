@@ -1,0 +1,8 @@
+#!/bin/bash
+# Placeholder fixture: Python embedded in a shell script writes into the inbox without the marker.
+python3 - <<'PY'
+import os
+p = os.path.expanduser('~/inbox/example-heredoc.md')
+with open(p, 'w') as f:
+    f.write('example finding\n')
+PY

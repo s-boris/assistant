@@ -1,0 +1,9 @@
+# Quarantined tests: still run, but a failure here does not turn CI red (after the one automatic retry).
+# Read from main (the land's base commit), so a branch can't quarantine its own red test; a change to this file
+# runs the full suite. One node id (or test file) per line, both keys required (by = who answers for it), at most 30 days out:
+#   tests/area/test_x.py::test_name  by=WHO  expires=YYYY-MM-DD  # why, and what fixes it
+# Expired or malformed entries count again and are listed in the nightly ci-nightly note. Fix the test, then drop
+# its line; never extend an expiry without a new reason.
+tests/inbox/test_concurrency.py::test_ten_concurrent_writers_and_ingest  by=main-session  expires=2026-11-11  # red under host load ~40 with 2x8 workers; make the writers' wait deterministic
+tests/inbox/test_hook.py::test_missing_store_is_created  by=main-session  expires=2026-11-11  # json decode under host load; find the half-written read
+tests/ops/test_ci_cleanup.py::test_sweep_keeps_young_owned_and_held_dirs  by=main-session  expires=2026-11-11  # red once on the runner, not reproduced in 24 concurrent runs at load ~30; find the race in _procs/_ci_sweep

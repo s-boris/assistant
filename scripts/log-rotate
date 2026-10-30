@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""log-rotate: keep append-only logs bounded. A log larger than --limit KB is cut down, in place, to its newest
+--keep KB, starting at a line boundary. Idempotent: a second run right after finds nothing to do.
+
+  log-rotate [--dry-run] [--limit KB] [--keep KB]   trim what is over the limit; one line per trimmed file
+  log-rotate --list                                  every target with its size; '*' = over the limit
+
+Targets: every `>>` / `2>>` redirect in ~/crontab, plus every *.log and *.err file under ~/.local/state
+(recursive). Only regular files inside $HOME; symlinks are skipped. Nothing else is touched (state files such as
+json, tsv or db), and nothing is deleted or renamed.
+In place (same inode, mode and owner): writers keep the file open with O_APPEND (cron >>, nohup daemons), so their
+next write lands at the new end. Lines appended during the trim itself may be lost.
+Defaults: --limit 1024, --keep 256. Logs that cap themselves at a lower size are never touched.
+Env (tests): LOG_ROTATE_STATE (state dir), LOG_ROTATE_CRONTAB (crontab file).
+Exit 0 (an unreadable file is reported on stderr and skipped); 2 = usage error.
+Tests: ~/opt/assistant/tests/legacy/log-rotate/run.sh
+"""
+import argparse
+import os
+import re
+import sys
+
+HOME = os.path.realpath(os.path.expanduser("~"))
+STATE = os.environ.get("LOG_ROTATE_STATE") or os.path.join(HOME, ".local/state")
+CRONTAB = os.environ.get("LOG_ROTATE_CRONTAB") or os.path.join(HOME, "crontab")
+REDIRECT = re.compile(r"(?:^|[\s;&|])[12]?>>\s*(\S+)")
+
+
+def crontab_targets(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if line.lstrip().startswith("#"):
+            continue
+        for m in REDIRECT.finditer(line):
+            p = m.group(1).strip("'\"")
+            p = p.replace("$HOME", HOME).replace("${HOME}", HOME)
+            out.append(os.path.expanduser(p))
+    return out
+
+
+def state_targets(root):
+    out = []
+    for d, dirs, files in os.walk(root):          # os.walk does not follow symlinked dirs
+        dirs.sort()
+        out += [os.path.join(d, f) for f in sorted(files) if f.endswith((".log", ".err"))]
+    return out
+
+
+def targets():
+    seen, out = set(), []
+    for p in crontab_targets(CRONTAB) + state_targets(STATE):
+        p = os.path.abspath(p)
+        if p in seen:
+            continue
+        seen.add(p)
+        if os.path.islink(p) or not os.path.isfile(p):
+            continue
+        real = os.path.realpath(p)
+        if not (real.startswith(HOME + os.sep) or real.startswith(os.path.realpath(STATE) + os.sep)):
+            continue
+        out.append(p)
+    return out
+
+
+def trim(path, keep):
+    """Cut PATH to its newest KEEP bytes, from the first line start inside them. Returns the new size."""
+    with open(path, "r+b") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        if size <= keep:
+            return size
+        fh.seek(size - keep - 1)
+        data = fh.read(keep + 1)
+        if data[:1] == b"\n":
+            data = data[1:]
+        else:
+            nl = data.find(b"\n")
+            data = data[nl + 1:] if 0 <= nl < len(data) - 1 else data[1:]
+        fh.seek(0)
+        fh.write(data)
+        fh.truncate()
+        return len(data)
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="log-rotate", description="keep append-only logs bounded (in place)")
+    ap.add_argument("--dry-run", action="store_true", help="say what would be trimmed, change nothing")
+    ap.add_argument("--list", action="store_true", help="every target with its size")
+    ap.add_argument("--limit", type=int, default=1024, help="trim logs larger than this many KB (default 1024)")
+    ap.add_argument("--keep", type=int, default=256, help="keep the newest this many KB (default 256)")
+    a = ap.parse_args(argv)
+    if a.keep < 1 or a.limit < a.keep:
+        ap.error("need 1 <= --keep <= --limit")
+    limit, keep = a.limit * 1024, a.keep * 1024
+    for p in targets():
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        if a.list:
+            print(f"{'*' if size > limit else ' '} {size // 1024:>8} KB  {p}")
+            continue
+        if size <= limit:
+            continue
+        if a.dry_run:
+            print(f"would trim {p}: {size // 1024} KB -> ~{a.keep} KB")
+            continue
+        try:
+            new = trim(p, keep)
+        except OSError as e:
+            print(f"log-rotate: {p}: {e.strerror}", file=sys.stderr)
+            continue
+        print(f"trimmed {p}: {size // 1024} KB -> {new // 1024} KB")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

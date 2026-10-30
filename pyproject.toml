@@ -1,0 +1,95 @@
+[project]
+name = "assistant"
+version = "0.1.0"
+description = "Harness monorepo: core library, ops tooling (assistant CLI), packages and adapters."
+requires-python = ">=3.11,<3.14"
+# Runtime code that ~/bin uses is stdlib-only (cron runs /usr/bin/python3 -I). Dev tools live in the dev group.
+dependencies = []
+
+[dependency-groups]
+# assistant-tools: the typed tool registry's runtime (FastMCP, Pydantic), for its tests; deployed as its own venv.
+# assistant-hub: hub-only runtime (DBOS), for the workflow tests; shipped in hub releases' vendor/.
+dev = ["ruff", "basedpyright", "pytest", "pytest-xdist", "jsonschema", "pyyaml", "assistant-tools", "assistant-hub"]
+
+[tool.uv]
+package = false
+# Resolve only releases at least two weeks old (bump deliberately with the lock).
+exclude-newer = "2026-10-07T00:00:00Z"
+# Deliberate exceptions to the two-week rule (security updates: CA distrust, FastMCP auth fix), each pinned to
+# the day after its upload. Drop an entry once exclude-newer passes that date.
+exclude-newer-package = { fastmcp = "2026-10-21T00:00:00Z", fastmcp-slim = "2026-10-21T00:00:00Z", certifi = "2026-10-21T00:00:00Z", dbos = "2026-10-16T00:00:00Z", cedarpy = "2026-10-15T00:00:00Z" }
+# Lock only for where it runs (Linux x86_64; requires-python < 3.14 above): fewer wheel records in uv.lock and
+# requirements.lock (a cp314t wheel's record tripped secretscan's card-number pattern, a false positive).
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.14'"]
+
+[tool.uv.workspace]
+# Members (packages/*) are added here when a package grows its own pyproject.toml.
+members = ["packages/tools", "packages/hub"]
+
+[tool.uv.sources]
+assistant-tools = { workspace = true }
+assistant-hub = { workspace = true }
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["adapters", ".venv*", "node_modules", "scripts/lib/legacy", "tests/legacy/inbox-lint",
+    # moved from ~/opt as they were (30.10): ruff-clean one, then drop its line
+    "tests/legacy/ai-releases",
+    "tests/legacy/assistant",
+    "tests/legacy/battery-guard",
+    "tests/legacy/botlib",
+    "tests/legacy/cron-fail",
+    "tests/legacy/damp-watch",
+    "tests/legacy/evals-inspect",
+    "tests/legacy/evals",
+    "tests/legacy/event-card",
+    "tests/legacy/flight-watch",
+    "tests/legacy/ha-health-watch",
+    "tests/legacy/hddheat",
+    "tests/legacy/lastcall",
+    "tests/legacy/party",
+    "tests/legacy/plans-watch",
+    "tests/legacy/rave-radar",
+    "tests/legacy/remind",
+    "tests/legacy/secretscan",
+    "tests/legacy/self-review",
+    "tests/legacy/shop",
+    "tests/legacy/sleepin",
+    "tests/legacy/strike-watch",
+    "tests/legacy/tg-cmd",
+    "tests/legacy/train-watch",
+    "tests/legacy/unraid-health",
+    "tests/legacy/vault-events",
+    "tests/legacy/watch",
+    "tests/legacy/webagent",
+    "tests/legacy/codebase-sync",
+    "tests/legacy/dash-data",
+    "tests/legacy/livecount",
+    "tests/legacy/home-place",
+    "tests/legacy/cifeed",
+    "tests/legacy/dash",
+    "tests/legacy/dst",
+    "tests/legacy/docs-lint",
+    "tests/legacy/hooks",
+    "tests/legacy/codebase-precheck",
+    "tests/legacy/voice-mode",
+    "tests/legacy/phonegw",
+    "tests/legacy/boot",
+    "web/dash/tools",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.basedpyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.11"
+include = ["core", "packages"]
+reportMissingModuleSource = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "packages"]
+addopts = "-q -p no:cacheprovider --import-mode=importlib"
+tmp_path_retention_policy = "failed"  # a green test's tmp_path goes at once; a green session's basetemp too

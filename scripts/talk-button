@@ -1,0 +1,107 @@
+#!/usr/local/bin/python3.13 -I
+"""talk-button: the "📞 Talk" button (callback_data call:talk on the pinned status board and on event cards):
+the voice relay rings the owner, once.
+
+  talk-button          ring him (`voice-relay call --reason "you tapped Talk"`); prints one line only when he should know
+  talk-button --json   the same, but prints the outcome as JSON ({"status", "exit", "say"}) instead of the line
+
+Normally run by telegram-plus as an instant button (callbacks.json entry "talk": no Claude turn; its stdout goes to
+him as a silent reply, exit 1 tells the session). The session runs it itself for a call:talk button event that the
+plugin did not handle (meta without instant_button), in the background, with no reply.
+The relay's own limits apply: it rings only him (45 s), at most 3 outbound calls per hour, and a call already on or
+ringing is refused. Silent (exit 0): answered, declined, busy, no answer, a call already on, or another tap still
+ringing (a lock; nothing runs twice). One line + exit 0: the hourly limit. One line + exit 1: relay down, call bridge
+off, ring failed or timed out (the session gets told and can look at the relay).
+Files: ~/.local/state/talk-button/ (0700): lock, log (time + outcome per tap; no text).
+Env (tests): TALK_RELAY (the voice-relay command, default ~/bin/voice-relay), TALK_STATE_DIR, TALK_TIMEOUT (s, 110).
+Tests: ~/opt/talk-button-tests/run.sh.
+"""
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser('~')
+STATE_DIR = os.environ.get('TALK_STATE_DIR') or os.path.join(HOME, '.local/state/talk-button')
+RELAY = os.environ.get('TALK_RELAY') or os.path.join(HOME, 'bin/voice-relay')
+TIMEOUT = float(os.environ.get('TALK_TIMEOUT') or 110)
+REASON = 'you tapped Talk'
+
+SILENT = {'answered', 'busy', 'declined', 'no_answer', 'in_call', 'running'}
+
+
+def log(line):
+    try:
+        with open(os.path.join(STATE_DIR, 'log'), 'a') as f:
+            f.write('%s %s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), line))
+    except OSError:
+        pass
+
+
+def ring():
+    """(status, detail) from one `voice-relay call`."""
+    try:
+        p = subprocess.run([RELAY, 'call', '--reason', REASON, '--say', 'you tapped Talk, so I am here. What is up?'], capture_output=True, text=True, timeout=TIMEOUT,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return 'timeout', ''
+    except OSError as e:
+        return 'down', type(e).__name__
+    if p.returncode == 2:
+        return 'down', ''
+    try:
+        res = json.loads((p.stdout or '').strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        res = {}
+    status = str(res.get('status') or '') if isinstance(res, dict) else ''
+    detail = str(res.get('detail') or '') if isinstance(res, dict) else ''
+    if not status:
+        status = {0: 'answered', 3: 'no_answer', 4: 'in_call'}.get(p.returncode, 'failed')
+    return status, detail
+
+
+def outcome(status, detail):
+    """(line for him or '', exit code)."""
+    if status in SILENT:
+        return '', 0
+    if status == 'rate_limited':
+        m = re.search(r'max (\d+)', detail)
+        return '📞 Call limit reached (%s per hour). Try again a bit later.' % (m.group(1) if m else 3), 0
+    if status == 'down':
+        return "📞 Can't ring you: the voice relay is down.", 1
+    if status == 'unavailable':
+        return "📞 Can't ring you: the call bridge is off.", 1
+    if status == 'timeout':
+        return "📞 The voice relay didn't answer in time.", 1
+    if 'provider' in detail:
+        return "📞 Can't ring you: the voice service didn't start.", 1
+    return "📞 The call didn't go through.", 1
+
+
+def main(argv):
+    as_json = '--json' in argv
+    if any(a not in ('--json',) for a in argv):
+        print(__doc__.strip().split('\n\n')[1], file=sys.stderr)
+        return 2
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, 'lock'), 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        status, detail = 'running', ''
+    else:
+        status, detail = ring()
+    say, code = outcome(status, detail)
+    log('tap -> %s%s' % (status, ' (%s)' % detail[:120] if detail and code else ''))
+    if as_json:
+        print(json.dumps({'status': status, 'exit': code, 'say': say}, ensure_ascii=False))
+    elif say:
+        print(say)
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

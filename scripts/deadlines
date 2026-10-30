@@ -1,0 +1,899 @@
+#!/usr/bin/env python3
+"""deadlines: the owner's yearly Swiss money/admin deadline radar (home canton) + tax-document checklist.
+
+  deadlines list [--days 365] [--all] [--json]      upcoming deadlines, sorted (--all: also the
+                                                    "if applicable" ones whose profile flag is unknown/off)
+  deadlines show ID                                 one item: dates, action, planned reminders, sources
+  deadlines checklist tax YEAR [--offline] [--json] documents for the YEAR tax return, checked against
+                                                    paperless (read-only: search hits + tier-1 fields, no content)
+  deadlines sync [--dry-run] [--horizon 200] [--force]
+                                                    create owner reminders (remind add --owner --tag
+                                                    deadline:<id>:<date>:<lead>) for deadlines within the
+                                                    horizon; idempotent (tags + a ledger of what it created)
+  deadlines validate [--strict] [--cron]            sanity-check the data file (run after the yearly update);
+                                                    also warns on stale data: 'checked' > 12 months old, next
+                                                    year's amount missing from November on, sources without a
+                                                    live check (file://, or hosts scraper-canary skips for
+                                                    robots.txt; read from its state, never fetched). Warnings
+                                                    keep exit 0; --strict makes any warning exit 1; --cron
+                                                    (weekly, after scraper-canary): silent, ONE ~/inbox note
+                                                    deadlines-validate-DATE.md only on errors or new warnings
+
+Data:    ~/.config/deadlines/ch-<canton>.json   (home.canton of the profile; dates, amounts per year, lead times, sources; edit yearly)
+Profile: ~/.config/deadlines/profile.json (owner facts that switch "if applicable" items on/off; an item's `if`
+         key set to "check" = probably applies, unconfirmed: synced, flagged "check:" in list/show, and the
+         reminder carries the item's check_text; `until_from_profile` KEY: no occurrence after that year/date)
+State:   ~/.local/state/deadlines/synced.json (tags sync created: never re-created once fired or cancelled)
+
+Test overrides: DEADLINES_DATA, DEADLINES_PROFILE, DEADLINES_STATE, DEADLINES_TODAY="YYYY-MM-DD"
+(or DEADLINES_NOW="YYYY-MM-DD HH:MM"), DEADLINES_CANARY_STATE (scraper-canary state.json), DEADLINES_VALIDATE_STATE (validate --cron state dir),
+DEADLINES_INBOX, DEADLINES_REMIND (remind binary), DEADLINES_PAPERLESS (paperless
+binary). REMIND_DB / REMIND_TG / REMIND_INBOX pass through to remind.
+"""
+import argparse, json, os, re, subprocess, sys
+from calendar import monthrange
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+import assistant_profile  # noqa: E402  (home.canton: data file name, holiday wording)
+
+HOME = os.path.expanduser('~')
+CANTON = (assistant_profile.get('home.canton') or 'XX').upper()
+DATA = os.environ.get('DEADLINES_DATA') or f'{HOME}/.config/deadlines/ch-{CANTON.lower()}.json'
+PROFILE = os.environ.get('DEADLINES_PROFILE') or f'{HOME}/.config/deadlines/profile.json'
+STATE = os.environ.get('DEADLINES_STATE') or f'{HOME}/.local/state/deadlines/synced.json'
+REMIND = os.environ.get('DEADLINES_REMIND') or (f'{HOME}/bin/remind' if os.path.exists(f'{HOME}/bin/remind') else 'remind')
+PAPERLESS = os.environ.get('DEADLINES_PAPERLESS') or (
+    f'{HOME}/bin/paperless' if os.path.exists(f'{HOME}/bin/paperless') else 'paperless')
+VALIDATE_STATE = os.environ.get('DEADLINES_VALIDATE_STATE') or f'{HOME}/.local/state/deadlines-validate'
+VALIDATE_INBOX = os.environ.get('DEADLINES_INBOX') or f'{HOME}/inbox'
+CANARY_STATE = os.environ.get('DEADLINES_CANARY_STATE') or f'{HOME}/.local/state/scraper-canary/state.json'
+TZ = assistant_profile.tz()
+FMT = '%Y-%m-%d %H:%M'
+TAG_PREFIX = 'deadline:'
+
+
+# ---------------------------------------------------------------- time
+
+def now_local():
+    if os.environ.get('DEADLINES_NOW'):
+        return datetime.strptime(os.environ['DEADLINES_NOW'], FMT)
+    if os.environ.get('DEADLINES_TODAY'):
+        return datetime.combine(date.fromisoformat(os.environ['DEADLINES_TODAY']), datetime.min.time()).replace(hour=7)
+    return datetime.now(TZ).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def easter(y):
+    """Gregorian Easter Sunday (anonymous algorithm)."""
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    mo = (h + l - 7 * m + 114) // 31
+    return date(y, mo, (h + l - 7 * m + 114) % 31 + 1)
+
+
+def holidays_sh(y):
+    """Public holidays (a cantonal rest-day law): 1-2 Jan, 1 May, 1 Aug, 25-26 Dec + Good Friday, Easter Monday,
+    Ascension, Whit Monday."""
+    e = easter(y)
+    fixed = [(1, 1), (1, 2), (5, 1), (8, 1), (12, 25), (12, 26)]
+    return {date(y, m, d) for m, d in fixed} | {e - timedelta(days=2), e + timedelta(days=1),
+                                                e + timedelta(days=39), e + timedelta(days=50)}
+
+
+def is_workday(d):
+    return d.weekday() < 5 and d not in holidays_sh(d.year)
+
+
+def shift(d, mode):
+    """'before': last working day on/before d (act-by, conservative); 'after': next working day
+    (legal deadlines that fall on a weekend/holiday extend); None: unchanged."""
+    if mode not in ('before', 'after'):
+        return d
+    step = -1 if mode == 'before' else 1
+    while not is_workday(d):
+        d += timedelta(days=step)
+    return d
+
+
+# ---------------------------------------------------------------- data
+
+def load_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        if default is not None:
+            return default
+        sys.exit(f'deadlines: missing {path}')
+    except json.JSONDecodeError as e:
+        sys.exit(f'deadlines: {path} is not valid JSON: {e}')
+
+
+def load_all(check=True):
+    """check=False (validate): only the outer shape; check_data reports bad items one by one."""
+    data = load_json(DATA)
+    if not isinstance(data, dict):
+        sys.exit(f'deadlines: {DATA} is not a JSON object')
+    if check:
+        dl = data.get('deadlines')
+        if not isinstance(dl, list) or not all(isinstance(it, dict) and it.get('id') for it in dl):
+            sys.exit(f"deadlines: {DATA}: 'deadlines' must be a list of items with an id (run `deadlines validate`)")
+    prof = load_json(PROFILE, {})
+    if not isinstance(prof, dict):
+        sys.exit(f'deadlines: {PROFILE} is not a JSON object')
+    return data, {k: v for k, v in prof.items() if not k.startswith('_')}
+
+
+class Fmt(dict):
+    def __missing__(self, k):
+        return '{' + k + '}'
+
+
+def render(s, item, y):
+    """Fill {year} {prev} {next} {amount} placeholders for the occurrence year y."""
+    amounts = item.get('amounts') or {}
+    amt = amounts.get(str(y))
+    vals = Fmt(year=y, prev=y - 1, next=y + 1,
+               amount=amt if amt else f'(amount for {y} not in data yet)')
+    for k, v in (item.get('vars') or {}).items():
+        vals[k] = v
+    return (s or '').format_map(vals)
+
+
+def applicability(item, prof):
+    """(active, why): active=True means it applies to the owner and may be synced.
+    Profile value 'check' = probably applies but unconfirmed: active (synced), why starts with 'check:'."""
+    cond = item.get('if')
+    if not cond:
+        return True, ''
+    v = prof.get(cond)
+    if v in (None, '', 'unknown'):
+        return False, f'if applicable: profile "{cond}" unknown'
+    if v is False or v == 'no':
+        return False, f'not applicable: profile "{cond}" = no'
+    if v == 'check':
+        return True, f'check: profile "{cond}" unconfirmed'
+    return True, ''
+
+
+def until_limit(item, prof):
+    """Last due date allowed by `until_from_profile` (profile value: a year = through 31 Dec of it, or an ISO
+    date); None = no limit (key unset, value unknown or unreadable: `if` decides whether the item applies)."""
+    key = item.get('until_from_profile')
+    if not key:
+        return None
+    v = prof.get(key)
+    if isinstance(v, bool) or v in (None, '', 'unknown'):
+        return None
+    s = str(v).strip()
+    if re.fullmatch(r'\d{4}', s):
+        return date(int(s), 12, 31)
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def ymd(y, mo, d):
+    """date(y, mo, d) clamped to the month's end: a 29 Feb rule or anniversary falls on 28 Feb in other years."""
+    return date(y, mo, min(d, monthrange(y, mo)[1]))
+
+
+def add_months(d, n):
+    """Same day n calendar months later/earlier, clamped to the month's end (14 Aug - 1 → 14 Jul)."""
+    m = d.month - 1 + n
+    y, m = d.year + m // 12, m % 12 + 1
+    last = (date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)).day
+    return date(y, m, min(d.day, last))
+
+
+def occurrences(item, prof, start, end):
+    """Occurrences with due date in [start, end]: dicts {due, act_by, year}."""
+    out = []
+    spec = item.get('date')
+    dates = []
+    if item.get('date_from_profile'):
+        v = prof.get(item['date_from_profile'])
+        if v:
+            try:
+                base = date.fromisoformat(str(v))
+            except ValueError:
+                base = None
+            if base:
+                off = int(item.get('offset_days', 0))
+                if item.get('offset_years'):
+                    y2 = base.year + int(item['offset_years'])
+                    base = base.replace(year=y2, day=min(base.day, 28)) if (base.month, base.day) == (2, 29) else base.replace(year=y2)
+                if item.get('offset_months'):
+                    base = add_months(base, int(item['offset_months']))
+                if item.get('to_year_end'):
+                    base = date(base.year, 12, 31)
+                if item.get('repeat_years'):
+                    for y in range(start.year - 1, end.year + 2):
+                        dates.append(ymd(y, base.month, base.day) + timedelta(days=off))
+                else:
+                    dates.append(base + timedelta(days=off))
+    elif spec and re.fullmatch(r'\d{4}-\d{2}-\d{2}', spec):
+        dates.append(date.fromisoformat(spec))
+    elif spec and re.fullmatch(r'\d{2}-\d{2}', spec):
+        mo, d = int(spec[:2]), int(spec[3:])
+        for y in range(start.year, end.year + 1):
+            dates.append(ymd(y, mo, d))
+    years = item.get('years')
+    last = until_limit(item, prof)
+    for dd in dates:
+        if years and dd.year not in years:
+            continue
+        if last and dd > last:
+            continue
+        act = shift(dd, item.get('workday'))
+        if start <= act <= end or start <= dd <= end:
+            out.append({'due': dd, 'act_by': act, 'year': dd.year})
+    return sorted(out, key=lambda o: o['act_by'])
+
+
+def upcoming(data, prof, today, days, include_inactive):
+    rows = []
+    end = today + timedelta(days=days)
+    for it in data['deadlines']:
+        active, why = applicability(it, prof)
+        if not active and not include_inactive:
+            continue
+        for o in occurrences(it, prof, today, end):
+            if o['act_by'] < today:
+                continue
+            rows.append({'id': it['id'], 'item': it, 'active': active, 'why': why, **o})
+    rows.sort(key=lambda r: (r['act_by'], r['id']))
+    return rows
+
+
+def window_txt(it, o):
+    we = it.get('window_end')
+    if we:
+        end = ymd(o['year'], int(we[:2]), int(we[3:]))
+        if end < o['due']:
+            end = ymd(end.year + 1, int(we[:2]), int(we[3:]))
+        return f"{o['due']:%d %b} – {end:%d %b %Y}"
+    return ''
+
+
+# ---------------------------------------------------------------- list / show
+
+def cmd_list(a):
+    data, prof = load_all()
+    today = now_local().date()
+    rows = upcoming(data, prof, today, a.days, a.all)
+    if a.json:
+        print(json.dumps([{
+            'id': r['id'], 'due': r['due'].isoformat(), 'act_by': r['act_by'].isoformat(),
+            'days_left': (r['act_by'] - today).days, 'title': render(r['item']['title'], r['item'], r['year']),
+            'category': r['item'].get('category'), 'active': r['active'], 'note': r['why'],
+            'covered_by': r['item'].get('covered_by'), 'verified': r['item'].get('verified')}
+            for r in rows], ensure_ascii=False, indent=1))
+        return 0
+    print(f"Deadlines ({data.get('region', 'CH')}), from {today:%a %Y-%m-%d}, next {a.days} days"
+          + ('' if a.all else '  (--all adds the "if applicable" ones)'))
+    if not rows:
+        print('  (none)')
+    unknown = [it for it in data['deadlines'] if it.get('date_from_profile')
+               and prof.get(it['date_from_profile']) in (None, '', 'unknown')]
+    for r in rows:
+        it = r['item']
+        left = (r['act_by'] - today).days
+        win = window_txt(it, r)
+        when = win if win else f"{r['act_by']:%a %d %b %Y}"
+        if r['act_by'] != r['due']:
+            when += f" (due {r['due']:%a %d %b}, act by this working day)"
+        flags = []
+        if it.get('covered_by'):
+            flags.append(f"→ {it['covered_by']}")
+        if r['why']:
+            flags.append(r['why'])
+        if it.get('verified') not in (None, 'verified'):
+            flags.append(f"source: {it['verified']}")
+        print(f"  {left:>4}d  {when}  {render(it['title'], it, r['year'])}"
+              + (f"  [{'; '.join(flags)}]" if flags else ''))
+    if a.all and unknown:
+        print('  Date unknown (set it in profile.json once the owner tells me):')
+        for it in unknown:
+            print(f"     -   {render(it['title'], it, today.year)}  [profile \"{it['date_from_profile']}\"]")
+    return 0
+
+
+def find(data, iid):
+    for it in data['deadlines']:
+        if it['id'] == iid:
+            return it
+    sys.exit(f"deadlines: no item '{iid}'. Items: " + ', '.join(i['id'] for i in data['deadlines']))
+
+
+def cmd_show(a):
+    data, prof = load_all()
+    it = find(data, a.id)
+    now = now_local()
+    today = now.date()
+    active, why = applicability(it, prof)
+    occ = occurrences(it, prof, today, today + timedelta(days=800))
+    y = occ[0]['year'] if occ else today.year
+    print(f"{it['id']}: {render(it['title'], it, y)}")
+    print(f"  category: {it.get('category', '-')}   applies: {'yes' if active and not why else why}"
+          + (f"   handled by: {it['covered_by']}" if it.get('covered_by') else ''))
+    if it.get('date'):
+        print(f"  date rule: {it['date']}" + (f" (window to {it['window_end']})" if it.get('window_end') else '')
+              + ({'before': f', on a weekend/{CANTON} holiday: act on the previous working day',
+                 'after': f', on a weekend/{CANTON} holiday: moves to the next working day'}.get(it.get('workday'), '')))
+    if it.get('until_from_profile'):
+        last = until_limit(it, prof)
+        print(f"  until: profile {it['until_from_profile']} = {prof.get(it['until_from_profile'])!r}"
+              + (f" → last due date {last}" if last else ' (no limit set)'))
+    elif it.get('date_from_profile'):
+        print(f"  date from profile: {it['date_from_profile']} = {prof.get(it['date_from_profile'])!r}"
+              + (f" {int(it['offset_years']):+d} years" if it.get('offset_years') else '')
+              + (f" {int(it['offset_months']):+d} month(s)" if it.get('offset_months') else '')
+              + (" → 31 Dec of that year" if it.get('to_year_end') else '')
+              + (f" {int(it.get('offset_days', 0)):+d} days" if it.get('offset_days') else '')
+              + (", every year" if it.get('repeat_years') else ''))
+    for o in occ[:2]:
+        print(f"  next: {o['act_by']:%a %Y-%m-%d}" + (f" (legal date {o['due']})" if o['due'] != o['act_by'] else '')
+              + f", in {(o['act_by'] - today).days} days")
+    if it.get('amounts'):
+        print('  amounts: ' + ', '.join(f'{k}: {v}' for k, v in sorted(it['amounts'].items())))
+    if it.get('action'):
+        print(f"  action: {render(it['action'], it, y)}")
+    if it.get('notes'):
+        print(f"  notes: {render(it['notes'], it, y)}")
+    if it.get('remind') and not it.get('covered_by') and it.get('sync', True):
+        leads = ', '.join(f"{l['before']} d before" for l in it['remind'])
+        print(f"  sync reminders: {leads} at {it.get('time', data.get('default_time', '09:00'))}")
+    print(f"  verified: {it.get('verified', '-')} (checked {it.get('checked', data.get('updated', '?'))})")
+    for s in it.get('sources', []):
+        print(f"  source: {s.get('title', '')} {s['url']}")
+    return 0
+
+
+# ---------------------------------------------------------------- sync
+
+def remind_list():
+    """{tag: {'at','text'}} for every reminder carrying a deadline: tag."""
+    res = subprocess.run([REMIND, 'list'], capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        sys.exit(f'deadlines: `remind list` failed: {res.stderr.strip()}')
+    out = {}
+    for line in res.stdout.splitlines():
+        m = re.match(r'^\s*\d+\.\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s+(?:\[owner\] )?(.*?)\s+\(tag (\S+)\)\s*$', line)
+        if m and m.group(3).startswith(TAG_PREFIX):
+            out[m.group(3)] = {'at': m.group(1), 'text': m.group(2)}
+    return out
+
+
+def next_slot(now, hhmm):
+    """First hh:mm at or after now + 1 h, never inside quiet hours (00:00–08:00)."""
+    h, m = map(int, hhmm.split(':'))
+    cand = now.replace(hour=h, minute=m)
+    if cand < now + timedelta(hours=1):
+        cand += timedelta(days=1)
+    return cand
+
+
+def reminder_text(it, o, lead_days, data, check=False):
+    """check: the profile marks the item 'check' (unconfirmed): the item's check_text (or a generic line) goes
+    right after the date, so the 400-char cap never cuts it."""
+    days = lead_days
+    title = render(it['title'], it, o['year'])
+    when = f"{o['act_by']:%a %d %b}"
+    base = render(it.get('remind_text') or '', it, o['year'])
+    if not base:
+        base = render(it.get('action') or '', it, o['year'])
+        if len(base) > 160:
+            base = base[:157].rsplit(' ', 1)[0] + '…'
+    txt = f"📅 {title}: {when}" + (f" (in {days} day{'s' if days != 1 else ''})" if days else ' (today)')
+    if check:
+        txt += '. ' + (render(it.get('check_text') or '', it, o['year']).rstrip('.')
+                       or 'Check that this still applies to you')
+    if base:
+        txt += f". {base}"
+    return txt[:400]
+
+
+def plan(data, prof, now, horizon, created=()):
+    """Desired reminders {tag: {'at', 'text', 'item'}} for active, uncovered items in the horizon.
+    created: tags made by earlier syncs (a lead that already fired means no catch-up nudge)."""
+    today = now.date()
+    end = today + timedelta(days=horizon)
+    want = {}
+    default_time = data.get('default_time', '09:00')
+    for it in data['deadlines']:
+        active, why = applicability(it, prof)
+        if not active or it.get('covered_by') or not it.get('sync', True) or not it.get('remind'):
+            continue
+        chk = why.startswith('check')
+        hhmm = it.get('time', default_time)
+        for o in occurrences(it, prof, today, end):
+            if o['act_by'] < today:
+                continue
+            placed, missed = 0, 0
+            prefix = f"{TAG_PREFIX}{it['id']}:{o['act_by']}:"
+            done_before = any(t.startswith(prefix) for t in created)
+            for lead in it['remind']:
+                n = int(lead['before'])
+                d = o['act_by'] - timedelta(days=n)
+                h, m = map(int, lead.get('time', hhmm).split(':'))
+                at = datetime.combine(d, datetime.min.time()).replace(hour=h, minute=m)
+                if at <= now:
+                    missed += 1
+                    continue
+                tag = f"{TAG_PREFIX}{it['id']}:{o['act_by']}:{n}d"
+                want[tag] = {'at': at.strftime(FMT), 'text': reminder_text(it, o, n, data, chk), 'item': it['id']}
+                placed += 1
+            if missed and not placed and not done_before:
+                # every lead is already past but the deadline isn't: one catch-up nudge
+                at = next_slot(now, hhmm)
+                if at.date() <= o['act_by']:
+                    n = (o['act_by'] - at.date()).days
+                    tag = f"{TAG_PREFIX}{it['id']}:{o['act_by']}:late"
+                    want[tag] = {'at': at.strftime(FMT), 'text': reminder_text(it, o, n, data, chk), 'item': it['id']}
+    return want
+
+
+def parse_tag(tag):
+    parts = tag[len(TAG_PREFIX):].split(':')
+    if len(parts) != 3:
+        return None
+    try:
+        return parts[0], date.fromisoformat(parts[1]), parts[2]
+    except ValueError:
+        return None
+
+
+def run_remind(args, dry):
+    if dry:
+        return True, ''
+    res = subprocess.run([REMIND] + args, capture_output=True, text=True, timeout=60)
+    return res.returncode == 0, (res.stdout + res.stderr).strip()
+
+
+def cmd_sync(a):
+    data, prof = load_all()
+    now = now_local()
+    today = now.date()
+    ledger = load_json(STATE, {'created': {}})
+    created = ledger.setdefault('created', {})
+    want = plan(data, prof, now, a.horizon, created)
+    have = remind_list()
+    active_ids = {it['id'] for it in data['deadlines']
+                  if applicability(it, prof)[0] and not it.get('covered_by') and it.get('sync', True)}
+    end = today + timedelta(days=a.horizon)
+    added = updated = kept = skipped = removed = 0
+    lines = []
+    for tag, w in sorted(want.items(), key=lambda kv: kv[1]['at']):
+        h = have.get(tag)
+        if h:
+            if h['at'] == w['at'] and h['text'] == w['text']:
+                kept += 1
+                continue
+            ok, msg = run_remind(['cancel', '--tag', tag], a.dry_run)
+            ok2, msg2 = run_remind(['add', '--owner', '--tag', tag, w['at'], w['text']], a.dry_run)
+            if not (ok and ok2):
+                print(f'deadlines: remind failed for {tag}: {msg} {msg2}', file=sys.stderr); return 1
+            created[tag] = now.strftime(FMT)
+            updated += 1
+            lines.append(f"  updated  {w['at']}  {tag}")
+            continue
+        if tag in created and not a.force:
+            skipped += 1      # created earlier and now gone: it fired or the owner cancelled it
+            continue
+        ok, msg = run_remind(['add', '--owner', '--tag', tag, w['at'], w['text']], a.dry_run)
+        if not ok:
+            print(f'deadlines: remind add failed for {tag}: {msg}', file=sys.stderr); return 1
+        created[tag] = now.strftime(FMT)
+        added += 1
+        lines.append(f"  {'would add' if a.dry_run else 'added'}  {w['at']}  {w['text'][:110]}  ({tag})")
+    for tag, h in sorted(have.items()):
+        if tag in want:
+            continue
+        p = parse_tag(tag)
+        stale = p is None or p[0] not in active_ids or (today <= p[1] <= end)
+        if not stale or h['at'] <= now.strftime(FMT):
+            continue
+        ok, msg = run_remind(['cancel', '--tag', tag], a.dry_run)
+        if not ok:
+            print(f'deadlines: remind cancel failed for {tag}: {msg}', file=sys.stderr); return 1
+        removed += 1
+        lines.append(f"  {'would remove' if a.dry_run else 'removed'}  {h['at']}  ({tag}: no longer planned)")
+    if not a.dry_run:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        # forget ledger entries for deadlines long past, so the file stays small
+        cutoff = today - timedelta(days=400)
+        ledger['created'] = {t: v for t, v in created.items() if (parse_tag(t) or (0, today))[1] >= cutoff}
+        tmp = STATE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(ledger, f, indent=1)
+        os.replace(tmp, STATE)
+    if not a.quiet or lines:
+        print('\n'.join(lines) if lines else '  nothing to change')
+        print(f"{'dry run: ' if a.dry_run else ''}{added} added, {updated} updated, {removed} removed, "
+              f"{kept} already set, {skipped} skipped (fired or cancelled earlier; --force re-creates)"
+              f"  [horizon {a.horizon} d → {end}]")
+    return 0
+
+
+# ---------------------------------------------------------------- checklist
+
+DOC_RE = re.compile(r'^#(\d+)\s+(\S*)\s+(.*?)\s+\| corr: (.*?) \| type: (.*?) \| tags: (.*)$')
+
+
+def paperless_search(q, n=15):
+    res = subprocess.run([PAPERLESS, 'search', q, '-n', str(n)], capture_output=True, text=True, timeout=90)
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or 'paperless search failed')
+    docs = []
+    for line in res.stdout.splitlines():
+        m = DOC_RE.match(line.strip())
+        if m:
+            docs.append({'id': int(m.group(1)), 'created': m.group(2), 'title': m.group(3).strip(),
+                         'corr': m.group(4).strip(), 'type': m.group(5).strip(), 'tags': m.group(6).strip()})
+    return docs
+
+
+# No document content. The vault's tier-1 fields give period_years (the years of the
+# first two dd.mm.yyyy dates near the top, e.g. a Lohnausweis' von/bis; never the dates), and a year-scoped full-text
+# search ("<query> <year>", ids only) stands in for "the text mentions the year".
+_fields, _year_hits = {}, {}
+FIELDS = 'title,document_type,correspondent,document_date,period_years'
+
+
+def paperless_fields(i):
+    if i not in _fields:
+        res = subprocess.run([PAPERLESS, 'fields', str(i), '--fields', FIELDS], capture_output=True, text=True,
+                             timeout=300)
+        try:
+            f = json.loads(res.stdout) if res.returncode == 0 else {}
+        except ValueError:
+            f = {}
+        _fields[i] = f if isinstance(f, dict) else {}
+    return _fields[i]
+
+
+def period_years(f):
+    """The vault's period_years (ints, at most two) from a fields answer. Years before 2000 are dropped: the vault
+    counts 19xx dates too, and a birth date near the top of a Lohnausweis could take a period slot."""
+    ys = []
+    for y in f.get('period_years') or []:
+        try:
+            if int(y) >= 2000:
+                ys.append(int(y))
+        except (TypeError, ValueError):
+            pass
+    return ys[:2]
+
+
+def year_hits(queries, year):
+    """Ids of documents whose text matches one of the queries AND mentions the year (full-text search, ids only)."""
+    key = (tuple(queries), year)
+    if key not in _year_hits:
+        ids = set()
+        for q in queries:
+            ids |= {d['id'] for d in paperless_search(f'{q} {year}')}
+        _year_hits[key] = ids
+    return _year_hits[key]
+
+
+def check_item(ci, year, claimed, default_excl=()):
+    """→ (status, evidence). status: found / maybe / missing / n/a"""
+    pc = ci.get('paperless')
+    if not pc:
+        return 'n/a', 'not something paperless would hold (check yourself)'
+    excl = {t.lower() for t in pc.get('exclude_types', default_excl)}
+    seen = {}
+    for q in pc.get('queries', []):
+        for d in paperless_search(q):
+            if d['id'] in claimed or d['type'].lower() in excl:
+                continue
+            seen.setdefault(d['id'], d)
+    if not seen:
+        return 'missing', 'nothing in paperless'
+    hits, maybes = [], []
+    rx = re.compile(pc['confirm'], re.I) if pc.get('confirm') else None
+    for d in sorted(seen.values(), key=lambda d: d['id']):
+        f = paperless_fields(d['id'])
+        meta = ' | '.join(str(x) for x in (d['title'], d['type'], d['tags'], d.get('corr') or '',
+                                            f.get('document_type') or '', f.get('correspondent') or ''))
+        # the search already hit the text; the confirm words must be in the metadata for a "found"
+        confirmed = not rx or bool(rx.search(meta))
+        unconf = '' if confirmed else '; title unconfirmed'
+        ys = period_years(f)
+        created = d['created'][:4]
+        if pc.get('year_mode') == 'period':
+            # Lohnausweis: the period (von/bis) dates are the first dd.mm.yyyy dates in the text
+            if ys and all(y == year for y in ys):
+                (hits if confirmed else maybes).append((d, f"period {ys[0]}{unconf}"))
+            elif year in ys:
+                maybes.append((d, f'year appears in the dates{unconf}'))
+        else:
+            if year in ys and all(y in (year, year + 1) for y in ys) and created in (str(year), str(year + 1)):
+                (hits if confirmed else maybes).append((d, f'dated {year}{unconf}'))
+            elif created in (str(year), str(year + 1)) and (str(year) in d['title']
+                                                              or d['id'] in year_hits(pc.get('queries', []), year)):
+                maybes.append((d, f'mentions {year}, created {d["created"]}{unconf}'))
+    if hits:
+        for d, _ in hits:
+            claimed.add(d['id'])
+        return 'found', '; '.join(f"#{d['id']} {d['title'][:50]} ({why})" for d, why in hits)
+    if maybes:
+        return 'maybe', '; '.join(f"#{d['id']} {d['title'][:50]} ({why})" for d, why in maybes[:3])
+    return 'missing', f'no {year} document among {len(seen)} paperless match(es)'
+
+
+def cmd_checklist(a):
+    data, prof = load_all()
+    cl = (data.get('checklists') or {}).get(a.kind)
+    if not cl:
+        sys.exit(f"deadlines: no checklist '{a.kind}' (have: {', '.join(data.get('checklists', {}))})")
+    year = a.year
+    today = now_local().date()
+    results = []
+    claimed = set()
+    err = None
+    for ci in cl['items']:
+        active, why = applicability(ci, prof)
+        if a.offline or err:
+            st, ev = ('skipped', 'offline') if a.offline else ('error', err)
+        else:
+            try:
+                st, ev = check_item(ci, year, claimed, cl.get('exclude_types', ()))
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+                err = f'paperless unavailable: {e}'
+                st, ev = 'error', err
+        if active and ci.get('optional'):
+            why = 'optional'
+        results.append({'id': ci['id'], 'title': render(ci['title'], ci, year + 1), 'status': st,
+                        'evidence': ev, 'active': active and not ci.get('optional'), 'note': why,
+                        'from': render(ci.get('from', ''), ci, year + 1),
+                        'when': render(ci.get('when', ''), ci, year + 1), 'why': ci.get('why', '')})
+    if a.json:
+        print(json.dumps({'tax_year': year, 'checked': today.isoformat(), 'items': results},
+                         ensure_ascii=False, indent=1))
+        return 0
+    have = sum(r['status'] == 'found' for r in results)
+    if getattr(a, 'md', False):
+        word = {'found': 'have (paperless)', 'maybe': 'probably (paperless, check)', 'missing': 'missing',
+                'n/a': 'check yourself', 'skipped': 'not checked', 'error': 'paperless error'}
+        print(f"_Tax year {year}; paperless "
+              f"{'not checked (offline)' if a.offline else f'checked {today} (read-only)'}._\n")
+        print('| Status | Document | From · when | Evidence |')
+        print('|---|---|---|---|')
+        for r in results:
+            opt = '' if r['active'] else f" _({r['note']})_"
+            fw = ' · '.join(x for x in (r['from'], r['when']) if x)
+            ev = r['evidence'] if r['status'] not in ('skipped',) else ''
+            cells = [word[r['status']], r['title'] + opt, fw, ev]
+            print('| ' + ' | '.join(str(c).replace('|', '/') for c in cells) + ' |')
+        print(f"\n{have}/{len(results)} found in paperless.")
+        return 0
+    mark = {'found': '[x]', 'maybe': '[?]', 'missing': '[ ]', 'n/a': '[ ]', 'skipped': '[ ]', 'error': '[!]'}
+    print(render(cl['title'], cl, year + 1).replace('{tax_year}', str(year)))
+    print(f"  paperless checked {today} (read-only)" if not a.offline else '  (offline: paperless not checked)')
+    for r in results:
+        opt = '' if r['active'] else f"  ({r['note']})"
+        print(f"  {mark[r['status']]} {r['title']}{opt}")
+        detail = []
+        if r['from'] or r['when']:
+            detail.append(' · '.join(x for x in (r['from'], r['when']) if x))
+        if r['status'] in ('found', 'maybe', 'missing', 'error', 'n/a'):
+            detail.append(f"paperless: {r['evidence']}")
+        for d in detail:
+            print(f"      {d}")
+    print(f"  {have}/{len(results)} found in paperless; [?] = probably, check; items without paperless "
+          f"evidence may be on paper or in e-banking.")
+    return 0
+
+
+# ---------------------------------------------------------------- validate
+
+def canary_skipped_hosts(path=None):
+    """Hosts whose deadline source links scraper-canary can't check live (SKIP = robots.txt refuses us), from its
+    state file (never fetched here). None when the canary has no deadlines results yet (unknown, not 'all fine')."""
+    st = load_json(path or CANARY_STATE, {'results': {}}) if os.path.exists(path or CANARY_STATE) else {}
+    res = [r for r in (st.get('results') or {}).values() if isinstance(r, dict) and r.get('tool') == 'deadlines'
+           and r.get('source') not in (None, '*')]
+    if not res:
+        return None
+    return {r['source'].split('/')[0].lower() for r in res if r.get('status') == 'SKIP'}
+
+
+def stale_warnings(data, today, canary_hosts):
+    """Stale-data warnings: old 'checked' dates, next year's amounts missing from November on, sources that no
+    weekly live check covers."""
+    out, cutoff, ny = [], add_months(today, -12), str(today.year + 1)
+    for it in data.get('deadlines') or []:
+        if not isinstance(it, dict):
+            continue
+        iid = it.get('id', '?')
+        ck = it.get('checked') or data.get('updated')
+        try:
+            ckd = date.fromisoformat(str(ck)[:10]) if ck else None
+        except ValueError:
+            ckd = None
+            out.append(f'{iid}: unreadable checked date {ck!r}')
+        if ck and ckd and ckd < cutoff:
+            out.append(f'{iid}: checked {ckd} is over 12 months old (re-check the sources, then bump checked)')
+        elif not ck:
+            out.append(f'{iid}: no checked date')
+        if today.month >= 11 and (it.get('amounts') or '{amount}' in json.dumps(it)) \
+                and ny not in (it.get('amounts') or {}):
+            out.append(f'{iid}: no amount for {ny} yet (usually published by now; add it with an official source)')
+        dead = []
+        for src in it.get('sources') or []:
+            u = str(src.get('url') or '') if isinstance(src, dict) else ''
+            scheme = u.split(':', 1)[0].lower() if ':' in u else ''
+            if scheme not in ('http', 'https'):
+                dead.append(f'{u or "(no url)"} ({scheme or "no"}:// source)')
+                continue
+            host = u.split('/')[2].split('@')[-1].split(':')[0].lower() if u.count('/') >= 2 else ''
+            if canary_hosts and host in canary_hosts:
+                dead.append(f'{host} (robots.txt blocks scraper-canary)')
+        if dead:
+            out.append(f'{iid}: no live check for ' + '; '.join(dead))
+    return out
+
+
+def check_data(data, prof):
+    """(errors, warnings) for the data file + profile."""
+    errs, warns = [], []
+    dl = data.get('deadlines')
+    if not isinstance(dl, list):
+        errs.append("no 'deadlines' list")
+        dl = []
+    bad = [i for i, it in enumerate(dl) if not isinstance(it, dict)]
+    if bad:
+        errs.append(f"deadlines entries #{', #'.join(map(str, bad))} are not objects")
+    dl = [it for it in dl if isinstance(it, dict)]
+    ids = [it.get('id') for it in dl]
+    if len(ids) != len(set(ids)):
+        errs.append('duplicate deadline ids')
+    today = now_local().date()
+    for it in dl:
+        iid = it.get('id', '?')
+        if not it.get('id'):
+            errs.append(f"item without id (title {str(it.get('title'))[:40]!r})")
+        if not it.get('title'):
+            errs.append(f'{iid}: no title')
+        d = it.get('date')
+        if d is not None and not isinstance(d, str):
+            errs.append(f"{iid}: date must be a string 'MM-DD' or 'YYYY-MM-DD', not {d!r}")
+            d = None
+        if d and not (re.fullmatch(r'\d{2}-\d{2}', d) or re.fullmatch(r'\d{4}-\d{2}-\d{2}', d)):
+            errs.append(f'{iid}: bad date {d!r}')
+        if d:
+            try:
+                (date.fromisoformat(d) if len(d) == 10 else date(2024, int(d[:2]), int(d[3:])))
+            except ValueError:
+                errs.append(f'{iid}: impossible date {d!r}')
+        if not d and not it.get('date_from_profile'):
+            errs.append(f'{iid}: needs date or date_from_profile')
+        if not it.get('sources') and not it.get('covered_by'):
+            warns.append(f'{iid}: no sources')
+        rem = it.get('remind', [])
+        for l in rem if isinstance(rem, list) else [None]:
+            if not isinstance(l, dict) or not isinstance(l.get('before'), int) or l['before'] < 0:
+                errs.append(f'{iid}: remind.before must be a non-negative int')
+        srcs = it.get('sources') or []
+        if not isinstance(srcs, list) or not all(isinstance(x, dict) and x.get('url') for x in srcs):
+            errs.append(f'{iid}: sources must be a list of objects with a url')
+        if '{amount}' in json.dumps(it):
+            for y in (today.year,):     # next year: stale_warnings, from November on
+                if str(y) not in (it.get('amounts') or {}):
+                    warns.append(f'{iid}: no amount for {y} (update the data file)')
+        if it.get('if') and it['if'] not in prof:
+            warns.append(f"{iid}: profile has no key '{it['if']}'")
+        uk = it.get('until_from_profile')
+        if uk:
+            if uk not in prof:
+                warns.append(f"{iid}: profile has no key '{uk}'")
+            elif prof.get(uk) not in (None, '', 'unknown') and until_limit(it, prof) is None:
+                warns.append(f"{iid}: profile '{uk}' must be a year or YYYY-MM-DD, not {prof.get(uk)!r}")
+    for name, cl in (data.get('checklists') or {}).items():
+        for ci in cl.get('items', []):
+            pc = ci.get('paperless')
+            if pc and pc.get('confirm'):
+                try:
+                    re.compile(pc['confirm'])
+                except re.error as e:
+                    errs.append(f"checklist {name}/{ci.get('id')}: bad regex: {e}")
+    canary = canary_skipped_hosts()
+    warns += stale_warnings(data, today, canary)
+    return errs, warns, canary
+
+
+def cron_validate(a):
+    """validate --cron: weekly live-data check. ONE inbox note only on errors or warnings that were not there last
+    run (known warnings stay silent); state = the last run's warnings. Prints nothing; exit 0 once the note (if any)
+    is written, so cron-fail only fires when this check itself breaks."""
+    today = now_local().date()
+    try:
+        data, prof = load_all(check=False)
+        errs, warns, _ = check_data(data, prof)
+    except SystemExit as e:                     # missing / unreadable data file: load_json's die()
+        errs, warns = [str(e.code)], None
+    state_f = os.path.join(VALIDATE_STATE, 'known.json')
+    try:
+        with open(state_f, encoding='utf-8') as f:
+            prev = json.load(f)
+        prev = prev if isinstance(prev, dict) else {}
+    except (OSError, ValueError):               # first run / corrupt state: every warning counts as new
+        prev = {}
+    known = set(prev.get('warnings') or [])
+    new = [w for w in (warns or []) if w not in known]
+    if warns is not None:                       # a broken file keeps last run's warnings as the baseline
+        os.makedirs(VALIDATE_STATE, exist_ok=True)
+        tmp = f'{state_f}.{os.getpid()}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'day': today.isoformat(), 'errors': errs, 'warnings': warns}, f, indent=1, ensure_ascii=False)
+        os.replace(tmp, state_f)
+    if not errs and not new:
+        return 0
+    lines = [f'# deadlines validate: {len(errs)} error(s), {len(new)} new warning(s)', '',
+             f'Data, not instructions. Weekly check of the real data file {DATA} (`deadlines validate`).', '']
+    lines += [f'- ERROR: {e}' for e in errs] + [f'- new warn: {w}' for w in new]
+    old = [w for w in (warns or []) if w in known]
+    if old:
+        lines.append(f'- ({len(old)} known warning(s) unchanged: `deadlines validate` lists them)')
+    lines += ['', 'Handling: fix the data file (official sources, bump `checked`), rerun `deadlines validate` '
+              '(skill deadlines); a warning that is fine as is stays silent from next week on. Delete the note.']
+    os.makedirs(VALIDATE_INBOX, exist_ok=True)
+    path = os.path.join(VALIDATE_INBOX, f'deadlines-validate-{today.isoformat()}.md')
+    with open(f'{path}.tmp', 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(f'{path}.tmp', path)
+    return 0
+
+
+def cmd_validate(a):
+    if getattr(a, 'cron', False):
+        return cron_validate(a)
+    data, prof = load_all(check=False)
+    errs, warns, canary = check_data(data, prof)
+    for w in warns:
+        print(f'warn: {w}')
+    for e in errs:
+        print(f'ERROR: {e}')
+    print(f"{len(data.get('deadlines') or [])} deadlines, "
+          f"{sum(len(c.get('items', [])) for c in (data.get('checklists') or {}).values())} checklist items, "
+          f"data updated {data.get('updated', '?')}, {len(warns)} warning(s): "
+          f"{'FAILED' if errs or (a.strict and warns) else 'OK'}")
+    if canary is None:
+        print('note: scraper-canary has no deadlines results yet: robots-blocked sources unknown')
+    return 1 if errs or (getattr(a, 'strict', False) and warns) else 0
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog='deadlines', description=__doc__.split('\n\n')[0])
+    sp = p.add_subparsers(dest='cmd')
+    l = sp.add_parser('list'); l.add_argument('--days', type=int, default=365)
+    l.add_argument('--all', action='store_true'); l.add_argument('--json', action='store_true')
+    s = sp.add_parser('show'); s.add_argument('id')
+    c = sp.add_parser('checklist'); c.add_argument('kind'); c.add_argument('year', type=int)
+    c.add_argument('--offline', action='store_true'); c.add_argument('--json', action='store_true')
+    c.add_argument('--md', action='store_true', help='Markdown table (for reports)')
+    y = sp.add_parser('sync'); y.add_argument('--dry-run', action='store_true')
+    y.add_argument('--horizon', type=int, default=200); y.add_argument('--force', action='store_true')
+    y.add_argument('--quiet', action='store_true', help='print only when something changes (cron)')
+    v = sp.add_parser('validate')
+    v.add_argument('--strict', action='store_true', help='exit 1 on warnings too')
+    v.add_argument('--cron', action='store_true', help='weekly cron: inbox note on errors / new warnings only')
+    a = p.parse_args(argv[1:])
+    if not a.cmd:
+        a = p.parse_args(['list'])
+    return {'list': cmd_list, 'show': cmd_show, 'checklist': cmd_checklist, 'sync': cmd_sync,
+            'validate': cmd_validate}[a.cmd](a)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

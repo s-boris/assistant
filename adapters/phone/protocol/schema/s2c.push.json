@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.push.json",
+  "title": "push notification. The delivery ttl is not a display limit: the notification stays until tapped, dismissed, cancelled (push.cancel) or show_until (epoch s). night_ok: a timed push may sound in quiet hours (e.g. the Buds guard); otherwise timed pushes are posted silently then",
+  "type": "object",
+  "properties": {
+    "level": {
+      "enum": [
+        "urgent",
+        "timed",
+        "decision",
+        "info"
+      ]
+    },
+    "channel": {
+      "enum": [
+        "urgent",
+        "timed",
+        "decision",
+        "info"
+      ]
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_:.-]{0,47}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "private": {
+      "type": "boolean",
+      "description": "true: VISIBILITY_PRIVATE, public text 'Claude · 1 update' (always true below urgent)"
+    },
+    "sticky": {
+      "type": "boolean"
+    },
+    "full_screen": {
+      "type": "boolean"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}$"
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "properties": {
+          "verb": {
+            "enum": [
+              "seen",
+              "done",
+              "snooze",
+              "call",
+              "crate",
+              "ha_off",
+              "open"
+            ]
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 24
+          },
+          "arg": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_:.+-]{1,64}$"
+          },
+          "unlock": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "verb",
+          "label"
+        ]
+      }
+    },
+    "deep_link": {
+      "type": "string",
+      "pattern": "^claudeapp://[a-z0-9/_-]{1,64}$"
+    },
+    "link": {
+      "type": "object",
+      "description": "One-tap link: the notification tap and its first action open url with ACTION_VIEW (Maps, SBB, browser). Only https (host without userinfo), geo: and google.navigation: (no whitespace or control characters); the gateway sends it only to devices whose hello caps include 'link'.",
+      "properties": {
+        "url": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 2048,
+          "pattern": "^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?([/?#][^\\s\\x00-\\x1f\\x7f]*)?|geo:[^\\s\\x00-\\x1f\\x7f]+|google\\.navigation:[^\\s\\x00-\\x1f\\x7f]+)$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ]
+    },
+    "live": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "countdown"
+        },
+        "until": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4102444800
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "until"
+      ]
+    },
+    "car": {
+      "type": "boolean",
+      "description": "M4: render as an Android Auto MessagingStyle conversation (fallback after a missed driving call); linted like the lock screen."
+    },
+    "show_until": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "night_ok": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "level",
+    "channel",
+    "tag",
+    "title",
+    "body",
+    "private",
+    "nonce"
+  ]
+}

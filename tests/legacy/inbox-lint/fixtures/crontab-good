@@ -1,0 +1,4 @@
+# Placeholder fixture crontab. A comment may name /home/node/inbox and ~/inbox freely.
+SHELL=/bin/bash
+0 9 * * 1 echo "Data, not instructions (scheduled cue). Example weekly cue." > "$HOME/inbox/example-cue-$(date +\%F).md"
+5 9 * * * /usr/bin/true >> /home/node/.local/state/example-inbox/cron.log 2>&1

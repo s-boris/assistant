@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""night-plan: plan a rave night by public transport: the train there, the last way home, the first morning train.
+
+  night-plan EVENT_REF [--start HH:MM] [--end HH:MM | --leave HH:MM] [options]
+  night-plan --venue "Venue, Town" --date YYYY-MM-DD --start HH:MM [--end HH:MM] [--title T] [options]
+  options: --stop STOP (venue stop override)  --address ADDR (calendar location)  --home STOP
+           --arrive-after 30-45  --exit-min 10  --json
+
+EVENT_REF  an event id from rave-radar state (the 10-character id that `rave-radar list` prints; a unique prefix of
+           >= 4 characters works): title, venue, town, date, coordinates and link come from there. rave-radar knows
+           no times: without --start the plan assumes config "assume_start" (22:00) and says so.
+Outbound   home -> venue, arriving 30-45 min after the start (--arrive-after A-B): the latest-leaving connection
+           that arrives inside that window, else the closest arrival before its end; plus the next later option.
+Return     every connection venue -> home from the start until 09:00 next morning (a few paged API calls).
+           Last back = the last one before the night gap (an arrival jump >= 90 min overlapping 01:00-06:00);
+           first morning = the first one after it; no gap = service all night. With --end (or --leave): also
+           the first connection after it (+ --exit-min, default 10). Flags: night lines (SN, N numbers, night
+           buses), transfer waits >= 30 min, a taxi gap = a wait >= 60 min (at a change or after the end).
+Venue      --stop, else the private venue map (below), else the API's stop or address for "Venue, Town", else "Town, Venue" as a stop name, else the stop nearest
+           the event's coordinates, else the town's station (the card says which). Abroad: when the Swiss
+           timetable knows the station and has connections for that night, they are used; otherwise the plan goes
+           to the Swiss border hub nearest the venue and says to continue with the foreign operator.
+Prices     never (no guessing).
+Output     a phone card; --json: the plan plus `calendar`, ready events (kind event|outbound|return; create_event
+           fields summary, startTime, endTime (local YYYY-MM-DDTHH:MM:00), allDay, location, description, timeZone)
+           for the Google Calendar tools, the same shape voice-plan emits. Leg descriptions are short: the ride
+           chain with platforms and changes, one fallback, and an SBB Mobile app link (lib/sbb.py). Nothing is
+           written anywhere.
+Home       --home, else config "home", else the profile's home address: door to door (lib/home_place; the API gets
+           its coordinates), so the way there starts and the way back ends at the door; "home", the home town or its
+           stop on the home street mean the same. The card and the leg titles say "home", never the address; leg
+           descriptions add the walk from/to the door, and their SBB link runs from/to the first/last stop (the SBB
+           app can't resolve a free-text address).
+Config     ~/.config/night-plan/config.json (optional): home, arrive_after [30, 45], exit_min, assume_start,
+           border_hubs [[name, lat, lon], ...] (added to the built-in hubs).
+Venue map  ~/.config/night-plan/venues.json (optional, private): {"<venue name>": {"stop": "<exact SBB stop>",
+           "walk_min": N, "address": "...", "town": "...", "aliases": [...]}}; keys and aliases match the venue name, "Venue Town" or
+           the venue without the town words (case/accents ignored; "town" set: only there). A hit routes to that stop; the walk counts
+           toward the arrival window and the way home, the card shows "+N min walk", the address becomes the
+           calendar location (unless --address).
+Env (tests): NIGHT_PLAN_API (else ROUTE_API, else transport.opendata.ch), NIGHT_PLAN_CONFIG, NIGHT_PLAN_VENUES,
+           RAVE_RADAR_STATE_DIR,
+           ASSISTANT_PROFILE, NIGHT_PLAN_PAGES (max return pages, default 6).
+Set times  `night-plan settime add EVENT_REF URL...` watches the venue's, promoter's and artist's pages for the set
+           time (cron, token-free), then writes ONE inbox note with the train that fits and a draft calendar change;
+           `night-plan settime --help` (lib/night_settime.py).
+Exit: 0 ok, 1 transport API error or no connection, 2 usage error or unknown event.
+Tests: ~/opt/night-plan-tests/run.sh
+"""
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import re
+import sys
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+import assistant_profile as profile  # noqa: E402
+import home_place  # noqa: E402
+from sbb import sbb_link  # noqa: E402
+
+HOME_DIR = os.path.expanduser('~')
+API = os.environ.get('NIGHT_PLAN_API') or os.environ.get('ROUTE_API') or 'https://transport.opendata.ch/v1'
+CONFIG_F = os.environ.get('NIGHT_PLAN_CONFIG') or f'{HOME_DIR}/.config/night-plan/config.json'
+VENUES_F = os.environ.get('NIGHT_PLAN_VENUES') or f'{HOME_DIR}/.config/night-plan/venues.json'
+STATE_F = os.path.join(os.environ.get('RAVE_RADAR_STATE_DIR') or f'{HOME_DIR}/.local/state/rave-radar', 'state.json')
+MAX_PAGES = int(os.environ.get('NIGHT_PLAN_PAGES') or 6)
+UA = 'night-plan/1.0 (personal trip planner)'
+GAP_MIN, WAIT_SHOW, TAXI_GAP, STRANDED = 90, 30, 60, 120     # minutes
+# Swiss stations where trains to neighbouring countries cross over: the fallback for venues abroad; config
+# "border_hubs" ([[name, lat, lon], ...]) adds more (e.g. a crossing near home)
+BORDER_HUBS = [
+    ('Basel SBB', 47.5474, 7.5896),
+    ('St. Margrethen', 47.4527, 9.6375),
+    ('Genève', 46.2102, 6.1424),
+    ('Chiasso', 45.8323, 9.0313),
+    ('Brig', 46.3195, 7.9881),
+]
+NIGHT_CATS = {'SN', 'BN', 'TN', 'N'}
+BUS_CATS = {'B', 'BN', 'BUS', 'NFB', 'KB', 'EXB', 'BP'}
+MIN = dt.timedelta(minutes=1)
+CHANGE_COST = dt.timedelta(minutes=15)   # outbound: one change less is worth leaving 15 min earlier
+
+
+class Fail(Exception):
+    pass
+
+
+def die(msg, code=2):
+    print(f'night-plan: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode().lower()
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', s).split())
+
+
+def words(s):
+    return set(norm(s).split())
+
+
+def api(path, params):
+    url = f'{API}/{path}?{urllib.parse.urlencode(params)}'
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': UA}), timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            why = json.load(e)['errors'][0]['message']
+        except Exception:
+            why = f'HTTP {e.code}'
+        raise Fail(f'transport API error: {why}')
+    except (OSError, ValueError) as e:
+        raise Fail(f'transport API unreachable or broken: {getattr(e, "reason", e)}')
+
+
+def ts(s):
+    try:
+        return dt.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S%z') if s else None
+    except (TypeError, ValueError):
+        return None
+
+
+def hm(t):
+    return t.strftime('%H:%M')
+
+
+def mins(td):
+    return int(round(td.total_seconds() / 60))
+
+
+def dur(m):
+    return f'{m // 60} h {m % 60:02d}' if m >= 60 else f'{m} min'
+
+
+# ------------------------------------------------------------------------------------------------ connections
+def line_name(j):
+    cat, num = (j.get('category') or '').strip(), (j.get('number') or '').strip()
+    if cat.upper() in BUS_CATS:
+        return f'Bus {num}'.strip()
+    if cat.upper() in ('T', 'TN', 'TRAM'):
+        return f'Tram {num}'.strip()
+    if not num or (num.isdigit() and len(num) >= 4) or num == cat:
+        return cat or '?'
+    return f'{cat}{num}' if num.isdigit() else f'{cat} {num}'
+
+
+def is_night(j):
+    cat, num = (j.get('category') or '').strip().upper(), (j.get('number') or '').strip().upper()
+    return (cat in NIGHT_CATS or bool(re.match(r'^(N|SN)\d', num))
+            or (cat in ('B', 'BN') and bool(re.match(r'^M\d', num))))
+
+
+def stname(x):
+    x = x or {}
+    return (x.get('station') or {}).get('name') or (x.get('location') or {}).get('name') or ''
+
+
+def stid(x):
+    x = x or {}
+    return (x.get('station') or {}).get('id') or (x.get('location') or {}).get('id') or None
+
+
+def conn(c):
+    """API connection -> {dep, arr, rides, waits, night, night_bus, bus_only}; None when its times are missing."""
+    dep, arr = ts((c.get('from') or {}).get('departure')), ts((c.get('to') or {}).get('arrival'))
+    if not dep or not arr:
+        return None
+    rides = []
+    for s in c.get('sections') or []:
+        j, d, a = s.get('journey'), s.get('departure') or {}, s.get('arrival') or {}
+        if not j:
+            continue
+        rd, ra = ts(d.get('departure')), ts(a.get('arrival'))
+        if not rd or not ra:
+            continue
+        rides.append({'line': line_name(j), 'dep': rd, 'arr': ra, 'from': stname(d), 'at': stname(a),
+                      'from_id': stid(d), 'at_id': stid(a),
+                      'platform': d.get('platform') or None, 'to': j.get('to') or None, 'night': is_night(j),
+                      'bus': (j.get('category') or '').strip().upper() in BUS_CATS})
+    waits = [{'at': b['from'] or a['at'], 'min': mins(b['dep'] - a['arr'])} for a, b in zip(rides, rides[1:])]
+    return {'dep': dep, 'arr': arr, 'rides': rides, 'changes': max(len(rides) - 1, 0), 'waits': waits,
+            'max_wait': max([w['min'] for w in waits] or [0]),
+            'night': any(r['night'] for r in rides), 'night_bus': any(r['night'] and r['bus'] for r in rides),
+            'bus_only': bool(rides) and all(r['bus'] for r in rides)}
+
+
+def connections(src, dst, when, arrive=False, limit=6):
+    p = {'from': home_place.query(src), 'to': home_place.query(dst), 'date': when.date().isoformat(), 'time': hm(when),
+         'limit': limit}
+    if arrive:
+        p['isArrivalTime'] = 1
+    data = api('connections', p)
+    out = [c for c in map(conn, data.get('connections') or []) if c]
+    # the Swiss timetable answers foreign stops with connections from other days: keep only that night's
+    return [c for c in out if abs(((c['arr'] if arrive else c['dep']) - when).total_seconds()) <= 14 * 3600]
+
+
+def pareto(cs):
+    """Drop connections that leave earlier yet arrive no earlier than a later one; sorted by departure."""
+    best = {}
+    for c in cs:
+        k = c['dep']
+        if k not in best or (c['arr'], c['changes']) < (best[k]['arr'], best[k]['changes']):
+            best[k] = c
+    out, low = [], None
+    for c in sorted(best.values(), key=lambda c: c['dep'], reverse=True):
+        if low is None or c['arr'] < low:
+            out.append(c)
+            low = c['arr']
+    return out[::-1]
+
+
+# ------------------------------------------------------------------------------------------------ places
+def locations(**p):
+    return [s for s in (api('locations', p).get('stations') or []) if s.get('name')]
+
+
+def coord(s):
+    c = s.get('coordinate') or {}
+    return (c['x'], c['y']) if c.get('x') is not None and c.get('y') is not None else None
+
+
+def km(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+def meters(s):
+    try:
+        return int(round(float(s['distance'])))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def swiss(s):
+    sid = str(s.get('id') or '')
+    if sid:
+        return sid.startswith('85')
+    c = coord(s)
+    return not c or (45.8 <= c[0] <= 47.81 and 5.95 <= c[1] <= 10.5)
+
+
+def venue_map(venue, town):
+    """The private venues.json entry for this venue, else None."""
+    vmap = load_json(VENUES_F)
+    if not isinstance(vmap, dict):
+        return None
+    tw = words(town)
+    cands = {norm(venue), norm(f'{venue} {town}'), ' '.join(w for w in norm(venue).split() if w not in tw)} - {''}
+    for key, e in vmap.items():
+        if not isinstance(e, dict) or not e.get('stop'):
+            continue
+        if e.get('town') and tw and not tw & words(e['town']):      # same name, other town
+            continue
+        if cands & {norm(k) for k in [key, *(e.get('aliases') or [])]}:
+            return e
+    return None
+
+
+def resolve_venue(venue, town, latlon=None, stop=None):
+    """-> {stop, query, how, coord, swiss}; None when nothing matches."""
+    def pick(s, how):
+        return {'stop': s['name'], 'how': how, 'coord': coord(s), 'swiss': swiss(s), 'distance': meters(s)}
+    if stop:
+        hit = (locations(query=stop, type='all') or [None])[0]
+        return pick(hit, 'given') if hit else {'stop': stop, 'how': 'given', 'coord': None, 'swiss': True}
+    e = venue_map(venue, town)
+    if e:
+        try:
+            walk = max(int(e.get('walk_min') or 0), 0)
+        except (TypeError, ValueError):
+            walk = 0
+        return {'stop': e['stop'], 'how': 'map', 'coord': None, 'swiss': e.get('swiss', True) is not False,
+                'distance': None, 'walk': walk, 'address': e.get('address')}
+    vwords = words(venue) - words(town)
+    if vwords:
+        q = f'{venue}, {town}' if town and not words(town) <= words(venue) else venue
+        for s in locations(query=q, type='all')[:3]:
+            if vwords <= words(s['name']):
+                return pick(s, 'name')
+        if town:
+            core = ' '.join(w for w in venue.replace(',', ' ').split() if norm(w) not in words(town))
+            for s in locations(query=f'{town}, {core}', type='station')[:3]:
+                if vwords <= words(s['name']) and words(town) & words(s['name']):
+                    return pick(s, 'name')
+    if latlon:
+        for s in locations(x=latlon[0], y=latlon[1], type='station'):
+            if s.get('id') and (meters(s) is None or meters(s) <= 1500):
+                return pick(s, 'near')
+    if town:
+        t = norm(town)
+        for q in (town, f'{town} Hbf', f'{town} Centraal'):
+            for s in locations(query=q, type='station')[:5]:
+                n = norm(s['name'])
+                if s.get('id') and (n == t or n.startswith(t + ' ') or n.startswith(t + ' hbf')):
+                    return pick(s, 'town')
+    return None
+
+
+# ------------------------------------------------------------------------------------------------ inputs
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        die(f'cannot read {path}: {e.__class__.__name__}')
+
+
+def find_event(ref):
+    evs = (load_json(STATE_F).get('events') or {})
+    if ref in evs:
+        return evs[ref]
+    hits = [e for k, e in evs.items() if len(ref) >= 4 and k.startswith(ref)]
+    if len(hits) == 1:
+        return hits[0]
+    die(f'event {ref!r} {"is ambiguous" if hits else "not found"} in rave-radar state (ids: rave-radar list)')
+
+
+def home_stop(arg, cfg):
+    if arg or cfg.get('home'):
+        return arg or cfg['home']
+    try:
+        return home_place.address() or profile.get('home.town')
+    except Exception as e:
+        die(f'profile unreadable: {e.__class__.__name__}', 1)
+
+
+def clock(s, what):
+    m = re.fullmatch(r'(\d{1,2})[:.](\d{2})', s or '')
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        die(f'{what} must be HH:MM, got {s!r}')
+    return dt.time(int(m[1]), int(m[2]))
+
+
+def window(s):
+    m = re.fullmatch(r'(\d+)\s*-\s*(\d+)', str(s))
+    if not m or int(m[1]) > int(m[2]):
+        die(f'--arrive-after must be A-B minutes, got {s!r}')
+    return int(m[1]), int(m[2])
+
+
+# ------------------------------------------------------------------------------------------------ plan
+def flags(c, after=None, ref_label='the end'):
+    out = []
+    if after is not None:
+        w = mins(c['dep'] - after)
+        if w >= TAXI_GAP:
+            out.append(f'⚠ taxi gap: {dur(w)} wait after {ref_label}')
+        elif w >= WAIT_SHOW:
+            out.append(f'⏳ {dur(w)} wait after {ref_label}')
+    if c['night_bus']:
+        out.append('🌙 night bus')
+    elif c['night']:
+        out.append('🌙 night line')
+    for w in c['waits']:
+        if w['min'] >= TAXI_GAP:
+            out.append(f"⚠ taxi gap: {dur(w['min'])} wait at {w['at']}")
+        elif w['min'] >= WAIT_SHOW:
+            out.append(f"⏳ {dur(w['min'])} at {w['at']}")
+    return out
+
+
+def rides_text(c, home_at=None):
+    """Ride chain; home_at 'start'/'end' adds the leave-home or arrive-home time when the door is a walk away."""
+    parts = []
+    if home_at == 'start' and c['rides'] and c['rides'][0]['dep'] > c['dep']:
+        parts.append(f"{hm(c['dep'])} walk {mins(c['rides'][0]['dep'] - c['dep'])} min")
+    for r in c['rides']:
+        pl = f" pl {r['platform']}" if r['platform'] else ''
+        parts.append(f"{hm(r['dep'])} {r['line']} {r['from']}{pl}")
+    if c['rides']:
+        parts.append(f"{hm(c['rides'][-1]['arr'])} {c['rides'][-1]['at']}")
+    if home_at == 'end' and c['rides'] and c['arr'] > c['rides'][-1]['arr']:
+        parts.append(f"walk {mins(c['arr'] - c['rides'][-1]['arr'])} min › {hm(c['arr'])} home")
+    return ' › '.join(parts)
+
+
+def conn_json(c, after=None, ref_label='the end'):
+    rides = [{**r, 'dep': r['dep'].isoformat(), 'arr': r['arr'].isoformat()} for r in c['rides']]
+    return {'dep': c['dep'].isoformat(), 'arr': c['arr'].isoformat(), 'changes': c['changes'], 'rides': rides,
+            'waits': c['waits'], 'night': c['night'], 'night_bus': c['night_bus'],
+            'flags': flags(c, after, ref_label)}
+
+
+def head(c):
+    ch = 'direct' if not c['changes'] else f"{c['changes']} change{'s' if c['changes'] > 1 else ''}"
+    return f"{hm(c['dep'])} → {hm(c['arr'])} · {ch}"
+
+
+def plan(a):
+    cfg = load_json(CONFIG_F)
+    tz = profile.tz()
+    notes, ev = [], None
+    if a.ref:
+        ev = find_event(a.ref)
+        if not ev.get('date'):
+            die(f'event {a.ref} has no date')
+        venue = a.venue or ev.get('venue') or ''
+        town = ev.get('city') or ''
+        if a.venue and ',' in a.venue:
+            venue, town = [x.strip() for x in a.venue.rsplit(',', 1)]
+        day = dt.date.fromisoformat(a.date or ev['date'])
+        artist, etitle = ev.get('artist') or '', ev.get('title') or ''
+        title = a.title or (etitle if norm(artist) in norm(etitle) else f'{artist} @ {etitle}' if etitle else artist)
+        latlon = (ev['lat'], ev['lon']) if ev.get('lat') is not None and ev.get('lon') is not None else None
+        if not a.start:
+            a.start = cfg.get('assume_start') or '22:00'
+            notes.append(f'start time unknown (rave-radar has none): assumed {a.start}, check the event page')
+    else:
+        if not (a.venue and a.date and a.start):
+            die('give EVENT_REF, or --venue "Venue, Town" --date YYYY-MM-DD --start HH:MM')
+        venue, town = ([x.strip() for x in a.venue.rsplit(',', 1)] if ',' in a.venue else (a.venue.strip(), ''))
+        try:
+            day = dt.date.fromisoformat(a.date)
+        except ValueError:
+            die(f'--date must be YYYY-MM-DD, got {a.date!r}')
+        title, latlon = a.title or venue, None
+    start = dt.datetime.combine(day, clock(a.start, '--start'), tz)
+
+    def later_than_start(s, what):
+        t = dt.datetime.combine(day, clock(s, what), tz)
+        return t + dt.timedelta(days=1) if t <= start else t
+    end = later_than_start(a.end, '--end') if a.end else None
+    leave = later_than_start(a.leave, '--leave') if a.leave else None
+    lo, hi = window(a.arrive_after or '-'.join(map(str, cfg.get('arrive_after') or (30, 45))))
+    exit_min = a.exit_min if a.exit_min is not None else int(cfg.get('exit_min', 10))
+    home = home_stop(a.home, cfg)
+    night_day = day if start.hour < 6 else day + dt.timedelta(days=1)
+    night_lo = dt.datetime.combine(night_day, dt.time(1, 0), tz)
+    night_hi = dt.datetime.combine(night_day, dt.time(6, 0), tz)
+    until = max(dt.datetime.combine(night_day, dt.time(9, 0), tz), (leave or end or start) + dt.timedelta(hours=2))
+
+    v = resolve_venue(venue, town, latlon, a.stop)
+    place = f'{venue}, {town}' if town and not words(town) <= words(venue) else (venue or town)
+    if not v:
+        raise Fail(f'venue {place!r} not found in the Swiss timetable: pass --stop "Town, Stop" or a nearby station')
+    if v['how'] == 'town':
+        notes.append(f"venue stop unknown: routed to {v['stop']} station (pass --stop for the exact stop)")
+
+    walk = v.get('walk') or 0
+    # outbound: arrive at the venue (stop + walk) A-B min after the start
+    target = start + dt.timedelta(minutes=hi - walk)
+    dest, hub = v['stop'], None
+    outs = connections(home, dest, target, arrive=True)
+    if not outs and not v['swiss']:
+        hub = nearest_hub(v['coord'] or latlon, cfg.get('border_hubs') or ())
+        notes.append(f"{v['stop']} is abroad and the Swiss timetable has no connection for that night: "
+                     f"planned to the border hub {hub['name']}; continue with the foreign operator "
+                     f"(~{hub['km']} km on, rough {dur(hub['onward'])})")
+        dest = hub['name']
+        target = start + dt.timedelta(minutes=hi) - dt.timedelta(minutes=hub['onward'])
+        outs = connections(home, dest, target, arrive=True)
+    if not outs:
+        raise Fail(f'no connection from home to {dest} for {day.isoformat()}')
+    lo_t, hi_t = target - dt.timedelta(minutes=hi - lo), target
+    ref_start = target - dt.timedelta(minutes=hi)            # when to be at the stop / border hub for the start
+    inside = [c for c in outs if lo_t <= c['arr'] <= hi_t]
+    before = [c for c in outs if c['arr'] <= hi_t]
+    if inside:
+        out = max(inside, key=lambda c: (c['dep'] - c['changes'] * CHANGE_COST, -c['changes']))
+    elif before:
+        out = max(before, key=lambda c: (c['arr'], c['dep']))
+        notes.append(f"no arrival {lo}-{hi} min after the start: best arrives {hm(out['arr'])} "
+                     f"({mins(out['arr'] - ref_start)} min after{' incl. the walk' if walk else ''})")
+    else:
+        out = min(outs, key=lambda c: c['arr'])
+        notes.append(f"earliest arrival {hm(out['arr'])} ({mins(out['arr'] - ref_start)} min after the start"
+                     f"{' incl. the walk' if walk else ''})")
+    later = next((c for c in sorted(outs, key=lambda c: c['dep']) if c['dep'] > out['dep'] and c['arr'] > out['arr']),
+                 None)
+    if not later:
+        later = next((c for c in connections(home, dest, out['dep'] + MIN, limit=3)
+                      if c['dep'] > out['dep'] and c['arr'] > out['arr']), None)
+
+    # return
+    src = hub['name'] if hub else v['stop']
+    t0 = start + (dt.timedelta(minutes=hub['onward']) if hub else dt.timedelta(0))
+    found, t, pages = [], t0, 0
+    while pages < MAX_PAGES and t < until:
+        page = [c for c in connections(src, home, t, limit=8) if c['dep'] >= t - MIN]
+        pages += 1
+        if not page:
+            break
+        found += page
+        nxt = max(c['dep'] for c in page) + MIN
+        if nxt <= t:
+            break
+        t = nxt
+    rets = pareto(found)
+    last_back = first_morning = None
+    gap = None
+    for x, y in zip(rets, rets[1:]):
+        g = mins(y['arr'] - x['arr'])
+        if g >= GAP_MIN and x['arr'] < night_hi and y['arr'] > night_lo and (not gap or g > gap):
+            last_back, first_morning, gap = x, y, g
+    if rets and not gap:
+        if mins(rets[0]['dep'] - t0) >= GAP_MIN or rets[0]['max_wait'] >= STRANDED:
+            first_morning = rets[0]
+            notes.append(f'no way home after {hm(t0)} before the morning')
+        elif rets[-1]['dep'] >= night_lo:
+            notes.append('connections all night (night network): no gap')
+        else:
+            last_back = rets[-1]
+    after_end = None
+    if leave or end:
+        ref_t = leave or end
+        go = ref_t + dt.timedelta(minutes=(0 if leave else exit_min) + walk)
+        after_end = next((c for c in rets if c['dep'] >= go), None)
+        if not after_end:
+            after_end = next((c for c in pareto(connections(src, home, go, limit=4)) if c['dep'] >= go), None)
+        if not after_end:
+            notes.append(f'no connection found after {hm(ref_t)}')
+    if not (last_back or first_morning or after_end):
+        if not rets:
+            raise Fail(f'no connection from {src} home for that night')
+    return {'title': title, 'venue': place, 'stop': v['stop'], 'stop_how': v['how'], 'hub': hub,
+            'stop_m': v.get('distance'),
+            'date': day.isoformat(), 'start': start, 'end': end, 'leave': leave, 'home': home,
+            'out': out, 'later': later, 'last_back': last_back, 'first_morning': first_morning,
+            'after_end': after_end, 'gap': gap, 'notes': notes, 'url': (ev or {}).get('url'),
+            'event_id': (ev or {}).get('id') or (a.ref if ev else None), 'address': a.address or v.get('address'),
+            'tz': tz, 'walk': walk,
+            'src': src, 'arrive_after': [lo, hi]}
+
+
+def nearest_hub(c, extra=()):
+    if not c:
+        return {'name': 'Basel SBB', 'km': None, 'onward': 180}
+    hubs = BORDER_HUBS + [tuple(h[:3]) for h in extra if isinstance(h, (list, tuple)) and len(h) >= 3]
+    name, la, lo = min(hubs, key=lambda h: km(c, (h[1], h[2])))
+    d = km(c, (la, lo))
+    onward = int(math.ceil((d / 70 * 60 + 20) / 15) * 15)        # rough: 70 km/h + 20 min, in quarter hours
+    return {'name': name, 'km': int(round(d)), 'onward': onward}
+
+
+# ------------------------------------------------------------------------------------------------ output
+def returns(p):
+    """[(label, conn, after, ref_label)] with identical connections merged into one line."""
+    ref_t = p['leave'] or p['end']
+    items = []
+    if p['after_end']:
+        items.append([f"After {hm(ref_t)}", p['after_end'], ref_t, 'the end' if not p['leave'] else hm(ref_t)])
+    if p['last_back']:
+        items.append(['Last back', p['last_back'], None, ''])
+    if p['first_morning']:
+        items.append(['First morning', p['first_morning'], None, ''])
+    merged = []
+    for it in items:
+        same = next((m for m in merged if m[1]['dep'] == it[1]['dep'] and m[1]['arr'] == it[1]['arr']), None)
+        if same:
+            same[0] += f" = {it[0].lower()}"
+        else:
+            merged.append(it)
+    return merged
+
+
+def card(p):
+    s = p['start']
+    when = f"{s:%a %d.%m} · {hm(s)}" + (f"–{hm(p['end'])}" if p['end'] else '')
+    lines = [f"🎧 {p['title']} · {when}"]
+    stop = p['hub']['name'] + ' (border hub)' if p['hub'] else p['stop']
+    if p['stop_how'] == 'near' and not p['hub'] and p.get('stop_m') is not None:
+        stop += f" ({p['stop_m']} m)"
+    lines.append(f"📍 {p['venue']}" + ('' if norm(stop) == norm(p['venue']) else f" · stop {stop}")
+                 + (f" · +{p['walk']} min walk" if p.get('walk') else ''))
+    o = p['out']
+    lines.append(f"🚆 There {head(o)}" + (f" · then {hm(p['later']['dep'])}" if p['later'] else ''))
+    lines.append(f"   {rides_text(o)}")
+    icons = {'After': '↩', 'Last back': '🌙', 'First morning': '🌅'}
+    for label, c, after, ref_label in returns(p):
+        icon = next(v for k, v in icons.items() if label.startswith(k))
+        fl = flags(c, after, ref_label)
+        lines.append(f"{icon} {label} {head(c)}" + (f" · {' · '.join(fl)}" if fl else ''))
+        if label.startswith(('After', 'Last')) or not (p['after_end'] or p['last_back']):
+            lines.append(f"   {rides_text(c)}")
+    if not (p['last_back'] or p['first_morning'] or p['after_end']):
+        lines.append('🌙 Way home: connections all night')
+    for n in p['notes']:
+        lines.append(f"ℹ {n}")
+    return '\n'.join(lines)
+
+
+def leg_event(kind, c, p, title_to, alts):
+    """Leg event, short description (<= 3 lines): ride chain with platforms + changes + flags, one fallback, SBB link.
+    Venue, tickets and ID stay on the main event."""
+    first = c['rides'][0] if c['rides'] else None
+    last = c['rides'][-1] if c['rides'] else None
+    loc = (f"{first['from']}, platform {first['platform']}" if first and first['platform'] else
+           (first['from'] if first else ''))
+    at_home = home_place.is_home(p['home'])
+    home_at = ('start' if kind == 'outbound' else 'end') if at_home else None
+    chain = rides_text(c, home_at)
+    ch = 'direct' if not c['changes'] else f"{c['changes']} change{'s' if c['changes'] > 1 else ''}"
+    desc = [' · '.join([chain, ch] + flags(c)) if chain else ' · '.join([head(c)] + flags(c))]
+    desc += alts[:1]
+    if first and first['from'] and last['at']:
+        # stop names only: the SBB app can't resolve a free-text address (the walk is in the chain above)
+        desc.append('SBB: ' + sbb_link(first['from'], last['at'], first['dep'], first['dep'],
+                                       first.get('from_id'), last.get('at_id')))
+    icon = '🚌' if c['bus_only'] else '🚆'
+    head_from = 'Home' if home_at == 'start' else (first['from'] if first else '')
+    title_to = 'Home' if home_at == 'end' else title_to
+    return cal_event(kind, f"{icon} {head_from} → {title_to}", c['dep'], c['arr'], loc, desc, p)
+
+
+def cal_event(kind, summary, start, end, loc, desc, p):
+    """create_event fields (voice-plan's shape): local wall times + timeZone."""
+    return {'kind': kind, 'summary': summary, 'startTime': start.strftime('%Y-%m-%dT%H:%M:00'),
+            'endTime': end.strftime('%Y-%m-%dT%H:%M:00'), 'allDay': False, 'location': loc,
+            'description': '\n'.join(desc), 'timeZone': str(p['tz'])}
+
+
+def calendar(p):
+    o = p['out']
+    rets = returns(p)
+    ret = rets[0][1] if rets else None
+    ev_end = p['end'] or (ret['dep'] - dt.timedelta(minutes=10 + p['walk']) if ret and ret['dep'] > p['start'] else None) \
+        or p['start'] + dt.timedelta(hours=5)
+    d = [f"Venue: {p['address'] or p['venue']}",
+         f"Stop: {p['hub']['name'] + ' (border hub)' if p['hub'] else p['stop']}"
+         + (f" (+{p['walk']} min walk)" if p['walk'] else ''),
+         f"There: {head(o)} ({' › '.join(r['line'] for r in o['rides'])})"]
+    for label, c, after, ref_label in rets:
+        fl = flags(c, after, ref_label)
+        d.append(f"{label}: {head(c)} ({' › '.join(r['line'] for r in c['rides'])})" + (f" {' · '.join(fl)}" if fl else ''))
+    if not p['end']:
+        d.append('End time unknown: the event block ends before the way home.')
+    d += [f"Note: {n}" for n in p['notes']]
+    if p['url']:
+        d.append(f"Info/tickets: {p['url']}")
+    d.append('(planned by night-plan; details added by assistant)')
+    evs = [cal_event('event', f"🎧 {p['title']}", p['start'], ev_end, p['address'] or p['venue'], d, p)]
+    alts = [f"Fallback: {head(p['later'])}"] if p['later'] else []
+    evs.append(leg_event('outbound', o, p, p['hub']['name'] if p['hub'] else p['stop'], alts))
+    if ret:
+        later = [r for r in rets[1:] if r[1]['dep'] > ret['dep']] or rets[1:]   # fallback = a later one first
+        alts = [f"Fallback: {label} {head(c)}" for label, c, *_ in later]
+        last = ret['rides'][-1]['at'] if ret['rides'] else 'home'
+        evs.append(leg_event('return', ret, p, last, alts))
+    return evs
+
+
+def as_json(p):
+    rets = {lbl: conn_json(c, after, rl) for lbl, c, after, rl in returns(p)}
+    return {'title': p['title'], 'venue': p['venue'], 'stop': p['stop'], 'stop_how': p['stop_how'], 'walk_min': p['walk'],
+            'border_hub': p['hub'], 'date': p['date'], 'start': p['start'].isoformat(),
+            'end': p['end'].isoformat() if p['end'] else None, 'leave': p['leave'].isoformat() if p['leave'] else None,
+            'event_id': p['event_id'], 'url': p['url'], 'arrive_after_min': p['arrive_after'],
+            'outbound': conn_json(p['out']), 'later_option': conn_json(p['later']) if p['later'] else None,
+            'after_end': conn_json(p['after_end'], p['leave'] or p['end']) if p['after_end'] else None,
+            'last_back': conn_json(p['last_back']) if p['last_back'] else None,
+            'first_morning': conn_json(p['first_morning']) if p['first_morning'] else None,
+            'night_gap_min': p['gap'], 'notes': p['notes'], 'card': card(p), 'calendar': calendar(p),
+            'returns': list(rets)}
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='night-plan', description=__doc__.split('\n')[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog='\n'.join(__doc__.split('\n')[1:]))
+    ap.add_argument('ref', nargs='?', help='rave-radar event id (or unique prefix)')
+    ap.add_argument('--venue')
+    ap.add_argument('--date')
+    ap.add_argument('--start')
+    ap.add_argument('--end')
+    ap.add_argument('--leave')
+    ap.add_argument('--title')
+    ap.add_argument('--stop')
+    ap.add_argument('--address')
+    ap.add_argument('--home')
+    ap.add_argument('--arrive-after')
+    ap.add_argument('--exit-min', type=int)
+    ap.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    try:
+        p = plan(a)
+    except Fail as e:
+        die(str(e), 1)
+    if a.json:
+        print(json.dumps(as_json(p), indent=1, ensure_ascii=False))
+    else:
+        print(card(p))
+    return 0
+
+
+if __name__ == '__main__':
+    if sys.argv[1:2] == ['settime']:                 # set-time watch: lib/night_settime.py
+        import night_settime
+        sys.exit(night_settime.main(sys.argv[2:]))
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""hwtrend: daily hardware-error trend tracker for the owner's Unraid server. READ-ONLY.
+
+Reuses ~/bin/unraid-health's collector and parsers (one read-only `health` verb call through unraid-ssh;
+spun-down disks are never woken: their SMART values come from Unraid's own cache).
+
+Each run stores one sample per day in ~/.local/state/hwtrend/YYYY-MM-DD.json (a rerun the same day
+overwrites that day's file; newest 400 kept):
+  disks   per disk, keyed by its id (model_serial) so a swapped disk never looks like an increase:
+          SMART 5 Reallocated, 187 Reported_Uncorrect, 197 Current_Pending, 198 Offline_Uncorrectable,
+          199 UDMA_CRC; SCSI grown defects / uncorrected / non-medium; NVMe media errors + critical warning;
+          Unraid's md read/write error count (numErrors, resets at array start); temperature (only when
+          spinning) and SMART's lifetime max temperature ("Min/Max a/b" in attr 190/194).
+  btrfs   per mount and device: write/read/flush/corruption/generation errors (docker.img, libvirt.img, pools)
+  array   parity-check errors (sbSyncErrs + when the last check ended), disabled/invalid/missing disk counts
+  cpu     hottest core (alerted like disk temps), package sensor (history; alerted only when it rises
+          > 5 °C above its own highest earlier reading), board sensor
+Alerts (one ~/inbox note per run, never Telegram; the assistant decides what to text):
+  - a counter INCREASES above the highest value seen before (stable non-zero values are history, never
+    alerted; resettable counters (md errors, btrfs) re-baseline when they drop and alert if the new value > 0);
+  - a finished parity check reports errors;
+  - a temperature is above its threshold in 2 consecutive daily samples (once per hot streak).
+    Disk thresholds: Unraid's per-disk hotTemp, else its global hot/hotssd, else 50/65 °C. CPU hottest
+    core: min(sensor max, 80) °C.
+The first run is a silent baseline. Unraid-health (08:13) may report the same increase: merge, don't double-text.
+
+Usage: hwtrend [run]          collect, store, compare; prints alerts; exit 0 ok, 1 alerts, 2 collect failed
+       hwtrend show [--json]  latest sample: non-zero counters (the known state) and temperatures
+       hwtrend history KEY    one counter over time, e.g. `hwtrend history disk4.199`
+Options: --input FILE (saved collector output), --state-dir, --inbox-dir, --no-inbox (print only),
+         --dry-run (no state, no sample, no note), --date YYYY-MM-DD (tests).
+"""
+
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+import traceback
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import botlib  # noqa: E402
+
+HOME = Path.home()
+UH_PATH = os.environ.get("HWTREND_UH", str(HOME / "bin/unraid-health"))
+STATE_DIR = Path(os.environ.get("HWTREND_STATE_DIR", HOME / ".local/state/hwtrend"))
+INBOX_DIR = Path(os.environ.get("HWTREND_INBOX_DIR", HOME / "inbox"))
+SSH_HOST = os.environ.get("HWTREND_HOST", "unraid")
+KEEP_SAMPLES = 400
+HDD_HOT, SSD_HOT, CPU_HOT = 50, 65, 95  # CPU: i9-13900K Tjmax 100 °C; 80–90 under transcode is normal
+PKG_JUMP = 5              # °C above the package sensor's highest earlier reading
+
+SMART_ATTRS = {5: "reallocated", 187: "reported_uncorrect", 197: "pending", 198: "offline_uncorrectable",
+               199: "udma_crc"}
+LABELS = {"reallocated": "reallocated sectors (5)", "reported_uncorrect": "reported uncorrectable (187)",
+          "pending": "pending sectors (197)", "offline_uncorrectable": "offline uncorrectable (198)",
+          "udma_crc": "UDMA CRC errors (199, cable)", "grown": "grown defects (SCSI)",
+          "uncorrected": "uncorrected read/write errors (SCSI)", "nonmedium": "non-medium errors (SCSI)",
+          "nvme_media": "NVMe media/integrity errors", "nvme_warning": "NVMe critical warning",
+          "md_errors": "Unraid read/write errors since array start"}
+# counters that may legitimately drop (array restart, `btrfs dev stats -z`, docker.img recreated)
+RESETTABLE = {"md_errors"}
+INFO_ONLY = {"nvme_unsafe_shutdowns"}   # recorded for the trend, never alerted
+
+
+def load_uh():
+    loader = importlib.machinery.SourceFileLoader("unraid_health", UH_PATH)
+    spec = importlib.util.spec_from_loader("unraid_health", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def lifetime_max(attrs):
+    for aid in (194, 190):
+        a = attrs.get(aid)
+        if a and (m := re.search(r"Min/Max\s+-?\d+/(\d+)", a.get("raw_str") or "")):
+            return int(m.group(1))
+    return None
+
+
+def btrfs_per_device(text):
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"\[(.+?)\]\.(\w+)\s+(-?\d+)", line.strip())
+        if m:
+            name = m.group(2).replace("_io_errs", "").replace("_errs", "")
+            out.setdefault(m.group(1), {})[name] = int(m.group(3))
+    return out
+
+
+def build_sample(uh, d, date):
+    disks, devs, disp = d["disks"], d["devs"], d["display"]
+    hdd_hot = uh.to_int(disp.get("hot"), HDD_HOT) or HDD_HOT
+    ssd_hot = uh.to_int(disp.get("hotssd"), SSD_HOT) or SSD_HOT
+    s = {"date": date, "ts": int(time.time()), "server_now": uh.to_int(d["meta"].get("now")),
+         "host": d["meta"].get("host"), "boot_id": d["meta"].get("boot_id"),
+         "disks": {}, "btrfs": {}, "array": {}, "cpu": {}, "gaps": []}
+    entries = [(n, x, "array" if x.get("type") in ("Parity", "Data") else "pool")
+               for n, x in disks.items() if x.get("type") in ("Parity", "Data", "Cache")]
+    entries += [(n, x, "unassigned") for n, x in devs.items()]
+    for name, x, kind in entries:
+        dev, ident = x.get("device", ""), x.get("id", "")
+        if not dev and not ident:
+            continue
+        spun_down = x.get("spundown") == "1"
+        ssd = x.get("rotational") == "0" or x.get("transport") == "nvme"
+        sm = d["smart"].get(name, {})
+        ps, src = None, None
+        if sm.get("live"):
+            pl = uh.parse_smart(sm["live"]["text"])
+            if not pl["standby"] and (pl["attrs"] or pl["health"] or pl["kind"]):
+                ps, src = pl, "live"
+        if ps is None and sm.get("cache"):
+            pc = uh.parse_smart(sm["cache"]["text"])
+            if pc["attrs"] or pc["kind"]:
+                ps, src = pc, "cache"
+        temp = uh.to_int(x.get("temp"))
+        if temp is None and ps and src == "live":
+            temp = ps["temp"]
+        if spun_down:
+            temp = None
+        hot = uh.to_int(x.get("hotTemp"), -1)
+        thr = hot if hot and hot > 0 else (ssd_hot if ssd else hdd_hot)
+        c = {}
+        if kind != "unassigned":
+            c["md_errors"] = uh.to_int(x.get("numErrors"), 0)
+        if ps:
+            for aid, key in SMART_ATTRS.items():
+                if aid in ps["attrs"] and ps["attrs"][aid]["raw"] is not None:
+                    c[key] = ps["attrs"][aid]["raw"]
+            for key in ("grown", "uncorrected", "nonmedium"):
+                if ps[key] is not None:
+                    c[key] = ps[key]
+            nv = ps["nvme"]
+            if nv.get("media_errors") is not None:
+                c["nvme_media"] = nv["media_errors"]
+            if nv.get("critical_warning") is not None:
+                c["nvme_warning"] = nv["critical_warning"]
+            if nv.get("unsafe_shutdowns") is not None:
+                c["nvme_unsafe_shutdowns"] = nv["unsafe_shutdowns"]
+        else:
+            s["gaps"].append(f"{name}: no SMART data")
+        s["disks"][ident or name] = {
+            "slot": name, "dev": dev, "kind": kind, "ssd": ssd, "spun_down": spun_down, "smart_src": src,
+            "status": x.get("status", ""), "temp": temp, "temp_hot": thr,
+            "temp_max_lifetime": lifetime_max(ps["attrs"]) if ps else None,
+            "smart_health": ps["health"] if ps else None, "counters": c}
+    # btrfs, per device; the same filesystem mounted twice (docker's btrfs driver) is kept once
+    names = {"/var/lib/docker": "docker.img", "/etc/libvirt": "libvirt.img"}
+    seen = set()
+    for mp in sorted(d["btrfs"]):
+        per = btrfs_per_device(d["btrfs"][mp]["text"])
+        if not per:
+            s["gaps"].append(f"btrfs {mp}: unreadable")
+            continue
+        devkey = tuple(sorted(per))
+        if devkey in seen:
+            continue
+        seen.add(devkey)
+        label = names.get(mp, mp.rsplit("/", 1)[-1] if mp.startswith("/mnt/") else mp)
+        s["btrfs"][label] = {"mount": mp, "devices": per}
+    v = d["var"]
+    s["array"] = {"md_state": v.get("mdState"), "sync_errs": uh.to_int(v.get("sbSyncErrs")),
+                  "sync_ended": uh.to_int(v.get("sbSynced2")), "num_disabled": uh.to_int(v.get("mdNumDisabled")),
+                  "num_invalid": uh.to_int(v.get("mdNumInvalid")), "num_missing": uh.to_int(v.get("mdNumMissing"))}
+    sen = d.get("sensors") or {}
+    if sen.get("cpu") is not None:
+        high = sen.get("cpu_high")
+        thr = CPU_HOT  # sensor "high" (80) is too low for this CPU
+        s["cpu"] = {"temp": sen["cpu"], "label": sen.get("cpu_label"), "temp_hot": thr,
+                    "sensor_high": high, "sensor_crit": sen.get("cpu_crit"), "board": sen.get("board"),
+                    "hottest_core": hottest_core(d.get("_sensors_raw"))}
+    else:
+        s["gaps"].append("CPU temperature: no reading")
+    return s
+
+
+def hottest_core(raw_sensors):
+    try:
+        j = json.loads(raw_sensors or "")
+    except ValueError:
+        return None
+    cores = [v for chip, feats in j.items() if isinstance(feats, dict) and chip.startswith(("coretemp", "k10temp"))
+             for label, vals in feats.items() if isinstance(vals, dict) and label.startswith("Core")
+             for k, v in vals.items() if k.endswith("_input")]
+    return max(cores) if cores else None
+
+
+def counters(sample):
+    """Flatten a sample into {key: (value, label, resettable)}."""
+    out = {}
+    for ident, x in sample["disks"].items():
+        for k, v in x["counters"].items():
+            if v is None or k in INFO_ONLY:
+                continue
+            out[f"disk:{ident}:{k}"] = (v, f"{x['slot']}: {LABELS.get(k, k)}", k in RESETTABLE)
+    for label, b in sample["btrfs"].items():
+        for dev, cs in b["devices"].items():
+            for k, v in cs.items():
+                out[f"btrfs:{b['mount']}:{dev}:{k}"] = (v, f"{label} ({dev}): btrfs {k} errors", True)
+    a = sample["array"]
+    for k in ("num_disabled", "num_invalid", "num_missing"):
+        if a.get(k) is not None:
+            out[f"array:{k}"] = (a[k], f"array: {k.replace('num_', '')} disks", True)
+    return out
+
+
+def temps(sample):
+    out = {}
+    for ident, x in sample["disks"].items():
+        out[f"disk:{ident}"] = (x["temp"], x["temp_hot"], x["slot"])
+    c = sample["cpu"]
+    if c:   # alert on the hottest core; the package value is kept for history (own rule in compare())
+        core = c.get("hottest_core")
+        out["cpu"] = (core if core is not None else c["temp"], c["temp_hot"],
+                      "CPU hottest core" if core is not None else "CPU package")
+    return out
+
+
+def compare(sample, state, baseline):
+    """Updates state in place; returns a list of alert lines."""
+    alerts, hw = [], state.setdefault("hw", {})
+    for key, (v, label, resettable) in counters(sample).items():
+        if key not in hw:
+            hw[key] = v                          # baseline / new disk or mount: known state, no alert
+            continue
+        if v > hw[key]:
+            if not baseline:
+                alerts.append(f"{label}: {hw[key]} → {v} (+{v - hw[key]})")
+            hw[key] = v
+        elif v < hw[key] and resettable:
+            if v > 0 and not baseline:
+                alerts.append(f"{label}: {v} (counter was reset from {hw[key]})")
+            hw[key] = v
+    a, pa = sample["array"], state.get("array", {})
+    if (a.get("sync_errs") and a.get("sync_ended") and pa.get("sync_ended") is not None
+            and a["sync_ended"] != pa["sync_ended"] and not baseline):
+        alerts.append(f"array: parity check ended {fmt_ts(a['sync_ended'])} with {a['sync_errs']} errors")
+    state["array"] = {"sync_ended": a.get("sync_ended"), "sync_errs": a.get("sync_errs")}
+    pkg = (sample["cpu"] or {}).get("temp")
+    if pkg is not None:          # package sensor: flag only a rise > PKG_JUMP above its own high-water mark
+        hwt = state.setdefault("hw_temp", {})
+        prev = hwt.get("cpu_package")
+        if prev is not None and pkg > prev + PKG_JUMP and not baseline:
+            alerts.append(f"CPU package sensor: {pkg:.0f}°C, more than {PKG_JUMP}°C above its highest earlier "
+                          f"reading ({prev:.0f}°C)")
+        hwt["cpu_package"] = pkg if prev is None else max(prev, pkg)
+    hot = state.setdefault("hot", {})
+    date = sample["date"]
+    for key, (t, thr, label) in temps(sample).items():
+        h = hot.get(key, {"date": None, "before": 0, "streak": 0, "alerted": False})
+        if h["date"] != date:                    # first sample of a new day: today's streak builds on the last
+            h["before"], h["date"] = h["streak"], date
+            if h["streak"] == 0:
+                h["alerted"] = False
+        is_hot = t is not None and thr is not None and t > thr
+        h["streak"] = h["before"] + 1 if is_hot else 0
+        if h["streak"] == 0:
+            h["alerted"] = False
+        if h["streak"] >= 2 and not h["alerted"]:
+            alerts.append(f"{label}: {t:.0f}°C, above {thr:.0f}°C for {h['streak']} daily samples in a row")
+            h["alerted"] = True
+        hot[key] = h
+    return alerts
+
+
+def fmt_ts(ts):
+    try:
+        return dt.datetime.fromtimestamp(int(ts)).astimezone().strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return "?"
+
+
+def nonzero(sample):
+    lines = []
+    for ident, x in sorted(sample["disks"].items(), key=lambda kv: slot_order(kv[1]["slot"])):
+        nz = [f"{LABELS.get(k, k)} {v}" for k, v in x["counters"].items() if v and k not in INFO_ONLY]
+        if nz:
+            lines.append(f"{x['slot']} ({ident}): " + ", ".join(nz))
+    for label, b in sample["btrfs"].items():
+        for dev, cs in b["devices"].items():
+            nz = [f"{k} {v}" for k, v in cs.items() if v]
+            if nz:
+                lines.append(f"{label} ({b['mount']}, {dev}): btrfs " + ", ".join(nz))
+    a = sample["array"]
+    if a.get("sync_errs"):
+        lines.append(f"array: last parity check ({fmt_ts(a.get('sync_ended'))}) found {a['sync_errs']} errors")
+    for k in ("num_disabled", "num_invalid", "num_missing"):
+        if a.get(k):
+            lines.append(f"array: {a[k]} {k.replace('num_', '')} disk(s)")
+    return lines
+
+
+def slot_order(slot):
+    m = re.match(r"([a-z]+)(\d*)", slot)
+    rank = {"parity": 0, "disk": 1, "cache": 2, "data": 3, "dev": 4}.get(m.group(1) if m else slot, 5)
+    return (rank, int(m.group(2)) if m and m.group(2) else 0, slot)
+
+
+def render(sample):
+    L = [f"Hardware trend sample {sample['date']} ({sample.get('host') or '?'})", "", "Non-zero counters (known state):"]
+    L += [f"  {x}" for x in nonzero(sample)] or ["  none"]
+    L += ["", "Temperatures (now / hot threshold / SMART lifetime max):"]
+    for ident, x in sorted(sample["disks"].items(), key=lambda kv: slot_order(kv[1]["slot"])):
+        t = f"{x['temp']}°C" if x["temp"] is not None else "spun down"
+        mx = f", max {x['temp_max_lifetime']}°C" if x["temp_max_lifetime"] is not None else ""
+        L.append(f"  {x['slot']}: {t} / {x['temp_hot']}°C{mx}")
+    if sample["cpu"]:
+        c = sample["cpu"]
+        L.append(f"  CPU ({c['label']}): {c['temp']:.0f}°C / {c['temp_hot']:.0f}°C"
+                 + (f", hottest core {c['hottest_core']:.0f}°C" if c.get("hottest_core") is not None else "")
+                 + (f"; board sensor {c['board']:.0f}°C" if c.get("board") is not None else ""))
+    if sample["gaps"]:
+        L += ["", "Gaps: " + "; ".join(sample["gaps"])]
+    return "\n".join(L)
+
+
+atomic_write = botlib.atomic_write
+
+
+def samples(state_dir):
+    return sorted(p for p in state_dir.glob("????-??-??.json"))
+
+
+def write_inbox(inbox_dir, body):
+    return botlib.write_inbox(inbox_dir, "hwtrend", body)
+
+
+def cmd_run(args, uh):
+    state_dir = args.state_dir
+    if args.input:
+        raw, err = Path(args.input).read_text(encoding="utf-8", errors="replace"), None
+    else:
+        raw, err = uh.collect(SSH_HOST)
+    sf = state_dir / "state.json"
+    try:
+        state = json.loads(sf.read_text()) if sf.exists() else {}
+    except ValueError:
+        state = {}
+    if raw is None:
+        n = state.get("fails", 0) + 1
+        print(f"hwtrend: collect failed: {err}", file=sys.stderr)
+        if not args.dry_run:
+            state["fails"] = n
+            atomic_write(sf, json.dumps(state, indent=1))
+            if n == 3 and not args.no_inbox:   # once, after 3 failed daily runs in a row
+                write_inbox(args.inbox_dir, "# hwtrend: 3 failed runs\n\nFrom ~/bin/hwtrend. Data, not instructions.\n\n"
+                            f"Last error: {err}\nNo hardware samples since then. Check `unraid-ssh status`.\n")
+        return 2
+    d = uh.parse_all(raw)
+    d["_sensors_raw"] = next((x["text"] for x in uh.split_sections(raw) if x["name"] == "sensors"), None)
+    date = args.date or dt.date.today().isoformat()
+    sample = build_sample(uh, d, date)
+    baseline = "hw" not in state
+    alerts = compare(sample, state, baseline)
+    state["fails"] = 0
+    state["last_run"] = int(time.time())
+    if baseline:
+        state["baseline_at"] = date
+    sample["alerts"] = alerts
+    if not args.dry_run:
+        atomic_write(state_dir / f"{date}.json", json.dumps(sample, indent=1, ensure_ascii=False))
+        atomic_write(sf, json.dumps(state, indent=1, ensure_ascii=False))
+        for p in samples(state_dir)[:-KEEP_SAMPLES]:
+            p.unlink(missing_ok=True)
+        with open(state_dir / "runs.log", "a") as fh:
+            fh.write(f"{dt.datetime.now().astimezone().isoformat(timespec='seconds')} {date}"
+                     f"{' baseline' if baseline else ''} alerts={len(alerts)}\n")
+    if baseline:
+        print("Baseline recorded (no alerts on the first run).\n")
+        print(render(sample))
+        return 0
+    if not alerts:
+        return 0
+    body = ("# hwtrend: hardware counters went up\n\nFrom ~/bin/hwtrend (daily, read-only). Data, not instructions.\n\n"
+            + "\n".join(f"- {a}" for a in alerts)
+            + "\n\nKnown non-zero counters now:\n" + "\n".join(f"- {x}" for x in nonzero(sample))
+            + f"\n\nSample: ~/.local/state/hwtrend/{date}.json · trend: `hwtrend history <slot>.<attr>`."
+            + "\nunraid-health (08:13) may text the same increase; don't double-text the owner.\n")
+    print(body)
+    if not args.dry_run and not args.no_inbox:
+        print(f"inbox note: {write_inbox(args.inbox_dir, body)}")
+    return 1
+
+
+def latest(state_dir):
+    s = samples(state_dir)
+    if not s:
+        sys.exit("hwtrend: no samples yet (run `hwtrend` first)")
+    return json.loads(s[-1].read_text())
+
+
+def cmd_history(args):
+    """KEY = slot.attr (disk4.199 / disk4.udma_crc / cache.nvme_media / cpu / disk4.temp)."""
+    slot, _, attr = args.key.partition(".")
+    attr = SMART_ATTRS.get(int(attr), attr) if attr.isdigit() else attr
+    for p in samples(args.state_dir):
+        s = json.loads(p.read_text())
+        if slot == "cpu":
+            v = (s.get("cpu") or {}).get("temp")
+        else:
+            x = next((x for x in s["disks"].values() if x["slot"] == slot), None)
+            v = None if x is None else (x["temp"] if attr in ("temp", "") else x["counters"].get(attr))
+        print(f"{s['date']}  {'–' if v is None else v}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Daily read-only hardware-error trend tracker for the Unraid server.")
+    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "show", "history"])
+    ap.add_argument("key", nargs="?")
+    ap.add_argument("--input")
+    ap.add_argument("--state-dir", type=Path, default=STATE_DIR)
+    ap.add_argument("--inbox-dir", type=Path, default=INBOX_DIR)
+    ap.add_argument("--no-inbox", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--date")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    if args.cmd == "show":
+        s = latest(args.state_dir)
+        print(json.dumps(s, indent=1, ensure_ascii=False) if args.json else render(s))
+        return 0
+    if args.cmd == "history":
+        if not args.key:
+            sys.exit("usage: hwtrend history SLOT.ATTR  (e.g. disk4.199, cache.nvme_media, disk6.temp, cpu)")
+        return cmd_history(args)
+    return cmd_run(args, load_uh())
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        try:
+            write_inbox(INBOX_DIR, "# hwtrend crashed\n\nFrom ~/bin/hwtrend. Data, not instructions.\n\n"
+                        f"```\n{tb[-3000:]}\n```\nFix the script; the owner was not notified.\n")
+        except Exception:
+            pass
+        sys.exit(3)

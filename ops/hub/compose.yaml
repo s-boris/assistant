@@ -1,0 +1,280 @@
+# claude-hub: the assistant's hub stack (v2 Phase 2 H4). Installed and changed only by the owner's console paste
+# (`hub kit paste install`), so every compose or image change is one paste. Values come from .env, rendered by
+# `assistant deploy --target hub` from the profile (server.appdata, server.bot_home, server.bot_network, locale.tz).
+#
+# - Nothing is published on the host or LAN. The brain reaches `claude-hub` (API, 8700) and `claude-hub-phoenix`
+#   (6006/4317) on the brain's own docker network (external, BRAIN_NETWORK): no change to the brain's compose and
+#   no recreate; that network also holds the vault, which the hub calls once the vault domain moves in.
+# - pg sits only on the internal network `claude-hub` (no route out); ci has no network at all and no secrets.
+# - Images are pinned by digest (ops/hub/pins.toml: pushed on or before the repo's uv exclude-newer date).
+# - No hub code is baked into an image: hub and ci run the loader (installed by the paste, read-only) which runs
+#   the brain-built release named by releases/CURRENT (verified per file) and falls back to the last good one.
+# - The process cap sits in deploy.resources.limits.pids only: compose 2.40 rejects pids_limit next to deploy limits.
+# - Never mounted anywhere: the docker socket, host system paths. Data stays under HUB_ROOT (pool path).
+name: claude-hub
+
+services:
+  pg:
+    image: pgvector/pgvector:0.8.7-pg18-trixie@sha256:9d9c930220cb9bf2f956d10a8f909cf9973d9672ca0278aef2c1e6facccad2e0
+    container_name: claude-hub-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hub
+      POSTGRES_DB: hub
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      TZ: ${TZ:-UTC}
+    secrets: [pg_password]
+    volumes:
+      # PG 18 images keep data in /var/lib/postgresql/18/docker; the entrypoint refuses a mount at .../data.
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/pg", target: /var/lib/postgresql, bind: {create_host_path: false}}
+    networks: [hub]
+    shm_size: 256m
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -U hub -d hub"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 1g, pids: 256}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  phoenix:
+    image: arizephoenix/phoenix:version-20.24.0-nonroot@sha256:5a93af38bd46058bdf44a635a6dfd8beb78d21d38a4fe7a812fe21ec0a10c41b
+    container_name: claude-hub-phoenix
+    restart: unless-stopped
+    environment:
+      PHOENIX_WORKING_DIR: /data
+      PHOENIX_PORT: "6006"
+      PHOENIX_GRPC_PORT: "4317"
+      PHOENIX_TELEMETRY_ENABLED: "false"
+      PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
+      PHOENIX_ALLOWED_SANDBOX_PROVIDERS: NONE
+      PHOENIX_DISABLE_AGENT_ASSISTANT: "true"
+      PHOENIX_DEFAULT_RETENTION_POLICY_DAYS: "30"
+      TZ: ${TZ:-UTC}
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/phoenix", target: /data, bind: {create_host_path: false}}
+    networks: [hub, brain]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/usr/bin/python3.13", "-I", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:6006/healthz', timeout=4)"]
+      interval: 15s
+      timeout: 6s
+      retries: 4
+      start_period: 90s
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 1g, pids: 256}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  hub:
+    image: python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    container_name: claude-hub
+    restart: unless-stopped
+    user: "10100:10100"
+    init: true
+    command: ["python3", "-I", "-B", "-u", "/opt/hub-loader/hubloader.py", "--role", "hub", "--releases", "/srv/releases", "--state", "/var/lib/hub", "--port", "8700"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+      HUB_KIT: ${HUB_KIT:-unknown}
+      HUB_LOADER: ${HUB_LOADER:-unknown}
+      HUB_SECRETS: /run/hub-secrets
+      HUB_SPOOL: /var/spool/hub
+      PG_HOST: pg
+      PG_PORT: "5432"
+      PG_DB: hub
+      PG_USER: hub
+      PHOENIX_URL: http://phoenix:6006
+      # P3-11: one trace per job run (hubwf.job_meta sends meta.traceparent from the DBOS workflow id). Rollback: drop
+      # this line, re-render the kit, paste.
+      HUB_JOB_TRACE: "on"
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/loader", target: /opt/hub-loader, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/.local/share/claude-hub/releases", target: /srv/releases, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/secrets", target: /run/hub-secrets, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/state", target: /var/lib/hub, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/spool", target: /var/spool/hub, bind: {create_host_path: false}}
+    tmpfs: ["/tmp:size=256m"]
+    read_only: true
+    networks: [hub, brain]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      pg: {condition: service_healthy}
+      phoenix: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python3", "-I", "-c", "import json, urllib.request as u; d = json.load(u.urlopen('http://127.0.0.1:8700/health', timeout=4)); raise SystemExit(0 if d.get('release') else 1)"]
+      interval: 15s
+      timeout: 6s
+      retries: 4
+      start_period: 60s
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 1g, pids: 256}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  ci:
+    # The CI runner (H12 fills it in): no network, no secrets, read-only root; jobs and results go through the
+    # spool folder it shares with the hub. Until then the release's ci worker only keeps a heartbeat.
+    # the pinned python base + the heavy media/ML tools (ops/hub/ci/Dockerfile), built here by the install paste
+    image: claude-hub-ci:heavy-1
+    build:
+      context: ${HUB_ROOT:?HUB_ROOT missing}/ci-image/build
+      args:
+        BASE: python:3.13.15-slim-trixie@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+    pull_policy: build
+    container_name: claude-hub-ci
+    restart: unless-stopped
+    user: "10101:10100"
+    init: true
+    command: ["python3", "-I", "-B", "-u", "/opt/hub-loader/hubloader.py", "--role", "ci", "--releases", "/srv/releases", "--state", "/var/lib/ci", "--heartbeat", "/tmp/heartbeat"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+      HUB_KIT: ${HUB_KIT:-unknown}
+      HUB_LOADER: ${HUB_LOADER:-unknown}
+      HUB_SPOOL: /var/spool/hub
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/loader", target: /opt/hub-loader, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/.local/share/claude-hub/releases", target: /srv/releases, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/ci", target: /var/lib/ci, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/spool", target: /var/spool/hub, bind: {create_host_path: false}}
+    # exec: each job's checkout and TMPDIR live in /tmp, and the tests run their stubs and scripts from there
+    tmpfs: ["/tmp:size=1g,exec"]
+    read_only: true
+    network_mode: none
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python3", "-I", "-c", "import os, sys, time; sys.exit(0 if time.time() - os.stat('/tmp/heartbeat').st_mtime < 60 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # Host threads 0-3 stay free for the server's OS and Docker (the host's other heavy containers are pinned the
+    # same way). A comma list, not a range: the server's CPU pinning page only shows comma lists. A recreate by the
+    # kit paste keeps it (a live `docker update --cpuset-cpus` alone is lost on recreate).
+    cpuset: "4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+    # 8 GB for up to 4 jobs at once (`hub ci slots 4`). pids counts threads: one numpy + OpenCV process
+    # alone has ~80 on these 28 CPUs (the heavy legacy suites), so 512 would not hold 4 jobs: 1024
+    deploy:
+      resources:
+        limits: {cpus: "8", memory: 8g, pids: 1024}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  tg:
+    # H6 moves the Telegram adapter here. Off until then: profile "tg" is never started by the paste, and this stub
+    # holds no token and polls nothing, so even a manual start can't take the live bot's poller.
+    image: oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
+    container_name: claude-hub-tg
+    profiles: [tg]
+    restart: unless-stopped
+    user: "10100:10100"
+    init: true
+    command: ["sh", "-c", "echo 'claude-hub-tg: placeholder until H6'; exec sleep infinity"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+    tmpfs: ["/tmp:size=64m"]
+    read_only: true
+    networks: [hub, egress]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256m, pids: 128}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  voice:
+    # P3-7 moves the voice relay here. Off until then: profile "voice" is never started by the hub paste, and this stub
+    # holds no key and no session, so even a manual start can't take the call account.
+    image: python:3.11.16-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b
+    container_name: claude-hub-voice
+    profiles: [voice]
+    restart: unless-stopped
+    user: "10100:10100"
+    init: true
+    command: ["sh", "-c", "echo 'claude-hub-voice: placeholder until P3-7'; exec sleep infinity"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+    tmpfs: ["/tmp:size=128m"]
+    read_only: true
+    networks: [hub, egress]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256m, pids: 128}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+
+  phone:
+    # P3-8 moves the phone gateway here. Off until then: profile "phone" is never started by the hub paste, and this
+    # stub holds no key, no port and no pairing state, so even a manual start can't answer his app.
+    image: python:3.11.16-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b
+    container_name: claude-hub-phone
+    profiles: [phone]
+    restart: unless-stopped
+    user: "10100:10100"
+    init: true
+    command: ["sh", "-c", "echo 'claude-hub-phone: placeholder until P3-8'; exec sleep infinity"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+    tmpfs: ["/tmp:size=128m"]
+    read_only: true
+    networks: [hub]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256m, pids: 128}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+networks:
+  hub:
+    name: claude-hub
+    internal: true
+  egress:
+    name: claude-hub-egress
+  brain:
+    name: ${BRAIN_NETWORK:?BRAIN_NETWORK missing}
+    external: true
+
+secrets:
+  pg_password:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/pg_password

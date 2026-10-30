@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Fake ~/bin/ha for party tests: list light|media_player --json and device-url from $FAKE_HA_DIR/ha.json."""
+import json
+import os
+import sys
+
+d = os.environ['FAKE_HA_DIR']
+a = sys.argv[1:]
+with open(os.path.join(d, 'calls.log'), 'a') as fh:
+    fh.write(' '.join(a) + '\n')
+cfg = json.load(open(os.path.join(d, 'ha.json')))
+if cfg.get('fail'):
+    print('ha: error: cannot reach Home Assistant (URLError)', file=sys.stderr)
+    sys.exit(1)
+if a == ['list', 'light', '--json']:
+    print(json.dumps(cfg['lights']))
+elif a == ['list', 'media_player', '--json']:
+    print(json.dumps(cfg['players']))
+elif len(a) == 2 and a[0] == 'device-url' and a[1] in cfg['urls']:
+    print(cfg['urls'][a[1]])
+else:
+    print('ha: refused: fake ha: unexpected call ' + ' '.join(a), file=sys.stderr)
+    sys.exit(2)

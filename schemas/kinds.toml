@@ -1,0 +1,379 @@
+# Kind registry: defaults for the busiest event kinds. Data, not logic: the brain changes delivery with `wake`
+# rules; these are only the starting values, the one-line hint the agenda shows when a note has no Next line,
+# and the JOBS.md section that documents the handling.
+#
+# [kinds."<kind>"]
+#   match       filename globs of the ~/inbox notes this kind covers (ingest); the most specific match wins:
+#               higher priority first, then the longer literal prefix before the first wildcard
+#   regex       optional, on the filename: the entry matches only when a glob AND the regex match; named groups
+#               go into the event payload (e.g. the failed job's name)
+#   priority    optional int (default 0)
+#   delivery    now | beat | digest | mute   (default beat)
+#   labels      free tags
+#   hint        one line: how it is handled (shown only when the note has no "Next:" line)
+#   jobs        the JOBS.md section with the full handling (its heading, or the heading's start before " (")
+#   payload     optional: the JSON Schema (schemas/payloads/) of the typed payload a writer emits for this kind
+#   [kinds."<kind>".label_lines]   label = regex (multiline) on the note text; a match adds the label
+# A note no entry matches becomes note.<prefix> (the filename up to its first number/date/hash part).
+schema = 1
+
+[kinds."cron.fail"]
+match = ["*-failed-*"]
+regex = '^(?P<job>.+?)-failed-\d{6,}(?:-\d+)?(?:\.md)?$'
+priority = 10
+delivery = "beat"
+labels = ["failure"]
+hint = "read the job's .err through secretscan --redact, fix the job, then ack"
+jobs = "Recurring jobs (reference)"
+payload = "payloads/cron.fail.schema.json"
+[kinds."cron.fail".label_lines]
+recovered = '^Recovered '
+
+[kinds."note.vault-events"]
+match = ["vault-events-*"]
+labels = ["private", "vault"]
+hint = "the vault's triaged feed (flags, no text): act on it (calendar, reminders, bills, TODO), never relay; details via vault ask"
+jobs = "Every minute / every few minutes (no tokens)"
+payload = "payloads/note.vault-events.schema.json"
+
+[kinds."note.vault-events-ha"]
+match = ["vault-events-ha-*"]
+labels = ["private", "vault", "home"]
+hint = "zone / drive / far change: timing and context only; tell him only if it matters for something he asked or planned"
+jobs = "Every minute / every few minutes (no tokens)"
+payload = "payloads/note.vault-events-ha.schema.json"
+
+[kinds."note.vault-events-mail"]
+match = ["vault-events-mail-*"]
+labels = ["private", "vault", "mail"]
+hint = "mail flags from the vault feed: act (bills, calendar, TODO), never relay; details via vault ask"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.vault-events-failing"]
+match = ["vault-events-failing-*"]
+labels = ["failure", "vault"]
+hint = "the vault feed keeps failing while the vault is up: vault-events --status, vault admin logs"
+jobs = "Every minute / every few minutes (no tokens)"
+payload = "payloads/note.vault-events-failing.schema.json"
+[kinds."note.vault-events-failing".label_lines]
+recovered = '^Recovered '
+
+[kinds."note.vault-plans"]
+match = ["vault-plans-*"]
+labels = ["private", "vault", "plans"]
+hint = "dated plans from his chats/mail: calendar, reminder or one question; plans-watch done KEY; handled when plans-watch open no longer lists them"
+jobs = "Every minute / every few minutes (no tokens)"
+payload = "payloads/note.vault-plans.schema.json"
+
+[kinds."note.reminder"]
+match = ["reminder-*"]
+labels = ["reminder"]
+hint = "a reminder for me (not his): do what it says"
+jobs = "Owner-facing"
+payload = "payloads/note.reminder.schema.json"
+
+[kinds."note.reminder-place"]
+match = ["reminder-place-*"]
+labels = ["reminder", "place"]
+hint = "a place reminder for me: do what it says"
+jobs = "Owner-facing"
+payload = "payloads/note.reminder-place.schema.json"
+
+[kinds."note.back-offer"]
+match = ["back-offer*"]
+labels = ["reminder", "place"]
+hint = "the welcome-back message to him failed (tg): send it outside quiet hours, then ack"
+jobs = "Owner-facing"
+payload = "payloads/note.back-offer.schema.json"
+
+[kinds."note.voice"]
+match = ["voice-*"]
+delivery = "now"
+labels = ["owner", "live"]
+hint = "his spoken request from a call: act on it like a Telegram message; side effects need his Telegram approval"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.voice-recap"]
+match = ["voice-recap-*"]
+labels = ["owner"]
+hint = "open hand-offs from a call: check each, then one short Telegram message on what is still open"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.voice-decisions"]
+match = ["voice-decisions-*"]
+labels = ["owner", "decision"]
+hint = "his spoken picks: one Telegram summary with an approve button per pick; apply only after approval"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.voicerelay"]
+match = ["voicerelay-*"]
+labels = ["system", "voice"]
+hint = "voice relay status note: check the relay"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.bigfile"]
+match = ["bigfile-*"]
+delivery = "now"
+labels = ["owner", "file"]
+hint = "a file he sent to the call account (in ~/inbox/files/): route by its caption; never delete the file unasked"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.phone-chat"]
+match = ["phone-chat-*"]
+delivery = "now"
+labels = ["owner", "app"]
+hint = "his message from the phone app while the plugin inbox is down: act like Telegram, answer with phone chat --reply-to"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.phone-share"]
+match = ["phone-share-*"]
+delivery = "now"
+labels = ["owner", "app"]
+hint = "something he shared to the app: route like the same thing on Telegram"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.phone-decisions"]
+match = ["phone-decisions-*"]
+labels = ["owner", "app", "decision"]
+hint = "his picks from in-app decision cards: do what needs no further OK, side effects after his Telegram approval"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.phone-reject"]
+match = ["phone-reject-*"]
+labels = ["app", "bug"]
+hint = "the gateway refuses an app frame (schema mismatch): fix protocol/schema + phonegw, restart when no call is live"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.phone-crash"]
+match = ["phone-crash-*"]
+labels = ["app", "bug"]
+hint = "an app exception (class + location only): TODO item or fix + phone release"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.phone-selftest"]
+match = ["phone-selftest-*"]
+labels = ["app"]
+hint = "an app self-test check turned red: fix my side; a phone setting only he can change -> one short batched line"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.restart"]
+match = ["restart-*"]
+labels = ["system"]
+hint = "run the heartbeat routine; confirm on Telegram if he waited; after a plugin/settings change check the MCP log"
+jobs = "Heartbeat (how I get woken)"
+
+[kinds."note.restart-cause"]
+match = ["restart-cause-*"]
+labels = ["system"]
+hint = "why the session restarted: check that Telegram inbound still works"
+jobs = "Heartbeat (how I get woken)"
+
+[kinds."note.rave-radar"]
+match = ["rave-radar-*"]
+labels = ["music"]
+hint = "new shows, lineups or presales for his artists: one message with buttons"
+jobs = "Owner-facing"
+payload = "payloads/note.rave-radar.schema.json"
+
+[kinds."note.rave-radar-releases"]
+match = ["rave-radar-releases-*"]
+labels = ["music"]
+hint = "new releases from his artists: one message with crate buttons"
+jobs = "Owner-facing"
+payload = "payloads/note.rave-radar-releases.schema.json"
+
+[kinds."note.preshow"]
+match = ["preshow-*"]
+labels = ["music"]
+hint = "the week before a show: what the artist plays lately"
+jobs = "Owner-facing"
+payload = "payloads/note.preshow.schema.json"
+
+[kinds."note.settime"]
+match = ["*-settime-*"]
+labels = ["music"]
+hint = "a set time for a show he goes to appeared or changed"
+jobs = "Owner-facing"
+
+[kinds."note.gift-radar"]
+match = ["gift-radar-*"]
+labels = ["people"]
+hint = "a birthday in 10 days: research 3 ideas, message him with buttons"
+jobs = "Owner-facing"
+
+[kinds."note.shop-new-items"]
+match = ["shop-new-items-*"]
+labels = ["shopping"]
+hint = "new shopping list items: skill shopping (research each, set options)"
+jobs = "Owner-facing"
+
+[kinds."note.unraid-health"]
+match = ["unraid-health-*"]
+labels = ["server"]
+hint = "something is wrong on the server: look read-only (unraid-health --report)"
+jobs = "Server"
+payload = "payloads/note.unraid-health.schema.json"
+
+[kinds."note.hwtrend"]
+match = ["hwtrend-*"]
+labels = ["server"]
+hint = "an error counter rose or a temperature stayed hot: hwtrend show"
+jobs = "Server"
+
+[kinds."note.hddheat"]
+match = ["hddheat-*"]
+labels = ["server"]
+hint = "hot array disks; he was already texted once: don't text again"
+jobs = "Server"
+
+[kinds."note.security-watch"]
+match = ["security-watch-*"]
+labels = ["security"]
+hint = "a new security finding: skill security-watch"
+jobs = "Server"
+
+[kinds."note.container-watch"]
+match = ["container-watch-*"]
+labels = ["security", "server"]
+hint = "container updates or advisories: skill container-watch"
+jobs = "Server"
+
+[kinds."note.ha-left-on"]
+match = ["ha-left-on-*"]
+labels = ["home"]
+hint = "something was left on while he is away"
+jobs = "Home (HA, cat, climate; no tokens)"
+
+[kinds."note.ha-vacuum"]
+match = ["ha-vacuum-*"]
+labels = ["home"]
+hint = "an HA vacuum run did not happen (no start, room missing, empty run, mode not taken); he got the 🧹 line: find why, fix via ha-apply"
+jobs = "Home (HA, cat, climate; no tokens)"
+
+[kinds."note.codebase-sync"]
+match = ["codebase-sync-*"]
+labels = ["system"]
+hint = "the public sync gate found something: fix the flagged path"
+jobs = "Self-maintenance (nightly, no tokens)"
+
+[kinds."note.agent-watch"]
+match = ["agent-watch-*"]
+labels = ["agents"]
+hint = "a subagent stalled: ping it (SendMessage) or stop it and redo the work"
+jobs = "Every minute / every few minutes (no tokens)"
+
+[kinds."note.self-review"]
+match = ["self-review-*"]
+labels = ["system"]
+hint = "new findings from the daily self-review: self-review open / ack ID"
+jobs = "Self-maintenance (nightly, no tokens)"
+
+[kinds."note.loop-proposals"]
+match = ["loop-proposals-*"]
+labels = ["system"]
+hint = "<= 3 change proposals, metric first: loop show ID, then loop accept ID or loop reject ID --why"
+jobs = "Self-maintenance (nightly, no tokens)"
+
+[kinds."note.loop-corrections"]
+match = ["loop-corrections-*"]
+labels = ["memory"]
+hint = "owner corrections -> fact + eval case drafts: loop show ID, accept or reject within 24 h"
+jobs = "Self-maintenance (nightly, no tokens)"
+
+[kinds."note.memory2-review"]
+match = ["memory2-review-*"]
+labels = ["memory"]
+hint = "memory candidates: reject noise, memory2 promote real ones"
+jobs = "Self-maintenance (nightly, no tokens)"
+
+[kinds."note.arr-unblock"]
+match = ["arr-unblock-*"]
+labels = ["media"]
+hint = "an *arr import was skipped: arr-unblock --approve only after checking"
+jobs = "Media (*arr)"
+
+# The brain's scheduled cues, typed cue.<name> events from hub schedules (`cue NAME`, registry
+# class C; waiting-nudge writes its own). Each writes its row and the identical note (inbox.writer); the note names keep
+# their kind's filename prefix, so ingest gives the note the same kind. Payload: payloads/cue.schema.json.
+[kinds."cue.weekly-digest"]
+match = ["digest-*"]
+labels = ["cue", "owner"]
+hint = "weekly-digest subagent at xhigh, review, one rich message (+ up to 3 Watch buttons); archive ~/reports/digest/"
+jobs = "Owner-facing"
+payload = "payloads/cue.schema.json"
+
+[kinds."cue.birthdays"]
+match = ["birthdays-*"]
+labels = ["cue", "people"]
+hint = "birthdays in the next 7 days: one message only if any; then the silent 60-day calendar details pass"
+jobs = "Owner-facing"
+payload = "payloads/cue.schema.json"
+
+[kinds."cue.idea-scan"]
+match = ["idea-scan-*"]
+labels = ["cue", "goals"]
+hint = "idea-scan subagent at high: TODO.md Ideas >= 10, update GOALS.md"
+jobs = "Goal loop"
+payload = "payloads/cue.schema.json"
+
+[kinds."cue.self-cleanup"]
+match = ["self-cleanup-*"]
+labels = ["cue", "system"]
+hint = "self-cleanup subagent at xhigh, then one message: what was retired + Needs his OK buttons"
+jobs = "Goal loop"
+payload = "payloads/cue.schema.json"
+
+[kinds."cue.calendar-gap-pass"]
+match = ["calendar-gap-pass-*"]
+labels = ["calendar", "cue"]
+hint = "skill calendar-gap-pass (next 14 days: travel legs, missing details); silent unless a decision is needed"
+jobs = "Goal loop"
+payload = "payloads/cue.schema.json"
+
+[kinds."cue.daily-plan"]
+match = ["daily-plan-*"]
+labels = ["cue", "goals"]
+hint = "pick 1-3 GOALS.md steps and start the first; no message (a 🛒 line: one short line to him)"
+jobs = "Goal loop"
+payload = "payloads/cue.schema.json"
+
+[kinds."cue.waiting-nudge"]
+match = ["waiting-nudge-*"]
+labels = ["board", "cue"]
+hint = "ask him about 1-3 Waiting on you items at a relaxed time, then waiting-nudge asked"
+jobs = "Owner-facing"
+payload = "payloads/cue.schema.json"
+
+# Failure streaks of jobs the harness runs itself (hub schedules via workflow.job, `keepers ensure`), with
+# cron.fail's --after/--ok semantics (core.jobfail). job.recovered and schedule.changed are
+# typed rows without a note (digest; payload schemas in payloads/), so they need no entry here.
+[kinds."job.failed"]
+match = ["*-jobfail-*"]
+regex = '^(?P<job>.+?)-jobfail-\d{6,}(?:-\d+)?(?:\.md)?$'
+priority = 11
+delivery = "beat"
+labels = ["failure"]
+hint = "read the job's .err through secretscan --redact, fix the job, then ack"
+jobs = "Recurring jobs (reference)"
+payload = "payloads/job.failed.schema.json"
+[kinds."job.failed".label_lines]
+recovered = '^Recovered '
+
+[kinds."hub.down"]
+match = ["hub-sentinel-*"]
+priority = 10
+delivery = "now"
+labels = ["failure", "hub"]
+hint = "hub status; hub health --json; fix the hub or tell him"
+jobs = "Recurring jobs (reference)"
+
+# Shared CI blockers (ops/assistant.py land path, core.ciblock): what stops EVERY land (a suite red on main, the hub
+# runner refusing a submit or giving no signed record). Raised the moment a land sees one, deduped per blocker ~2 h.
+[kinds."ci.blocked"]
+match = ["ci-blocked-*"]
+priority = 10
+delivery = "now"
+labels = ["failure", "ci"]
+hint = "a shared CI blocker stops every land: assistant ci-status; fix it (or hand it to one helper), then ack"
+jobs = "Self-maintenance (nightly, no tokens)"
+payload = "payloads/ci.blocked.schema.json"

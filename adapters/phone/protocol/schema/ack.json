@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ack.json",
+  "title": "ack (both directions)",
+  "type": "object",
+  "properties": {
+    "ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+      },
+      "minItems": 1,
+      "maxItems": 256
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ids"
+  ]
+}

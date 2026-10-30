@@ -1,0 +1,73 @@
+#!/usr/local/bin/python3.13 -I
+"""browsersvc: the browser service, one process in front of Chrome's CDP in claude-hub-browser: a committing click
+or Enter needs a hub approval token (packages/browsersvc docstring). The brain's side of it, read-only.
+
+  browsersvc status [--json]          the clients' CDP route and the 24 h counts of this home's service log
+  browsersvc route [--json]           the CDP endpoint clients use (exit 3: the container's service is down)
+  browsersvc audit [--hours N] [--json]   commits with / without a consumed token, denials, would-denials; exit 1
+                                      when a committing action passed without a token in enforce mode
+  browsersvc log [-n N]               the last decisions (no labels, URLs or page text)
+Exit: 0 ok, 1 audit finding / failure, 2 usage, 3 route not usable. The container's own counts: `browser-hub audit`.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [
+    os.environ.get("ASSISTANT_LIB", ""),
+    os.path.join(_here, "lib"),
+    os.path.join(_here, ".."),
+    os.path.join(_here, "..", "packages"),
+]
+for _pkg in ("core", "browsersvc"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+
+def main(argv):
+    import argparse
+    import json
+
+    import browsersvc as B
+
+    ap = argparse.ArgumentParser(prog="browsersvc", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("route")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("audit")
+    s.add_argument("--hours", type=float, default=24.0)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("log")
+    s.add_argument("-n", type=int, default=20)
+    a = ap.parse_args(argv)
+    if a.cmd == "route":
+        r = B.route()
+        print(json.dumps(r) if a.json else f"{r['cdp']} ({r['via']}, mode {r['mode']})")
+        return 0 if r["ok"] else 3
+    if a.cmd == "audit":
+        r = B.audit(a.hours)
+        print(json.dumps(r) if a.json else " · ".join(f"{k} {v}" for k, v in r.items()))
+        return 1 if r["unguarded"] and B.mode() == "enforce" else 0
+    if a.cmd == "log":
+        for r in B.records(24 * 30)[-a.n :]:
+            print(json.dumps(r, ensure_ascii=False))
+        return 0
+    r = B.route()
+    st = {"route": r["via"], "cdp": r["cdp"], "audit_24h": B.audit(24)}
+    if a.json:
+        print(json.dumps(st))
+    else:
+        print(f"clients: {st['cdp']} ({st['route']})")
+        print("24 h: " + " · ".join(f"{k} {v}" for k, v in st["audit_24h"].items() if k != "hours"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

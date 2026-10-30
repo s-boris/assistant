@@ -1,0 +1,840 @@
+#!/usr/local/bin/python3.13 -I
+"""abx: one pinned browser window + tab per agent in the shared headed Chrome (Vercel agent-browser 0.39.1 over CDP),
+with the web-agent commit gate built in. The only way agents reach agent-browser (hook abx-raw-guard blocks the rest).
+
+  abx start [--task ID] [URL]     own window + tab, strictly pinned; prints the session id (ab-xxxxxx)
+  abx -s SID <command> [args]     an agent-browser command in that session (allowlisted verbs and flags only)
+  abx stop -s SID | --task ID     close the session's own tab and its daemon (never the last tab)
+  abx list [--task ID]            sessions (--task: only that web task's SIDs, one per line; exit 4 = none)
+  abx sweep [--min N]             stops sessions idle > N min (default 30) whose web task is over (an open task
+                                  keeps its tab for the resume agent), and any whose tab is gone
+
+Commands: snapshot [-i -c -u -d N -s SEL] · get text|html|value|attr|title|url|count|box|styles · is visible|enabled|
+checked · wait SEL|MS|--text|--url|--load|--fn · screenshot [PATH under the output dir] [--full --annotate] ·
+console|errors · open|goto|navigate URL (http/https) · back|forward|reload · click|dblclick|check|uncheck @REF ·
+fill|type @REF TEXT · select REF|SEL VALUE... · hover|focus|scrollintoview REF|SEL · scroll DIR [PX] · press KEY ·
+keyboard type|inserttext|press|down|up ARG · find LOCATOR VALUE text|hover|focus · eval JS | -b B64 | --stdin ·
+dialog status|accept [TEXT]|dismiss. Global flags: --json, --max-output N.
+
+Gate (fails closed): clicks and typing go by @ref from this session's own snapshots, so the label is the element's
+accessible name from the snapshot plus its live text/attributes (an image button's alt, aria-labelledby: not a label
+the agent writes). Clicks, check/uncheck, typing into a button, Enter/Space on the focused element, Enter in typed
+text, dialog accept and JS go through webagent.guard() (the webagent-guard decision on the MCP: hard commits need an
+approved web task, soft commits/Enter/JS/coordinates are off while a task runs). Always refused: JS clicks/submits/
+requests and cookie/storage access in eval or wait --fn, typing a card number or IBAN, typing into password/card/CVC/
+IBAN fields, cookies/storage/state/auth/network/upload/download/tabs/windows/raw CDP and session or launch flags.
+Output: page text is wrapped in content boundaries; his personal data (name, address, postcode + town, e-mail, phone,
+IBAN, card digits) is masked as [personal] in everything abx prints, always (lib/ownermask.py: the private profile,
+patterns when a value can't be loaded; a mask error withholds the output); while secure-fill values are live, abx also
+redacts its own output (securefill's hook, fail closed). Never launches a browser (attach-only, CDP 127.0.0.1:9222, or the browser service's
+front :9223 while ~/.config/assistant/browsersvc is shadow|enforce: browsersvc.route; enforce with the service down =
+exit 1); test mode (ABX_TEST=1) never touches either port. Outside test mode the env hooks (WEBAGENT_*, SECUREFILL_*,
+ABX_*, BROWSERSVC_*, BROWSER_*, ASSISTANT_PROFILE) are dropped and HOME is the account's own (passwd), so no override
+moves the gate, the state, the binary, the profile or the CDP endpoint.
+Exit: 0 ok, 1 agent-browser error, 2 usage/refused, 3 gate deny, 4 tab gone.
+Tests: ~/opt/agent-browser/tests/run.sh (private). Pinned to agent-browser 0.39.1: re-run the tests before upgrades.
+"""
+import base64
+import glob
+import json
+import os
+import pwd
+import re
+import secrets
+import subprocess
+import sys
+import time
+
+LIVE_CDP_PORT = "9222"
+SVC_CDP_PORT = "9223"   # the browser service's front (browsersvc.PORT; the hub's claude-hub-browser:9223 too)
+TEST = os.environ.get("ABX_TEST") == "1"
+if not TEST:            # an agent can't point abx at another gate, task state, secure-fill state, binary, profile or
+    #                     CDP endpoint: the test hooks of abx and of the libraries it loads go (BROWSER_*: browsersvc's
+    #                     host switch + hub URL, securefill's port), and HOME is the account's own, since every default
+    #                     path here and in those libraries hangs off it (a fake HOME = another gate library)
+    for _k in [k for k in os.environ if k.startswith(("WEBAGENT_", "SECUREFILL_", "ABX_", "BROWSERSVC_", "BROWSER_"))
+               or k == "ASSISTANT_PROFILE"]:
+        os.environ.pop(_k, None)
+    try:
+        _h = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        _h = ""
+    if not _h.startswith("/"):
+        print("abx: refused: this account has no home directory in the user database", file=sys.stderr)
+        sys.exit(2)
+    os.environ["HOME"] = _h
+HOME = os.path.expanduser("~")
+
+
+def _o(name, default):
+    return (os.environ.get(name) if TEST else None) or default
+
+
+AB_BIN = _o("ABX_BIN", f"{HOME}/opt/agent-browser/node_modules/agent-browser/bin/agent-browser-linux-x64")
+STATE = _o("ABX_STATE", f"{HOME}/.local/state/agent-browser")
+SOCK = _o("ABX_SOCK", f"{STATE}/sock")          # unix socket paths max ~103 bytes: keep it short
+SESS = f"{STATE}/sessions"
+CDP_PORT = _o("ABX_CDP_PORT", LIVE_CDP_PORT)
+OUT_DIR = _o("ABX_OUT", f"{HOME}/.local/share/browser/ab-output")
+LIB = _o("WEBAGENT_LIB", f"{HOME}/bin/lib")
+
+
+def _route():
+    """The browser service in front of Chrome's CDP while its switch is on (browsersvc.route: shadow = the
+    service when it answers, enforce = the service only); off or not deployed = Chrome directly. Test mode
+    never routes."""
+    if TEST:
+        return None
+    try:
+        if LIB not in sys.path:
+            sys.path.insert(0, LIB)
+        import browsersvc
+        return browsersvc.route()
+    except Exception:
+        on = os.path.exists(f"{HOME}/.config/assistant/browsersvc")
+        return {"mode": "unknown", "port": int(LIVE_CDP_PORT), "ok": not on, "via": "direct (browsersvc broken)"}
+
+
+CDP_ROUTE = _route()
+if CDP_ROUTE:
+    CDP_PORT = str(CDP_ROUTE["port"])
+SF_STATE = _o("SECUREFILL_STATE", f"{HOME}/.local/state/securefill")
+CONFIG = f"{STATE}/config.json"                  # an empty config: no user (~/.agent-browser) or project config
+POLICY = f"{STATE}/policy.json"
+POLICY_BODY = {"default": "allow", "deny": ["state", "network", "upload", "download"]}
+FEATURE = "bin.abx"
+NODE_NEWWIN = r"""
+const [port, url] = process.argv.slice(1);
+const v = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+const ws = new WebSocket(v.webSocketDebuggerUrl);
+ws.onopen = () => ws.send(JSON.stringify({id: 1, method: 'Target.createTarget', params: {url, newWindow: true}}));
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id === 1) { console.log(m.result ? m.result.targetId : ''); process.exit(m.result ? 0 : 1); } };
+setTimeout(() => process.exit(2), 5000);
+"""
+# The focused element (through open shadow roots and same-origin frames) for Enter / Space / typed keys: clickable or
+# not, its role and an accessible-name-like label. {frame: true} = focus inside a frame abx can't read.
+FOCUS_JS = r"""(() => {
+  let e = document.activeElement, n = 0;
+  while (e && n++ < 12) {
+    if (e.shadowRoot && e.shadowRoot.activeElement) { e = e.shadowRoot.activeElement; continue; }
+    if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') {
+      let d = null; try { d = e.contentDocument; } catch (x) {}
+      if (!d) return {frame: true};
+      e = d.activeElement; continue;
+    }
+    break;
+  }
+  if (!e || e.tagName === 'BODY' || e.tagName === 'HTML') return {none: true};
+  const t = e.tagName.toLowerCase(), ty = (e.getAttribute('type') || '').toLowerCase();
+  const role = (e.getAttribute('role') || '').toLowerCase();
+  const s = (x) => String(x || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  const parts = [];
+  for (const id of (e.getAttribute('aria-labelledby') || '').split(/\s+/)) {
+    const r = id && e.ownerDocument.getElementById(id); if (r) parts.push(s(r.textContent)); }
+  parts.push(s(e.getAttribute('aria-label')), s(e.innerText || e.textContent), s(e.getAttribute('title')), s(e.getAttribute('alt')));
+  if (t === 'input' && ['submit', 'button', 'reset', 'image'].includes(ty)) parts.push(s(e.value));
+  for (const im of e.querySelectorAll('img[alt], svg title')) parts.push(s(im.getAttribute('alt') || im.textContent));
+  if (e.labels) for (const l of e.labels) parts.push(s(l.innerText || l.textContent));
+  const btn = ['submit', 'button', 'image', 'reset'];
+  const roles = ['button', 'link', 'checkbox', 'radio', 'switch', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'tab', 'option'];
+  const clickable = t === 'button' || (t === 'a' && e.hasAttribute('href')) || t === 'summary' ||
+    (t === 'input' && (btn.includes(ty) || ty === 'checkbox' || ty === 'radio')) || roles.includes(role);
+  const kind = role || (t === 'input' ? (ty === 'checkbox' || ty === 'radio' ? ty : (btn.includes(ty) ? 'button' : 'textbox'))
+    : (t === 'a' ? 'link' : t));
+  return {clickable, role: kind, label: [...new Set(parts.filter(Boolean))].join(' ').slice(0, 400)};
+})()"""
+
+GET_SUBS = {"text", "html", "value", "attr", "title", "url", "count", "box", "styles"}
+IS_SUBS = {"visible", "enabled", "checked"}
+KEYBOARD_SUBS = {"type", "inserttext", "press", "down", "up"}
+FIND_LOCATORS = {"role", "text", "label", "placeholder", "alt", "title", "testid", "first", "last", "nth"}
+FIND_ACTIONS = {"text", "hover", "focus"}       # find … click/fill/type/check: by @ref instead (the gate needs the name)
+DIALOG_SUBS = {"status", "accept", "dismiss"}
+# verb -> {flag: arity}; every other token starting with "-" is refused (an allowlist, not a deny list)
+FLAGS = {
+    "snapshot": {"-i": 0, "--interactive": 0, "-c": 0, "--compact": 0, "-u": 0, "-d": 1, "--depth": 1, "-s": 1,
+                 "--selector": 1},
+    "get": {}, "is": {}, "console": {"--clear": 0}, "errors": {"--clear": 0},
+    "wait": {"--text": 1, "-t": 1, "--url": 1, "-u": 1, "--load": 1, "-l": 1, "--fn": 1, "-f": 1, "--timeout": 1},
+    "screenshot": {"--full": 0, "--annotate": 0, "--if-changed": 0, "--threshold": 1},
+    "open": {}, "goto": {}, "navigate": {}, "back": {}, "forward": {}, "reload": {},
+    "click": {"--human": 0}, "dblclick": {"--human": 0}, "check": {}, "uncheck": {},
+    "fill": {}, "type": {}, "select": {}, "hover": {}, "focus": {}, "scrollintoview": {}, "scroll": {},
+    "press": {}, "keyboard": {}, "find": {"--name": 1, "--exact": 0}, "eval": {"-b": 1, "--base64": 1, "--stdin": 0},
+    "dialog": {},
+}
+GLOBAL_FLAGS = {"--json": 0, "--max-output": 1}
+NAV = {"open", "goto", "navigate"}
+FRONT = {"click", "dblclick", "check", "uncheck", "fill", "type", "select", "hover", "focus", "scrollintoview",
+         "scroll", "press", "keyboard", "find", "dialog"}
+REF = re.compile(r"^@?e\d{1,7}$")
+CLICKABLE_ROLES = {"button", "link", "checkbox", "radio", "switch", "menuitem", "menuitemcheckbox", "menuitemradio",
+                   "tab", "option", "treeitem"}
+ENTER_KEYS = {"enter", "numpadenter", "return"}
+SPACE_KEYS = {"space", " ", "spacebar"}
+# JS refused in eval / wait --fn for every caller: clicks, submits, requests (an exfil channel too) and cookies/storage
+JS_ALWAYS = re.compile(r"\.(?:click|submit|requestSubmit|dispatchEvent|initMouseEvent)\s*\(|\bfetch\s*\(|"
+                       r"XMLHttpRequest|sendBeacon|\bWebSocket\b|\bEventSource\b|\.form\b[^;]*\.submit|document\s*\.\s*cookie"
+                       r"|\bcookieStore\b|\blocalStorage\b|\bsessionStorage\b|\bindexedDB\b|\bcaches\s*\.|navigator\s*\."
+                       r"\s*credentials|\bwindow\s*\.\s*open\s*\(|\bimport\s*\(", re.I)
+SECRET_FIELD = re.compile(r"card\s*-?\s*(?:number|no\b|nr\b)|kartennummer|num[ée]ro\s+de\s+carte|numero\s+(?:della\s+)?carta"
+                          r"|\bcvc2?\b|\bcvv2?\b|\bcvn\b|\bcsc\b|security\s+code|sicherheitscode|pr[üu]fnummer|cryptogram"
+                          r"|\biban\b|password|passwort|kennwort|mot\s+de\s+passe|\bpin\b|\btan\b|\botp\b", re.I)
+BOUND = re.compile(r"^--- (?:END_)?AGENT_BROWSER_PAGE_CONTENT")
+
+
+def die(msg, code=2, log=None):
+    if log:
+        _usage("exec", outcome=log[0], attrs={"verb": log[1]})
+    print(redact("die", "", f"abx: {msg}\n")[1], end="", file=sys.stderr)   # a label may carry his data
+    sys.exit(code)
+
+
+def _usage(kind, outcome=None, ms=None, attrs=None):
+    try:
+        if LIB not in sys.path:
+            sys.path.insert(0, LIB)
+        import usage
+        usage.log(FEATURE, kind, outcome=outcome, ms=ms, attrs={k: v for k, v in (attrs or {}).items() if v is not None})
+    except Exception:
+        pass
+
+
+def _webagent():
+    if LIB not in sys.path:
+        sys.path.insert(0, LIB)
+    import webagent
+    return webagent
+
+
+def _write_if(path, body):
+    want = json.dumps(body)
+    try:
+        with open(path) as f:
+            if f.read() == want:
+                return
+    except OSError:
+        pass
+    with open(path + ".tmp", "w") as f:
+        f.write(want)
+    os.chmod(path + ".tmp", 0o600)
+    os.replace(path + ".tmp", path)
+
+
+def ensure_dirs():
+    if TEST and str(CDP_PORT) in (LIVE_CDP_PORT, SVC_CDP_PORT):
+        die(f"test mode never touches the live browser (port {LIVE_CDP_PORT}) or its service (port {SVC_CDP_PORT})")
+    if CDP_ROUTE and not CDP_ROUTE.get("ok"):
+        die("the browser service is down while its switch says enforce: `browsersvc ensure` (nothing goes to Chrome "
+            "around it)", 1)
+    for d in (STATE, SOCK, SESS, OUT_DIR):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    _write_if(CONFIG, {})            # rewritten whenever it differs: no init scripts, plugins, proxies, extensions
+    _write_if(POLICY, POLICY_BODY)   # second layer inside the daemon (category level)
+
+
+def env():
+    e = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "LC_ALL", "TZ")}
+    e.update(AGENT_BROWSER_SOCKET_DIR=SOCK, AGENT_BROWSER_CDP=str(CDP_PORT), AGENT_BROWSER_PIN_TAB="1",
+             AGENT_BROWSER_IDLE_TIMEOUT_MS="1800000", AGENT_BROWSER_CONTENT_BOUNDARIES="1",
+             AGENT_BROWSER_MAX_OUTPUT="60000", AGENT_BROWSER_NO_WEBMCP="1", AGENT_BROWSER_NO_AUTO_DIALOG="1",
+             AGENT_BROWSER_SCREENSHOT_DIR=OUT_DIR, AGENT_BROWSER_ACTION_POLICY=POLICY, AGENT_BROWSER_CONFIG=CONFIG)
+    return e
+
+
+def ab(sid, args, timeout=90):
+    try:
+        return subprocess.run([AB_BIN, "--session", sid] + args, env=env(), cwd=STATE, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        die(f"agent-browser timed out after {timeout}s: {' '.join(args[:2])}", 1)
+    except OSError as e:
+        die(f"agent-browser could not run ({type(e).__name__})", 1)
+
+
+def abj(sid, args, timeout=20):
+    """An internal JSON call -> data dict, or None on any failure (a closed tab exits 4 at once)."""
+    r = ab(sid, ["--json"] + args, timeout=timeout)
+    if "tab_gone" in (r.stdout or "") + (r.stderr or ""):
+        die("tab_gone: this session's tab was closed; `abx stop` it and start a new one (never another tab)", 4,
+            log=("tab_gone", args[0]))
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return None
+    return d.get("data") if d.get("success") and isinstance(d.get("data"), dict) else None
+
+
+def sess_path(sid):
+    if not re.fullmatch(r"ab-[0-9a-f]{6}", sid or ""):
+        die("bad session id (abx start prints one)")
+    return f"{SESS}/{sid}.json"
+
+
+def load(sid):
+    try:
+        with open(sess_path(sid)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        die(f"unknown session {sid} (abx start)", 4)
+
+
+def save(sid, rec):
+    p = sess_path(sid)
+    with open(p + ".tmp", "w") as f:
+        json.dump(rec, f)
+    os.chmod(p + ".tmp", 0o600)
+    os.replace(p + ".tmp", p)
+
+
+def cdp_pages():
+    import urllib.request
+    with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/list", timeout=5) as r:
+        return [t for t in json.load(r) if t.get("type") == "page"]
+
+
+def cdp_get(path):
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}{path}", timeout=3).read()
+    except OSError:
+        pass
+
+
+def seed_target(sid, rec):
+    """The daemon's tab binding file: re-seeded when missing or changed, so a restarted daemon attaches to OUR tab
+    instead of opening a stray one (an agent-browser internal: re-test on upgrades)."""
+    p = f"{SOCK}/{sid}.target"
+    try:
+        with open(p) as f:
+            if json.load(f).get("targetId") == rec["target"]:
+                return
+    except (OSError, ValueError):
+        pass
+    with open(p + ".tmp", "w") as f:
+        json.dump({"targetId": rec["target"], "url": rec.get("url") or "about:blank", "pinned": True}, f)
+    os.chmod(p + ".tmp", 0o600)
+    os.replace(p + ".tmp", p)
+
+
+def daemon_pid(sid):
+    try:
+        with open(f"{SOCK}/{sid}.pid") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def start(argv):
+    task, url = None, ""
+    while argv:
+        a = argv.pop(0)
+        if a == "--task" and argv:
+            task = argv.pop(0)
+            if not re.fullmatch(r"wa[0-9a-f]{4,16}", task):
+                die("--task takes a web task id (webagent start prints it)")
+        elif not url and not a.startswith("-"):
+            url = a
+        else:
+            die("usage: abx start [--task ID] [URL]")
+    ensure_dirs()
+    if url and not re.match(r"^(https?://|about:blank$)", url):
+        die("start URL must be http(s)")
+    t0 = time.time()
+    sid = "ab-" + secrets.token_hex(3)
+    try:
+        r = subprocess.run(["node", "--input-type=module", "-e", NODE_NEWWIN, str(CDP_PORT), url or "about:blank"],
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, cwd=STATE)
+    except (OSError, subprocess.TimeoutExpired):
+        die("could not open a window over CDP (browser start?)", 1)
+    tid = r.stdout.strip()
+    if r.returncode or not re.fullmatch(r"[0-9A-F]{32}", tid):
+        die("could not open a window over CDP (browser start?)", 1)
+    now = time.time()
+    rec = {"sid": sid, "target": tid, "task": task, "url": url or "about:blank", "started": now, "used": now,
+           "refs": {}, "refs_pid": ""}
+    save(sid, rec)
+    seed_target(sid, rec)
+    r = ab(sid, ["get", "url"])
+    if r.returncode:
+        stop(sid, quiet=True)
+        die("attach failed: " + strip(r.stdout or r.stderr)[:200], 1)
+    _usage("invoke", ms=round((time.time() - t0) * 1000), attrs={"task": bool(task)})
+    if task:
+        try:                                   # the task's workflow records its window (no-op while off)
+            _webagent().wf_task(task, "lease", sid=sid)
+        except Exception:
+            pass
+    print(sid)
+
+
+def stop(sid, quiet=False):
+    rec = load(sid)
+    tid = rec["target"]
+    try:
+        pages = cdp_pages()
+    except OSError:
+        pages = []
+    if any(p["id"] == tid for p in pages):
+        if len(pages) <= 1:                    # never close the last tab (that quits Chrome)
+            seed_target(sid, rec)
+            ab(sid, ["open", "about:blank"], timeout=20)
+        else:
+            cdp_get(f"/json/close/{tid}")
+    if os.path.exists(f"{SOCK}/{sid}.sock"):
+        ab(sid, ["close"], timeout=20)         # attach-only: ends the daemon, leaves Chrome running
+    left = [f"{SOCK}/{n}" for n in os.listdir(SOCK) if n.startswith(sid + ".")] if os.path.isdir(SOCK) else []
+    for p in left + [sess_path(sid)]:          # target, config, pid, sock, stream, version
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    if not quiet:
+        print(f"stopped {sid}")
+
+
+def strip(text):
+    return "\n".join(ln for ln in (text or "").splitlines() if not BOUND.match(ln)).strip()
+
+
+# ---------------------------------------------------------------- the gate
+def deny(msg, verb, why):
+    try:
+        _webagent()._glog({"tool": "abx:" + verb, "decision": "deny", "why": why, "agent": True})
+    except Exception:
+        pass
+    die(msg, 3, log=("blocked", verb))
+
+
+def no_dialog(sid, verb):
+    d = abj(sid, ["dialog", "status"], timeout=10)
+    if d is None:
+        deny("could not check for an open dialog (gate fails closed); retry, or `dialog dismiss`", verb, "dialog_check")
+    if d.get("hasDialog"):
+        die(f"a {d.get('type') or 'JS'} dialog is open: “{str(d.get('message') or '')[:120]}”: run `dialog dismiss`, "
+            "or `dialog accept` if accepting it is the step (gated like a click)")
+
+
+def ref_label(sid, rec, ref, verb):
+    """Role + accessible name from this session's own snapshot + the live text/attributes. Unknown ref -> deny."""
+    r = ref.lstrip("@")
+    known = (rec.get("refs") or {}).get(r)
+    if known is None or rec.get("refs_pid") != daemon_pid(sid):
+        deny(f"@{r} is not from this session's latest snapshots: run `abx -s {rec['sid']} snapshot -i` and use its refs",
+             verb, "unknown_ref")
+    role, name = known
+    parts = [role, name]
+    qs = [["get", "text", "@" + r], ["get", "attr", "@" + r, "aria-label"], ["get", "attr", "@" + r, "title"],
+          ["get", "attr", "@" + r, "alt"]]
+    if role == "button":                       # an input button's caption; never a text field's typed value
+        qs.append(["get", "attr", "@" + r, "value"])
+    for q in qs:
+        d = abj(sid, q, timeout=15)
+        if d is None:
+            if q[1] == "text":                 # the element can't be read: never click blind
+                deny(f"could not read @{r} (gone or covered?): take a fresh snapshot", verb, "unreadable")
+            continue
+        v = d.get("text") if q[1] == "text" else d.get("value")
+        v = re.sub(r"\s+", " ", str(v)).strip()[:200] if v is not None else ""
+        if v and v not in parts:
+            parts.append(v)
+    return role, " ".join(p for p in parts if p)
+
+
+def focused(sid, verb):
+    d = abj(sid, ["eval", "-b", base64.b64encode(FOCUS_JS.encode()).decode()], timeout=15)
+    v = d.get("result") if isinstance(d, dict) else None
+    if not isinstance(v, dict):
+        deny("could not read the focused element (gate fails closed): click the labelled button by @ref instead",
+             verb, "focus_unreadable")
+    if v.get("frame"):
+        deny("the focus is inside a frame abx can't read: click the labelled button by @ref instead", verb, "focus_frame")
+    return v
+
+
+def card_like(text):
+    wa = _webagent()
+    for m in wa.CARD_RE.finditer(text):
+        if wa._luhn(re.sub(r"\D", "", m.group(0))):
+            return True
+    return bool(wa.IBAN_RE.search(text))
+
+
+def guard(sid, verb, name, ti):
+    """webagent.guard() on the MCP-shaped event; any error -> deny (fails closed, unlike the MCP hook)."""
+    try:
+        wa = _webagent()
+        r = wa.guard({"tool_name": wa.TOOL + name, "tool_input": ti, "agent_id": "abx:" + sid})
+    except SystemExit:
+        raise
+    except Exception as e:
+        die(f"gate unavailable ({type(e).__name__}): refusing the interaction", 3, log=("gate_error", verb))
+    if r:
+        die(r["hookSpecificOutput"]["permissionDecisionReason"], 3, log=("blocked", verb))
+
+
+def gate_js(sid, verb, code):
+    if JS_ALWAYS.search(code or ""):
+        deny("JS clicks, submits, requests, popups and cookie/storage access are off in abx: click by @ref (the commit "
+             "check reads its name); cookies and storage are never read or exported", verb, "js")
+    guard(sid, verb, "evaluate", {"function": code})
+
+
+def gate_click(sid, verb, label):
+    if verb in ("check", "uncheck") and "checkbox" not in label.lower():
+        label = "checkbox " + label
+    guard(sid, verb, "click", {"element": label, "target": ""})
+
+
+def gate_keys(sid, verb, keys_text, is_key):
+    """Enter / Space (or typed newlines / spaces) act on the focused element: a button or link = a click on it."""
+    if is_key:
+        k = keys_text.split("+")[-1].strip().lower() if keys_text.strip() else keys_text.lower()
+        enter, space = k in ENTER_KEYS, k in SPACE_KEYS
+    else:
+        enter, space = bool(re.search(r"[\r\n]", keys_text)), " " in keys_text
+    if not (enter or space):
+        return
+    f = focused(sid, verb)
+    if f.get("clickable"):
+        gate_click(sid, verb, f"{f.get('role') or ''} {f.get('label') or ''}".strip())
+    elif enter:
+        guard(sid, verb, "press_key", {"key": "Enter"})
+
+
+def gate_type(sid, rec, verb, ref, text):
+    if card_like(text):
+        deny("card numbers and IBANs are never typed by an agent (securefill fills cards; IBANs: never)", verb, "card")
+    role, label = ref_label(sid, rec, ref, verb)
+    d = abj(sid, ["get", "attr", "@" + ref.lstrip("@"), "type"], timeout=15) or {}
+    if str(d.get("value") or "").lower() == "password" or SECRET_FIELD.search(label):
+        deny("passwords, card numbers, CVCs and IBANs are never typed by an agent (his login: hand-off; card: "
+             "securefill commit)", verb, "secret_field")
+    if role in CLICKABLE_ROLES:                # typing into a button presses it
+        gate_click(sid, verb, label)
+    if re.search(r"[\r\n]", text):
+        guard(sid, verb, "type", {"element": label, "text": "", "submit": True})
+
+
+def gate(sid, rec, verb, args):
+    pos = args
+    if verb in ("click", "dblclick", "check", "uncheck"):
+        no_dialog(sid, verb)
+        gate_click(sid, verb, ref_label(sid, rec, pos[0], verb)[1])
+    elif verb in ("fill", "type"):
+        no_dialog(sid, verb)
+        gate_type(sid, rec, verb, pos[0], pos[1] if len(pos) > 1 else "")
+    elif verb == "press":
+        no_dialog(sid, verb)
+        gate_keys(sid, verb, pos[0] if pos else "", True)
+    elif verb == "keyboard":
+        no_dialog(sid, verb)
+        sub, arg = (pos + ["", ""])[:2]
+        if sub in ("type", "inserttext"):
+            if card_like(arg):
+                deny("card numbers and IBANs are never typed by an agent", verb, "card")
+            gate_keys(sid, verb, arg, False)
+        else:
+            gate_keys(sid, verb, arg, True)
+    elif verb == "eval":
+        gate_js(sid, verb, pos[0] if pos else "")
+    elif verb == "wait" and rec.get("_fn") is not None:
+        gate_js(sid, verb, rec["_fn"])
+    elif verb == "dialog" and pos and pos[0] == "accept":
+        d = abj(sid, ["dialog", "status"], timeout=10)
+        if d is None:
+            deny("could not read the dialog (gate fails closed)", verb, "dialog_unreadable")
+        try:
+            wa = _webagent()
+            executing = any(wa.effective(t) == "executing" for t in wa.all_tasks())
+        except Exception:
+            die("gate unavailable: refusing the interaction", 3, log=("gate_error", verb))
+        if not executing:                      # the confirm of an approved click (executing) passes; else it's a click
+            gate_click(sid, verb, f"dialog {d.get('type') or ''}: {d.get('message') or ''}")
+
+
+# ---------------------------------------------------------------- parsing + run
+def parse(argv):
+    """-> (global flags, verb, positionals, verb flags as list); refuses anything off the allowlists."""
+    gflags, i = [], 0
+    while i < len(argv) and argv[i].startswith("-"):
+        a = argv[i]
+        if a not in GLOBAL_FLAGS:
+            die(f"flag {a} is not allowed (abx fixes browser, session, pin and config)")
+        n = GLOBAL_FLAGS[a]
+        if i + n >= len(argv):
+            die(f"{a} needs a value")
+        if a == "--max-output" and not re.fullmatch(r"\d{1,7}", argv[i + 1]):
+            die("--max-output takes a number")
+        gflags += argv[i:i + 1 + n]
+        i += 1 + n
+    if i >= len(argv):
+        die("missing command")
+    verb, rest = argv[i], argv[i + 1:]
+    if verb not in FLAGS:
+        die(f"'{verb}' is not allowed through abx (read, navigate and interact by @ref only; cookies, storage, state, "
+            "auth, network, upload, download, tabs, windows, frames, mouse and browser-level commands stay off)",
+            log=("refused", verb[:24]))
+    allowed, pos, vflags, j = FLAGS[verb], [], [], 0
+    while j < len(rest):
+        a = rest[j]
+        if a in GLOBAL_FLAGS and a == "--json":
+            gflags.append(a)
+        elif a.startswith("-") and len(a) > 1 and not re.fullmatch(r"-\d+", a):
+            if a not in allowed:
+                die(f"flag {a} is not allowed for {verb}", log=("refused", verb))
+            n = allowed[a]
+            if j + n >= len(rest):
+                die(f"{a} needs a value")
+            vflags += rest[j:j + 1 + n]
+            j += n
+        else:
+            pos.append(a)
+        j += 1
+    return gflags, verb, pos, vflags
+
+
+def check_args(rec, verb, pos, vflags):
+    if verb in NAV:
+        if len(pos) != 1 or not re.match(r"^(https?://|about:blank$)", pos[0]):
+            die("only http(s) URLs (no file:, chrome:, javascript:, data:)")
+    elif verb in ("click", "dblclick", "check", "uncheck", "fill", "type"):
+        if not pos or not REF.match(pos[0]):
+            die(f"{verb} takes an @ref from your latest `snapshot -i` (abx reads the element's name from it; CSS "
+                "selectors and find … click are off for clicks and typing)", log=("refused", verb))
+        if verb in ("fill", "type") and len(pos) != 2:
+            die(f"usage: {verb} @REF TEXT")
+        if verb not in ("fill", "type") and len(pos) != 1:
+            die(f"usage: {verb} @REF")
+    elif verb == "get":
+        if not pos or pos[0] not in GET_SUBS:
+            die("get: text|html|value|attr|title|url|count|box|styles")
+    elif verb == "is":
+        if not pos or pos[0] not in IS_SUBS:
+            die("is: visible|enabled|checked")
+    elif verb == "keyboard":
+        if not pos or pos[0] not in KEYBOARD_SUBS or len(pos) != 2:
+            die("keyboard: type|inserttext|press|down|up ARG")
+    elif verb == "find":
+        if len(pos) < 3 or pos[0] not in FIND_LOCATORS or pos[2] not in FIND_ACTIONS:
+            die("find LOCATOR VALUE text|hover|focus (to click or type: snapshot -i, then click/fill @ref)",
+                log=("refused", verb))
+    elif verb == "dialog":
+        if not pos or pos[0] not in DIALOG_SUBS:
+            die("dialog: status|accept [TEXT]|dismiss")
+    elif verb == "screenshot":
+        for p in pos:
+            if REF.match(p):
+                continue
+            if not os.path.realpath(p).startswith(os.path.realpath(OUT_DIR) + "/"):
+                die(f"screenshot path must be under {OUT_DIR} (or none: it prints the path)")
+    elif verb == "snapshot":
+        if pos:
+            die("snapshot takes flags only (-i -c -u -d N -s SEL)")
+    elif verb == "eval":
+        b64 = [vflags[k + 1] for k, f in enumerate(vflags) if f in ("-b", "--base64")]
+        if "--stdin" in vflags:
+            code = sys.stdin.read(1 << 20)
+        elif b64:
+            try:
+                code = base64.b64decode(b64[0], validate=True).decode()
+            except (ValueError, UnicodeDecodeError):
+                die("eval -b: not valid base64 UTF-8")
+        else:
+            code = " ".join(pos)
+        if not code.strip():
+            die("eval: no script")
+        return ["eval", "-b", base64.b64encode(code.encode()).decode()], [code]   # gated text = executed text
+    elif verb == "wait":
+        fn = [vflags[k + 1] for k, f in enumerate(vflags) if f in ("--fn", "-f")]
+        rec["_fn"] = fn[0] if fn else None
+    return None, pos
+
+
+def print_snapshot(sid, rec, gflags, args):
+    want_json = "--json" in gflags
+    mo = int(gflags[gflags.index("--max-output") + 1]) if "--max-output" in gflags else 60000
+    r = ab(sid, ["--json", "snapshot"] + args)
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        return (r.returncode or 1), r.stdout or "", r.stderr or ""
+    data = d.get("data") or {}
+    if d.get("success") and isinstance(data.get("refs"), dict):
+        pid = daemon_pid(sid)
+        refs = rec.get("refs") if rec.get("refs_pid") == pid else {}
+        for k in data.get("removedRefs") or []:
+            refs.pop(k, None)
+        for k, v in data["refs"].items():
+            if REF.match(k) and isinstance(v, dict):
+                refs[k] = [str(v.get("role") or "")[:40], re.sub(r"\s+", " ", str(v.get("name") or ""))[:300]]
+        if len(refs) > 6000:                   # oldest refs first out (ids only grow)
+            refs = dict(sorted(refs.items(), key=lambda kv: int(kv[0][1:]))[-4000:])
+        rec["refs"], rec["refs_pid"] = refs, pid
+        save(sid, rec)
+    if want_json:
+        out = r.stdout
+    elif d.get("success"):
+        b = d.get("_boundary") or {}
+        snap = str(data.get("snapshot") or "")
+        if len(snap) > mo:
+            snap = snap[:mo] + f"\n[truncated at {mo} chars: scope with -s SEL, -d N or -i]"
+        out = (f"--- AGENT_BROWSER_PAGE_CONTENT nonce={b.get('nonce', '')} origin={b.get('origin', '')} ---\n{snap}\n"
+               f"--- END_AGENT_BROWSER_PAGE_CONTENT nonce={b.get('nonce', '')} ---\n")
+    else:
+        out = ""
+    err = "" if d.get("success") else "✗ " + str(d.get("error") or "snapshot failed") + "\n"
+    return (0 if d.get("success") else 1), out, err
+
+
+def sf_redact(cmd, out, err):
+    """While secure-fill fingerprints are live: abx's own output redacted at the source (securefill's PostToolUse
+    logic on a Bash-shaped event), so a redirect into a file can't carry a value either. Errors -> withheld."""
+    if not glob.glob(os.path.join(SF_STATE, "fp", "*.json")):
+        return out, err
+    try:
+        if LIB not in sys.path:
+            sys.path.insert(0, LIB)
+        os.environ["SECUREFILL_STATE"] = SF_STATE
+        import securefill
+        r = securefill.hook({"tool_name": "Bash", "tool_input": {"command": "abx " + cmd},
+                             "tool_response": {"stdout": out, "stderr": err}})
+        if r:
+            new = r["hookSpecificOutput"]["updatedToolOutput"]
+            return new.get("stdout", out), new.get("stderr", err)
+        return out, err
+    except Exception:
+        w = "[securefill: abx output withheld (redaction error while secure-fill data is live)]\n"
+        return (w if out else ""), (w if err else "")
+
+
+def owner_mask(out, err):
+    """His personal data out of everything abx prints, always, with or without a secure fill (lib/ownermask.py: profile
+    values with securefill's matcher, patterns for cards / IBANs / what the profile lacks). Errors -> withheld."""
+    try:
+        if LIB not in sys.path:
+            sys.path.insert(0, LIB)
+        os.environ["SECUREFILL_STATE"] = SF_STATE
+        import ownermask
+        return ownermask.mask(out), ownermask.mask(err)
+    except Exception:
+        w = "[abx: output withheld (personal-data mask error)]\n"
+        return (w if out else ""), (w if err else "")
+
+
+def redact(cmd, out, err):
+    return sf_redact(cmd, *owner_mask(out, err))
+
+
+def run(sid, argv):
+    gflags, verb, pos, vflags = parse(argv)
+    ensure_dirs()
+    rec = load(sid)
+    try:
+        gone = rec["target"] not in {p["id"] for p in cdp_pages()}
+    except OSError:
+        die("the browser is not reachable over CDP (browser start?)", 1)
+    if gone:                                   # never re-bind: a pinned session ends with its tab
+        die("tab_gone: this session's tab was closed; `abx stop` it and start a new one (never another tab)", 4,
+            log=("tab_gone", verb))
+    seed_target(sid, rec)
+    ab_args, pos = check_args(rec, verb, pos, vflags)
+    if verb in FRONT:                          # own window, but an intruder tab could land in it: re-front first
+        cdp_get(f"/json/activate/{rec['target']}")   # (CDP HTTP: `tab <id>` would reset the snapshot refs)
+    gate(sid, rec, verb, pos)
+    rec.pop("_fn", None)
+    rec["used"] = time.time()
+    save(sid, rec)
+    if verb == "snapshot":
+        rc, out, err = print_snapshot(sid, rec, gflags, vflags)
+    else:
+        r = ab(sid, gflags + (ab_args or [verb] + pos + vflags))
+        rc, out, err = r.returncode, r.stdout or "", r.stderr or ""
+        if verb in NAV and rc == 0:
+            rec["url"] = pos[0]
+            save(sid, rec)
+    out, err = redact(" ".join([verb] + pos[:1]), out, err)
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    if rc and "tab_gone" in out + err:
+        _usage("exec", outcome="tab_gone", attrs={"verb": verb})
+        sys.exit(4)
+    sys.exit(1 if rc else 0)
+
+
+def task_open(tid):
+    """True while the session's web task is open (running/pending/approved/executing); unsure -> True."""
+    if not tid:
+        return False
+    try:
+        wa = _webagent()
+        t = wa.load(tid)
+        return bool(t) and wa.effective(t) in wa.OPEN
+    except Exception:
+        return True
+
+
+def sessions():
+    out = []
+    for n in sorted(os.listdir(SESS)) if os.path.isdir(SESS) else []:
+        if n.endswith(".json"):
+            try:
+                with open(f"{SESS}/{n}") as f:
+                    out.append(json.load(f))
+            except (OSError, ValueError):
+                pass
+    return out
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    if argv[0] == "start":
+        return start(argv[1:])
+    if argv[0] in ("list", "sweep"):
+        ensure_dirs()
+        try:
+            live = {p["id"] for p in cdp_pages()}
+        except OSError:
+            live = None
+        lim, want, found = None, None, False
+        if argv[0] == "list" and "--task" in argv[:-1]:
+            want = argv[argv.index("--task") + 1]
+        if argv[0] == "sweep":
+            try:
+                lim = float(argv[argv.index("--min") + 1]) if "--min" in argv else 30.0
+            except (ValueError, IndexError):
+                die("usage: abx sweep [--min N]")
+        for s in sessions():
+            idle = (time.time() - s.get("used", 0)) / 60
+            gone = live is not None and s.get("target") not in live
+            if want:
+                if s.get("task") == want:
+                    print(s["sid"])
+                    found = True
+            elif lim is None:
+                print(f"{s['sid']}  task {s.get('task') or '-'}  idle {int(idle)} min  tab {'gone' if gone else 'open'}")
+            elif gone or (idle > lim and not task_open(s.get("task"))):
+                stop(s["sid"])
+        if want and not found:
+            die(f"no session for task {want}", 4)
+        return
+    if argv[0] == "stop" and len(argv) == 3 and argv[1] in ("-s", "--task"):
+        ensure_dirs()
+        if argv[1] == "-s":
+            return stop(argv[2])
+        hits = [s["sid"] for s in sessions() if s.get("task") == argv[2]]
+        if not hits:
+            die(f"no session for task {argv[2]}", 4)
+        for s in hits:
+            stop(s)
+        return
+    if argv[0] == "-s" and len(argv) >= 3:
+        return run(argv[1], argv[2:])
+    die("usage: abx start [--task ID] [URL] | abx -s SID <command> | abx stop -s SID|--task ID | abx list [--task ID] | "
+        "abx sweep [--min N]")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

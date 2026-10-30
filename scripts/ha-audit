@@ -1,0 +1,1367 @@
+#!/usr/bin/env python3
+"""ha-audit: READ-ONLY cleanup audit of the owner's Home Assistant (HA OS VM; URL: profile services.ha_url).
+
+Usage:
+  ha-audit [--md FILE] [--json FILE] [--no-history] [--check]
+           [--url URL] [--token-file FILE]
+
+  --check       connect, print HA version + a few counts, exit
+  --md / --json write the grouped cleanup report (privacy-gated)
+  default       print the 8-line phone summary only
+
+READ-ONLY by construction:
+  * REST: method GET only, path must fully match REST_GET_ALLOW, query keys REST_QUERY_ALLOW,
+    redirects refused.
+  * Websocket: only the message types in WS_ALLOW with their allowed keys; supervisor/api only
+    with method "get" on SUPERVISOR_GET_ALLOW endpoints. Anything else raises ReadOnlyViolation
+    before a byte is sent (tests: ~/opt/assistant/tests/legacy/ha-audit prove call_service/POST/DELETE can't go out).
+Privacy:
+  * states/registries are cut down to allowlisted fields right after fetching (slim_*): no
+    attributes except automation/script/update/person-tracker fields, no state values except
+    available/unavailable/unknown (on/off for automation/script/update).
+  * person/device_tracker and location-ish sensors: only exists/unavailable/which device, no ages.
+  * names/titles/errors are scrubbed (IPs, MACs, emails, coordinates, street addresses), Bluetooth
+    device names are replaced, and a final privacy gate re-scrubs the whole report.
+Token: ~/.secrets/ha-admin-token (never printed).
+"""
+import argparse
+import base64
+import collections
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import socket
+import ssl
+import struct
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def _profile_ha_url():
+    """services.ha_url from the private profile (bin/lib/assistant_profile); guarded: a copy without bin/lib or
+    a broken profile falls back to the public placeholder (then pass --url or HA_URL)."""
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+        import assistant_profile
+        return str(assistant_profile.get('services.ha_url'))
+    except Exception:
+        return 'http://198.51.100.7:8123'
+
+
+DEFAULT_URL = _profile_ha_url()
+DEFAULT_TOKEN_FILE = os.path.expanduser('~/.secrets/ha-admin-token')
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+
+class ReadOnlyViolation(Exception):
+    """Raised before anything that is not an allowlisted read could be sent."""
+
+
+class HAError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------------- allowlists
+REST_GET_ALLOW = tuple(re.compile(p) for p in (
+    r'/api/',
+    r'/api/config',
+    r'/api/states',
+    r'/api/services',
+    r'/api/config/config_entries/entry',
+    r'/api/config/automation/config/[A-Za-z0-9_.\-]{1,80}',
+    r'/api/config/script/config/[a-z0-9_]{1,80}',
+    r'/api/history/period/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:\d{2})?',
+    r'/api/hassio/(?:addons|core/info|os/info|supervisor/info|resolution/info|addons/[a-z0-9_\-]{1,80}/info)',
+))
+REST_QUERY_ALLOW = {'filter_entity_id', 'end_time', 'minimal_response', 'no_attributes'}
+
+WS_ALLOW = {  # message type -> allowed extra keys (besides id/type)
+    'config/entity_registry/list': set(),
+    'config/device_registry/list': set(),
+    'config/area_registry/list': set(),
+    'config_entries/get': {'type_filter', 'domain'},
+    'config_entries/flow/progress': set(),
+    'repairs/list_issues': set(),
+    'trace/list': {'domain', 'item_id'},
+    'supervisor/api': {'endpoint', 'method'},
+}
+SUPERVISOR_GET_ALLOW = re.compile(
+    r'/(?:addons|core/info|os/info|supervisor/info|resolution/info|addons/[a-z0-9_\-]{1,80}/info)')
+
+
+def check_rest(method, path, query=None):
+    if method != 'GET':
+        raise ReadOnlyViolation(f'REST {method} refused: ha-audit is GET-only')
+    if not isinstance(path, str) or not any(p.fullmatch(path) for p in REST_GET_ALLOW):
+        raise ReadOnlyViolation(f'REST GET {path!r} is not on the read-only allowlist')
+    bad = set(query or {}) - REST_QUERY_ALLOW
+    if bad:
+        raise ReadOnlyViolation(f'query keys {sorted(bad)} not allowed')
+
+
+def check_ws(msg_type, params):
+    if msg_type not in WS_ALLOW:
+        raise ReadOnlyViolation(f'websocket type {msg_type!r} is not on the read-only allowlist')
+    extra = set(params) - WS_ALLOW[msg_type]
+    if extra:
+        raise ReadOnlyViolation(f'websocket {msg_type}: keys {sorted(extra)} not allowed')
+    if msg_type == 'supervisor/api':
+        if params.get('method') != 'get':
+            raise ReadOnlyViolation('supervisor/api: only method "get" is allowed')
+        if not SUPERVISOR_GET_ALLOW.fullmatch(str(params.get('endpoint', ''))):
+            raise ReadOnlyViolation(f"supervisor/api endpoint {params.get('endpoint')!r} not allowed")
+    if msg_type == 'trace/list' and params.get('domain') not in ('automation', 'script'):
+        raise ReadOnlyViolation('trace/list: domain must be automation or script')
+
+
+# ----------------------------------------------------------------------------- clients
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        raise ReadOnlyViolation('redirect refused')
+
+
+class RestClient:
+    def __init__(self, base, token, timeout=90):
+        self.base = base.rstrip('/')
+        self._token = token
+        self.timeout = timeout
+        self._opener = urllib.request.build_opener(_NoRedirect())
+
+    def request(self, method, path, query=None):
+        check_rest(method, path, query)
+        url = self.base + urllib.parse.quote(path, safe='/:')
+        if query:
+            url += '?' + urllib.parse.urlencode(query, safe=',')
+        req = urllib.request.Request(url, method='GET', headers={
+            'Authorization': 'Bearer ' + self._token, 'Accept': 'application/json'})
+        try:
+            with self._opener.open(req, timeout=self.timeout) as r:
+                body = r.read()
+        except urllib.error.HTTPError as e:
+            raise HAError(f'HTTP {e.code}') from None
+        return json.loads(body.decode('utf-8')) if body else None
+
+    def get(self, path, query=None):
+        return self.request('GET', path, query)
+
+
+class WSClient:
+    """Minimal RFC 6455 client (stdlib). Only call() sends HA commands, and only allowlisted ones."""
+
+    def __init__(self, base, token, timeout=90):
+        u = urllib.parse.urlparse(base)
+        port = u.port or (443 if u.scheme == 'https' else 80)
+        sock = socket.create_connection((u.hostname, port), timeout=timeout)
+        if u.scheme == 'https':
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        self.sock = sock
+        self._buf = bytearray()
+        self._id = 0
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f'GET /api/websocket HTTP/1.1\r\nHost: {u.netloc}\r\nUpgrade: websocket\r\n'
+                           f'Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
+                           f'Sec-WebSocket-Version: 13\r\n\r\n').encode())
+        head = self._read_until(b'\r\n\r\n').decode('latin-1')
+        lines = head.split('\r\n')
+        if len(lines[0].split()) < 2 or lines[0].split()[1] != '101':
+            raise HAError(f'websocket upgrade failed: {lines[0][:60]}')
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        hdrs = {ln.split(':', 1)[0].strip().lower(): ln.split(':', 1)[1].strip() for ln in lines[1:] if ':' in ln}
+        if hdrs.get('sec-websocket-accept') != accept:
+            raise HAError('websocket accept key mismatch')
+        if self._recv_json().get('type') != 'auth_required':
+            raise HAError('websocket: no auth_required')
+        self._send_json({'type': 'auth', 'access_token': token})
+        msg = self._recv_json()
+        if msg.get('type') != 'auth_ok':
+            raise HAError('websocket auth failed')
+        self.ha_version = msg.get('ha_version')
+
+    # -- framing
+    def _read_until(self, delim):
+        while delim not in self._buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise HAError('connection closed during handshake')
+            self._buf.extend(chunk)
+        i = self._buf.index(delim) + len(delim)
+        out = bytes(self._buf[:i])
+        del self._buf[:i]
+        return out
+
+    def _read_exact(self, n):
+        while len(self._buf) < n:
+            chunk = self.sock.recv(max(65536, min(n - len(self._buf), 1 << 22)))
+            if not chunk:
+                raise HAError('websocket closed')
+            self._buf.extend(chunk)
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def _send_frame(self, opcode, payload):
+        mask = os.urandom(4)
+        n = len(payload)
+        hdr = bytes([0x80 | opcode])
+        if n < 126:
+            hdr += bytes([0x80 | n])
+        elif n < 65536:
+            hdr += bytes([0x80 | 126]) + struct.pack('!H', n)
+        else:
+            hdr += bytes([0x80 | 127]) + struct.pack('!Q', n)
+        m = (mask * (n // 4 + 1))[:n]
+        masked = (int.from_bytes(payload, 'big') ^ int.from_bytes(m, 'big')).to_bytes(n, 'big') if n else b''
+        self.sock.sendall(hdr + mask + masked)
+
+    def _recv_message(self):
+        parts = []
+        while True:
+            b1, b2 = self._read_exact(2)
+            op, n = b1 & 0x0F, b2 & 0x7F
+            if n == 126:
+                n = struct.unpack('!H', self._read_exact(2))[0]
+            elif n == 127:
+                n = struct.unpack('!Q', self._read_exact(8))[0]
+            mask = self._read_exact(4) if b2 & 0x80 else None
+            data = self._read_exact(n)
+            if mask:
+                data = bytes(c ^ mask[i % 4] for i, c in enumerate(data))
+            if op == 0x9:          # ping -> pong (control frame, not an HA command)
+                self._send_frame(0xA, data)
+                continue
+            if op == 0xA:
+                continue
+            if op == 0x8:
+                raise HAError('websocket closed by server')
+            parts.append(data)
+            if b1 & 0x80:
+                return b''.join(parts)
+
+    def _recv_json(self):
+        return json.loads(self._recv_message().decode('utf-8'))
+
+    def _send_json(self, obj):
+        self._send_frame(0x1, json.dumps(obj).encode('utf-8'))
+
+    # -- the only command path
+    def call(self, msg_type, **params):
+        check_ws(msg_type, params)
+        self._id += 1
+        mid = self._id
+        self._send_json(dict(params, id=mid, type=msg_type))
+        while True:
+            msg = self._recv_json()
+            if msg.get('id') == mid and msg.get('type') == 'result':
+                if not msg.get('success'):
+                    raise HAError(f"{msg_type}: {(msg.get('error') or {}).get('code', 'error')}")
+                return msg.get('result')
+
+    def close(self):
+        try:
+            self._send_frame(0x8, struct.pack('!H', 1000))
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ----------------------------------------------------------------------------- privacy
+EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+')
+EMAIL_SLUG_RE = re.compile(r'(?<![a-z0-9])[a-z0-9]+(?:_[a-z0-9]+)*?_(?:gmail|googlemail|outlook|hotmail|live|yahoo|icloud|'
+                           r'gmx|bluewin|protonmail|proton|hispeed|sunrise)_(?:com|ch|de|net|me|li)(?![a-z0-9])', re.I)
+MAC_RE = re.compile(r'(?<![0-9A-Za-z])[0-9A-Fa-f]{2}(?:[:\-_][0-9A-Fa-f]{2}){5}(?![0-9A-Za-z])')
+MAC12_RE = re.compile(r'(?<![0-9A-Za-z])(?=[0-9]{0,11}[A-Fa-f])[0-9A-Fa-f]{12}(?![0-9A-Za-z])')
+IP4_RE = re.compile(r'(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d.])')
+IP6_RE = re.compile(r'(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f:])')
+IP6C_RE = re.compile(r'(?<![0-9A-Fa-f:])(?=[0-9A-Fa-f:]*[0-9A-Fa-f])(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?::'
+                     r'(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?![0-9A-Fa-f:])')
+COORD_RE = re.compile(r'(?<![\w.])-?\d{1,3}\.\d{4,}(?![\w.])')
+STREET_RE = re.compile(r'\b[\wÄÖÜäöüß\-]*(?:strasse|straße|str\.|gasse|weg|platz|allee)\s+\d+[a-z]?\b', re.I)
+PLZ_RE = re.compile(r'\b(?:CH-)?[1-9]\d{3}\s+[A-ZÄÖÜ][a-zäöü]{2,}')
+REDACTION_TAGS = ('<email>', '<mac>', '<ip>', '<coord>', '<address>')
+
+
+def scrub(s, names=False):
+    if s is None:
+        return None
+    s = str(s)
+    s = EMAIL_RE.sub('<email>', s)
+    s = EMAIL_SLUG_RE.sub('<email>', s)
+    s = MAC_RE.sub('<mac>', s)
+    s = MAC12_RE.sub('<mac>', s)
+    s = IP4_RE.sub('<ip>', s)
+    s = IP6_RE.sub('<ip>', s)
+    s = IP6C_RE.sub('<ip>', s)
+    s = COORD_RE.sub('<coord>', s)
+    s = STREET_RE.sub('<address>', s)
+    if names:
+        s = PLZ_RE.sub('<address>', s)
+    return s
+
+
+def short_err(s, n=90):
+    s = re.sub(r"'[^']*'|\"[^\"]*\"", "'…'", str(s or ''))
+    return scrub(s, names=True)[:n]
+
+
+def privacy_gate(text):
+    """Re-scrub a finished report; returns (text, number of late redactions)."""
+    out = scrub(text)
+    late = sum(out.count(t) - text.count(t) for t in REDACTION_TAGS)
+    if late and os.environ.get('HA_AUDIT_DEBUG_GATE'):
+        for a, b in zip(text.splitlines(), out.splitlines()):
+            if a != b:
+                print('gate changed line:', b[:160], file=sys.stderr)
+    return out, late
+
+
+SENSITIVE_DOMAINS = {'person', 'device_tracker', 'zone', 'proximity'}
+SENSITIVE_OBJ_RE = re.compile(
+    r'geocod|location|wifi|ssid|bssid|bluetooth|ble_|beacon|(?:^|_)ip(?:_|$)|ip_address|public_ip|'
+    r'notification|media|activity|address|gps|latitude|longitude|altitude|coordinat|place|travel|'
+    r'distance|direction|proximity|zone|network|carrier|connection', re.I)
+
+
+def is_sensitive(eid):
+    dom, _, obj = eid.partition('.')
+    return dom in SENSITIVE_DOMAINS or bool(SENSITIVE_OBJ_RE.search(obj))
+
+
+BT_DOMAINS = {
+    'bluetooth', 'ibeacon', 'private_ble_device', 'bthome', 'switchbot', 'oralb', 'bluemaestro', 'eq3btsmart',
+    'idasen_desk', 'inkbird', 'kegtron', 'leaone', 'medcom_ble', 'melnor', 'moat', 'mopeka', 'qingping',
+    'sensorpro', 'sensorpush', 'snooz', 'thermobeacon', 'thermopro', 'bluetooth_le_tracker', 'acaia',
+    'iron_os', 'gardena_bluetooth', 'dormakaba_dkey', 'keymitt_ble', 'fjaraskupan', 'aranet',
+    'bluetooth_adapters', 'xiaomi_ble', 'govee_ble', 'yalexs_ble', 'led_ble'}
+
+
+def is_bt_domain(d):
+    return bool(d) and (d in BT_DOMAINS or d.endswith('_ble'))
+
+
+# ----------------------------------------------------------------------------- slimming
+BAD = ('unavailable', 'unknown')
+UNKNOWN_OK_DOMAINS = {'button', 'input_button', 'scene', 'event', 'notify', 'stt', 'tts', 'wake_word',
+                      'conversation', 'ai_task', 'image', 'assist_satellite'}
+NO_ENTITY_OK = {'radio_browser', 'thread', 'go2rtc', 'backup', 'cloud', 'hassio', 'bluetooth', 'dhcp',
+                'zeroconf', 'ssdp', 'usb', 'homeassistant_hardware', 'otbr', 'matter', 'application_credentials',
+                'webrtc', 'mqtt', 'zha', 'hacs', 'google_assistant', 'alexa', 'homekit', 'mobile_app',
+                'local_calendar', 'local_todo', 'music_assistant', 'esphome', 'analytics', 'homeassistant_alerts'}
+
+
+def state_class(v):
+    if v == 'unavailable':
+        return 'unavailable'
+    if v in ('unknown', None, ''):
+        return 'unknown'
+    return 'available'
+
+
+def slim_state(s):
+    eid = str(s.get('entity_id', ''))
+    dom = eid.split('.', 1)[0]
+    a = s.get('attributes') or {}
+    out = {'entity_id': eid, 'domain': dom, 'cls': state_class(s.get('state')),
+           'last_changed': s.get('last_changed'), 'last_updated': s.get('last_updated'),
+           'restored': bool(a.get('restored'))}
+    if dom in ('automation', 'script'):
+        out['on'] = s.get('state') == 'on'
+        out['last_triggered'] = a.get('last_triggered')
+        if dom == 'automation':
+            out['id'] = str(a['id']) if a.get('id') is not None else None
+    elif dom == 'update':
+        out['on'] = s.get('state') == 'on'
+        for k in ('installed_version', 'latest_version', 'skipped_version', 'title'):
+            out[k] = scrub(a.get(k), names=True) if a.get(k) is not None else None
+    elif dom == 'person':
+        out['device_trackers'] = [t for t in (a.get('device_trackers') or []) if isinstance(t, str)]
+    return out
+
+
+def slim_entity(e):
+    return {k: e.get(k) for k in ('entity_id', 'id', 'platform', 'config_entry_id', 'device_id', 'area_id',
+                                  'disabled_by', 'hidden_by', 'entity_category')}
+
+
+def slim_entry(e):
+    dom = e.get('domain') or '?'
+    return {'entry_id': e.get('entry_id'), 'domain': dom,
+            'title': dom if is_bt_domain(dom) else scrub(e.get('title'), names=True),
+            'state': e.get('state'), 'source': e.get('source'), 'disabled_by': e.get('disabled_by'),
+            'reason': short_err(e.get('reason'), 120) if e.get('reason') else None}
+
+
+def slim_device(dv, entry_domain, bt_counter):
+    doms = sorted({entry_domain.get(c) for c in (dv.get('config_entries') or []) if entry_domain.get(c)})
+    conns = dv.get('connections') or []
+    is_bt = any(isinstance(c, (list, tuple)) and c and c[0] == 'bluetooth' for c in conns) or \
+        any(is_bt_domain(x) for x in doms)
+    if is_bt:
+        bt_counter[0] += 1
+        name = f"Bluetooth device #{bt_counter[0]} ({doms[0] if doms else 'bluetooth'})"
+    else:
+        name = scrub(dv.get('name_by_user') or dv.get('name') or '(unnamed)', names=True)
+    return {'id': dv.get('id'), 'name': name, 'manufacturer': scrub(dv.get('manufacturer'), True),
+            'model': None if is_bt else scrub(dv.get('model'), True), 'config_entries': list(dv.get('config_entries') or []),
+            'domains': doms, 'area_id': dv.get('area_id'), 'disabled_by': dv.get('disabled_by'),
+            'entry_type': dv.get('entry_type'), 'via_device_id': dv.get('via_device_id'), 'is_bt': is_bt}
+
+
+ENTITY_ID_RE = re.compile(r'^([a-z][a-z0-9_]*)\.([a-z0-9_]+)$')
+REG_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [x.strip() for x in v.split(',') if x.strip()]
+    if isinstance(v, list):
+        return [x.strip() for x in v if isinstance(x, str)]
+    return []
+
+
+def walk_refs(obj, refs, bp=False):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == 'use_blueprint' and isinstance(v, dict):
+                refs['blueprint'] = True
+                walk_refs(v.get('input') or {}, refs, bp=True)
+            elif k == 'device_id':
+                refs['devices'].update(x for x in _as_list(v) if '{' not in x)
+            elif k == 'area_id':
+                refs['areas'].update(x for x in _as_list(v) if '{' not in x)
+            elif k in ('service', 'action') and isinstance(v, str):
+                if ENTITY_ID_RE.match(v):
+                    refs['services'].add(v)
+            elif k in ('entity_id', 'entity', 'entities'):
+                for x in _as_list(v):
+                    if ENTITY_ID_RE.match(x) or REG_ID_RE.match(x):
+                        refs['entities'].add(x)
+                if isinstance(v, (dict, list)):
+                    walk_refs(v, refs, bp)
+            else:
+                walk_refs(v, refs, bp)
+    elif isinstance(obj, list):
+        for x in obj:
+            walk_refs(x, refs, bp)
+    elif bp and isinstance(obj, str) and ENTITY_ID_RE.match(obj):
+        refs['bp_candidates'].add(obj)
+
+
+def _n(cfg, *keys):
+    for k in keys:
+        v = cfg.get(k)
+        if v is not None:
+            return len(v) if isinstance(v, list) else 1
+    return 0
+
+
+def summarize_config(cfg):
+    refs = {'entities': set(), 'devices': set(), 'areas': set(), 'services': set(), 'bp_candidates': set(),
+            'blueprint': False}
+    walk_refs(cfg, refs)
+    out = {k: sorted(v) if isinstance(v, set) else v for k, v in refs.items()}
+    out.update(n_triggers=_n(cfg, 'triggers', 'trigger'), n_conditions=_n(cfg, 'conditions', 'condition'),
+               n_actions=_n(cfg, 'actions', 'action', 'sequence'))
+    return out
+
+
+# ----------------------------------------------------------------------------- collection
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def days_since(ts, now):
+    t = parse_ts(ts) if not isinstance(ts, dt.datetime) else ts
+    return None if t is None else round((now - t).total_seconds() / 86400, 1)
+
+
+def bucket(days):
+    if days is None:
+        return 'never'
+    for lim, lab in ((1, '<1 d'), (7, '1–7 d'), (30, '7–30 d'), (90, '30–90 d')):
+        if days < lim:
+            return lab
+    return '>90 d'
+
+
+def fetch_history(rest, ids, now, days=30, chunk=25):
+    """Per entity: was it good in the window, when it went bad, how many changes. No states kept."""
+    out = {}
+    start = (now - dt.timedelta(days=days)).replace(microsecond=0).isoformat()
+    end = now.replace(microsecond=0).isoformat()
+    for i in range(0, len(ids), chunk):
+        res = rest.get('/api/history/period/' + start, {
+            'filter_entity_id': ','.join(ids[i:i + chunk]), 'end_time': end,
+            'minimal_response': '', 'no_attributes': ''})
+        for series in res or []:
+            if not series or not isinstance(series, list):
+                continue
+            eid = series[0].get('entity_id')
+            if not eid:
+                continue
+            good = [j for j, x in enumerate(series) if x.get('state') not in BAD and x.get('state') is not None]
+            rec = {'oldest': series[0].get('last_changed'), 'n_changes': len(series) - 1,
+                   'last_change': series[-1].get('last_changed') if len(series) > 1 else None,
+                   'good_in_window': bool(good)}
+            if good:
+                j = good[-1]
+                rec['bad_since'] = series[j + 1].get('last_changed') if j + 1 < len(series) else None
+            else:
+                rec['bad_since'] = series[0].get('last_changed')
+            out[eid] = rec
+    return out
+
+
+def collect(rest, ws, now, history=True):
+    d = {'errors': [], 'fetched_at': now.isoformat()}
+
+    def step(name, fn):
+        try:
+            return fn()
+        except ReadOnlyViolation:
+            raise
+        except Exception as e:  # noqa: BLE001 - partial results beat none
+            d['errors'].append(f'{name}: {type(e).__name__}: {short_err(e, 120)}')
+            return None
+
+    cfg = step('config', lambda: rest.get('/api/config')) or {}
+    d['ha_version'] = cfg.get('version') or getattr(ws, 'ha_version', None)
+    d['n_components'] = len(cfg.get('components') or [])
+    del cfg
+    states = step('states', lambda: rest.get('/api/states')) or []
+    d['states'] = [slim_state(s) for s in states if isinstance(s, dict)]
+    del states
+    svc = step('services', lambda: rest.get('/api/services'))
+    d['services'] = None if svc is None else sorted(
+        f"{x.get('domain')}.{s}" for x in svc if isinstance(x, dict) for s in (x.get('services') or {}))
+    entries = step('config_entries', lambda: rest.get('/api/config/config_entries/entry'))
+    if entries is None:
+        entries = step('config_entries_ws', lambda: ws.call('config_entries/get')) or []
+    d['entries'] = [slim_entry(e) for e in entries if isinstance(e, dict)]
+    entry_domain = {e['entry_id']: e['domain'] for e in d['entries']}
+    ents = step('entity_registry', lambda: ws.call('config/entity_registry/list')) or []
+    d['entities'] = [slim_entity(e) for e in ents if isinstance(e, dict)]
+    del ents
+    devs = step('device_registry', lambda: ws.call('config/device_registry/list')) or []
+    btc = [0]
+    d['devices'] = [slim_device(x, entry_domain, btc) for x in devs if isinstance(x, dict)]
+    areas = step('area_registry', lambda: ws.call('config/area_registry/list')) or []
+    d['areas'] = {a.get('area_id'): scrub(a.get('name'), True) for a in areas if isinstance(a, dict)}
+    flows = step('flows', lambda: ws.call('config_entries/flow/progress')) or []
+    d['flows'] = [{'handler': f.get('handler'), 'source': (f.get('context') or {}).get('source')}
+                  for f in flows if isinstance(f, dict)]
+    iss = step('repairs', lambda: ws.call('repairs/list_issues')) or {}
+    d['issues'] = [{'domain': i.get('domain'), 'issue_id': scrub(i.get('issue_id'), True),
+                    'severity': i.get('severity'), 'translation_key': i.get('translation_key'),
+                    'is_fixable': i.get('is_fixable'), 'ignored': bool(i.get('ignored')),
+                    'breaks_in': i.get('breaks_in_ha_version'), 'created': i.get('created')}
+                   for i in (iss.get('issues') if isinstance(iss, dict) else iss) or [] if isinstance(i, dict)]
+    d['traces'] = {}
+    for dom in ('automation', 'script'):
+        tr = step(f'traces_{dom}', lambda dom=dom: ws.call('trace/list', domain=dom)) or []
+        d['traces'][dom] = [{'item_id': str(t.get('item_id')), 'execution': t.get('script_execution'),
+                             'error': short_err(t.get('error')) if t.get('error') else None,
+                             'start': (t.get('timestamp') or {}).get('start')} for t in tr if isinstance(t, dict)]
+    # automation / script configs: reference + count summaries only
+    d['automation_cfg'], d['script_cfg'] = {}, {}
+    for s in d['states']:
+        if s['domain'] == 'automation':
+            if not s.get('id'):
+                d['automation_cfg'][s['entity_id']] = {'error': 'no id (YAML outside automations.yaml)'}
+                continue
+            if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,80}', s['id']):
+                d['automation_cfg'][s['entity_id']] = {'error': 'unusual id, not fetched'}
+                continue
+            c = step(f"automation_cfg {s['entity_id']}", lambda s=s: rest.get('/api/config/automation/config/' + s['id']))
+            d['automation_cfg'][s['entity_id']] = summarize_config(c) if isinstance(c, dict) else \
+                {'error': 'config not readable via UI API (YAML-defined?)'}
+        elif s['domain'] == 'script':
+            obj = s['entity_id'].split('.', 1)[1]
+            c = step(f"script_cfg {s['entity_id']}", lambda obj=obj: rest.get('/api/config/script/config/' + obj))
+            d['script_cfg'][s['entity_id']] = summarize_config(c) if isinstance(c, dict) else \
+                {'error': 'config not readable via UI API (YAML-defined?)'}
+    n_cfg = sum(1 for e in d['errors'] if e.startswith(('automation_cfg', 'script_cfg')))
+    if n_cfg:
+        d['errors'] = [e for e in d['errors'] if not e.startswith(('automation_cfg', 'script_cfg'))] + \
+            [f'{n_cfg} automation/script configs not readable via the UI API']
+    # supervisor (HA OS): websocket supervisor/api GET, REST /api/hassio fallback
+    def sup(endpoint):
+        try:
+            return ws.call('supervisor/api', endpoint=endpoint, method='get')
+        except HAError:
+            r = rest.get('/api/hassio' + endpoint)
+            return r.get('data') if isinstance(r, dict) and 'data' in r else r
+    sv = {}
+    for ep in ('/core/info', '/os/info', '/supervisor/info'):
+        info = step(f'supervisor {ep}', lambda ep=ep: sup(ep)) or {}
+        sv[ep.split('/')[1]] = {k: info.get(k) for k in ('version', 'version_latest', 'update_available')}
+    res = step('supervisor /resolution/info', lambda: sup('/resolution/info')) or {}
+    sv['resolution'] = {
+        'unsupported': [str(x) for x in res.get('unsupported') or []],
+        'unhealthy': [str(x) for x in res.get('unhealthy') or []],
+        'issues': [{'type': x.get('type'), 'context': x.get('context'), 'reference': scrub(x.get('reference'), True)}
+                   for x in res.get('issues') or [] if isinstance(x, dict)],
+        'suggestions': [{'type': x.get('type'), 'context': x.get('context'),
+                         'reference': scrub(x.get('reference'), True)}
+                        for x in res.get('suggestions') or [] if isinstance(x, dict)]}
+    ad = step('supervisor /addons', lambda: sup('/addons')) or {}
+    sv['addons'] = []
+    for x in ad.get('addons') or []:
+        if not isinstance(x, dict):
+            continue
+        a = {'name': scrub(x.get('name'), True), 'slug': x.get('slug'), 'state': x.get('state'),
+             'version': x.get('version'), 'version_latest': x.get('version_latest'),
+             'update_available': bool(x.get('update_available')), 'boot': None}
+        if a['state'] != 'started' and a['slug'] and re.fullmatch(r'[a-z0-9_\-]{1,80}', a['slug']):
+            info = step(f"addon {a['slug']}", lambda a=a: sup(f"/addons/{a['slug']}/info")) or {}
+            a['boot'] = info.get('boot')
+        sv['addons'].append(a)
+    d['supervisor'] = sv
+    # recorder history: long-bad entities + phone battery sensors (booleans/timestamps only)
+    d['history'], d['history_ok'] = {}, False
+    if history:
+        ids = sorted({s['entity_id'] for s in d['states'] if s['cls'] != 'available'
+                      and s['domain'] not in UNKNOWN_OK_DOMAINS})
+        phone_devs = {x['id'] for x in d['devices'] if 'mobile_app' in x['domains']}
+        ids += sorted(e['entity_id'] for e in d['entities'] if e.get('device_id') in phone_devs
+                      and e['entity_id'].endswith('_battery_level') and e['entity_id'] not in ids)
+        h = step('history', lambda: fetch_history(rest, ids, now))
+        if h is not None:
+            d['history'], d['history_ok'] = h, True
+    return d
+
+
+# ----------------------------------------------------------------------------- analysis
+def slug(s):
+    return re.sub(r'_+', '_', re.sub(r'[^a-z0-9]+', '_', (s or '').lower())).strip('_')
+
+
+def analyze(d, now):
+    st = {s['entity_id']: s for s in d.get('states', [])}
+    reg = {e['entity_id']: e for e in d.get('entities', []) if e.get('entity_id')}
+    reg_by_id = {e['id']: e for e in d.get('entities', []) if e.get('id')}
+    devs = {x['id']: x for x in d.get('devices', [])}
+    areas = d.get('areas', {})
+    entries = {x['entry_id']: x for x in d.get('entries', [])}
+    hist = d.get('history') or {}
+    services = set(d['services']) if d.get('services') is not None else None
+    starts = [t for t in (parse_ts(s['last_changed']) for s in st.values()) if t]
+    ha_start = min(starts) if starts else None
+    F = {'ha_version': d.get('ha_version'), 'generated': now.strftime('%Y-%m-%d %H:%M UTC'),
+         'errors': d.get('errors', []), 'uptime_days': days_since(ha_start, now) if ha_start else None,
+         'history_ok': d.get('history_ok', False),
+         'recorder_days': max((days_since(h.get('oldest'), now) or 0 for h in hist.values()), default=None),
+         'counts': {'states': len(st), 'registry': len(reg), 'devices': len(devs), 'entries': len(entries),
+                    'automations': sum(1 for s in st.values() if s['domain'] == 'automation'),
+                    'scripts': sum(1 for s in st.values() if s['domain'] == 'script')}}
+
+    def integ(eid):
+        r = reg.get(eid)
+        return (r.get('platform') or '?') if r else 'no registry (YAML/legacy)'
+
+    def dev_of(eid):
+        r = reg.get(eid) or {}
+        return devs.get(r.get('device_id'))
+
+    def area_of(eid):
+        r = reg.get(eid) or {}
+        aid = r.get('area_id') or (dev_of(eid) or {}).get('area_id')
+        return areas.get(aid, '') if aid else ''
+
+    def cls_of(eid):
+        if eid in st:
+            return st[eid]['cls']
+        r = reg.get(eid)
+        if r and r.get('disabled_by'):
+            return 'disabled'
+        return 'no state' if r else 'missing'
+
+    # 1a unavailable / unknown, with how long
+    bad = []
+    for eid, s in st.items():
+        if s['cls'] == 'available' or (s['cls'] == 'unknown' and s['domain'] in UNKNOWN_OK_DOMAINS):
+            continue
+        h = hist.get(eid)
+        if h:
+            since, basis = parse_ts(h.get('bad_since')), ('history' if h['good_in_window'] else 'whole window')
+        else:
+            since = parse_ts(s['last_changed'])
+            basis = 'since HA start' if (ha_start and since and (since - ha_start).total_seconds() < 900) else 'state'
+        days = days_since(since, now) if since else None
+        bad.append({'entity_id': eid, 'domain': s['domain'], 'integration': integ(eid), 'cls': s['cls'],
+                    'days': days, 'basis': basis, 'device': (dev_of(eid) or {}).get('name', ''),
+                    'area': area_of(eid), 'restored': s['restored'], 'sensitive': is_sensitive(eid)})
+    F['bad'] = bad
+    F['bad_long'] = [b for b in bad if b['days'] is not None and b['days'] >= 7]
+    F['bad_since_start'] = [b for b in bad if b['basis'] == 'since HA start' and b not in F['bad_long']]
+    bad_long_ids = {b['entity_id'] for b in F['bad_long']}
+
+    # 1b orphaned
+    orph = collections.OrderedDict()
+
+    def add_orph(eid, why):
+        orph.setdefault(eid, {'entity_id': eid, 'integration': integ(eid), 'cls': cls_of(eid), 'why': []})
+        orph[eid]['why'].append(why)
+    F['restored_failing'] = collections.Counter()
+    for eid, s in st.items():
+        if s['restored'] and s['domain'] not in ('automation', 'script'):
+            ce = entries.get((reg.get(eid) or {}).get('config_entry_id'))
+            if ce and ce.get('state') != 'loaded':
+                F['restored_failing'][ce['domain']] += 1   # integration not loaded: see 3a, not an orphan
+                continue
+            add_orph(eid, 'no longer provided by its (loaded) integration')
+    for eid, r in reg.items():
+        ce = r.get('config_entry_id')
+        if ce and ce not in entries:
+            add_orph(eid, 'its integration entry is gone')
+        if r.get('device_id') and r['device_id'] not in devs:
+            add_orph(eid, 'its device is gone')
+    for eid, s in st.items():
+        if eid not in reg and s['cls'] == 'unavailable' and s['domain'] not in UNKNOWN_OK_DOMAINS | {'automation', 'script'}:
+            add_orph(eid, 'no unique_id (YAML/legacy) and unavailable')
+    F['orphans'] = list(orph.values())
+
+    # 1c disabled
+    dis = [r for r in reg.values() if r.get('disabled_by')]
+    by = collections.defaultdict(collections.Counter)
+    for r in dis:
+        by[r.get('platform') or '?'][r['disabled_by']] += 1
+    F['disabled_counts'] = {k: dict(v) for k, v in sorted(by.items(), key=lambda kv: -sum(kv[1].values()))}
+    ling = []
+    for r in dis:
+        ce = entries.get(r.get('config_entry_id')) if r.get('config_entry_id') else None
+        why = None
+        if r.get('config_entry_id') and not ce:
+            why = 'integration entry gone'
+        elif r.get('device_id') and r['device_id'] not in devs:
+            why = 'device gone'
+        elif ce and ce.get('disabled_by'):
+            why = 'whole integration disabled'
+        elif ce and ce.get('source') == 'ignore':
+            why = 'integration ignored'
+        if why:
+            ling.append({'entity_id': r['entity_id'], 'integration': r.get('platform'), 'why': why,
+                         'disabled_by': r['disabled_by']})
+    F['disabled_lingering'] = ling
+    F['disabled_user'] = [r['entity_id'] for r in dis if r['disabled_by'] == 'user']
+
+    # 1d duplicates
+    all_ids = set(st) | set(reg)
+    ents_by_dev0 = collections.defaultdict(list)
+    for r in reg.values():
+        if r.get('device_id') and not r.get('disabled_by'):
+            ents_by_dev0[r['device_id']].append(r['entity_id'])
+
+    def dev_dead(dv):
+        en = ents_by_dev0.get(dv) or []
+        return bool(en) and all(cls_of(e) == 'unavailable' for e in en)
+    dups = []
+    for eid in sorted(all_ids):
+        m = re.match(r'^(.+)_(\d{1,2})$', eid)
+        if m and int(m.group(2)) >= 2 and m.group(1) in all_ids:
+            base = m.group(1)
+            stale = cls_of(base) in ('unavailable', 'missing', 'no state') or bool(st.get(base, {}).get('restored'))
+            dd, db = (reg.get(eid) or {}).get('device_id'), (reg.get(base) or {}).get('device_id')
+            if dd and db and dd != db and dd in devs and db in devs:
+                if dev_dead(db) and not dev_dead(dd) and devs[db].get('model') == devs[dd].get('model'):
+                    kind = 'separate devices, same default name; original device dead (see 2c)'
+                else:
+                    kind = 'separate devices, same default name (rename only)'
+            elif dd and dd == db:
+                kind = 'same device twice'
+            elif stale:
+                kind = 'stale original'
+            else:
+                kind = 'check'
+            dups.append({'entity_id': eid, 'base': base, 'cls': cls_of(eid), 'base_cls': cls_of(base),
+                         'integration': integ(eid), 'base_integration': integ(base), 'kind': kind,
+                         'stale_base': stale and not kind.startswith('separate')})
+    F['duplicates'] = [x for x in dups if not x['kind'].startswith('separate')]
+    F['same_name_devices'] = collections.Counter(x['integration'] for x in dups if x['kind'].startswith('separate'))
+    F['same_name_dead_original'] = sum(1 for x in dups if 'original device dead' in x['kind'])
+
+    # 2 devices
+    ents_by_dev = collections.defaultdict(list)
+    for r in reg.values():
+        if r.get('device_id'):
+            ents_by_dev[r['device_id']].append(r)
+    parents = {x['via_device_id'] for x in devs.values() if x.get('via_device_id')}
+    F['dev_empty'], F['dev_dead'], F['dev_orphan'] = [], [], []
+    for x in devs.values():
+        row = {'name': x['name'], 'model': x.get('model'), 'integration': ', '.join(x['domains']) or '?',
+               'area': areas.get(x.get('area_id'), ''), 'id': x['id'], 'disabled_by': x.get('disabled_by')}
+        if x['config_entries'] and not any(c in entries for c in x['config_entries']):
+            F['dev_orphan'].append(row)
+        en = [r for r in ents_by_dev.get(x['id'], []) if not r.get('disabled_by')]
+        if not ents_by_dev.get(x['id']) and x['id'] not in parents and x.get('entry_type') != 'service' \
+                and x['domains'] != ['bluetooth']:   # Bluetooth adapters have no entities by design
+            F['dev_empty'].append(row)
+        elif en and all(st.get(r['entity_id'], {}).get('cls', 'unavailable') == 'unavailable' for r in en):
+            F['dev_dead'].append(dict(row, n_entities=len(en)))
+    F['dev_disabled'] = [{'name': x['name'], 'integration': ', '.join(x['domains']), 'by': x['disabled_by']}
+                         for x in devs.values() if x.get('disabled_by')]
+
+    # 2b phones (mobile_app) and person links
+    tracker_persons = collections.defaultdict(list)
+    F['persons'] = []
+    for pid, p in sorted((k, v) for k, v in st.items() if v['domain'] == 'person'):
+        trk = []
+        for t in p.get('device_trackers', []):
+            tracker_persons[t].append(pid)
+            dv = dev_of(t)
+            trk.append({'tracker': t, 'exists': t in st or t in reg, 'cls': cls_of(t),
+                        'device': (dv or {}).get('name', '(no device: legacy/router tracker)')})
+        F['persons'].append({'person': pid, 'cls': p['cls'], 'trackers': trk})
+    notify_svcs = {s.split('notify.mobile_app_', 1)[1]: s for s in (services or []) if s.startswith('notify.mobile_app_')}
+    phones = []
+    for x in devs.values():
+        if 'mobile_app' not in x['domains']:
+            continue
+        pe = ents_by_dev.get(x['id'], [])
+        trackers = [r['entity_id'] for r in pe if r['entity_id'].startswith('device_tracker.')]
+        linked = sorted({p for t in trackers for p in tracker_persons.get(t, [])})
+        batt = [r['entity_id'] for r in pe if r['entity_id'].endswith('_battery_level')]
+        last, last_basis = None, None
+        for b in batt:
+            h = hist.get(b)
+            if h and h.get('last_change'):
+                cand = days_since(h['last_change'], now)
+                last = cand if last is None else min(last, cand)
+                last_basis = 'battery history'
+            elif h and not h.get('last_change'):
+                cand = days_since(h.get('oldest'), now)
+                if last is None:
+                    last, last_basis = cand, 'no battery change in recorder window (≥)'
+        if last is None:
+            ups = [days_since(st[r['entity_id']]['last_updated'], now) for r in pe
+                   if r['entity_id'] in st and not is_sensitive(r['entity_id'])]
+            ups = [u for u in ups if u is not None]
+            if ups:
+                last, last_basis = min(ups), 'last state update (resets at HA restart)'
+        notify = notify_svcs.get(slug(x['name']))
+        phones.append({'name': x['name'], 'model': x.get('model'), 'manufacturer': x.get('manufacturer'),
+                       'id': x['id'], 'entry_ids': x['config_entries'], 'n_entities': len(pe),
+                       'n_unavailable': sum(1 for r in pe if cls_of(r['entity_id']) == 'unavailable'),
+                       'trackers': trackers, 'linked_persons': linked, 'last_days': last,
+                       'last_basis': last_basis, 'notify': notify, 'referenced_by': []})
+    F['phones'] = phones
+
+    # 3 integrations
+    ents_by_entry = collections.defaultdict(list)
+    for r in reg.values():
+        if r.get('config_entry_id'):
+            ents_by_entry[r['config_entry_id']].append(r)
+    devs_by_entry = collections.Counter(c for x in devs.values() for c in x['config_entries'])
+    F['int_failing'] = [e for e in entries.values() if not e.get('disabled_by') and e.get('source') != 'ignore'
+                        and e.get('state') not in ('loaded', None)]
+    F['int_ignored'] = [e for e in entries.values() if e.get('source') == 'ignore']
+    F['int_disabled'] = [e for e in entries.values() if e.get('disabled_by') and e.get('source') != 'ignore']
+    F['int_discovered'] = [f for f in d.get('flows', []) if f.get('source') not in ('user', 'reauth', 'reconfigure')]
+    F['int_unused'], F['int_dead'] = [], []
+    for e in entries.values():
+        if e.get('state') != 'loaded' or e.get('disabled_by') or e.get('source') == 'ignore':
+            continue
+        en = [r for r in ents_by_entry.get(e['entry_id'], []) if not r.get('disabled_by')]
+        if not ents_by_entry.get(e['entry_id']) and not devs_by_entry.get(e['entry_id']):
+            F['int_unused'].append(dict(e, exempt=e['domain'] in NO_ENTITY_OK))
+        elif en and all(cls_of(r['entity_id']) == 'unavailable' for r in en):
+            F['int_dead'].append(dict(e, n_entities=len(en)))
+
+    # 4 automations / scripts
+    existing = set(st) | set(reg)
+    known_domains = {i.split('.', 1)[0] for i in existing}
+    phone_by_notify = {p['notify']: p for p in phones if p['notify']}
+    phone_by_dev = {p['id']: p for p in phones}
+    phone_ents = {r['entity_id']: phone_by_dev[r['device_id']] for r in reg.values() if r.get('device_id') in phone_by_dev}
+
+    def check_refs(eid, c):
+        miss, disabled, longbad, mdev, marea, msvc = [], [], [], [], [], []
+        cands = list(c.get('entities', [])) + [x for x in c.get('bp_candidates', [])
+                                               if x.split('.', 1)[0] in known_domains or x.split('.', 1)[0] in
+                                               ('light', 'switch', 'sensor', 'binary_sensor', 'cover', 'climate', 'media_player', 'lock')]
+        for x in cands:
+            ent = reg_by_id[x]['entity_id'] if REG_ID_RE.match(x) and x in reg_by_id else x
+            if REG_ID_RE.match(x) and x not in reg_by_id:
+                miss.append('(registry id of a deleted entity)')
+            elif ent not in existing:
+                miss.append(ent)
+            elif reg.get(ent, {}).get('disabled_by'):
+                disabled.append(ent)
+            elif ent in bad_long_ids:
+                longbad.append(ent)
+            if ent in phone_ents:
+                phone_ents[ent]['referenced_by'].append(eid)
+        for dv in c.get('devices', []):
+            if dv not in devs:
+                mdev.append('(deleted device)')
+            elif dv in phone_by_dev:
+                phone_by_dev[dv]['referenced_by'].append(eid)
+        for a in c.get('areas', []):
+            if a not in areas:
+                marea.append(a)
+        for s in c.get('services', []):
+            if s in phone_by_notify:
+                phone_by_notify[s]['referenced_by'].append(eid)
+            elif s.startswith('notify.mobile_app_') and services is not None and s not in services:
+                msvc.append(s)
+            elif services is not None and s not in services and s.split('.', 1)[0] not in (
+                    'script', 'automation', 'scene', 'homeassistant'):
+                msvc.append(s)
+        return {k: sorted(set(v)) for k, v in (('missing', miss), ('disabled', disabled), ('long_unavailable', longbad),
+                                                ('missing_devices', mdev), ('missing_areas', marea),
+                                                ('missing_services', msvc)) if v}
+
+    id2auto = {s['id']: e for e, s in st.items() if s['domain'] == 'automation' and s.get('id')}
+    for dom, cfgs in (('automation', d.get('automation_cfg', {})), ('script', d.get('script_cfg', {}))):
+        rows = []
+        tr_err = collections.defaultdict(list)
+        for t in d.get('traces', {}).get(dom, []):
+            if t.get('execution') in ('error', 'failed_max_runs', 'failed_single', 'aborted') or t.get('error'):
+                target = id2auto.get(t['item_id']) if dom == 'automation' else f"script.{t['item_id']}"
+                tr_err[target or f"{dom} id {t['item_id']}"].append(t)
+        for eid, s in sorted((k, v) for k, v in st.items() if v['domain'] == dom):
+            c = cfgs.get(eid, {})
+            lt = days_since(s.get('last_triggered'), now) if s.get('last_triggered') else None
+            refs = check_refs(eid, c) if 'error' not in c else {}
+            rows.append({'entity_id': eid, 'cls': s['cls'], 'on': s.get('on'), 'last_days': lt,
+                         'never': not s.get('last_triggered'), 'cfg_error': c.get('error'),
+                         'blueprint': c.get('blueprint'), 'refs': refs,
+                         'n': (c.get('n_triggers'), c.get('n_conditions'), c.get('n_actions')),
+                         'trace_errors': [{'execution': t['execution'], 'error': t['error'],
+                                           'days': days_since(t.get('start'), now)} for t in tr_err.pop(eid, [])]})
+        F[dom] = rows
+        F[f'{dom}_trace_unmapped'] = {k: len(v) for k, v in tr_err.items()}
+
+    # 5 repairs / updates / add-ons
+    F['issues_active'] = [i for i in d.get('issues', []) if not i.get('ignored')]
+    F['issues_ignored'] = [i for i in d.get('issues', []) if i.get('ignored')]
+    for i in F['issues_active'] + F['issues_ignored']:
+        i['days'] = days_since(i.pop('created', None), now)
+    F['updates'] = [{'entity_id': e, 'title': s.get('title'), 'installed': s.get('installed_version'),
+                     'latest': s.get('latest_version'), 'skipped': s.get('skipped_version'),
+                     'integration': integ(e)} for e, s in sorted(st.items()) if s['domain'] == 'update' and s.get('on')]
+    F['updates_skipped'] = [e for e, s in st.items() if s['domain'] == 'update' and s.get('skipped_version')]
+    F['supervisor'] = d.get('supervisor') or {}
+    F['addons_stopped'] = [a for a in F['supervisor'].get('addons', []) if a.get('state') != 'started']
+    F['addons_update'] = [a for a in F['supervisor'].get('addons', []) if a.get('update_available')]
+    # Bluetooth platforms derive entity ids from BT names/MACs/UUIDs: replace them by stable hashes
+    bt_dev = {x['id'] for x in devs.values() if x.get('is_bt')}
+    mapping = {e: bt_mask(e, r.get('platform')) for e, r in reg.items()
+               if is_bt_domain(r.get('platform')) or r.get('device_id') in bt_dev}
+    F['bt_masked'] = len(mapping)
+    return _deep_replace(F, mapping) if mapping else F
+
+
+def bt_mask(eid, platform):
+    dom = eid.split('.', 1)[0]
+    return f"{dom}.[bt:{platform or 'bluetooth'}:{hashlib.sha1(eid.encode()).hexdigest()[:6]}]"
+
+
+def _deep_replace(obj, mapping):
+    if isinstance(obj, str):
+        return mapping.get(obj, obj)
+    if isinstance(obj, list):
+        return [_deep_replace(x, mapping) for x in obj]
+    if isinstance(obj, collections.Counter):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _deep_replace(v, mapping) for k, v in obj.items()}
+    return obj
+
+
+# ----------------------------------------------------------------------------- rendering
+CAP = 40
+
+
+def _ids(xs, n=6):
+    xs = list(xs)
+    s = ', '.join(f'`{scrub(x)}`' for x in xs[:n])
+    return s + (f' +{len(xs) - n}' if len(xs) > n else '')
+
+
+def _age(b):
+    if b.get('sensitive') or b['domain'] in ('person', 'device_tracker'):
+        return '(not shown)'
+    if b['days'] is None:
+        return '?'
+    if b['basis'] in ('whole window', 'since HA start'):
+        return f"≥ {int(b['days'])} d"
+    return bucket(b['days'])
+
+
+def _table(head, rows, cap=CAP):
+    out = ['| ' + ' | '.join(head) + ' |', '|' + '---|' * len(head)]
+    for r in rows[:cap]:
+        out.append('| ' + ' | '.join(str(c).replace('|', '/') if c not in (None, '') else '–' for c in r) + ' |')
+    if len(rows) > cap:
+        out.append(f'| … +{len(rows) - cap} more (JSON) |' + ' |' * (len(head) - 1))
+    return out
+
+
+def old_phones(F):
+    out = []
+    for p in F['phones']:
+        nm = f"{p['name']} {p.get('model') or ''}".lower()
+        named_old = any(k in nm for k in ('s20 fe', 's20fe', 'sm-g780', 'sm-g781', 's24 ultra', 'sm-s928'))
+        stale = p['last_days'] is not None and (p['last_days'] >= 30 or ('(≥)' in (p['last_basis'] or '') and p['last_days'] >= 7))
+        if named_old or stale:
+            out.append(p)
+    return out
+
+
+def summary_lines(F):
+    bl = F['bad_long']
+    top = collections.Counter(b['integration'] for b in bl).most_common(3)
+    olds = old_phones(F)
+    autos = F.get('automation', [])
+    a_err = [a for a in autos if a['cls'] == 'unavailable' or a['trace_errors']]
+    a_stale = [a for a in autos if a['on'] and (a['never'] or (a['last_days'] or 0) > 90)]
+    a_refs = [a for a in autos + F.get('script', []) if a['refs'].get('missing') or a['refs'].get('missing_devices') or a['refs'].get('missing_services')]
+    sv = F['supervisor']
+    upd = [u for u in F['updates']]
+    nobk = any(x.get('type') == 'no_current_backup' for x in (sv.get('resolution') or {}).get('issues', []))
+    qw = quick_wins(F)
+    return [
+        f"HA {F['ha_version']} cleanup audit, read-only, nothing changed",
+        f"1. Entities: {len(bl)} dead ≥7 d" + (f" ({', '.join(f'{k} {v}' for k, v in top)})" if top else '') +
+        f", {len(F['orphans'])} orphaned, {len(F['duplicates'])} real _N duplicates",
+        f"2. Devices: {len(F['dev_empty'])} empty, {len(F['dev_dead'])} all-unavailable; old phones: " +
+        (', '.join(f"{p['name']}" + (' (' + '/'.join(x.split('.')[1] for x in p['linked_persons']) + ')' if p['linked_persons'] else '')
+                   for p in olds) or 'none found'),
+        f"3. Integrations: {len(F['int_failing'])} failing, {len(F['int_ignored'])} ignored, "
+        f"{sum(1 for e in F['int_unused'] if not e['exempt'])} unused, {len(F['int_dead'])} all-dead",
+        f"4. Automations: {len(a_err)} broken/erroring, {len(a_stale)} never/90 d+ triggered, "
+        f"{len(a_refs)} point at missing things",
+        f"5. Repairs {len(F['issues_active'])} open; updates {len(upd)} pending"
+        + (f" (core {sv.get('core', {}).get('version')}→{sv.get('core', {}).get('version_latest')})" if sv.get('core', {}).get('update_available') else '')
+        + f"; {len(F['addons_stopped'])} add-ons stopped" + ('; NO current backup' if nobk else ''),
+        f"6. Quick wins: {sum(1 for q in qw if q[0] == 'quick')} groups; needs your call: {sum(1 for q in qw if q[0] != 'quick')}",
+        "7. All proposed changes are reversible (disable/hide) unless marked; I change nothing without your OK",
+    ]
+
+
+def quick_wins(F):
+    """(kind, group, what, api change, read-only verification, reversible)"""
+    q = []
+    res = (F.get('supervisor') or {}).get('resolution') or {}
+    if any(x.get('type') == 'no_current_backup' for x in res.get('issues', [])):
+        q.append(('decide', 'Backup first', 'Supervisor reports no current backup',
+                  'one full backup before any cleanup: ws `supervisor/api` {endpoint:"/backups/new/full", method:"post"} (or Settings → System → Backups)',
+                  'supervisor resolution no longer lists no_current_backup; backup appears in /backups',
+                  'n/a (adds a backup, changes nothing else)'))
+    stale_dups = [x for x in F['duplicates'] if x['stale_base'] and x['cls'] not in ('unavailable', 'missing')]
+    if F['orphans']:
+        q.append(('quick', 'Orphaned entities', f"{len(F['orphans'])} entities no integration provides",
+                  'ws `config/entity_registry/remove` {entity_id} (or first `config/entity_registry/update` {entity_id, disabled_by:"user"})',
+                  'ws `config/entity_registry/list` no longer lists it; GET /api/states/<id> → 404',
+                  'disable = yes (disabled_by null); remove = recreated if the integration ever provides it again'))
+    if stale_dups:
+        q.append(('quick', 'Stale originals of _2 duplicates', f"{len(stale_dups)} pairs where the original is dead and _2 is live",
+                  'remove the dead original, then `config/entity_registry/update` {entity_id:"x_2", new_entity_id:"x"}',
+                  'registry list shows one entity under the old id; automations referencing it resolve again',
+                  'rename = yes (rename back); removal of a dead entry is harmless'))
+    if F['int_ignored']:
+        q.append(('quick', 'Ignored discoveries', f"{len(F['int_ignored'])} ignored entries",
+                  'nothing needed (they only hide discoveries); optional DELETE /api/config/config_entries/entry/<id>',
+                  'GET /api/config/config_entries/entry no longer lists source=ignore',
+                  'yes: the device is simply rediscovered'))
+    if F['issues_active']:
+        q.append(('quick', 'Repairs', f"{len(F['issues_active'])} open issues",
+                  'fix the cause (per issue) or ws `repairs/ignore_issue` {domain, issue_id, ignore:true}',
+                  'ws `repairs/list_issues` shows it gone or ignored:true',
+                  'yes: ignore:false brings it back'))
+    off_never = [a for a in F.get('automation', []) if a['on'] and (a['never'] or (a['last_days'] or 0) > 90)]
+    if off_never:
+        q.append(('decide', 'Never/rarely triggered automations', f"{len(off_never)} on but idle (never or > 90 d)",
+                  'service `automation.turn_off` (keeps it, stops it) or delete via DELETE /api/config/automation/config/<id>',
+                  'GET /api/states/automation.x → off; GET /api/config/automation/config/<id> still 200',
+                  'turn_off = yes; delete = only via backup/automations.yaml git'))
+    olds = old_phones(F)
+    if olds:
+        q.append(('decide', 'Old phones', ', '.join(p['name'] for p in olds),
+                  'ws `person/update` drop their device_trackers from the person; then ws `config_entries/disable` {entry_id, disabled_by:"user"} for each phone entry (later DELETE entry)',
+                  'GET /api/states/person.<x> attribute device_trackers lists only current phones; config entry state not_loaded + disabled_by user',
+                  'person/update + disable = yes; deleting the mobile_app entry is not (phone must re-onboard)'))
+    if F['int_failing'] or F['int_dead']:
+        q.append(('decide', 'Failing / dead integrations', f"{len(F['int_failing'])} failing, {len(F['int_dead'])} all-unavailable",
+                  'POST /api/config/config_entries/entry/<id>/reload once; if still failing ws `config_entries/disable` {entry_id, disabled_by:"user"}',
+                  'GET /api/config/config_entries/entry → state loaded, or disabled_by user',
+                  'yes (disabled_by null re-enables)'))
+    unused = [e for e in F['int_unused'] if not e['exempt']]
+    if unused:
+        q.append(('decide', 'Unused integrations', f"{len(unused)} with no entities/devices",
+                  'ws `config_entries/disable` first, DELETE entry after a week',
+                  'GET /api/config/config_entries/entry → disabled_by user',
+                  'disable = yes; delete = re-add by hand'))
+    if F['dev_empty'] or F['dev_dead']:
+        q.append(('decide', 'Empty / dead devices', f"{len(F['dev_empty'])} empty, {len(F['dev_dead'])} dead",
+                  'ws `config/device_registry/update` {device_id, disabled_by:"user"}; removal via `config/device_registry/remove_config_entry` (if the integration supports it)',
+                  'ws `config/device_registry/list` → disabled_by user / gone',
+                  'disable = yes; remove = re-pair'))
+    if F['bad_long']:
+        q.append(('decide', 'Long-unavailable entities', f"{len(F['bad_long'])} dead ≥ 7 d",
+                  'per integration: fix (battery, re-pair) or `config/entity_registry/update` {entity_id, disabled_by:"user"}',
+                  'registry list → disabled_by user; state gone from /api/states',
+                  'yes'))
+    if F['updates'] or F['addons_stopped']:
+        q.append(('decide', 'Updates / stopped add-ons', f"{len(F['updates'])} updates, {len(F['addons_stopped'])} stopped add-ons",
+                  'update.install with backup:true (core/OS: after a full backup); stopped add-ons: uninstall via supervisor /addons/<slug>/uninstall',
+                  'GET /api/states/update.* → off; supervisor /addons lists state/version',
+                  'updates: partly (restore backup); uninstall: reinstall + restore config'))
+    return q
+
+
+def render_md(F, date):
+    L = [f"# Home Assistant cleanup audit — {date}", '',
+         '**Phone summary**', '']
+    L += [f'- {x}' if i else f'**{x}**' for i, x in enumerate(summary_lines(F))]
+    c = F['counts']
+    L += ['', f"Read-only snapshot of HA {F['ha_version']} at {F['generated']}: {c['states']} states, "
+          f"{c['registry']} registry entities, {c['devices']} devices, {c['entries']} integration entries, "
+          f"{c['automations']} automations, {c['scripts']} scripts. "
+          f"HA has been up ~{F['uptime_days']} d; recorder history "
+          + (f"covers ~{F['recorder_days']} d" if F['history_ok'] else 'was not used') +
+          '. Privacy: no states, coordinates, addresses, SSIDs, IPs, Bluetooth names, notification text or media '
+          'titles; person/tracker rows show only exists/unavailable/device; entity ids of Bluetooth devices are '
+          f"shown as `[bt:platform:hash]` ({F.get('bt_masked', 0)} masked; hash = sha1(entity_id)[:6]).", '']
+    if F['errors']:
+        L += ['Collection notes: ' + '; '.join(F['errors'][:8]), '']
+
+    # 1
+    L += ['## 1. Entities', '', '### 1a. Unavailable / unknown for ≥ 7 days (by integration)', '',
+          'Age basis: recorder history where available ("≥" = unavailable for the whole recorded window '
+          'or since HA start, so the real age is at least that).', '']
+    groups = collections.defaultdict(list)
+    for b in F['bad_long']:
+        groups[b['integration']].append(b)
+    rows = []
+    for k, v in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        un = sum(1 for b in v if b['cls'] == 'unavailable')
+        rows.append([k, len(v), f"{un} unavail / {len(v) - un} unknown", _ids([b['entity_id'] for b in v], 8)])
+    L += _table(['Integration', 'n', 'class', 'entities'], rows) if rows else ['None.']
+    L += ['', 'Detail (≤ 40):', '']
+    L += _table(['entity_id', 'integration', 'class', 'down for', 'device', 'area'],
+                [[f"`{scrub(b['entity_id'])}`", b['integration'], b['cls'], _age(b), b['device'], b['area']]
+                 for b in sorted(F['bad_long'], key=lambda b: (b['integration'], b['entity_id']))]) if F['bad_long'] else []
+    if F['bad_since_start']:
+        L += ['', f"Plus {len(F['bad_since_start'])} unavailable/unknown since the last HA start (< 7 d known, no "
+              f"history): {_ids([b['entity_id'] for b in F['bad_since_start']], 10)}"]
+    L += ['', '### 1b. Orphaned entities', '']
+    L += _table(['entity_id', 'integration', 'state class', 'why'],
+                [[f"`{scrub(o['entity_id'])}`", o['integration'], o['cls'], '; '.join(o['why'])] for o in F['orphans']]) \
+        if F['orphans'] else ['None.']
+    if F.get('restored_failing'):
+        L += ['', 'Not counted as orphans: ' + ', '.join(f'{v} {k}' for k, v in F['restored_failing'].most_common()) +
+              ' entities whose integration is failing to load (section 3a); they come back once it loads.']
+    L += ['', '### 1c. Disabled entities', '']
+    if F['disabled_counts']:
+        L += _table(['integration', 'by user', 'by integration (default-off)', 'by device/entry'],
+                    [[k, v.get('user', 0), v.get('integration', 0), v.get('device', 0) + v.get('config_entry', 0)]
+                     for k, v in F['disabled_counts'].items()], cap=15)
+        L += ['', '"By integration" is HA\'s default for diagnostic entities: normal, leave them.']
+    if F['disabled_lingering']:
+        L += ['', 'Lingering (disabled and their integration/device is gone or disabled):', '']
+        L += _table(['entity_id', 'integration', 'why'],
+                    [[f"`{scrub(x['entity_id'])}`", x['integration'], x['why']] for x in F['disabled_lingering']])
+    L += ['', '### 1d. Duplicates (`_2` suffix with the original still registered)', '']
+    L += _table(['duplicate', 'class', 'original', 'original class', 'integration', 'verdict'],
+                [[f"`{scrub(x['entity_id'])}`", x['cls'], f"`{scrub(x['base'])}`", x['base_cls'], x['integration'],
+                  x['kind']] for x in F['duplicates']]) if F['duplicates'] else ['None.']
+    if F.get('same_name_devices'):
+        L += ['', 'Not duplicates: ' + ', '.join(f'{v} {k}' for k, v in F['same_name_devices'].most_common()) +
+              ' `_N` entities belong to separate devices that share a default name (several identical bulbs/remotes); '
+              'renaming the devices would make them readable, nothing to delete.'
+              + (f" In {F['same_name_dead_original']} of these the original device is dead (section 2c)."
+                 if F.get('same_name_dead_original') else '')]
+
+    # 2
+    L += ['', '## 2. Devices', '', '### 2a. Old phones and person links', '']
+    for p in F['persons']:
+        L.append(f"- `{p['person']}` ({p['cls']}): trackers → " + ('; '.join(
+            f"`{t['tracker']}` {'exists' if t['exists'] else 'MISSING'}, {t['cls']}, device {t['device']}"
+            for t in p['trackers']) or 'none'))
+    L += ['']
+    L += _table(['phone (mobile_app)', 'model', 'last report', 'basis', 'entities (unavail)', 'linked to', 'notify svc', 'used by'],
+                [[p['name'], p.get('model'), ('?' if p['last_days'] is None else f"≥ {int(p['last_days'])} d"
+                  if '(≥)' in (p['last_basis'] or '') else bucket(p['last_days'])), p['last_basis'],
+                  f"{p['n_entities']} ({p['n_unavailable']})", ', '.join(p['linked_persons']) or '–',
+                  f"`{p['notify']}`" if p['notify'] else '–', _ids(sorted(set(p['referenced_by'])), 4) or '–']
+                 for p in F['phones']]) if F['phones'] else ['No mobile_app devices.']
+    L += ['', '### 2b. Devices with no entities (not hubs/services)', '']
+    L += _table(['device', 'model', 'integration', 'area'],
+                [[x['name'], x['model'], x['integration'], x['area']] for x in F['dev_empty']]) if F['dev_empty'] else ['None.']
+    L += ['', '### 2c. Devices whose enabled entities are all unavailable', '']
+    L += _table(['device', 'model', 'integration', 'area', 'entities'],
+                [[x['name'], x['model'], x['integration'], x['area'], x['n_entities']] for x in F['dev_dead']]) if F['dev_dead'] else ['None.']
+    if F['dev_orphan']:
+        L += ['', f"Devices whose integration entries are all gone: {', '.join(x['name'] for x in F['dev_orphan'][:15])}"]
+    if F['dev_disabled']:
+        L += ['', f"Disabled devices ({len(F['dev_disabled'])}): " +
+              ', '.join(f"{x['name']} ({x['integration']}, by {x['by']})" for x in F['dev_disabled'][:15])]
+
+    # 3
+    L += ['', '## 3. Integrations', '', '### 3a. Failed / not loaded / setup_retry', '']
+    L += _table(['integration', 'title', 'state', 'reason'],
+                [[e['domain'], e['title'], e['state'], e.get('reason')] for e in F['int_failing']]) if F['int_failing'] else ['None.']
+    if F['int_dead']:
+        L += ['', 'Loaded but every enabled entity unavailable:', '']
+        L += _table(['integration', 'title', 'entities'], [[e['domain'], e['title'], e['n_entities']] for e in F['int_dead']])
+    L += ['', '### 3b. Ignored and pending discoveries', '']
+    L.append('- Ignored: ' + (', '.join(f"{e['domain']} ({e['title']})" for e in F['int_ignored']) or 'none'))
+    disc = collections.Counter(f"{f['handler']} via {f['source']}" for f in F['int_discovered'])
+    L.append('- Discovered, waiting for a decision: ' + (', '.join(f'{k} ×{v}' if v > 1 else k for k, v in disc.items()) or 'none'))
+    if F['int_disabled']:
+        L.append('- Disabled entries: ' + ', '.join(f"{e['domain']} ({e['title']})" for e in F['int_disabled']))
+    L += ['', '### 3c. Unused (loaded, no entities and no devices)', '']
+    un = [e for e in F['int_unused'] if not e['exempt']]
+    ex = [e for e in F['int_unused'] if e['exempt']]
+    L += _table(['integration', 'title'], [[e['domain'], e['title']] for e in un]) if un else ['None.']
+    if ex:
+        L += ['', 'Also entity-less but normal for their kind: ' + ', '.join(sorted({e['domain'] for e in ex}))]
+
+    # 4
+    for dom in ('automation', 'script'):
+        rows = F.get(dom, [])
+        L += ['', f"## 4{'a' if dom == 'automation' else 'b'}. {dom.capitalize()}s ({len(rows)})", '']
+        broken = [a for a in rows if a['cls'] == 'unavailable']
+        erring = [a for a in rows if a['trace_errors']]
+        off = [a for a in rows if dom == 'automation' and a['cls'] == 'available' and not a['on']]
+        idle = [a for a in rows if (a['on'] or dom == 'script') and a['cls'] == 'available' and (a['never'] or (a['last_days'] or 0) > 90)]
+        refs = [a for a in rows if a['refs']]
+        noread = [a for a in rows if a['cfg_error']]
+        L.append(f"- Unavailable (config invalid): " + (_ids([a['entity_id'] for a in broken], 12) or 'none'))
+        L.append(f"- Errors in stored traces: " + ('; '.join(
+            f"`{a['entity_id']}` {len(a['trace_errors'])}× {a['trace_errors'][0]['execution']}"
+            + (f" ({a['trace_errors'][0]['error']})" if a['trace_errors'][0]['error'] else '') for a in erring[:12]) or 'none'))
+        if F.get(f'{dom}_trace_unmapped'):
+            L.append(f"- Trace errors of items without a matching entity: {F[f'{dom}_trace_unmapped']}")
+        if dom == 'automation':
+            L.append(f"- Turned off: " + (_ids([a['entity_id'] for a in off], 12) or 'none'))
+        L.append(f"- Never triggered: " + (_ids([a['entity_id'] for a in idle if a['never']], 15) or 'none'))
+        L.append(f"- Last triggered > 90 d ago: " + (_ids([a['entity_id'] for a in idle if not a['never']], 15) or 'none'))
+        if noread:
+            L.append(f"- Config not readable via the UI API ({len(noread)}; YAML-defined): " + _ids([a['entity_id'] for a in noread], 8))
+        if refs:
+            L += ['', 'References to missing / disabled / dead things:', '']
+            L += _table([dom, 'missing entities', 'missing devices/areas/services', 'disabled', 'dead ≥ 7 d'],
+                        [[f"`{a['entity_id']}`", _ids(a['refs'].get('missing', []), 4),
+                          _ids(a['refs'].get('missing_devices', []) + a['refs'].get('missing_areas', []) + a['refs'].get('missing_services', []), 4),
+                          _ids(a['refs'].get('disabled', []), 4), _ids(a['refs'].get('long_unavailable', []), 4)] for a in refs])
+
+    # 5
+    sv = F['supervisor']
+    L += ['', '## 5. Repairs, updates, add-ons', '', '### 5a. Repairs', '']
+    L += _table(['integration', 'issue', 'severity', 'age', 'fixable', 'breaks in'],
+                [[i['domain'], f"{i['translation_key']} (`{i['issue_id']}`)", i['severity'], bucket(i['days']),
+                  'yes' if i['is_fixable'] else 'no', i.get('breaks_in')] for i in F['issues_active']]) if F['issues_active'] else ['No open repairs.']
+    if F['issues_ignored']:
+        L += ['', f"Ignored repairs: {len(F['issues_ignored'])} (" + ', '.join(f"{i['domain']}/{i['translation_key']}" for i in F['issues_ignored'][:8]) + ')']
+    res = sv.get('resolution') or {}
+    if any(res.get(k) for k in ('unsupported', 'unhealthy', 'issues', 'suggestions')):
+        L += ['', 'Supervisor resolution center: ' + '; '.join(filter(None, [
+            ('unsupported: ' + ', '.join(res['unsupported'])) if res.get('unsupported') else '',
+            ('unhealthy: ' + ', '.join(res['unhealthy'])) if res.get('unhealthy') else '',
+            ('issues: ' + ', '.join(f"{x['type']}/{x['context']}" + (f" ({x['reference']})" if x.get('reference') else '') for x in res.get('issues', []))) if res.get('issues') else '',
+            ('suggestions: ' + ', '.join(f"{x['type']}/{x['context']}" for x in res.get('suggestions', []))) if res.get('suggestions') else '']))]
+    L += ['', '### 5b. Pending updates', '']
+    for k in ('core', 'os', 'supervisor'):
+        x = sv.get(k) or {}
+        if x.get('version'):
+            L.append(f"- {k}: {x.get('version')}" + (f" → {x.get('version_latest')} available" if x.get('update_available') else ' (current)'))
+    L += [''] + (_table(['update entity', 'title', 'installed → latest', 'integration'],
+                        [[f"`{u['entity_id']}`", u['title'], f"{u['installed']} → {u['latest']}", u['integration']] for u in F['updates']])
+                 if F['updates'] else ['No update entities pending.'])
+    if F['updates_skipped']:
+        L += ['', f"Skipped versions: {_ids(F['updates_skipped'], 8)}"]
+    L += ['', '### 5c. Add-ons', '']
+    ads = sv.get('addons') or []
+    L.append(f"- Installed: {len(ads)}, started {sum(1 for a in ads if a['state'] == 'started')}")
+    L.append('- Stopped: ' + (', '.join(f"{a['name']} (boot {a.get('boot') or '?'})" for a in F['addons_stopped']) or 'none'))
+    L.append('- Update available: ' + (', '.join(f"{a['name']} {a['version']} → {a['version_latest']}" for a in F['addons_update']) or 'none'))
+
+    # 6
+    L += ['', '## 6. Plan: quick wins vs. your decision', '',
+          'Nothing below has been done. Each change is one API call per item; the verification is a read-only '
+          'call (re-running `ha-audit` covers all of them).', '']
+    L += _table(['', 'group', 'what', 'change via API', 'read-only verification', 'reversible'],
+                [['quick win' if k == 'quick' else 'your call', g, w, a, v, r] for k, g, w, a, v, r in quick_wins(F)], cap=20)
+    L += ['', '_Generated by `~/bin/ha-audit` (read-only; tests in ~/opt/assistant/tests/legacy/ha-audit)._', '']
+    return '\n'.join(L)
+
+
+def _jsonable(F):
+    out = json.loads(scrub(json.dumps(F, default=str, ensure_ascii=False)))
+    for k in ('bad', 'bad_long', 'bad_since_start'):
+        for b in out.get(k, []):
+            if b.get('sensitive') or b.get('domain') in ('person', 'device_tracker'):
+                b['days'], b['basis'] = None, '(not shown: location-related)'
+    return out
+
+
+def read_token(path):
+    with open(path) as fh:
+        t = fh.read().strip()
+    if not t or len(t) < 20:
+        raise SystemExit('ha-audit: token file empty or invalid')
+    return t
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='Read-only Home Assistant cleanup audit.')
+    ap.add_argument('--url', default=os.environ.get('HA_AUDIT_URL', DEFAULT_URL))
+    ap.add_argument('--token-file', default=os.environ.get('HA_AUDIT_TOKEN_FILE', DEFAULT_TOKEN_FILE))
+    ap.add_argument('--md')
+    ap.add_argument('--json')
+    ap.add_argument('--no-history', action='store_true')
+    ap.add_argument('--check', action='store_true')
+    ap.add_argument('--now', help=argparse.SUPPRESS)
+    ap.add_argument('--date', help=argparse.SUPPRESS)
+    a = ap.parse_args(argv)
+    now = parse_ts(a.now) if a.now else dt.datetime.now(dt.timezone.utc)
+    token = read_token(a.token_file)
+    rest = RestClient(a.url, token)
+    ws = WSClient(a.url, token)
+    try:
+        if a.check:
+            ents = ws.call('config/entity_registry/list')
+            print(f'HA {ws.ha_version}: {len(rest.get("/api/states"))} states, {len(ents)} registry entities')
+            return 0
+        data = collect(rest, ws, now, history=not a.no_history)
+    finally:
+        ws.close()
+    F = analyze(data, now)
+    date = a.date or dt.datetime.now().strftime('%Y-%m-%d')
+    late = 0
+    if a.md:
+        md, n = privacy_gate(render_md(F, date))
+        late += n
+        os.makedirs(os.path.dirname(os.path.abspath(a.md)), exist_ok=True)
+        with open(a.md, 'w') as fh:
+            fh.write(md)
+    if a.json:
+        js, n = privacy_gate(json.dumps(_jsonable(F), indent=1, ensure_ascii=False))
+        late += n
+        json.loads(js)
+        os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
+        with open(a.json, 'w') as fh:
+            fh.write(js)
+    out, n = privacy_gate('\n'.join(summary_lines(F)))
+    print(out)
+    if late + n:
+        print(f'(privacy gate redacted {late + n} late strings)', file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

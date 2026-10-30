@@ -1,0 +1,842 @@
+#!/usr/bin/env python3
+"""strike-watch: transport strikes on the owner's trip days (public strike calendars and news; no key, read-only).
+
+  strike-watch check [--json] [--now DATE]   strikes overlapping a trip day +-margin for that country and sector;
+                                             prints them (plus the ones in a window but filtered out, with why);
+                                             writes nothing
+  strike-watch check --cron [--dry-run]      the same, silent: ONE ~/inbox/strike-watch-<cc>-<date>-<source>-<hash>.md per NEW
+                                             relevant strike (dedupe in state.json); --dry-run prints what it would note
+  strike-watch status [--json]               trips + windows, expiry, sources' health, strikes already noted
+  strike-watch sources                       the sources and what they cover
+
+Config (private, 0600; trip places never live in this script): ~/.config/strike-watch/config.json
+  {"margin_days": 1,
+   "trips": [{"id": "x", "label": "short name",
+              "legs": [{"country": "BE", "from": "YYYY-MM-DD", "to": "YYYY-MM-DD",
+                        "sectors": ["rail", "air", "transit"], "what": "what he does there"}]}],
+   "places": {"IT": {"regions": ["..."], "provinces": ["..."],
+                     "air": ["AIRPORT WORD"], "rail": ["..."], "transit": ["..."]}},
+   "news": {"BE": [{"q": "search words", "hl": "fr", "gl": "BE", "days": 30}]},
+   "news_hints": {"BE": {"places": ["country, city and region names in every query language"],
+                         "words": ["operator or union", "prefix*"], "outlets": ["outlet name"]}},
+   "backup": {"BE:rail": "plan B text", "BE": "...", "*": "..."},
+   "country_names": {"XX": "name for a code the script doesn't know"}}
+  A leg's window is from - margin .. to + margin. Everything ends after the last window: the watch then does nothing.
+Sources (polite: one fetch per URL per run, 25 s timeout, a pause between news queries):
+  mit    Italian Ministry of Transport strike list (official; every sector; national, regional, local)       IT
+  irail  SNCB/NMBS disturbances through the iRail API (official rail feed; strike notices only)                BE
+  sncb   SNCB/NMBS press newsrooms, FR + NL RSS (strike / alternative-service releases)                        BE
+  news   Google News RSS per country, the config's queries (headlines with a strike word AND a day in them;
+         unconfirmed)                                                                                          any
+  belgiantrain.be and brusselsairport.be block plain fetches (Cloudflare / Akamai): the news queries cover them.
+Sectors: rail, air, transit (local buses, trams, metro), general (a general strike counts for every sector).
+Italian strikes named after one site (an airport, a station, a depot) count only when the site matches the
+config's place words for that sector; other regions and provinces are skipped.
+News headlines count for a country only when the headline (without the " - outlet" tail) names it: one of its
+places or words (whole words; "x*" = prefix). One that names only other countries' places moves to those that
+are watched (their own dedupe key) or is dropped; outlets alone don't count. No names configured = not filtered.
+Dedupe: Italian list per row; SNCB (feed + newsrooms) per day; news per country + days (official wins).
+A source failing 3 cron runs in a row writes ONE ~/inbox/strike-watch-failed-<source>.md (again only after it
+recovered). Never messages anyone.
+Exit: 0 ok (also: nothing to watch), 1 every source failed, 2 usage or config error.
+Env (tests): STRIKE_WATCH_CONFIG (file), STRIKE_WATCH_DIR (state), STRIKE_WATCH_INBOX, STRIKE_WATCH_NOW (ISO),
+STRIKE_WATCH_BASE (fake server: every URL becomes BASE/<host><path>?<query>), STRIKE_WATCH_PAUSE (seconds).
+"""
+import argparse
+import datetime as dt
+import email.utils
+import hashlib
+import html
+import json
+import os
+import pwd
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import http as web, jsonstate, locks  # noqa: E402
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+
+HOME = os.path.expanduser('~')
+CONFIG = os.environ.get('STRIKE_WATCH_CONFIG') or os.path.join(HOME, '.config/strike-watch/config.json')
+STATE_DIR = os.environ.get('STRIKE_WATCH_DIR') or os.path.join(HOME, '.local/state/strike-watch')
+STATE_F = os.path.join(STATE_DIR, 'state.json')
+LOCK_F = os.path.join(STATE_DIR, '.lock')
+INBOX = os.environ.get('STRIKE_WATCH_INBOX') or os.path.join(HOME, 'inbox')
+BASE = os.environ.get('STRIKE_WATCH_BASE', '').rstrip('/')
+PAUSE = float(os.environ.get('STRIKE_WATCH_PAUSE', '1.5'))
+UA = 'Mozilla/5.0 (X11; Linux x86_64) strike-watch/1.0 (personal, one fetch per page per day)'
+FAIL_NOTE_AFTER = 3
+
+MIT_URL = 'https://scioperi.mit.gov.it/mit2/public/scioperi'
+IRAIL_URLS = ['https://api.irail.be/v1/disturbances?format=json&lang=en']
+SNCB_FEEDS = ['https://press.sncb.be/feed', 'https://press.nmbs.be/feed']
+NEWS_URL = 'https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}'
+SOURCES = {   # name: (countries it covers, official?, what)
+    'mit': (['IT'], True, 'Italian Ministry of Transport strike list (scioperi.mit.gov.it)'),
+    'irail': (['BE'], True, 'SNCB/NMBS disturbances via the iRail API (strike notices)'),
+    'sncb': (['BE'], True, 'SNCB/NMBS press newsrooms (FR + NL RSS)'),
+    'news': ([], False, 'Google News RSS, config queries per country (headlines; unconfirmed)'),
+}
+COUNTRY = {'BE': 'Belgium', 'IT': 'Italy', 'FR': 'France', 'CH': 'Switzerland', 'DE': 'Germany', 'NL': 'Netherlands',
+           'AT': 'Austria', 'ES': 'Spain', 'PT': 'Portugal', 'GB': 'UK'}      # more via the config's country_names
+SECTOR_LABEL = {'rail': 'rail', 'air': 'air', 'transit': 'local transit', 'general': 'general strike'}
+ALL_SECTORS = ('rail', 'air', 'transit')
+
+STRIKE_RE = re.compile(
+    r"\b(strikes?|striking|walk-?outs?|industrial action|gr[eè]ves?|grévistes?|staking(?:en|sdag)?|staken|staakt|"
+    r"stakingsaanzegging|actiedag|action day|journ[ée]e d.action|service alternatif|alternatieve treindienst|"
+    r"alternative (?:train )?service|pr[ée]avis|scioper[oi]|scioperano|streiks?|streikt|warnstreik|"
+    r"mouvement social|vakbondsactie|arr[êe]t de travail|blocage g[ée]n[ée]ral)\b", re.I)
+SECTOR_RE = {
+    'rail': re.compile(r"\b(trains?|rail(?:way)?s?|sncb|nmbs|sncf|trenitalia|italo|trenord|sbb|cff|ffs|treins?|treinen|"
+                       r"treindienst|spoor|ferrovi\w*|treni|bahn|z[üu]ge?|tgv|eurostar|ice|eurocity|cheminots?)\b", re.I),
+    'air': re.compile(r"\b(airports?|a[ée]roports?|aeroport[oi]|luchthavens?|flughafens?|flights?|vols?|vluchten|vlucht|"
+                      r"voli|aere[oi]|fl[üu]ge?|airlines?|skeyes|enav|aiguilleurs|contr[ôo]leurs? a[ée]riens?|"
+                      r"air traffic|atc|aviation|ryanair|easyjet|bagagistes|handling)\b", re.I),
+    'transit': re.compile(r"\b(stib|mivb|de lijn|tec|bus|bussen|buses|trams?|metro|m[ée]tro|atm|tpl|mezzi pubblici|"
+                          r"trasporto pubblico|transports? en commun|openbaar vervoer|ratp|nahverkehr)\b", re.I),
+    'general': re.compile(r"(general strike|gr[eè]ve g[ée]n[ée]rale|gr[eè]ve nationale|algemene staking|nationale staking|"
+                          r"sciopero generale|generalstreik|national strike|nationwide strike|journ[ée]e d.action nationale|"
+                          r"nationale actiedag|interprofessionn?ell?e?|intersyndicale|national action|tout le pays|"
+                          r"landesweit|blocage g[ée]n[ée]ral)", re.I),
+}
+MIT_SECTORS = {'aereo': ['air'], 'ferroviario': ['rail'], 'trasporto pubblico locale': ['transit'],
+               'generale': ['general'], 'plurisettoriale': ['general']}
+# an Italian strike named after one site: "AEROPORTO DI X", "APT X", "SEDI DI X" ("AEROPORTI NAZIONALI" is not one)
+SITE_RE = re.compile(r"\b(AEROPORT[OI]|APT|SCAL[OI]|STAZION[EI]|SEDE|SEDI|IMPIANT[OI]|DEPOSIT[OI]|PRESIDI[OI])\s+"
+                     r"(?!NAZIONAL|ITALIAN|TUTT)(?:DI\s+|DEL\s+|DELLO\s+|DELLA\s+|DEGLI\s+)?[A-Z\"']", re.I)
+
+MONTHS = {
+    'january': 1, 'jan': 1, 'janvier': 1, 'januari': 1, 'januar': 1, 'gennaio': 1, 'jänner': 1,
+    'february': 2, 'feb': 2, 'février': 2, 'fevrier': 2, 'februari': 2, 'februar': 2, 'febbraio': 2,
+    'march': 3, 'mars': 3, 'maart': 3, 'märz': 3, 'marzo': 3,
+    'april': 4, 'apr': 4, 'avril': 4, 'aprile': 4,
+    'may': 5, 'mai': 5, 'mei': 5, 'maggio': 5,
+    'june': 6, 'juin': 6, 'juni': 6, 'giugno': 6,
+    'july': 7, 'juillet': 7, 'juli': 7, 'luglio': 7,
+    'august': 8, 'aug': 8, 'août': 8, 'aout': 8, 'augustus': 8, 'agosto': 8,
+    'september': 9, 'sept': 9, 'sep': 9, 'septembre': 9, 'settembre': 9,
+    'october': 10, 'oct': 10, 'octobre': 10, 'oktober': 10, 'okt': 10, 'ottobre': 10,
+    'november': 11, 'nov': 11, 'novembre': 11,
+    'december': 12, 'dec': 12, 'décembre': 12, 'decembre': 12, 'dezember': 12, 'dez': 12, 'dicembre': 12,
+}
+_MON = r'(' + '|'.join(sorted(MONTHS, key=len, reverse=True)) + r')\.?'
+_WD = (r'(?:(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|'
+       r'sunday|maandag|dinsdag|woensdag|donderdag|vrijdag|zaterdag|zondag|lunedì|martedì|mercoledì|giovedì|venerdì|'
+       r'sabato|domenica|montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag),?\s+)?')
+_SUF = r'(?:er|ers|e|ste|de|st|nd|rd|th|°|\.)?'
+_D = r'(\d{1,2})' + _SUF
+_DX = r'\d{1,2}' + _SUF                      # the same, not captured (inside repeats)
+_RANGE_SEP = r'(?:-|–|—|au|tot|to|bis|al|t/m|through|till|until)'
+_LIST_SEP = r'(?:/|en|and|e|ed|&|,|und|et|y)'
+_SEP = r'\s*(?:' + _RANGE_SEP + '|' + _LIST_SEP + r')\s*(?:le\s+|de\s+|the\s+|il\s+|dal\s+|du\s+)?'
+DM_RE = re.compile(r'(?<![\d.,/])' + _WD + _D + r'((?:' + _SEP + _WD + _DX + r')*)\s+' + _MON + r'(?![a-zà-ü])', re.I)
+MD_RE = re.compile(r'(?<![a-zà-ü])' + _MON + r'\s+' + _D + r'((?:' + _SEP + _DX + r')*)(?![\d])', re.I)
+# numeric: 5/11, 05/11/2026, 5.11.2026, "5.11." (a dot needs a year or a closing dot), 5-6/11
+NUM_RE = re.compile(r'(?<![\d.,/:])(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?(?:/(\d{1,2})(?:/(\d{2,4}))?|\.(\d{1,2})'
+                    r'(?:\.(\d{4})|\.(?![\d])))(?![\d,/])')
+
+
+class Fail(Exception):
+    pass
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+# ------------------------------------------------------------------------------------------------ small helpers
+def today(now):
+    return now.date() if isinstance(now, dt.datetime) else now
+
+
+def parse_now(s):
+    if not s:
+        return dt.datetime.now().astimezone()
+    try:
+        v = dt.datetime.fromisoformat(s)
+    except ValueError:
+        die(f'strike-watch: bad --now {s!r} (ISO date or datetime)')
+    return v if v.tzinfo else v.astimezone()
+
+
+def d_iso(s):
+    return dt.date.fromisoformat(str(s)[:10])
+
+
+def fmt_day(d):
+    return d.strftime('%a %d.%m.%Y')
+
+
+def fmt_span(a, b):
+    return fmt_day(a) if a == b else f'{fmt_day(a)} – {fmt_day(b)}'
+
+
+def clean(s):
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', s or ''))).strip()
+
+
+def url_for(url):
+    if not BASE:
+        return url
+    u = urllib.parse.urlsplit(url)
+    return f'{BASE}/{u.netloc}{u.path}' + (f'?{u.query}' if u.query else '')
+
+
+def fetch(url):
+    headers = {'User-Agent': UA, 'Accept': 'text/html,application/json,application/xml;q=0.9,*/*;q=0.8',
+               'Accept-Language': 'en,fr;q=0.8,nl;q=0.7,it;q=0.6,de;q=0.5'}
+    try:
+        with web.open(url_for(url), headers=headers, timeout=25) as r:
+            return r.read(5_000_000).decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        raise Fail(f'HTTP {e.code}')
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise Fail(f'unreachable ({getattr(e, "reason", e)})')
+
+
+def write_json(path, obj):
+    """Private state (0600), atomic (core.jsonstate)."""
+    jsonstate.save(path, obj, mode=0o600, indent=1, ensure_ascii=False, sort_keys=True)
+
+
+# ------------------------------------------------------------------------------------------------ dates in text
+def _year_for(month, day, ref):
+    for y in (ref.year - 1, ref.year, ref.year + 1):
+        try:
+            d = dt.date(y, month, day)
+        except ValueError:
+            continue
+        if ref - dt.timedelta(days=75) <= d <= ref + dt.timedelta(days=290):
+            return d
+    return None
+
+
+def _spans(first, rest, month, ref, year=None):
+    """day list text ("5", " au 7" ...) -> [(start, end)]; range words join, list words split."""
+    parts = [(None, first)] + [(m.group(1), m.group(2)) for m in
+                               re.finditer(r'(' + _RANGE_SEP + '|' + _LIST_SEP + r')\s*(?:le\s+|de\s+|the\s+|il\s+|dal\s+|du\s+)?'
+                                           + _WD + r'(\d{1,2})', rest or '', re.I)]
+    out = []
+    for sep, day in parts:
+        try:
+            d = dt.date(int(year), month, int(day)) if year else _year_for(month, int(day), ref)
+        except ValueError:
+            d = None
+        if not d:
+            continue
+        if out and out[-1][1] < d and ((sep and re.fullmatch(_RANGE_SEP, sep.strip(), re.I))
+                                       or d == out[-1][1] + dt.timedelta(days=1)):
+            out[-1] = (out[-1][0], d)       # "5 au 7", "5-7" and consecutive "5 et 6" are one span
+        else:
+            out.append((d, d))
+    return out
+
+
+def find_dates(text, ref):
+    """Day mentions in text (EN/FR/NL/IT/DE) -> sorted unique [(start, end)]; ref = publication day for the year."""
+    spans = []
+    for m in DM_RE.finditer(text):
+        mon = MONTHS.get(m.group(3).lower().rstrip('.'))
+        if mon:
+            spans += _spans(m.group(1), m.group(2), mon, ref)
+    for m in MD_RE.finditer(text):
+        mon = MONTHS.get(m.group(1).lower().rstrip('.'))
+        if mon:
+            spans += _spans(m.group(2), m.group(3), mon, ref)
+    for m in NUM_RE.finditer(text):
+        d1, d2, mon_s, y_s, mon_d, y_d = m.groups()[:6]
+        mon = int(mon_s or mon_d)
+        year = y_s or y_d
+        if not 1 <= mon <= 12:
+            continue
+        if year and len(year) == 2:
+            year = '20' + year
+        rest = f' - {d2}' if d2 else ''
+        spans += _spans(d1, rest, mon, ref, year=year)
+    return sorted(set(s for s in spans if s[0] <= s[1] and (s[1] - s[0]).days <= 14))
+
+
+def sectors_in(text):
+    found = [s for s in ('rail', 'air', 'transit', 'general') if SECTOR_RE[s].search(text)]
+    return found
+
+
+# ------------------------------------------------------------------------------------------------ sources
+def strike(source, country, sectors, start, end, title, link, **kw):
+    s = {'source': source, 'official': SOURCES[source][1], 'country': country, 'sectors': sorted(set(sectors)),
+         'start': start.isoformat(), 'end': end.isoformat(), 'title': title[:300], 'link': link, 'hours': '',
+         'who': '', 'scope': '', 'region': '', 'province': '', 'site': False, 'note': '', 'sector_unclear': False}
+    s.update(kw)
+    return s
+
+
+def parse_mit(page):
+    i = page.find('id="scioperiLarge"')
+    if i < 0:
+        raise Fail('MIT page: table scioperiLarge not found (page changed?)')
+    t = page[i:]
+    t = t[:t.find('</table>')] if '</table>' in t else t
+    head = [clean(x).lower().rstrip('*').strip() for x in re.findall(r'<th[^>]*>(.*?)</th>', t, re.S)]
+
+    def col(name):
+        for k, h in enumerate(head):
+            if h.startswith(name):
+                return k
+        return None
+    cols = {n: col(n) for n in ('inizio', 'fine', 'sindacati', 'settore', 'categoria', 'modalit', 'rilevanza', 'note',
+                                'regione', 'provincia')}
+    if any(cols[n] is None for n in ('inizio', 'fine', 'settore', 'categoria', 'regione')):
+        raise Fail('MIT page: columns changed (%s)' % ', '.join(head))
+    out, rows = [], 0
+    for r in re.findall(r'<tr[^>]*>(.*?)</tr>', t, re.S):
+        tds = [clean(x) for x in re.findall(r'<td[^>]*>(.*?)</td>', r, re.S)]
+        if len(tds) < len(head):
+            continue
+        rows += 1
+        g = lambda n: tds[cols[n]] if cols[n] is not None else ''  # noqa: E731
+        try:
+            a = dt.datetime.strptime(g('inizio'), '%d/%m/%Y').date()
+            b = dt.datetime.strptime(g('fine'), '%d/%m/%Y').date()
+        except ValueError:
+            continue
+        sec = MIT_SECTORS.get(g('settore').lower())
+        if not sec:
+            continue
+        cat = g('categoria')
+        out.append(strike('mit', 'IT', sec, a, b, f"{g('settore')}: {cat}", MIT_URL, hours=g('modalit'),
+                          who=g('sindacati'), scope=g('rilevanza'), region=g('regione'), province=g('provincia'),
+                          site=bool(SITE_RE.search(cat)), note=g('note'), category=cat))
+    if rows == 0 and 'Nessun' not in t:
+        raise Fail('MIT page: no rows parsed')
+    return out
+
+
+def parse_irail(text, now):
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise Fail('iRail: not JSON')
+    if not isinstance(data, dict) or 'disturbance' not in data:
+        raise Fail('iRail: no disturbance list')
+    out = []
+    for x in data.get('disturbance') or []:
+        title, desc = clean(x.get('title')), clean(x.get('description'))
+        body = f'{title} {desc}'
+        if not STRIKE_RE.search(body):
+            continue
+        try:
+            ref = dt.datetime.fromtimestamp(int(x.get('timestamp'))).date()
+        except (TypeError, ValueError):
+            ref = today(now)
+        spans = find_dates(body, ref) or ([(ref, ref)] if x.get('type') == 'disturbance' else [])
+        for a, b in spans:
+            out.append(strike('irail', 'BE', ['rail'], a, b, title, x.get('link') or 'https://www.belgiantrain.be/',
+                              note=desc[:240]))
+    return out
+
+
+def rss_items(text):
+    if '<rss' not in text[:2000] and '<feed' not in text[:2000] and '<channel' not in text[:5000]:
+        raise Fail('not an RSS feed')
+    items = []
+    for it in re.findall(r'<item>(.*?)</item>', text, re.S):
+        def tag(n):
+            m = re.search(rf'<{n}[^>]*>(.*?)</{n}>', it, re.S)
+            return clean(re.sub(r'<!\[CDATA\[|\]\]>', '', m.group(1))) if m else ''
+        try:
+            pub = email.utils.parsedate_to_datetime(tag('pubDate')).date()
+        except (TypeError, ValueError):
+            pub = None
+        items.append({'title': tag('title'), 'link': tag('link'), 'pub': pub, 'source': tag('source'),
+                      'desc': tag('description')})
+    return items
+
+
+def parse_sncb(text, now):
+    out = []
+    for it in rss_items(text):
+        if not STRIKE_RE.search(it['title']):
+            continue
+        ref = it['pub'] or today(now)
+        for a, b in find_dates(it['title'], ref):
+            out.append(strike('sncb', 'BE', ['rail'], a, b, it['title'], it['link']))
+    return out
+
+
+_LETTER = r'[^\W\d_]'
+
+
+def _name_re(names):
+    """One regex for the names of a country: whole words ("paris", "sncf"); a trailing * makes a prefix ("belg*")."""
+    alts = [re.escape(n[:-1]) if n.endswith('*') else re.escape(n) + f'(?!{_LETTER})'
+            for n in (str(x).strip().lower() for x in names) if n.strip('*')]
+    return re.compile(f'(?<!{_LETTER})(?:' + '|'.join(sorted(set(alts), key=len, reverse=True)) + ')', re.I) \
+        if alts else None
+
+
+def country_names(all_hints):
+    """-> ({country: regex of its places + words}, {country: regex of its places}) from the config's news_hints.
+    Places (country, city, region names) say which country a headline is about; words (operators, unions) only
+    confirm the query's own country; outlets name no country."""
+    own, places = {}, {}
+    for c, h in (all_hints or {}).items():
+        h, c = h or {}, str(c).upper()
+        for d, names in ((own, (h.get('places') or []) + (h.get('words') or [])), (places, h.get('places') or [])):
+            rx = _name_re(names)
+            if rx:
+                d[c] = rx
+    return own, places
+
+
+def headline_only(title, source):
+    """Google News appends " - <outlet>": the outlet's name is not what the headline is about."""
+    if source and title.lower().endswith(' - ' + source.lower()):
+        return title[:-(len(source) + 3)]
+    return title
+
+
+def about(title, country, names, watched):
+    """-> ([countries the headline counts for], why not): the query's country when the headline names it (a place
+    or a word); else the other watched countries whose places it names (each keeps its own dedupe key); else none.
+    A country without names in the config is not filtered (unless the headline names another country's place)."""
+    own, places = names
+    if country in own and own[country].search(title):
+        return [country], ''
+    others = sorted(c for c, rx in places.items() if c != country and rx.search(title))
+    if others:
+        moved = [c for c in others if c in watched]
+        return moved, ('' if moved else f"headline about {'/'.join(others)}, not {country}")
+    if country not in own:
+        return [country], ''
+    return [], f'headline not clearly about {country}'
+
+
+def parse_news(text, country, now, all_hints=None, watched=()):
+    """Headlines of one query for `country`. A headline counts for a country only when it names it (news_hints:
+    places in any of the query languages, or words); one naming only another watched country moves there."""
+    names = country_names(all_hints)
+    watched = set(watched) | {country}
+    outlets = {c: [o.lower() for o in (h or {}).get('outlets') or []] for c, h in (all_hints or {}).items()}
+    out = []
+    for it in rss_items(text):
+        title = it['title']
+        if not STRIKE_RE.search(title):
+            continue
+        ref = it['pub'] or today(now)
+        if (today(now) - ref).days > 45:
+            continue
+        outlet = (it['source'] or title.rsplit(' - ', 1)[-1]).lower()
+        targets, why = about(headline_only(title, it['source']), country, names, watched)
+        sec = sectors_in(title)
+        for a, b in find_dates(title, ref):
+            for c in targets or [country]:
+                extra = {'hinted': False, 'not_about': why} if not targets else {}
+                if c != country:
+                    extra['query_country'] = country
+                out.append(strike('news', c, sec or ['general'], a, b, title, it['link'], who=it['source'],
+                                  sector_unclear=not sec, published=ref.isoformat(),
+                                  known_outlet=any(o == outlet or o in outlet for o in outlets.get(c) or []),
+                                  **extra))
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ trips + matching
+def load_config():
+    try:
+        cfg = jsonstate.load(CONFIG, None, strict=True)
+    except ValueError as e:
+        die(f'strike-watch: config {CONFIG} is not valid JSON ({e})')
+    if not cfg:
+        die(f'strike-watch: no config at {CONFIG} (see --help)')
+    COUNTRY.update({str(k).upper(): str(v) for k, v in (cfg.get('country_names') or {}).items()})
+    try:
+        margin = int(cfg.get('margin_days', 1))
+        legs = []
+        for t in cfg.get('trips') or []:
+            for k, lg in enumerate(t.get('legs') or []):
+                a, b = d_iso(lg['from']), d_iso(lg.get('to') or lg['from'])
+                secs = [s for s in lg.get('sectors') or ALL_SECTORS if s in ALL_SECTORS]
+                legs.append({'trip': t.get('id') or t.get('label') or 'trip', 'label': t.get('label') or t.get('id'),
+                             'leg': k, 'country': lg['country'].upper(), 'from': a, 'to': b, 'sectors': secs,
+                             'what': lg.get('what', ''), 'win_from': a - dt.timedelta(days=margin),
+                             'win_to': b + dt.timedelta(days=margin)})
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        die(f'strike-watch: bad trip in config ({e.__class__.__name__}: {e})')
+    return cfg, legs
+
+
+def active_legs(legs, now):
+    return [lg for lg in legs if lg['win_to'] >= today(now)]
+
+
+def place_words(cfg, country, sector):
+    p = (cfg.get('places') or {}).get(country) or {}
+    return [w.upper() for w in p.get(sector) or []]
+
+
+def judge(s, lg, cfg, now):
+    """-> (relevant, reason, sectors hit) for one strike against one leg (same country, overlapping window)."""
+    a, b = d_iso(s['start']), d_iso(s['end'])
+    if b < today(now):
+        return False, 'already over', []
+    if s.get('hinted') is False:
+        return False, s.get('not_about') or f"headline not clearly about {s['country']}", []
+    want = set(lg['sectors'])
+    hit = sorted(want) if 'general' in s['sectors'] else sorted(want & set(s['sectors']))
+    if not hit:
+        return False, 'other sector (%s)' % ', '.join(s['sectors']), []
+    p = (cfg.get('places') or {}).get(s['country']) or {}
+    region = s.get('region') or ''
+    if region and region.lower() not in ('italia', 'tutte') and \
+            region.lower() not in [r.lower() for r in p.get('regions') or []]:
+        return False, f'other region ({region})', []
+    prov = s.get('province') or ''
+    if prov and prov.lower() not in ('tutte', '') and \
+            prov.lower() not in [r.lower() for r in p.get('provinces') or []]:
+        return False, f'other province ({prov})', []
+    if s.get('site'):
+        text = (s.get('category') or s['title']).upper()
+        words = [w for sec in hit for w in place_words(cfg, s['country'], sec)]
+        if not any(w in text for w in words):
+            return False, 'one site elsewhere', []
+    return True, '', hit
+
+
+def evaluate(strikes, legs, cfg, now):
+    relevant, skipped = [], []
+    for s in strikes:
+        a, b = d_iso(s['start']), d_iso(s['end'])
+        ok_legs, first_why = [], None
+        for lg in legs:
+            if lg['country'] != s['country'] or b < lg['win_from'] or a > lg['win_to']:
+                continue
+            ok, why, hit = judge(s, lg, cfg, now)
+            if ok:
+                ok_legs.append((lg, hit))
+            elif first_why is None:
+                first_why = (lg, why)
+        if not ok_legs and first_why is None:
+            continue
+        lg = (ok_legs[0] if ok_legs else first_why)[0]
+        same = [x for x in ok_legs if x[0]['trip'] == lg['trip']]
+        item = dict(s, trip=lg['trip'], trip_label=lg['label'], leg=lg['leg'],
+                    leg_what='; '.join(dict.fromkeys(x[0]['what'] for x in same if x[0]['what'])) or lg['what'],
+                    leg_from=min(x[0]['from'] for x in same or [(lg,)]).isoformat(),
+                    leg_to=max(x[0]['to'] for x in same or [(lg,)]).isoformat())
+        if ok_legs:
+            item['hit'] = [sec for sec in ALL_SECTORS if any(sec in x[1] for x in same)]
+            item['key'] = key_for(item)
+            relevant.append(item)
+        else:
+            item['why'] = first_why[1]
+            skipped.append(item)
+    # official: one per key (SNCB's FR + NL releases and iRail share a key per day); news: one per country + days,
+    # the most specific headline, dropped when an official item covers those days
+    off = list({r['key']: r for r in reversed([r for r in relevant if r['official']])}.values())
+    best_news = {}
+    for r in relevant:
+        if r['official']:
+            continue
+        if any(o['country'] == r['country'] and o['start'] <= r['end'] and r['start'] <= o['end'] and
+               set(o['hit']) & set(r['hit']) for o in off):
+            continue
+        k = r['key']
+        cur = best_news.get(k)
+        rank = lambda x: (len(x['hit']), len(set(x['sectors']) & set(ALL_SECTORS)),  # noqa: E731
+                          bool(x.get('known_outlet')), x.get('published', ''))
+        if cur is None or rank(r) > rank(cur):
+            best_news[k] = r
+    relevant = off + list(best_news.values())
+    skipped = list({(x['country'], x['start'], x['end'], x['title']): x for x in skipped}.values())
+    relevant.sort(key=lambda r: (r['start'], r['country'], not r['official']))
+    return relevant, skipped
+
+
+def key_for(r):
+    if r['source'] in ('irail', 'sncb'):     # one operator: its feed and both newsrooms describe the same strike
+        return f"sncb-{r['country']}-{r['start']}-{r['end']}"
+    if r['official']:
+        basis = '|'.join([r['source'], r['country'], r['start'], r['end'], r['title'], r.get('who', ''),
+                          r.get('region', ''), r.get('province', '')])
+        return f"{r['source']}-{hashlib.sha1(basis.encode()).hexdigest()[:10]}"
+    return f"news-{r['country']}-{r['start']}-{r['end']}"
+
+
+# ------------------------------------------------------------------------------------------------ gathering
+def gather(cfg, legs, now, log):
+    countries = {lg['country'] for lg in legs}
+    health, strikes = {}, []
+    news_cfg = cfg.get('news') or {}
+
+    def run(name, fn):
+        try:
+            got = fn()
+            health[name] = {'ok': True, 'count': len(got)}
+            strikes.extend(got)
+        except Fail as e:
+            health[name] = {'ok': False, 'error': str(e)}
+            log(f'{name}: {e}')
+        except Exception as e:        # a parser bug must not stop the other sources
+            health[name] = {'ok': False, 'error': f'parser error {e.__class__.__name__}: {e}'}
+            log(f'{name}: parser error {e!r}')
+
+    if 'IT' in countries:
+        run('mit', lambda: parse_mit(fetch(MIT_URL)))
+    if 'BE' in countries:
+        def irail():
+            got, errs = [], []
+            for u in IRAIL_URLS:
+                try:
+                    got += parse_irail(fetch(u), now)
+                except Fail as e:
+                    errs.append(str(e))
+            if len(errs) == len(IRAIL_URLS):
+                raise Fail('; '.join(errs))
+            return got
+
+        def sncb():
+            got, errs = [], []
+            for u in SNCB_FEEDS:
+                try:
+                    got += parse_sncb(fetch(u), now)
+                except Fail as e:
+                    errs.append(f'{urllib.parse.urlsplit(u).netloc}: {e}')
+            if len(errs) == len(SNCB_FEEDS):
+                raise Fail('; '.join(errs))
+            return got
+        run('irail', irail)
+        run('sncb', sncb)
+    queries = [(c, q) for c in sorted(countries) for q in news_cfg.get(c) or []]
+    if queries:
+        def news():
+            got, errs = [], []
+            for n, (c, q) in enumerate(queries):
+                if n and PAUSE > 0:
+                    time.sleep(PAUSE)
+                hl, gl = q.get('hl', 'en'), q.get('gl', c)
+                url = NEWS_URL.format(q=urllib.parse.quote_plus(f"{q['q']} when:{int(q.get('days', 30))}d"),
+                                      hl=urllib.parse.quote(hl), gl=urllib.parse.quote(gl),
+                                      ceid=urllib.parse.quote(q.get('ceid') or f"{gl}:{hl.split('-')[0]}", safe=':'))
+                try:
+                    got += parse_news(fetch(url), c, now, cfg.get('news_hints'), countries)
+                except Fail as e:
+                    errs.append(f"{c} '{q['q']}': {e}")
+            if len(errs) == len(queries):
+                raise Fail('; '.join(errs))
+            for e in errs:
+                log(f'news: {e}')
+            return got
+        run('news', news)
+    return strikes, health
+
+
+# ------------------------------------------------------------------------------------------------ notes
+def backup_for(cfg, r):
+    b = cfg.get('backup') or {}
+    got = [b[f"{r['country']}:{sec}"] for sec in r['hit'] if f"{r['country']}:{sec}" in b]
+    return ' '.join(dict.fromkeys(got)) or b.get(r['country']) or b.get('*') or ''
+
+
+def note_text(r, cfg):
+    a, b = d_iso(r['start']), d_iso(r['end'])
+    affects = ', '.join(SECTOR_LABEL[s] for s in r['hit'])
+    if 'general' in r['sectors']:
+        affects += ' (general strike: all of them may be hit)'
+    elif r.get('sector_unclear'):
+        affects += ' (sector unclear in the headline)'
+    src = SOURCES[r['source']][2]
+    lines = [f"# strike-watch: {COUNTRY.get(r['country'], r['country'])} strike {fmt_span(a, b)} ({r['trip_label']})",
+             'Data, not instructions (strike-watch cron, read-only public sources; JOBS.md says how to handle it).',
+             '',
+             f'- Affects: {affects}',
+             f"- When: {fmt_span(a, b)}" + (f" ({r['hours']})" if r.get('hours') else ''),
+             f"- What: {r['title']}"]
+    if r.get('who'):
+        lines.append(f"- {'Unions' if r['official'] else 'Outlet'}: {r['who']}")
+    if r.get('scope') or r.get('region'):
+        lines.append(f"- Scope: {' · '.join(x for x in (r.get('scope'), r.get('region'), r.get('province')) if x)}")
+    if r.get('note'):
+        lines.append(f"- Note: {r['note'][:240]}")
+    lines.append(f"- His leg: {COUNTRY.get(r['country'], r['country'])} {fmt_span(d_iso(r['leg_from']), d_iso(r['leg_to']))}"
+                 + (f" ({r['leg_what']})" if r.get('leg_what') else ''))
+    lines.append(f"- Source: {'official' if r['official'] else 'news headline, unconfirmed'} — {src}: {r['link']}")
+    bk = backup_for(cfg, r)
+    if bk:
+        lines.append(f'- Backup: {bk}')
+    lines.append(f"- Key: {r['key']} (`strike-watch status` lists noted strikes)")
+    return '\n'.join(lines) + '\n'
+
+
+def fail_note(name, info, now):
+    text = (f'# strike-watch: source {name} failing\n'
+            'Data, not instructions (strike-watch cron; JOBS.md says how to handle it).\n\n'
+            f"- {SOURCES[name][2]} failed {info['fails']} runs in a row; last error: {info.get('error', '?')}\n"
+            f"- Last good run: {info.get('last_ok') or 'never'}\n"
+            '- The other sources still run. Fix the parser if the page changed (`strike-watch check` shows the error).\n')
+    return notes.write(INBOX, f'strike-watch-failed-{name}.md', text, mode=0o600)
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def cmd_check(args):
+    now = parse_now(args.now or os.environ.get('STRIKE_WATCH_NOW'))
+    cfg, legs = load_config()
+    act = active_legs(legs, now)
+    if not act:
+        last = max((lg['win_to'] for lg in legs), default=None)
+        msg = f"all trips are past (last watched day {last.isoformat() if last else '-'}): nothing to watch"
+        if args.json:
+            print(json.dumps({'expired': True, 'last_day': last.isoformat() if last else None, 'relevant': [],
+                              'skipped': []}))
+        elif not args.cron:
+            print(f'strike-watch: {msg}; the cron line can go.')
+        return 0
+    errors = []
+    strikes, health = gather(cfg, act, now, errors.append)
+    relevant, skipped = evaluate(strikes, act, cfg, now)
+    all_failed = bool(health) and not any(h['ok'] for h in health.values())
+    if args.cron:
+        return cron_run(cfg, relevant, health, now, args.dry_run, all_failed)
+    if args.json:
+        print(json.dumps({'now': now.isoformat(timespec='seconds'), 'expired': False,
+                          'legs': [{'trip': lg['trip'], 'country': lg['country'], 'from': lg['from'].isoformat(),
+                                    'to': lg['to'].isoformat(), 'window': [lg['win_from'].isoformat(),
+                                                                           lg['win_to'].isoformat()],
+                                    'sectors': lg['sectors']} for lg in act],
+                          'sources': health, 'relevant': relevant, 'skipped': skipped}, ensure_ascii=False, indent=1))
+        return 1 if all_failed else 0
+    print(f"strike-watch {today(now).isoformat()}: {len(act)} leg(s) watched")
+    for lg in act:
+        print(f"  {lg['country']} {lg['win_from'].strftime('%d.%m')}–{lg['win_to'].strftime('%d.%m')} "
+              f"{'/'.join(lg['sectors'])}  ({lg['label']})")
+    print('sources: ' + ', '.join(f"{n} {'ok (%d)' % h['count'] if h['ok'] else 'FAILED: ' + h['error']}"
+                                  for n, h in health.items()))
+    if relevant:
+        print(f'\n{len(relevant)} strike(s) on his trip days:')
+        for r in relevant:
+            print(f"- {r['country']} {fmt_span(d_iso(r['start']), d_iso(r['end']))} "
+                  f"[{', '.join(SECTOR_LABEL[s] for s in r['hit'])}] "
+                  f"{'official' if r['official'] else 'news'}: {r['title'][:150]}"
+                  + (f" ({r['hours']})" if r.get('hours') else ''))
+            print(f"    {r['link'][:160]}")
+    else:
+        print('\nno strike on his trip days (for the watched countries and sectors)')
+    if skipped:
+        print(f'\n{len(skipped)} in a window but not his (filtered):')
+        for s in skipped:
+            print(f"- {s['country']} {fmt_span(d_iso(s['start']), d_iso(s['end']))} {s['why']}: {s['title'][:110]}")
+    return 1 if all_failed else 0
+
+
+def cron_run(cfg, relevant, health, now, dry, all_failed):
+    fd = locks.acquire(LOCK_F, wait=0)                    # held until the process ends (core.locks)
+    if fd is None:
+        print('strike-watch: another run holds the lock', file=sys.stderr)
+        return 0
+    state = jsonstate.load(STATE_F, {}, strict=True)
+    seen = state.setdefault('seen', {})
+    src = state.setdefault('sources', {})
+    stamp = now.isoformat(timespec='seconds')
+    wrote = []
+    for r in relevant:
+        k = r['key']
+        if k in seen:
+            continue
+        if not r['official'] and any(v.get('official') and v['country'] == r['country'] and v['start'] <= r['end']
+                                     and r['start'] <= v['end'] and set(v.get('hit', [])) & set(r['hit'])
+                                     for v in seen.values()):
+            continue      # an official note already covers these days
+        name = (f"strike-watch-{r['country'].lower()}-{r['start'].replace('-', '')}-{r['source']}-"
+                f"{hashlib.sha1(k.encode()).hexdigest()[:8]}.md")
+        if dry:
+            print(f'would note {name}:\n{note_text(r, cfg)}')
+            continue
+        notes.write(INBOX, name, note_text(r, cfg), mode=0o600)
+        seen[k] = {'first': stamp, 'note': name, 'country': r['country'], 'start': r['start'], 'end': r['end'],
+                   'hit': r['hit'], 'official': r['official'], 'title': r['title'][:160], 'trip': r['trip']}
+        wrote.append(name)
+    for name, h in health.items():
+        s = src.setdefault(name, {})
+        if h['ok']:
+            s.update(fails=0, last_ok=stamp, noted=False, error='')
+        else:
+            s['fails'] = s.get('fails', 0) + 1
+            s['error'] = h['error']
+            if s['fails'] >= FAIL_NOTE_AFTER and not s.get('noted') and not dry:
+                fail_note(name, s, now)
+                s['noted'] = True
+    state['last_run'] = stamp
+    keep = today(now) - dt.timedelta(days=60)
+    for k in [k for k, v in seen.items() if d_iso(v['end']) < keep]:
+        del seen[k]
+    if not dry:
+        write_json(STATE_F, state)
+    return 1 if all_failed else 0
+
+
+def cmd_status(args):
+    now = parse_now(args.now or os.environ.get('STRIKE_WATCH_NOW'))
+    cfg, legs = load_config()
+    state = jsonstate.load(STATE_F, {}, strict=True)
+    act = active_legs(legs, now)
+    last = max((lg['win_to'] for lg in legs), default=None)
+    out = {'expired': not act, 'last_day': last.isoformat() if last else None, 'last_run': state.get('last_run'),
+           'legs': [{'trip': lg['trip'], 'country': lg['country'], 'window': [lg['win_from'].isoformat(),
+                                                                              lg['win_to'].isoformat()],
+                     'sectors': lg['sectors'], 'active': lg in act} for lg in legs],
+           'sources': state.get('sources', {}), 'noted': state.get('seen', {})}
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return 0
+    print(f"strike-watch: {'EXPIRED (nothing to watch)' if not act else 'active'}; last watched day "
+          f"{out['last_day']}; last cron run {out['last_run'] or 'never'}")
+    for lg in out['legs']:
+        print(f"  {'*' if lg['active'] else ' '} {lg['trip']}: {lg['country']} {lg['window'][0]} .. {lg['window'][1]} "
+              f"{'/'.join(lg['sectors'])}")
+    for n, s in out['sources'].items():
+        print(f"  source {n}: {'ok' if not s.get('fails') else 'failing x%d: %s' % (s['fails'], s.get('error'))}"
+              f" (last ok {s.get('last_ok') or 'never'})")
+    for k, v in sorted(out['noted'].items(), key=lambda kv: kv[1]['start']):
+        print(f"  noted {v['start']} {v['country']} {'/'.join(v.get('hit', []))}: {v['title'][:90]} ({v['note']})")
+    return 0
+
+
+def cmd_sources(_args):
+    for n, (cc, off, what) in SOURCES.items():
+        print(f"{n:6} {'official' if off else 'news    '} {','.join(cc) or 'config'}: {what}")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='strike-watch', description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    c = sub.add_parser('check')
+    c.add_argument('--json', action='store_true')
+    c.add_argument('--cron', action='store_true')
+    c.add_argument('--dry-run', action='store_true')
+    c.add_argument('--now')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--now')
+    sub.add_parser('sources')
+    a = ap.parse_args(argv)
+    if a.cmd == 'check':
+        return cmd_check(a)
+    if a.cmd == 'status':
+        return cmd_status(a)
+    return cmd_sources(a)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

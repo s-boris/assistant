@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# transcribe <audio-file> [--lang auto|de|en|sr|...]
+# Local speech-to-text (whisper.cpp, large-v3-turbo q8_0, CPU). Prints the transcript to stdout only.
+# Any audio/video ffmpeg can read works (Telegram voice notes are OGG/Opus).
+#
+# Fast path: the warm whisper-server on 127.0.0.1:8178 (model preloaded; ~/bin/whisper-server-ctl, started by
+# boot.sh, kept alive by cron). If it's down or errors, falls back to whisper-cli with identical settings.
+# Vocabulary: ~/.config/transcribe/vocab.txt is passed as Whisper's initial prompt so names/terms come out right
+# ("Radarr", the server's name, your town ...). Edit it freely; keep it short.
+#
+# Env overrides:
+#   TRANSCRIBE_MODEL    ggml model path (default ~/opt/whisper-models/ggml-large-v3-turbo-q8_0.bin; CLI path only,
+#                       the server uses whatever whisper-server-ctl loaded)
+#   TRANSCRIBE_THREADS  CPU threads (default min(nproc, 24); 32 is much slower when the host is busy, 16 ~15% slower)
+#   TRANSCRIBE_LANGS    the owner's languages (default de,en,sr). With --lang auto, if Whisper detects a
+#                       language outside this set that it commonly confuses with one inside it (e.g. ru/hr/sk
+#                       for Serbian, nl/lb for Swiss German), the note is re-run in that language.
+#   TRANSCRIBE_VOCAB    vocabulary file (default ~/.config/transcribe/vocab.txt; empty/missing = no prompt)
+#   TRANSCRIBE_SERVER   server URL (default http://127.0.0.1:8178; "off" = always use the CLI)
+#   TRANSCRIBE_DEBUG=1  show whisper/ffmpeg logs on stderr
+#
+# whisper.cpp lives in ~/opt/whisper.cpp with a local patch (~/opt/whisper-patches) that skips the
+# duplicate encoder pass after language detection (~40% faster for notes up to 30 s).
+# Rebuild/update: apt install build-essential cmake; cd ~/opt/whisper.cpp; git pull (re-apply the patch with
+# git apply ~/opt/whisper-patches/*.patch); cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON;
+# cmake --build build -j 24. Then: whisper-server-ctl restart.
+#
+# Tuning (regression set + WER/time runner in ~/opt/transcribe-tests; run.py --table):
+#   vocab prompt: WER 7.4% -> 2.9%, no hallucinations on silence/noise/unrelated speech, ~+0.1 s.
+#   beam 5 (default) beats greedy (3.8%) at ~same speed; large-v3 non-turbo q5_0 only 2.2% but 12 s per 30 s note;
+#   -ac (shortened audio context) breaks turbo completely; 24 threads beats 8/16/32.
+#   Timings (24 threads, busy host, end to end): server 3 s note ~3.4 s, 30 s note ~4.9 s; CLI ~3.6 s / ~4.9 s
+#   (encoder ~2.8 s per 30 s window dominates; the server only saves the ~0.2 s model load + a cold page cache);
+#   +~3-4 s on a Slavic/Germanic re-run.
+set -euo pipefail
+
+usage() { echo "usage: transcribe <audio-file> [--lang auto|de|en|sr|...]" >&2; exit 2; }
+
+lang=auto; file=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lang|-l) [ $# -ge 2 ] || usage; lang=$2; shift 2 ;;
+    --lang=*) lang=${1#--lang=}; shift ;;
+    -h|--help) usage ;;
+    *) [ -z "$file" ] || usage; file=$1; shift ;;
+  esac
+done
+[ -n "$file" ] || usage
+[ -r "$file" ] || { echo "transcribe: cannot read '$file'" >&2; exit 1; }
+
+WHISPER=$HOME/opt/whisper.cpp/build/bin/whisper-cli
+MODELS=$HOME/opt/whisper-models
+model=${TRANSCRIBE_MODEL:-$MODELS/ggml-large-v3-turbo-q8_0.bin}
+vad=$MODELS/ggml-silero-v6.2.0.bin
+threads=${TRANSCRIBE_THREADS:-$(( $(nproc) < 24 ? $(nproc) : 24 ))}
+allowed=${TRANSCRIBE_LANGS:-de,en,sr}
+vocab_file=${TRANSCRIBE_VOCAB:-$HOME/.config/transcribe/vocab.txt}
+server=${TRANSCRIBE_SERVER:-http://127.0.0.1:8178}
+[ -n "${TRANSCRIBE_MODEL:-}" ] && server=off   # a custom model only works via the CLI
+
+command -v ffmpeg >/dev/null || { echo "transcribe: ffmpeg not installed (boot.sh installs it)" >&2; exit 1; }
+
+# Vocabulary prompt: strip comments, join lines/commas into one "a, b, c" list.
+prompt=
+if [ -r "$vocab_file" ]; then
+  prompt=$(sed -e 's/#.*//' "$vocab_file" | tr '\n' ',' | sed -e 's/[[:space:]]*,[[:space:],]*/, /g' -e 's/^, //' -e 's/, $//' -e 's/^[[:space:]]*//')
+  [ -n "$prompt" ] && prompt="$prompt."
+fi
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/transcribe.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+debug() { [ "${TRANSCRIBE_DEBUG:-}" = 1 ]; }
+log() { if debug; then cat "$1" >&2; fi; }
+
+ffmpeg -nostdin -hide_banner -loglevel error -y -i "$file" -vn -ac 1 -ar 16000 -c:a pcm_s16le "$tmp/in.wav" 2>"$tmp/ffmpeg.log" \
+  || { cat "$tmp/ffmpeg.log" >&2; echo "transcribe: ffmpeg could not decode '$file'" >&2; exit 1; }
+
+# Whisper's full language names (server JSON) -> codes, for the languages the retry logic cares about.
+code_of() {
+  case "$1" in
+    english) echo en ;; german) echo de ;; serbian) echo sr ;; russian) echo ru ;; ukrainian) echo uk ;;
+    belarusian) echo be ;; bulgarian) echo bg ;; macedonian) echo mk ;; croatian) echo hr ;; bosnian) echo bs ;;
+    slovenian) echo sl ;; slovak) echo sk ;; czech) echo cs ;; polish) echo pl ;; dutch) echo nl ;;
+    luxembourgish) echo lb ;; afrikaans) echo af ;; yiddish) echo yi ;; danish) echo da ;; norwegian) echo no ;;
+    nynorsk) echo nn ;; swedish) echo sv ;; *) echo "$1" ;;
+  esac
+}
+
+run_server() {  # run_server <lang>: transcript -> $tmp/out.txt, detected language code -> $tmp/lang
+  [ "$server" != off ] || return 1
+  # no_language_probabilities: otherwise verbose_json runs a second language-detection encoder pass (+3 s).
+  curl -sS --max-time 600 "$server/inference" -F "file=@$tmp/in.wav" -F "language=$1" -F "prompt=$prompt" \
+    -F response_format=verbose_json -F no_language_probabilities=true -F token_timestamps=false -F no_timestamps=true -F beam_size=5 -F best_of=5 \
+    -F vad=true -F vad_speech_pad_ms=200 -F vad_min_silence_duration_ms=500 \
+    -o "$tmp/resp.json" 2>"$tmp/curl.log" || { log "$tmp/curl.log"; return 1; }
+  jq -e 'has("text")' "$tmp/resp.json" >/dev/null 2>&1 || { debug && cat "$tmp/resp.json" >&2; return 1; }
+  jq -r '.segments[]?.text' "$tmp/resp.json" >"$tmp/out.txt"
+  code_of "$(jq -r '.language // ""' "$tmp/resp.json")" >"$tmp/lang"
+  debug && echo "transcribe: via server, language $(cat "$tmp/lang")" >&2
+  return 0
+}
+
+run_cli() {  # run_cli <lang>: same outputs as run_server
+  for f in "$WHISPER" "$model" "$vad"; do
+    [ -e "$f" ] || { echo "transcribe: missing $f (see ~/opt/whisper-models, ~/opt/whisper.cpp)" >&2; exit 1; }
+  done
+  # VAD (silero) drops silence/noise, which otherwise makes Whisper hallucinate ("you", "Untertitel ...").
+  # Beam search 5 is whisper-cli's default.
+  "$WHISPER" -m "$model" -f "$tmp/in.wav" -l "$1" -t "$threads" -nt ${prompt:+--prompt "$prompt"} \
+    --vad -vm "$vad" -vp 200 -vsd 500 >"$tmp/out.txt" 2>"$tmp/whisper.log" \
+    || { cat "$tmp/whisper.log" >&2; echo "transcribe: whisper failed" >&2; exit 1; }
+  log "$tmp/whisper.log"
+  sed -n 's/.*auto-detected language: \([a-z]*\).*/\1/p' "$tmp/whisper.log" | head -1 >"$tmp/lang"
+}
+
+run() { run_server "$1" || run_cli "$1"; }
+
+run "$lang"
+
+if [ "$lang" = auto ]; then
+  detected=$(cat "$tmp/lang" 2>/dev/null || true)
+  case ",$allowed," in *",$detected,"*) retry= ;; *)
+    retry=
+    case "$detected" in
+      ru|uk|be|bg|mk|hr|bs|sl|sk|cs|pl) retry=sr ;;   # Slavic confusions -> Serbian
+      nl|lb|af|yi|da|no|nn|sv) retry=de ;;            # Germanic confusions (Swiss speakers) -> German
+    esac
+    case ",$allowed," in *",$retry,"*) ;; *) retry= ;; esac ;;
+  esac
+  if [ -n "$retry" ]; then
+    debug && echo "transcribe: detected '$detected', re-running as '$retry'" >&2
+    run "$retry"
+  fi
+fi
+
+# One line per segment from whisper; join into one clean paragraph.
+sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$tmp/out.txt" | grep -v '^$' | paste -sd' ' - || true

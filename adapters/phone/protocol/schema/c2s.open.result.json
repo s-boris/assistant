@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.open.result.json",
+  "title": "what the phone did with an open frame (no text, no url): opened = started directly; notified = a tap-to-open notification instead; refused = unsafe url or no such app; stale = arrived after until; no_handler = nothing on the phone opens it. how = what let it open (overlay = Display over other apps, foreground = the app on screen, companion = a companion device association) or notification/none.",
+  "type": "object",
+  "properties": {
+    "open_id": {
+      "type": "string",
+      "pattern": "^o_[A-Za-z0-9]{1,40}$"
+    },
+    "result": {
+      "enum": [
+        "opened",
+        "notified",
+        "refused",
+        "stale",
+        "no_handler"
+      ]
+    },
+    "how": {
+      "enum": [
+        "overlay",
+        "foreground",
+        "companion",
+        "notification",
+        "none"
+      ]
+    },
+    "locked": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "car": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "open_id",
+    "result"
+  ]
+}

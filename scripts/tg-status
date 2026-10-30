@@ -1,0 +1,1023 @@
+#!/usr/local/bin/python3.13 -I
+"""tg-status: one pinned message in the owner's Telegram chat that shows what the main session is doing.
+
+  tg-status refresh | render   re-render and edit the pinned message if anything changed
+                               (cron runs this every 5 min; it also turns a stale "working" into idle)
+  tg-status hook [event]       feed one Claude Code hook payload (JSON on stdin); used by ~/.claude/settings.json
+  tg-status note [text...]     set a one-line manual note shown under the header; no text clears it
+  tg-status title [ID|PREFIX [title...]]
+                               rename a background agent on the board (and in agent-watch): a short owner-readable
+                               title instead of its spawn description; no title clears it; no ID lists the titles
+                               (file: lib/agent_titles.py, ~/.local/state/agent-titles/titles.json)
+  tg-status reset              unpin and forget the current message, then send and pin a fresh one
+  tg-status show [--plain]     print what the message would say (no Telegram call)
+
+TODO.md "## Due" items are split with hb-gate's own parser (~/bin/hb-gate due_at: the earliest date/time in the
+line, yearless DD.MM = the nearest such day): "❗ Due" (and the ❗ count) only holds items whose time has come or
+that carry no date/time; the rest go under "🕒 Next", sorted, each with its time (HH:MM today, else DD.MM HH:MM).
+If hb-gate can't be loaded, every Due item counts as due (the old behaviour).
+The board carries one "📞 Talk" button (callback call:talk: telegram-plus runs ~/bin/talk-button as an instant button
+and the voice relay rings him; TG_STATUS_TALK=0 hides it); every edit re-sends it, since an edit without it drops it.
+Edits happen only when the board changed. Background-agent ages are shown in 10-min steps, and a change of ages
+alone edits at most once per 10 min (a helper agent's hook fires every minute).
+One sender: while the live tg-adapter runs (core.tg's gate; switch ~/.config/tg-adapter/direct-tg-status
+or direct-all = always direct), the board's Bot API calls become rows in the live outbox and the adapter makes them:
+the board is never held or deduped, its Talk keyboard is marked "keep" by the adapter (on_press), and tg-status reads
+no token. Otherwise, or when the adapter goes away mid-call, it calls the Bot API directly; an outbox that
+does not answer in 10 s backs the board off for 30 s like a 429.
+State, lock files and a log live in ~/.local/state/tg-status/. Only the main session (the claude process
+started with `--channels ...`) drives working/idle and the "Now:" line; its subagents (hook payloads that carry
+agent_id) only add or remove "Background" entries; every other claude process is ignored.
+Debugging: TG_STATUS_TRACE=1 in a session's environment logs every hook decision to the log file.
+Testing: TG_STATUS_DIR=<dir> for a separate state; TG_STATUS_API=<mock url> with TG_STATUS_TEST_TOKEN and
+TG_STATUS_TEST_CHAT (the real token only ever goes to api.telegram.org); TG_STATUS_DEBOUNCE=<seconds> (0 in tests,
+so no trailing render outlives a test); TG_STATUS_NOW=<epoch s | "YYYY-MM-DD HH:MM" Zurich> fixes the clock for the
+Due/Next split only; TG_STATUS_HB_GATE=<path> loads another hb-gate; TG_STATUS_BUTTONS=<path|off> (telegram-plus's
+buttons.json; with a mock API only when set). Tests: tests/legacy/tg-status/run.sh in ~/opt/assistant.
+"""
+import contextlib, fcntl, hashlib, html, json, os, re, subprocess, sys, time, types
+import urllib.error, urllib.request
+from datetime import datetime
+BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(BIN_DIR, 'lib'))
+import assistant_profile  # noqa: E402
+try:
+    import agent_titles  # noqa: E402  (renamed agents; without it the board shows spawn descriptions)
+except ImportError:
+    agent_titles = None
+
+
+def owner_zone():
+    """The owner's time zone (assistant_profile.tz(): locale.tz, else its fallback; never raises): times on the
+    board never follow the process TZ."""
+    return assistant_profile.tz()
+
+
+ZONE = owner_zone()
+
+HOME = os.path.expanduser('~')
+STATE_DIR = os.environ.get('TG_STATUS_DIR') or os.path.join(HOME, '.local/state/tg-status')
+STATE = os.path.join(STATE_DIR, 'state.json')
+TODO = os.environ.get('TG_STATUS_TODO') or os.path.join(HOME, 'workspace/TODO.md')
+TG_DIR = os.path.join(HOME, '.claude/channels/telegram')
+REAL_API = 'https://api.telegram.org'
+API = (os.environ.get('TG_STATUS_API') or REAL_API).rstrip('/')
+# The "📞 Talk" button under the board: callback call:talk, run by telegram-plus as an instant button
+# (callbacks.json → ~/bin/talk-button: the voice relay rings him). TG_STATUS_TALK=0 hides it. Its keyboard is marked
+# "keep" in telegram-plus's buttons.json (TG_STATUS_BUTTONS: a path or "off"; with a mock API only when set), and
+# the mark is refreshed weekly on an edit (the plugin forgets marks after 30 days).
+TALK = (os.environ.get('TG_STATUS_TALK') or '1').strip().lower() not in ('0', 'off', 'no', 'false')
+TALK_MARKUP = {'inline_keyboard': [[{'text': '📞 Talk', 'callback_data': 'call:talk'}]]}
+KEEP_REFRESH = 7 * 86400
+
+DEBOUNCE = float(os.environ.get('TG_STATUS_DEBOUNCE') or 4.0)   # at most one Telegram call per this many seconds; later updates get one trailing render
+STALE = 600        # "working" with no main-session hook activity for this long -> idle
+MAX_CHARS = 900    # visible length budget of the message
+AGE_STEP = 600     # background-agent ages are shown in steps of this; an age-only change edits at most this often
+SKIP_TOOLS = {'ToolSearch', 'TodoWrite', 'TaskList', 'TaskGet', 'TaskUpdate', 'TaskCreate', 'TaskOutput',
+              'SubagentHandback', 'ExitPlanMode'}
+SKIP_PREFIXES = ('mcp__plugin_telegram',)   # replies/reactions: the owner sees those anyway
+SHOWN_TASKS = ('subagent', 'workflow')       # background_tasks types listed under "Background"
+DONE = {'completed', 'failed', 'killed', 'stopped', 'cancelled', 'canceled', 'error', 'done'}
+TOKEN_RE = re.compile(r'\b\d{6,12}:[A-Za-z0-9_-]{30,}\b')
+
+_token = None
+
+
+# ---------------------------------------------------------------- small helpers
+
+def scrub(s):
+    s = str(s)
+    if _token:
+        s = s.replace(_token, '<token>')
+    return TOKEN_RE.sub('<token>', s)
+
+
+def log(msg):
+    try:
+        path = os.path.join(STATE_DIR, 'log')
+        if os.path.exists(path) and os.path.getsize(path) > 256 * 1024:
+            with open(path, 'rb') as f:
+                f.seek(-128 * 1024, 2)
+                tail = f.read()
+            with open(path, 'wb') as f:
+                f.write(tail)
+        with open(path, 'a') as f:
+            f.write(time.strftime('%F %T ') + scrub(msg) + '\n')
+    except Exception:
+        pass
+
+
+def clip(s, n):
+    s = ' '.join(str(s or '').split())
+    return s if len(s) <= n else s[:n - 1].rstrip() + '…'
+
+
+def hm(ts, now):
+    lt, ln = datetime.fromtimestamp(ts, ZONE), datetime.fromtimestamp(now, ZONE)
+    s = lt.strftime('%H:%M')
+    if lt.date() == ln.date():
+        return s
+    if now - ts < 6 * 86400:
+        return lt.strftime('%a ') + s
+    return '%d %s' % (lt.day, lt.strftime('%b ')) + s
+
+
+def dur(sec):
+    """Coarse age in AGE_STEP (10-min) steps: <10m, 10m … 50m, 1h, 1h10m … 23h50m, 1d2h."""
+    step = AGE_STEP // 60
+    m = int(max(sec, 0) // 60) // step * step
+    if m < step:
+        return '<%dm' % step
+    if m < 60:
+        return '%dm' % m
+    h, m = divmod(m, 60)
+    if h < 24:
+        return '%dh%02dm' % (h, m) if m else '%dh' % h
+    d, h = divmod(h, 24)
+    return '%dd%dh' % (d, h)
+
+
+def sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- state + locks
+
+@contextlib.contextmanager
+def flocked(name, timeout=15.0):
+    fd = os.open(os.path.join(STATE_DIR, name), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        end = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > end:
+                    raise TimeoutError('lock %s busy' % name)
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)   # closing the descriptor releases the lock
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def save(st):
+    tmp = '%s.tmp.%d' % (STATE, os.getpid())
+    with open(tmp, 'w') as f:
+        json.dump(st, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, STATE)
+
+
+@contextlib.contextmanager
+def state():
+    with flocked('state.lock'):
+        st = load()
+        yield st
+        save(st)
+
+
+# ---------------------------------------------------------------- which process is this hook from?
+
+def _proc(pid):
+    with open('/proc/%d/cmdline' % pid, 'rb') as f:
+        argv = [a.decode(errors='replace') for a in f.read().split(b'\0') if a]
+    with open('/proc/%d/stat' % pid, 'rb') as f:
+        rest = f.read().rsplit(b')', 1)[1].split()
+    return argv, int(rest[1]), rest[19].decode()   # argv, ppid, start time (clock ticks since boot)
+
+
+def _is_claude(pid, argv):
+    try:
+        if '/claude/versions/' in os.readlink('/proc/%d/exe' % pid):
+            return True
+    except OSError:
+        pass
+    head = argv[:2]   # native binary, or `node .../claude-code/cli.js`
+    return any(os.path.basename(a) == 'claude' or '/claude/versions/' in a or 'claude-code/cli' in a
+               for a in head)
+
+
+CHANNEL_FLAG = re.compile(r'^--(?:channels|dangerously-load-development-channels)(?:=.*)?$')
+
+
+def _has_channel(argv):
+    # Only the main session is started with channels (it owns the Telegram bot), whatever the plugin is called:
+    # plugin:telegram@claude-plugins-official today, plugin:telegram-plus@home-plugins after the switch.
+    return any(CHANNEL_FLAG.match(a) for a in argv)
+
+
+def claude_parent():
+    """Nearest claude process above us: (pid, start, is_main_session) or None."""
+    pid = os.getppid()
+    for _ in range(10):
+        if pid <= 1:
+            return None
+        try:
+            argv, ppid, start = _proc(pid)
+        except Exception:
+            return None
+        if _is_claude(pid, argv):
+            return pid, start, _has_channel(argv)
+        pid = ppid
+    return None
+
+
+def main_alive(main):
+    try:
+        argv, _, start = _proc(int(main['pid']))
+        return start == main.get('start') and _has_channel(argv)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- labels
+
+def tool_label(name, ti):
+    if not name or name in SKIP_TOOLS or name.startswith(SKIP_PREFIXES):
+        return None
+    ti = ti if isinstance(ti, dict) else {}
+    desc = ti.get('description') if isinstance(ti.get('description'), str) else ''
+    if name in ('Agent', 'Task'):
+        return 'Delegating: ' + (desc or ti.get('subagent_type') or 'a task')
+    if desc.strip():
+        return desc
+    fp = ti.get('file_path') or ti.get('notebook_path') or ''
+    base = os.path.basename(str(fp)) if fp else ''
+    if name == 'Read':
+        return 'Reading ' + (base or 'a file')
+    if name in ('Edit', 'MultiEdit', 'NotebookEdit'):
+        return 'Editing ' + (base or 'a file')
+    if name == 'Write':
+        return 'Writing ' + (base or 'a file')
+    if name == 'Grep':
+        return 'Searching for “%s”' % clip(ti.get('pattern'), 40)
+    if name == 'Glob':
+        return 'Looking for files: ' + clip(ti.get('pattern'), 40)
+    if name == 'WebFetch':
+        m = re.match(r'^[a-z]+://([^/]+)', str(ti.get('url') or ''))
+        return 'Reading ' + (m.group(1) if m else 'a web page')
+    if name == 'WebSearch':
+        return 'Searching the web: ' + clip(ti.get('query'), 60)
+    if name == 'Bash':
+        return 'Running a shell command'
+    if name == 'Skill':
+        return 'Using skill: %s' % (ti.get('skill') or '?')
+    if name == 'SendMessage':
+        s = ti.get('summary')
+        return 'Messaging an agent' + (': ' + s if isinstance(s, str) and s else '')
+    if name.startswith('mcp__'):
+        parts = name.split('__')
+        server = re.sub(r'^(claude_ai_|plugin_[^_]+_)', '', parts[1] if len(parts) > 1 else '')
+        tool = parts[-1] if len(parts) > 2 else ''
+        return '%s: %s' % (server.replace('_', ' '), tool.replace('_', ' '))
+    return name
+
+
+def prompt_label(p):
+    s = str(p.get('prompt') or '').lstrip()
+    if s.startswith('<channel'):
+        return 'Reading your Telegram message' if re.match(r'<channel[^>]*source="[^"]*telegram', s) \
+            else 'Handling a channel message'
+    if s.startswith('<agent-message'):
+        return "Reading an agent's report"
+    if s.startswith('<task-notification'):
+        return 'Handling a background task update'
+    if s.startswith('[heartbeat]'):
+        return 'Heartbeat: inbox and TODO'
+    if p.get('source') in ('schedule_wakeup', 'loop_wakeup'):
+        return 'Running a scheduled task'
+    return 'Working on your request'
+
+
+# ---------------------------------------------------------------- applying hook events
+
+def set_working(st, now):
+    if st.get('mode') != 'working':
+        st['mode'], st['since'] = 'working', now
+    st.pop('error', None)
+    st['last_activity'] = max(st.get('last_activity', 0), now)
+
+
+def set_idle(st, since):
+    if st.get('mode') != 'idle':
+        st['mode'], st['since'] = 'idle', since
+    st['idle_at'] = max(st.get('idle_at', 0), since)   # hooks run async: older stragglers must not undo this
+    st['last_activity'] = max(st.get('last_activity', 0), since)
+
+
+def fan_starts():
+    """Start times of in-flight agents from the daemon's job file, when there is one (best effort)."""
+    try:
+        with open(os.path.join(os.environ['CLAUDE_JOB_DIR'], 'state.json')) as f:
+            fan = json.load(f).get('fan') or []
+        return {x['id']: x['startedAt'] / 1000.0 for x in fan if x.get('id') and x.get('startedAt')}
+    except Exception:
+        return {}
+
+
+def reconcile(st, tasks, now, exclude=None):
+    """background_tasks (sent with Stop/SubagentStop) is the session's own list of in-flight work."""
+    if not isinstance(tasks, list):
+        return
+    agents, known, stopped = st['agents'], st['known'], st['stopped']
+    live = {}
+    for t in tasks:
+        if not isinstance(t, dict) or t.get('type') not in SHOWN_TASKS:
+            continue
+        tid = t.get('id')
+        if not tid or tid == exclude or str(t.get('status', '')).lower() in DONE:
+            continue
+        if known.get(tid, {}).get('nested') or now - stopped.get(tid, -1e9) < 60:
+            continue   # a subagent's helper, or it stopped after this list was taken
+        live[tid] = t.get('description') or known.get(tid, {}).get('desc') or t.get('agent_type') or 'agent'
+    for aid in list(agents):
+        if aid not in live and now - agents[aid].get('added', 0) > 3:
+            del agents[aid]
+    starts = None
+    for tid, desc in live.items():
+        if tid in agents:
+            agents[tid]['desc'] = desc
+            continue
+        if starts is None:
+            starts = fan_starts()
+        agents[tid] = {'desc': desc, 'started': starts.get(tid, now), 'added': now}
+        known.setdefault(tid, {'desc': desc, 't': now})
+
+
+def apply(st, ev, p, now, proc):
+    pid, start, _ = proc
+    main_thread = not p.get('agent_id')
+    for k in ('agents', 'known', 'stopped', 'spawns'):
+        if not isinstance(st.get(k), dict):
+            st[k] = {}
+    main = st.get('main') or {}
+    if (str(main.get('pid')), main.get('start')) != (str(pid), start):
+        # a new main-session process: whatever ran in the old one is gone
+        st['agents'], st['spawns'] = {}, {}
+        st['main'] = {'pid': pid, 'start': start}
+    if p.get('session_id'):
+        st['main']['session_id'] = p['session_id']
+    agents, known, stopped, spawns = st['agents'], st['known'], st['stopped'], st['spawns']
+
+    fresh = now >= st.get('idle_at', 0)   # False for a straggler that ran after this turn's Stop
+    if ev == 'UserPromptSubmit' and main_thread:
+        if fresh:
+            set_working(st, now)
+            st['now'] = prompt_label(p)
+    elif ev == 'PreToolUse' and main_thread:
+        ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
+        if fresh:
+            set_working(st, now)
+            label = tool_label(p.get('tool_name'), ti)
+            if label:
+                st['now'] = label
+        if p.get('tool_name') in ('Agent', 'Task') and p.get('tool_use_id'):
+            spawns[p['tool_use_id']] = {'desc': ti.get('description') or ti.get('subagent_type') or 'agent',
+                                        'type': ti.get('subagent_type') or 'general-purpose', 't': now}
+    elif ev == 'PostToolUse' and p.get('tool_name') in ('Agent', 'Task'):
+        r = p.get('tool_response') if isinstance(p.get('tool_response'), dict) else {}
+        ti = p.get('tool_input') if isinstance(p.get('tool_input'), dict) else {}
+        sp = spawns.pop(p.get('tool_use_id'), None) or {}
+        aid = r.get('agentId') or r.get('agent_id') or sp.get('aid')
+        if aid:
+            desc = r.get('description') or ti.get('description') or sp.get('desc') or 'agent'
+            known[aid] = {'desc': desc, 'nested': not main_thread, 't': now}
+            launched = r.get('isAsync') or r.get('status') == 'async_launched'
+            if main_thread and launched and aid not in stopped:
+                prev = agents.get(aid, {})
+                agents[aid] = {'desc': desc, 'started': prev.get('started', sp.get('t', now)), 'added': now}
+            else:
+                agents.pop(aid, None)   # a subagent's helper, or a foreground agent that just finished
+    elif ev == 'SubagentStart':
+        aid, typ = p.get('agent_id'), p.get('agent_type')
+        if aid and typ:   # agent_type "" = internal helper agents (summaries etc.)
+            stopped.pop(aid, None)
+            k = known.get(aid)
+            if k:
+                if not k.get('nested'):   # resumed via SendMessage, or already announced
+                    agents[aid] = {'desc': k['desc'], 'started': agents.get(aid, {}).get('started', now),
+                                   'added': now}
+            else:
+                # a fresh spawn: pair it with the oldest unclaimed main-thread Agent call of that type
+                cands = sorted((s['t'], tid) for tid, s in spawns.items()
+                               if not s.get('aid') and s.get('type') == typ and now - s['t'] < 60)
+                if cands:
+                    sp = spawns[cands[0][1]]
+                    sp['aid'] = aid
+                    agents[aid] = {'desc': sp['desc'], 'started': sp['t'], 'added': now}
+                    known[aid] = {'desc': sp['desc'], 't': now}
+    elif ev == 'SubagentStop':
+        aid = p.get('agent_id')
+        if aid and p.get('agent_type'):
+            agents.pop(aid, None)
+            stopped[aid] = now
+        reconcile(st, p.get('background_tasks'), now, exclude=aid)
+    elif ev == 'Stop' and main_thread:
+        set_idle(st, now)
+        reconcile(st, p.get('background_tasks'), now)
+    elif ev == 'StopFailure' and main_thread:
+        set_idle(st, now)
+        st['error'] = clip(p.get('error') or 'error', 40)
+    elif ev == 'SessionStart' and main_thread and p.get('source') in ('startup', 'resume'):
+        set_idle(st, now)
+    elif ev == 'SessionEnd' and main_thread and p.get('reason') != 'clear':
+        set_idle(st, now)
+
+
+def prune(st, now):
+    for key, ttl in (('spawns', 600), ('stopped', 3600), ('known', 3 * 86400)):
+        d = st.get(key)
+        if isinstance(d, dict):
+            for k in [k for k, v in d.items() if not isinstance(v, (dict, int, float))
+                      or now - (v.get('t', 0) if isinstance(v, dict) else v) > ttl]:
+                del d[k]
+
+
+# ---------------------------------------------------------------- rendering
+
+def strip_md(s):
+    s = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', s)
+    return re.sub(r'\*\*|__|`', '', s).strip()
+
+
+def read_todo():
+    out = {'due': [], 'in progress': [], 'waiting on you': []}
+    try:
+        with open(TODO, encoding='utf-8') as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return out
+    sec = None
+    for line in lines:
+        m = re.match(r'^#{1,3}\s+(.*?)\s*$', line)
+        if m:
+            sec = m.group(1).strip().lower()
+            continue
+        if sec not in out:
+            continue
+        m = re.match(r'^[-*+]\s+(?:\[[ xX]\]\s+)?(.*)$', line)   # top-level bullets only
+        if not m:
+            continue
+        item = m.group(1).strip()
+        b = re.match(r'^\*\*(.+?)\*\*\s*(.*)$', item)
+        if b:
+            title, rest = b.group(1), b.group(2)
+        else:
+            parts = re.split(r'\s+[—–]\s+', item, maxsplit=1)
+            title, rest = parts[0], (parts[1] if len(parts) > 1 else '')
+        rest = re.sub(r'^\s*(?:[—–:]|-(?=\s))\s*', '', rest)
+        out[sec].append((strip_md(title), strip_md(rest), item))   # item: the raw line for the due parser
+    return out
+
+
+# ---------------------------------------------------------------- due times (hb-gate's parser)
+
+_hg = []   # [module or None] once loaded
+
+
+def hb_gate():
+    """~/bin/hb-gate as a module (its due_at/TIME/TZ), or None. No .pyc is written next to it."""
+    if not _hg:
+        path = os.environ.get('TG_STATUS_HB_GATE') or os.path.join(BIN_DIR, 'hb-gate')
+        try:
+            with open(path, encoding='utf-8') as f:
+                src = f.read()
+            mod = types.ModuleType('hb_gate')
+            mod.__file__ = path
+            exec(compile(src, path, 'exec'), mod.__dict__)
+            if not callable(getattr(mod, 'due_at', None)):
+                raise AttributeError('no due_at')
+            _hg.append(mod)
+        except Exception as e:
+            log('hb-gate parser unavailable (%s: %s); every Due item counts as due' % (type(e).__name__, e))
+            _hg.append(None)
+    return _hg[0]
+
+
+def due_clock(now, tz):
+    v = (os.environ.get('TG_STATUS_NOW') or '').strip()
+    if v:
+        try:
+            if re.fullmatch(r'\d+(\.\d+)?', v):
+                return datetime.fromtimestamp(float(v), tz)
+            return datetime.strptime(v, '%Y-%m-%d %H:%M').replace(tzinfo=tz)
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(now, tz)
+
+
+def split_due(items, now):
+    """Due items -> (due now, next): display texts. Due now = hb-gate's rule (no date/time, or its time has come),
+    no-time items first, then by time; next = by time. Times: HH:MM today, else DD.MM HH:MM (DD.MM if no time)."""
+    hg = hb_gate()
+    if hg is None:
+        return [t for t, _, _ in items], []
+    ref = due_clock(now, hg.TZ)
+    try:
+        anchor = datetime.fromtimestamp(os.stat(TODO).st_mtime, hg.TZ).date()
+    except OSError:
+        anchor = ref.date()
+    due, nxt = [], []
+    for i, (title, _, raw) in enumerate(items):
+        try:
+            at = hg.due_at(raw, ref.date(), anchor)
+        except Exception:
+            at = None
+        if at is None:
+            due.append((float('-inf'), i, title))
+            continue
+        today = at.date() == ref.date()
+        if hg.TIME.search(raw):
+            when = at.strftime('%H:%M' if today else '%d.%m %H:%M')
+        else:
+            when = '' if today else at.strftime('%d.%m')
+        reached = hg.due_reached(at, ref) if hasattr(hg, 'due_reached') else at <= ref
+        (due if reached else nxt).append((at.timestamp(), i, ('%s %s' % (when, title)) if when else title))
+    return [x[2] for x in sorted(due)], [x[2] for x in sorted(nxt)]
+
+
+# ---------------------------------------------------------------- composing
+
+def compose(st, now, plain=False):
+    """Returns (body, footer)."""
+    return compose_full(st, now, plain)[:2]
+
+
+def compose_full(st, now, plain=False):
+    """Returns (body, footer, stable): stable = body with the agent ages masked (for the age-only edit throttle)."""
+    todo = read_todo()
+    due, upcoming = split_due(todo.get('due') or [], now)
+    titles = agent_titles.load() if agent_titles else {}
+    agents = sorted(({**a, 'desc': titles.get(aid) or a.get('desc')} for aid, a in (st.get('agents') or {}).items()),
+                    key=lambda a: a.get('started', now))
+    for width, count in ((100, 6), (80, 4), (60, 3), (45, 2), (35, 1)):
+        blocks = []   # each block: list of (prefix, bold label or None, text, age suffix)
+        # Line 1 is all the owner sees in the pinned header: state, counts, focus; compact.
+        counts = ''
+        if agents:
+            counts += ' ⚙%d' % len(agents)
+        if due:
+            counts += ' ❗%d' % len(due)
+        if todo.get('waiting on you'):
+            counts += ' ❓%d' % len(todo['waiting on you'])
+        err = st.get('error')
+        if st.get('mode') == 'working':
+            icon = '🟢'
+            focus = st.get('now') or ''
+        else:
+            icon = '⚠️' if err else '💤'
+            focus = ('error: %s' % err) if err else 'Idle'
+        if focus == 'Idle' and todo.get('in progress'):
+            focus = 'Idle · ' + todo['in progress'][0][0]
+        head = [(icon + counts + ' · ', None, clip(focus, width), '')]
+        note = (st.get('note') or {}).get('text')
+        if note:
+            head.append(('📌 ', None, clip(note, width + 20), ''))
+        blocks.append(head)
+        if agents:
+            b = [('', '⚙ Background:', '', '')]
+            for a in agents[:count]:
+                b.append(('• ', None, clip(a.get('desc'), width - 8), dur(now - a.get('started', now))))
+            if len(agents) > count:
+                b.append(('', None, '+%d more' % (len(agents) - count), ''))
+            blocks.append(b)
+        lists = (('❗ Due:', due),
+                 ('⏳ In progress:', ['%s — %s' % (t, s) if s else t for t, s, _ in todo.get('in progress') or []]),
+                 ('❓ Waiting on you:', [t for t, _, _ in todo.get('waiting on you') or []]),
+                 ('🕒 Next:', upcoming))
+        for label, items in lists:
+            if not items:
+                continue
+            b = [('', label, '', '')]
+            for t in items[:count]:
+                b.append(('• ', None, clip(t, width), ''))
+            if len(items) > count:
+                b.append(('', None, '+%d more' % (len(items) - count), ''))
+            blocks.append(b)
+        size = sum(len(p) + len(l or '') + len(t) + (len(a) + 3 if a else 0) + 1
+                   for b in blocks for p, l, t, a in b) + 2 * len(blocks) + 16
+        if size <= MAX_CHARS:
+            break
+
+    def line(p, l, t, a, mask=False):
+        t = t + (' (%s)' % ('·' if mask else a) if a else '')
+        if plain:
+            return p + (l or '') + t
+        return html.escape(p, False) + ('<b>%s</b>' % html.escape(l, False) if l else '') + html.escape(scrub(t), False)
+
+    body = '\n\n'.join('\n'.join(line(*x) for x in b) for b in blocks)
+    stable = '\n\n'.join('\n'.join(line(*x, mask=True) for x in b) for b in blocks)
+    footer = 'updated %s' % hm(now, now)
+    # Both links in the pinned message (dashboard + my browser view; both behind basic auth)
+    dom = assistant_profile.get('network.domain')
+    links = (('📊 Dashboard', 'https://dash.%s' % dom), ('🖥 Browser', 'https://browser.%s/vnc.html?autoconnect=1&resize=scale' % dom))
+    if plain:
+        footer = ' · '.join('%s %s' % l for l in links) + '\n' + footer
+    else:
+        footer = ' · '.join('<a href="%s">%s</a>' % (html.escape(u), html.escape(t, False)) for t, u in links) + '\n<i>%s</i>' % footer
+    return scrub(body), footer, scrub(stable)
+
+
+# ---------------------------------------------------------------- Telegram
+
+class TgError(Exception):
+    def __init__(self, code, desc, retry_after=None):
+        super().__init__('%s %s' % (code, desc))
+        self.code, self.desc, self.retry_after = code, desc, retry_after
+
+
+_OUTBOX = None
+
+
+def outbox():
+    """True = this process's board calls go through the live outbox (core.tg), decided once per process. Never
+    with a test API (TG_STATUS_API); off when core.tg can't be loaded."""
+    global _OUTBOX
+    if _OUTBOX is None:
+        _OUTBOX = False
+        if API == REAL_API:
+            try:
+                from core import tg as tgout
+                _OUTBOX = tgout.outbox_on('tg-status')[0]
+            except Exception as e:   # the direct path is the safe default
+                log('outbox gate: %s' % type(e).__name__)
+    return _OUTBOX
+
+
+def chat_id():
+    """The owner's chat: from the live adapter's config in outbox mode (no token read), else creds()."""
+    if outbox():
+        from core import tg as tgout
+        chat = tgout.owner_chat()
+        if chat:
+            return chat
+    return creds()[1]
+
+
+def creds():
+    global _token
+    if API != REAL_API:   # a test server never gets the real token
+        _token = os.environ['TG_STATUS_TEST_TOKEN']
+        return _token, os.environ.get('TG_STATUS_TEST_CHAT', '1')
+    tok = None
+    with open(os.path.join(TG_DIR, '.env')) as f:
+        for ln in f:
+            k, _, v = ln.strip().partition('=')
+            if k.strip().replace('export ', '') == 'TELEGRAM_BOT_TOKEN':
+                tok = v.strip().strip('"\'')
+    with open(os.path.join(TG_DIR, 'access.json')) as f:
+        chat = str(json.load(f)['allowFrom'][0])
+    if not tok:
+        raise RuntimeError('no TELEGRAM_BOT_TOKEN in %s/.env' % TG_DIR)
+    _token = tok
+    return tok, chat
+
+
+def _api(method, params):
+    tok, _ = creds()
+    req = urllib.request.Request('%s/bot%s/%s' % (API, tok, method), data=json.dumps(params).encode(),
+                                 headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {'ok': False, 'error_code': e.code, 'description': 'HTTP %s' % e.code}
+    except Exception as e:   # network trouble; never let a URL (with the token) reach a log
+        raise TgError(0, scrub('%s: %s' % (type(e).__name__, e)))
+    if not body.get('ok'):
+        raise TgError(body.get('error_code', 0), scrub(body.get('description', '')),
+                      (body.get('parameters') or {}).get('retry_after'))
+    return body.get('result')
+
+
+def call(method, **params):
+    if outbox():
+        from core import tg as tgout
+        mk = params.get('reply_markup') or {}
+        try:
+            return tgout.bot_call(method, params, sender='tg-status', hold=False, dedupe=False, timeout=10,
+                                  on_press='keep' if mk.get('inline_keyboard') else None)
+        except tgout.TgError as e:
+            if e.code == 0 and 'not sent within' in e.desc:
+                raise TgError(429, e.desc, 30)   # the outbox doesn't answer: back off like a 429
+            if e.code != -1:
+                raise TgError(e.code, scrub(e.desc))
+            log('outbox: %s; direct path' % e.desc)   # the live adapter went away: the direct call below
+    for attempt in range(3):
+        try:
+            return _api(method, params)
+        except TgError as e:
+            if e.code == 429 and e.retry_after is not None and e.retry_after <= 15 and attempt < 2:
+                log('429 on %s, retrying in %ss' % (method, e.retry_after))
+                time.sleep(e.retry_after + 0.3)
+                continue
+            raise
+
+
+def to_plain(text):
+    return html.unescape(re.sub(r'</?[a-z]+>', '', text))
+
+
+def markup():
+    return TALK_MARKUP if TALK else None
+
+
+def keep_buttons(chat, mid):
+    """Mark the board's keyboard "keep" in telegram-plus's buttons.json (a tap never strips the Talk button)."""
+    path = os.environ.get('TG_STATUS_BUTTONS')
+    if not markup() or path == 'off' or (not path and API != REAL_API) or outbox():   # outbox: the adapter marks it
+        return
+    path = path or os.path.join(TG_DIR, 'buttons.json')
+    key, now_ms = '%s:%s' % (chat, mid), int(time.time() * 1000)
+    try:
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except FileNotFoundError:
+            d = {}
+        d = d if isinstance(d, dict) else {}
+        cur = d.get(key)
+        if isinstance(cur, dict) and cur.get('on_press') == 'keep' and 0 <= now_ms - (cur.get('ts') or 0) < KEEP_REFRESH * 1000:
+            return
+        d[key] = {'on_press': 'keep', 'ts': now_ms}
+        tmp = '%s.tmp%d' % (path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(d, f)
+        os.replace(tmp, path)
+    except (OSError, ValueError) as e:
+        log('keep buttons %s: %s' % (mid, type(e).__name__))
+
+
+def publish(text, msg_id):
+    """Edit the pinned message, or send and pin a new one. Returns the message id."""
+    chat = chat_id()
+    mk = {'reply_markup': markup()} if markup() else {}
+    if msg_id:
+        for t, mode in ((text, 'HTML'), (to_plain(text), None)):
+            try:
+                kw = {'parse_mode': mode} if mode else {}
+                call('editMessageText', chat_id=chat, message_id=msg_id, text=t,
+                     link_preview_options={'is_disabled': True}, **kw, **mk)
+                keep_buttons(chat, msg_id)
+                return msg_id
+            except TgError as e:
+                d = e.desc.lower()
+                if 'not modified' in d:
+                    log('message %s already up to date (not modified)' % msg_id)
+                    return msg_id
+                if mode and "can't parse entities" in d:
+                    log('HTML rejected (%s); sending as plain text' % e.desc)
+                    continue
+                if 'message to edit not found' in d or "can't be edited" in d or 'message_id_invalid' in d:
+                    log('pinned message unusable (%s); sending a new one' % e.desc)
+                    break
+                raise
+        else:
+            return msg_id
+    try:
+        m = call('sendMessage', chat_id=chat, text=text, parse_mode='HTML', disable_notification=True,
+                 link_preview_options={'is_disabled': True}, **mk)
+    except TgError as e:
+        if "can't parse entities" not in e.desc.lower():
+            raise
+        m = call('sendMessage', chat_id=chat, text=to_plain(text), disable_notification=True, **mk)
+    new_id = m['message_id']
+    with state() as st:   # remember it before pinning, so a failure below can't cause duplicates
+        st['message_id'] = new_id
+    keep_buttons(chat, new_id)
+    try:
+        call('pinChatMessage', chat_id=chat, message_id=new_id, disable_notification=True)
+    except TgError as e:
+        log('pin failed: %s' % e.desc)
+    log('sent and pinned message %s' % new_id)
+    return new_id
+
+
+# ---------------------------------------------------------------- render / debounce
+
+def spawn_trailing(wait):
+    subprocess.Popen([sys.executable, '-I', os.path.abspath(__file__), '_trailing', '%.2f' % wait],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def plan(st, now):
+    """(needed, text, hash, stable hash) of a render now. Hashes cover the body and the links line, not the clock.
+    Not needed when nothing changed, or when only background-agent ages moved and the last edit is < AGE_STEP old."""
+    body, footer, stable = compose_full(st, now)
+    links = footer.split('\n')[0] + (json.dumps(markup(), sort_keys=True) if markup() else '')
+    h, hs = sha(body + '\n' + links), sha(stable + '\n' + links)
+    if not st.get('message_id'):
+        need = True
+    elif h == st.get('last_hash'):
+        need = False
+    else:
+        need = hs != st.get('last_stable') or now - st.get('updated_at', 0) >= AGE_STEP
+    return need, body + '\n\n' + footer, h, hs
+
+
+def dirty(st, now):
+    return plan(st, now)[0]
+
+
+def request_render():
+    """Send now if the last Telegram call is DEBOUNCE seconds old; otherwise make sure exactly one
+    trailing render is scheduled for when the window opens."""
+    now = time.time()
+    with state() as st:
+        if not dirty(st, now):
+            return
+        wait = max(st.get('last_send', 0) + DEBOUNCE, st.get('backoff_until', 0)) - now
+        if wait > 0:
+            if st.get('trailing_at', 0) < now:   # none pending (or a pending one died)
+                st['trailing_at'] = now + wait
+                spawn_trailing(wait)
+            return
+        st['last_send'] = now   # claim the window before talking to Telegram
+    send()
+
+
+def send():
+    with flocked('send.lock', timeout=60):
+        now = time.time()
+        with state() as st:
+            need, text, h, hs = plan(st, now)
+            if not need:
+                return
+            msg_id = st.get('message_id')
+        try:
+            new_id = publish(text, msg_id)
+        except TgError as e:
+            log('telegram: %s' % e.desc)
+            with state() as st:
+                if e.code == 429:
+                    st['backoff_until'] = time.time() + (e.retry_after or 30)
+                    if st.get('trailing_at', 0) < time.time():
+                        st['trailing_at'] = st['backoff_until']
+                        spawn_trailing(e.retry_after or 30)
+            return
+        with state() as st:
+            st['message_id'], st['last_hash'], st['last_stable'] = new_id, h, hs
+            st['last_send'] = st['updated_at'] = time.time()
+        if new_id == msg_id:
+            log('edited %s (%s)' % (msg_id, h))
+
+
+def stale_check(st, now):
+    main = st.get('main') or {}
+    if main.get('pid') and not main_alive(main):
+        if st.get('agents'):
+            st['agents'] = {}
+        if st.get('mode') == 'working':
+            set_idle(st, st.get('last_activity', now))
+    if st.get('mode') == 'working' and now - st.get('last_activity', 0) > STALE:
+        set_idle(st, st.get('last_activity', now))
+    prune(st, now)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_hook(arg_event):
+    t0 = time.time()
+    try:
+        p = json.loads(sys.stdin.read() or '{}')
+    except Exception:
+        return
+    if not isinstance(p, dict):
+        return
+    ev = p.get('hook_event_name') or arg_event
+    if ev in ('PreToolUse', 'UserPromptSubmit', 'Stop', 'StopFailure', 'SessionStart', 'SessionEnd') \
+            and p.get('agent_id'):
+        return   # a subagent's own steps never show up
+    if ev == 'PostToolUse' and p.get('tool_name') not in ('Agent', 'Task'):
+        return
+    proc = claude_parent()
+    if os.environ.get('TG_STATUS_TRACE'):
+        log('trace: %s agent=%s claude_pid=%s main=%s' % (ev, p.get('agent_id'), proc and proc[0], proc and proc[2]))
+    if not proc or not proc[2]:
+        return   # not the main session (a `claude -p` worker, another background session, ...)
+    with state() as st:
+        apply(st, ev, p, t0, proc)
+    request_render()
+
+
+def cmd_title(args):
+    """tg-status title [ID|PREFIX [title...]]: set, clear (no title) or list (no ID) agent titles."""
+    if agent_titles is None:
+        print('tg-status title: lib/agent_titles.py is missing', file=sys.stderr)
+        return 1
+    st = load()
+    if not args:
+        titles = agent_titles.load()
+        if not titles:
+            print('(no titles)')
+        for aid, t in sorted(titles.items()):
+            desc = ((st.get('known') or {}).get(aid) or (st.get('agents') or {}).get(aid) or {}).get('desc')
+            print('%s  "%s"%s' % (aid, t, '  (was: %s)' % desc if desc else ''))
+        return 0
+    want, text = args[0], ' '.join(args[1:]).strip()
+    if text in ('-', '--clear'):
+        text = ''
+    known = set(st.get('agents') or {}) | set(st.get('known') or {}) | set(agent_titles.load())
+    if want in known:
+        aid = want
+    else:
+        hits = sorted(k for k in known if len(want) >= 3 and k.startswith(want))
+        if len(hits) > 1:
+            print('ambiguous prefix %r: %s' % (want, ', '.join(hits[:5])), file=sys.stderr)
+            return 1
+        if hits:
+            aid = hits[0]
+        elif re.fullmatch(r'a[0-9a-f]{16}', want):
+            aid = want   # a full id the board has not seen yet (its hook may still be on the way)
+        else:
+            print('no agent matches %r (see `agent-watch status`)' % want, file=sys.stderr)
+            return 1
+    got = agent_titles.put(aid, text)
+    if got:
+        cut = ' (cut to %d chars)' % agent_titles.MAX if len(' '.join(text.split())) > agent_titles.MAX else ''
+        print('%s: "%s"%s' % (aid, got, cut))
+    else:
+        print('%s: title cleared (spawn description again)' % aid)
+    request_render()
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else 'refresh'
+    if cmd in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+        return 0
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        if cmd == 'hook':
+            cmd_hook(args[1] if len(args) > 1 else '')
+        elif cmd in ('refresh', 'render'):
+            with state() as st:
+                stale_check(st, time.time())
+            request_render()
+        elif cmd == '_trailing':
+            time.sleep(float(args[1]) if len(args) > 1 else DEBOUNCE)
+            with state() as st:
+                st['trailing_at'] = 0
+            request_render()
+        elif cmd == 'note':
+            text = ' '.join(args[1:]).strip()
+            with state() as st:
+                if text and text not in ('-', '--clear'):
+                    st['note'] = {'text': text, 't': time.time()}
+                else:
+                    st.pop('note', None)
+            request_render()
+        elif cmd == 'title':
+            return cmd_title(args[1:])
+        elif cmd == 'reset':
+            with flocked('send.lock', timeout=60):
+                with state() as st:
+                    old = st.pop('message_id', None)
+                    st.pop('last_hash', None)
+                    st.pop('last_stable', None)
+                    st['last_send'] = 0
+                if old:
+                    chat = chat_id()
+                    for method, kw in (('unpinChatMessage', {}),
+                                       ('editMessageText', {'text': '<i>Status board moved to a newer message.</i>',
+                                                            'parse_mode': 'HTML'})):
+                        try:
+                            call(method, chat_id=chat, message_id=old, **kw)
+                        except TgError as e:
+                            log('reset: %s on old message %s: %s' % (method, old, e.desc))
+            request_render()
+        elif cmd == 'show':
+            st = load()
+            body, footer = compose(st, time.time(), plain='--plain' in args)
+            print(body + '\n\n' + footer)
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    except Exception as e:
+        log('%s: %s: %s' % (cmd, type(e).__name__, e))
+        if cmd in ('hook', '_trailing'):
+            return 0   # hooks fail silently
+        print('tg-status %s failed: %s' % (cmd, scrub(e)), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

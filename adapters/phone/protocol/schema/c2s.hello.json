@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.hello.json",
+  "title": "app hello (first frame from the app)",
+  "type": "object",
+  "properties": {
+    "app": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 24
+    },
+    "code": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sdk": {
+      "type": "integer",
+      "minimum": 21,
+      "maximum": 99
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "caps": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_:.-]{0,23}$"
+      }
+    },
+    "perms": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,31}$"
+      },
+      "additionalProperties": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "battery_exempt": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "app",
+    "code",
+    "sdk"
+  ]
+}

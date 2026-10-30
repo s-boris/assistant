@@ -1,0 +1,1066 @@
+#!/usr/bin/env -S python3 -I
+"""phone: my door to the owner's phone app, through the phonegw internal API (loopback, Bearer token).
+
+  phone status [--json]                 gateway up?, devices: online, last seen, app version, rtt, p95, keepalive,
+                                        battery band, self-test, front sources, route (via internet), internet-path counters
+  phone pair [--name S25] [--json]      one-time pairing code (8 chars, valid 10 min, single use, 5 tries)
+  phone devices [--json]  |  phone revoke ID
+  phone push --level urgent|timed|decision|info --title T --body B [--action LABEL:VERB[:ARG]]... [--tag X]
+             [--ttl 30m] [--private] [--sticky] [--full-screen] [--live countdown:EPOCH] [--deep-link URI]
+             [--show-for 2h | --show-until EPOCH] [--night-ok]
+             non-urgent pushes wait out his quiet hours and sleep-in mornings (status held, exit 0) unless --night-ok
+             or --live; one whose --show-until ends before then is dropped (exit 0); the app hides a push at its
+             show_until (default: send moment + max(ttl, urgent 6h / timed 12h / decision 2d / info 1d))
+             [--wait 30] [--car] [--json]
+                                        --car: an Android Auto message (MessagingStyle; linted like the lock screen)
+  phone link URL | --maps "PLACE or LAT,LON" [--nav driving|transit|walking|bicycling] [--go] [--title T] [--body B]
+             [--label "Open in Maps"] [--level timed|info|decision|urgent] [--tag X] [--ttl 2h] [--wait 20]
+             [--no-telegram] [--telegram] [--json]
+                                        one-tap link: the notification tap (and its button) opens URL directly (Maps,
+                                        SBB, browser). Only https (no user@host), geo:, google.navigation:. --maps =
+                                        a Google Maps search, --nav = directions (from where he is; --go starts
+                                        navigation). Not delivered to the app within --wait (offline, older app, gw
+                                        down) -> the queued push is cancelled and Telegram gets the text with a URL
+                                        button (geo:/google.navigation: become https Maps links). --telegram = only
+                                        Telegram. Exit 0 delivered (app or Telegram) · 2 usage · 3 lint · 6 unsafe URL ·
+                                        else the app's code (4 offline, 5 no ack, 7 gw down) when Telegram failed too
+  phone open --nav PLACE [--mode d|r|w|b] | URL | --sbb FROM TO [--at HH:MM | --arrive HH:MM] | --app NAME
+             [--label T] [--tap] [--wait 6] [--no-telegram] [--via voice|drive|session|app] [--json]
+                                        phone actions: OPEN it on the phone now, no tap (Maps navigation: d drive,
+                                        r transit, w walk, b bike; PLACE "home" = his home from the profile; an https
+                                        link; an SBB Mobile connection, FROM "here" = SBB fills his location, --at =
+                                        depart at, --arrive = be there by (SBB timemode=arrival); an installed
+                                        app by name). The app opens it directly when Android lets it (Display over
+                                        other apps on, or the app on screen) and the gateway policy allows it (nav,
+                                        sbb, app, links on the direct-host list); else a tap-to-open notification.
+                                        --tap = always the notification. Not connected / no answer within --wait (a
+                                        stale socket) -> Telegram text with a URL button. JSON route opened|notified|
+                                        telegram|null, how overlay|foreground|companion|notification. Exit 0 route set ·
+                                        2 usage · 4 offline · 5 no answer · 6 refused/unknown app · 7 gateway down
+  phone car "TEXT" [--wait 30] [--json]  = push --level timed --car --title Claude: ONLY the fallback after a missed
+                                        driving call (`drive-update` runs that path); exit 0 = delivered to the phone
+  phone nfc [list] | map TAG ACTION | unmap TAG   NFC tag ids -> actions (leaving, talk, cat_filter, cat_desiccant,
+                                        cat_litter); unknown tags leave one ~/inbox/phone-nfc-*.md per tag and day
+  phone trip [status] | build TRIP      trip mode cache for the app: trip-pack HTML + trip-conditions text (offline)
+  phone trip on NAME | off              config trip (app trip worker + roaming saver; off = home), config_rev bump
+  phone cancel TAG [--json]
+  phone file get SHARE/NAME --out PATH [--json]   one stored file of a share (or a Track ID clip in flight) from the
+                                        gateway's internal API (hub mode: `hub phone inbox` and phone.act fetch them)
+  phone chat "text" [--buttons JSON] [--reply-to MSGID] [--wait S] [--json]
+  phone probe [--n 5] [--idle 1,5,15,60] [--json]
+  phone ring --reason "…" [--say "…"] [--show "…"] [--timeout 45] [--json]   ring him IN THE APP (CallStyle call);
+                                        answered -> Gemini greets with the reason (--say = its exact words), the
+                                        call runs over /v1/voice. The lock screen shows --show (default the reason)
+                                        only if it passes the lint (<= 80 chars), else "Claude". Exit 0 answered · 3 declined/missed/no answer · 4 no
+                                        phone online · 6 a call is on / rate-limited (3/h) / relay down · 7 gateway down
+  phone pushes [--tag X] [--id ID] [--limit N] [--probes] [--json]   push log: delivery/ack times, the tapped verb
+  phone ask now|where|car|battery|awake|alarm|dnd|net|activity|steps|sleep|workouts [DAYS] [--fresh] [--json]
+  phone ask near PLACE [--timeout S] [--json]   (PLACE = a fence name; the phone answers inside/band, never coordinates)
+                                        `phone ask now --json` = exactly `vault ha now --json`'s keys + source, vpn,
+                                        screen, steps_today (cached, no phone round trip unless --fresh)
+  phone widget board|leg|trip|home|all [--json-file F] [--changed] [--json]   default: build from my tools (tg-status,
+                                        train-watch/calcache, trip-conditions) and push; --changed = only on change
+  phone card decision|info [--json] < card.json  |  phone card deck [--max N]  |  phone card rm ID  |  phone cards
+  phone fence sync | list | add NAME --at LAT,LON [--r 150] [--kind K] [--until ISO] | rm NAME
+                                        sync = home/office (profile), gym/station/airport (~/.config/phonegw places),
+                                        tonight's venue (calcache + night-plan); list never prints coordinates
+  phone alarms sync [--hours 48] [--force]   his owner reminders of the next 48 h -> local alarms on the phone
+                                        (each with a push id + nonce: offline Snooze/Done sync back via remind act)
+  phone widget tiles                    tile states (sleep-in) for the app's tiles
+  phone widget home                     home-while-away status (ha reads + cat corner; no controls), auto every 10 min
+  phone geo [build]                     the offline place pack /v1/geo/ch (towns + stops); build = rebuild now
+  phone release APK [--notes "…"]...    publish claude-<name>-<code>.apk for the in-app updater (/v1/app/apk/<code>,
+                                        size + sha256 in `app.update`, sent to devices on an older code)
+                                        [--no-board]: when a device must still install it, ONE Waiting item
+                                        "Install app <name>" with the probe app-installed <code> goes on the
+                                        board (`board add`) and replaces an older one; it clears itself
+
+Verbs: seen, done, snooze, call, crate, ha_off, open (done/snooze/ha_off need the phone unlocked). urgent text must be
+lock-screen safe (title <= 40, body <= 80 chars, no links, amounts, identifiers or 5+ digit runs); lower levels are
+masked and shown privately ("Claude · 1 update").
+Exit: 0 ok (push: delivered, and acked within --wait when given) · 2 usage · 3 blocked by the lock-screen lint ·
+4 device offline / none paired (queued until ttl) · 5 no ack within --wait · 6 refused (verb/arg not allowed) ·
+7 gateway down.
+Env: PHONEGW_URL (default http://claude-hub-phone:8796: the gateway runs in claude-hub-phone), PHONEGW_TOKEN_FILE
+(default ~/.secrets/phone-cli-token). Live (the Telegram link fallback, phone.open usage lines, the release board item)
+with that token file or PHONE_LIVE=1; any other token file is a test gateway (none of the three).
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.dont_write_bytecode = True
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+URL = os.environ.get("PHONEGW_URL") or "http://claude-hub-phone:8796"     # the gateway runs in claude-hub-phone
+LIVE_TOKEN = os.path.join(HOME, ".secrets/phone-cli-token")
+TOKEN_FILE = os.environ.get("PHONEGW_TOKEN_FILE") or LIVE_TOKEN
+LIVE = TOKEN_FILE == LIVE_TOKEN or os.environ.get("PHONE_LIVE") == "1"    # else a test gateway's token
+VERBS = ("seen", "done", "snooze", "call", "crate", "ha_off", "open")
+EXIT = {"ok": 0, "usage": 2, "lint": 3, "offline": 4, "timeout": 5, "refused": 6, "down": 7}
+
+
+def egress():
+    """core.egress for the live default (claude-hub-phone + ~/.secrets/phone-cli-token, no PHONEGW_URL) when it
+    routes the handle "phone", else None (direct: tests, PHONEGW_URL). Files
+    (`phone file get`, up to 64 MiB, over the hub's 8 MiB cap) always go direct with the local token."""
+    if not (TOKEN_FILE == LIVE_TOKEN and not os.environ.get("PHONEGW_URL")):
+        return None
+    try:
+        lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+        if lib not in sys.path:
+            sys.path.append(lib)  # append, so ~/bin/lib never shadows anything
+        from core import egress as eg
+    except Exception:
+        return None
+    return eg if eg.mode("phone") in ("hub", "shadow") else None
+
+
+def no_token():
+    """The message for a missing token file."""
+    return "no internal token (%s)" % TOKEN_FILE
+
+
+class Fail(Exception):
+    def __init__(self, code, msg, data=None):
+        super().__init__(msg)
+        self.code, self.msg, self.data = code, msg, data
+
+
+def api(method, path, body=None, timeout=10):
+    eg = egress()
+    try:
+        if eg is not None:
+            token = eg.secret("phone")  # hub mode: the placeholder (the hub puts the token on the wire)
+        else:
+            with open(TOKEN_FILE) as fh:
+                token = fh.read().strip()
+    except (OSError, KeyError):  # KeyError: core.egress Missing (no local copy of the file)
+        raise Fail(EXIT["down"], no_token())
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(URL + path, data=data, method=method,
+                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with (eg.open(req, "phone", timeout=timeout) if eg is not None
+              else urllib.request.urlopen(req, timeout=timeout)) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            j = json.loads(e.read() or b"{}")
+        except ValueError:
+            j = {}
+        err = j.get("error", "http %d" % e.code)
+        code = {"lint": EXIT["lint"], "verb": EXIT["refused"], "arg": EXIT["refused"], "link": EXIT["refused"],
+                "usage": EXIT["usage"],
+                "auth": EXIT["down"]}.get(err, EXIT["usage"] if e.code < 500 else EXIT["down"])
+        raise Fail(code, "%s: %s" % (err, j.get("msg", "")) + ("".join("\n  - " + p for p in j.get("problems", []))), j)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        if eg is not None and isinstance(e, eg.Refused):
+            raise Fail(EXIT["down"], "the hub refused the phone call (%s); try `hub egress status`" % e.error)
+        raise Fail(EXIT["down"], "gateway down (%s); try `hub phone status`" % type(e).__name__)
+
+
+def parse_ttl(s):
+    m = re.fullmatch(r"(\d+)\s*([smhd]?)", str(s).strip())
+    if not m:
+        raise Fail(EXIT["usage"], "bad --ttl (e.g. 90s, 30m, 2h, 1d)")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def parse_action(spec):
+    m = re.match(r"^(.+?):([a-z_]+)(?::(.+))?$", spec)
+    if not m:
+        raise Fail(EXIT["usage"], "bad --action %r (LABEL:VERB[:ARG])" % spec)
+    if m.group(2) not in VERBS:
+        raise Fail(EXIT["refused"], "verb %r not allowed (allowed: %s)" % (m.group(2), ", ".join(VERBS)))
+    a = {"label": m.group(1), "verb": m.group(2)}
+    if m.group(3):
+        a["arg"] = m.group(3)
+    return a
+
+
+def ago(ts):
+    if not ts:
+        return "never"
+    s = int(time.time() - ts)
+    return "%d s ago" % s if s < 120 else "%d min ago" % (s // 60) if s < 7200 else "%d h ago" % (s // 3600)
+
+
+def ms(v):
+    return "–" if v is None else ("%d ms" % v if v < 1000 else "%.1f s" % (v / 1000))
+
+
+def out(args, data, text):
+    print(json.dumps(data, ensure_ascii=False) if getattr(args, "json", False) else text)
+
+
+def c_status(a):
+    s = api("GET", "/internal/status")
+    fr = s.get("front", {})
+    lines = ["%s up %s · front %s · %d device(s)" % (s["server"], ago(time.time() - s["uptime_s"]).replace(" ago", ""),
+                                                     ("on :%s" % fr.get("port")) if fr.get("on") else "off", len(s["devices"]))]
+    for d in s["devices"]:
+        if d["status"] != "active":
+            lines.append("  %s (%s): revoked" % (d["name"], d["id"]))
+            continue
+        st = d.get("selftest")
+        lines.append("  %s (%s): %s · app %s (%s) · rtt %s · p95 push %s · keepalive %s s · battery %s · selftest %s%s" % (
+            d["name"], d["id"], ("online" + (" via internet" if d.get("route") == "public" else "")) if d["online"]
+            else "offline, last seen " + ago(d["last_seen"]),
+            d.get("app") or "?", d.get("app_code") or "?", ms(d.get("rtt_ms")), ms(d.get("push_p95_ms")), d["keepalive_s"],
+            d.get("battery_band") or "?",
+            ("%d/%d" % (st["green"], st["total"]) + (" red: " + ", ".join(st["red"]) if st["red"] else "")) if st else "–",
+            " · pending %d" % d["pending"] if d.get("pending") else ""))
+        ab = d.get("app_budget") or {}
+        if ab.get("app"):                      # the app's own battery counters today vs the daily budget (spec 1.2)
+            v, cap = ab["app"], ab.get("budget") or {}
+            parts = ["%s %s/%s%s" % (k, v[k], cap[k], " OVER" if k in (ab.get("over") or []) else "")
+                     for k in ("reconnects_d", "wakeups_h", "loc_d", "cpu_s_d") if k in v and k in cap]
+            if "fgs_h" in v:
+                parts.append("fgs %s h" % v["fgs_h"])
+            lines.append("    app today: " + " · ".join(parts))
+    if fr.get("sources"):
+        lines.append("  front sources: " + ", ".join("%s %d" % kv for kv in sorted(fr["sources"].items())))
+    pub = fr.get("public")
+    if pub:                                   # internet path (phonegw public): counters since the gateway started
+        c = pub.get("counters") or {}
+        lines.append("  internet path: %s · live %d · ok %d · refused %d · denied %d · bans %d (banned now %d)" % (
+            ("on" if pub.get("site") else "on, site down") if pub.get("enabled") else "off", pub.get("live", 0),
+            c.get("ok", 0), c.get("refused", 0), c.get("denied", 0), c.get("bans", 0), pub.get("banned_now", 0)))
+    if fr.get("denied_private"):
+        lines.append("  refused private nets: " + ", ".join("%s %d" % kv for kv in sorted(fr["denied_private"].items())))
+    out(a, s, "\n".join(lines))
+    return 0
+
+
+def c_pair(a):
+    r = api("POST", "/internal/pair-code", {"name": a.name})
+    out(a, r, "pairing code %s (valid %d min, one use; type it in the app's pairing screen)" % (r["code"], r["ttl_s"] // 60))
+    return 0
+
+
+def c_devices(a):
+    r = api("GET", "/internal/devices")
+    out(a, r, "\n".join("%s  %-10s %-8s %s · %s" % (d["id"], d["name"] or "?", d["status"], d["model"] or "?",
+                                                   "online" if d["online"] else "last seen " + ago(d["last_seen"]))
+                        for d in r["devices"]) or "no devices paired (phone pair)")
+    return 0
+
+
+def c_revoke(a):
+    r = api("POST", "/internal/revoke", {"device_id": a.id})
+    out(a, r, "revoked %s%s" % (r["device_id"], " (socket closed)" if r.get("closed") else ""))
+    return 0
+
+
+def c_push(a):
+    body = {"level": a.level, "title": a.title, "body": a.body or "", "tag": a.tag, "private": a.private, "sticky": a.sticky,
+            "full_screen": a.full_screen, "actions": [parse_action(x) for x in a.action or []], "wait": a.wait,
+            "deep_link": a.deep_link, "car": bool(getattr(a, "car", False))}
+    if len(body["actions"]) > 3:
+        raise Fail(EXIT["usage"], "at most 3 actions")
+    if a.ttl:
+        body["ttl"] = parse_ttl(a.ttl)
+    if a.live:
+        m = re.fullmatch(r"countdown:(\d+)", a.live)
+        if not m:
+            raise Fail(EXIT["usage"], "--live countdown:EPOCH")
+        body["live"] = {"kind": "countdown", "until": int(m.group(1))}
+    if getattr(a, "night_ok", False):
+        body["night_ok"] = True
+    if getattr(a, "show_for", None):
+        body["show_s"] = parse_ttl(a.show_for)
+    elif getattr(a, "show_until", None):
+        body["show_until"] = int(a.show_until)
+    r = api("POST", "/internal/push", body, timeout=(a.wait or 0) + 15)
+    st = r.get("status")
+    code = {"acked": 0, "sent": 0, "held": 0, "dropped": 0, "queued": 4, "no_device": 4, "timeout": 5}.get(st, 2)
+    held = time.strftime("%H:%M", time.localtime(r["hold_until"])) if r.get("hold_until") else "?"
+    text = {"acked": "acked in %s" % ms(r.get("acked_ms")), "sent": "sent (not waiting for the ack)",
+            "held": "held for quiet hours / sleep-in until %s (server time)" % held,
+            "dropped": "dropped: its show_until ends before quiet hours / sleep-in end",
+            "queued": "device offline: queued until ttl", "no_device": "no paired device",
+            "timeout": "sent, no ack within %ss" % a.wait}.get(st, st)
+    out(a, r, "push %s [%s]: %s" % (r.get("id", "-"), r.get("tag"), text))
+    return code
+
+
+# ------------------------------------------------------------------ one-tap links
+LINK_RE = re.compile(r"^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?([/?#][^\s\x00-\x1f\x7f]*)?"
+                     r"|geo:[^\s\x00-\x1f\x7f]+|google\.navigation:[^\s\x00-\x1f\x7f]+)$")
+NAV_MODES = ("driving", "transit", "walking", "bicycling")
+GMAPS = "https://www.google.com/maps/"
+TG_BUTTONS = os.environ.get("PHONE_TG_BUTTONS")
+
+
+def safe_link(url):
+    """Same rule as the gateway and the app: https without userinfo, geo:, google.navigation:; no spaces/controls."""
+    return isinstance(url, str) and 6 <= len(url) <= 2048 and bool(LINK_RE.fullmatch(url))
+
+
+def maps_url(place, nav=None, go=False):
+    """Google Maps universal URLs (they open the Maps app on Android): search, or directions from here."""
+    q = urllib.parse.quote(place.strip(), safe=",")
+    if not nav:
+        return GMAPS + "search/?api=1&query=" + q
+    return GMAPS + "dir/?api=1&destination=%s&travelmode=%s%s" % (q, nav, "&dir_action=navigate" if go else "")
+
+
+def web_link(url):
+    """An https twin for Telegram (its URL buttons take http(s) only): geo: -> Maps search, google.navigation: -> dir."""
+    if url.startswith("https://"):
+        return url
+    if url.startswith("geo:"):
+        rest = url[4:]
+        coords, _, query = rest.partition("?")
+        qs = urllib.parse.parse_qs(query)
+        q = (qs.get("q") or [""])[0]
+        q = re.sub(r"\(.*\)$", "", q).strip() or coords.split(";")[0]
+        return maps_url(q) if q and q != "0,0" else None
+    if url.startswith("google.navigation:"):
+        qs = urllib.parse.parse_qs(url[len("google.navigation:"):])
+        q = (qs.get("q") or [""])[0].strip()
+        mode = {"d": "driving", "w": "walking", "b": "bicycling", "l": "driving"}.get((qs.get("mode") or ["d"])[0], "driving")
+        return maps_url(q, mode, go=True) if q else None
+    return None
+
+
+def link_telegram(text, label, url):
+    """tg-buttons with one URL button. A test gateway (not LIVE) never reaches the real Telegram."""
+    if not TG_BUTTONS and not LIVE:
+        return False, "skipped (test gateway, no PHONE_TG_BUTTONS)"
+    import subprocess
+    rows = json.dumps([[{"text": label, "url": url}]], ensure_ascii=False)
+    try:
+        p = subprocess.run([TG_BUTTONS or os.path.join(HOME, "bin/tg-buttons"), text, rows], capture_output=True,
+                           text=True, timeout=40)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, type(e).__name__
+    return p.returncode == 0, (p.stderr or "").strip()[:200] or "exit %d" % p.returncode
+
+
+def c_link(a):
+    if bool(a.url) == bool(a.maps):
+        raise Fail(EXIT["usage"], "give a URL or --maps PLACE (not both)")
+    if (a.nav or a.go) and not a.maps:
+        raise Fail(EXIT["usage"], "--nav/--go need --maps")
+    url = maps_url(a.maps, a.nav or ("driving" if a.go else None), a.go) if a.maps else a.url.strip()
+    if not safe_link(url):
+        raise Fail(EXIT["refused"], "unsafe or unsupported link (allowed: https:// without user@host, geo:, "
+                                    "google.navigation:; no spaces; <= 2048 chars)")
+    place = (a.maps or "").strip()
+    if a.title:
+        title = a.title
+    elif a.maps:
+        title = "📍 " + (place if not re.fullmatch(r"-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?", place) else "Location")
+    else:
+        title = "🔗 " + (urllib.parse.urlsplit(url).hostname or "Link") if url.startswith("https://") else "🔗 Link"
+    title = title[:120]
+    label = (a.label or ("Navigate" if a.go else "Directions" if a.nav else "Open in Maps" if a.maps
+                         or url.startswith(("geo:", "google.navigation:", GMAPS)) else "Open")).strip()[:24]
+    tag = a.tag or "link-" + __import__("hashlib").sha1(url.encode()).hexdigest()[:8]
+    res = {"url": url, "tag": tag}
+    code, why = EXIT["offline"], "telegram only"
+    if not a.telegram:
+        body = {"level": a.level, "title": title, "body": a.body or "", "tag": tag, "private": a.private,
+                "link": {"url": url, "label": label}, "wait": a.wait, "ttl": parse_ttl(a.ttl)}
+        try:
+            r = api("POST", "/internal/push", body, timeout=(a.wait or 0) + 15)
+            st = r.get("status")
+            if st in ("acked", "sent", "queued", "timeout") and not r.get("link"):
+                st = "old_gateway"                 # it dropped the link: the tap would open the app, not the URL
+            res.update({"app": st, "id": r.get("id")})
+            if st == "acked" or (st == "sent" and not a.wait) or st == "held":   # held: the app gets it after quiet hours
+                res.update({"ok": True, "route": "app"})
+                out(a, res, "link [%s] delivered to the app%s" % (tag, " in " + ms(r.get("acked_ms")) if st == "acked" else ""))
+                return 0
+            code = {"queued": EXIT["offline"], "no_device": EXIT["offline"], "unsupported": EXIT["offline"],
+                    "timeout": EXIT["timeout"]}.get(st, EXIT["down"])
+            why = {"queued": "phone offline", "no_device": "no paired phone", "unsupported": "app too old for links",
+                   "timeout": "no ack within %ss" % a.wait, "old_gateway": "gateway without link support (restart phonegw)"
+                   }.get(st, str(st))
+            if st in ("queued", "timeout", "old_gateway"):   # no late or link-less copy next to the Telegram one
+                try:
+                    api("POST", "/internal/push/cancel", {"tag": tag})
+                except Fail:
+                    pass
+        except Fail as e:
+            if e.code != EXIT["down"]:
+                raise
+            code, why = e.code, "gateway down"
+            res["app"] = "down"
+    if a.no_telegram:
+        res.update({"ok": False, "route": None})
+        if a.json:
+            print(json.dumps(res, ensure_ascii=False))
+        print("phone: link not delivered (%s); --no-telegram" % why, file=sys.stderr)
+        return code
+    web = web_link(url)
+    if not web:
+        raise Fail(code, "link not delivered (%s) and it has no https form for Telegram" % why, res)
+    ok, detail = link_telegram("\n".join(x for x in (title, a.body or "") if x), label, web)
+    res.update({"ok": ok, "route": "telegram" if ok else None, "telegram_url": web, "why": why})
+    if not ok:
+        raise Fail(code, "link not delivered: app %s, Telegram %s" % (why, detail), res)
+    out(a, res, "link [%s] sent to Telegram with a URL button (app: %s)" % (tag, why))
+    return 0
+
+
+OPEN_MODES = {"d": "driving", "r": "transit", "w": "walking", "b": "bicycling"}
+SBB_APP = "https://app.sbbmobile.ch/timetable"
+# SBB Mobile's own "current location" value for from=/to= (its deep-link parser maps it to the location field, which
+# the SBB app fills on the phone): no coordinates leave the phone, no lookup on our side.
+SBB_HERE = "CURRENT_POSITION"
+HOME_WORDS = ("home", "@home", "zuhause", "daheim", "heim", "nach hause")
+
+
+def home_address():
+    """His home address from the private profile (street, postcode town); never printed or logged."""
+    import subprocess
+    parts = []
+    for k in ("home.street", "home.postcode", "home.town"):
+        try:
+            p = subprocess.run([os.environ.get("PROFILE_GET") or os.path.join(HOME, "bin/profile-get"), k],
+                               capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        v = p.stdout.strip()
+        if p.returncode != 0 or not v:
+            return None
+        parts.append(v)
+    return "%s, %s %s" % tuple(parts)
+
+
+def sbb_epoch(at):
+    """Departure time for the SBB link: now, HH:MM today (tomorrow if already past by > 1 h) or YYYY-MM-DD HH:MM."""
+    import datetime as dt
+    now = dt.datetime.now().astimezone()
+    if not at:
+        return int(now.timestamp())
+    try:
+        if re.fullmatch(r"\d{1,2}:\d{2}", at):
+            h, m = map(int, at.split(":"))
+            t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if t < now - dt.timedelta(hours=1):
+                t += dt.timedelta(days=1)
+            return int(t.timestamp())
+        return int(dt.datetime.strptime(at, "%Y-%m-%d %H:%M").astimezone().timestamp())
+    except ValueError:
+        raise Fail(EXIT["usage"], "--at HH:MM or 'YYYY-MM-DD HH:MM'")
+
+
+def open_target(a):
+    """-> kind, url|None, app|None, label (for the phone), shown (for messages), button label."""
+    given = [x for x in (a.url, a.nav, a.sbb, a.app) if x]
+    if len(given) != 1:
+        raise Fail(EXIT["usage"], "give exactly one of URL, --nav PLACE, --sbb FROM TO, --app NAME")
+    if a.mode and not a.nav:
+        raise Fail(EXIT["usage"], "--mode needs --nav")
+    if (a.at or a.arrive) and not a.sbb:
+        raise Fail(EXIT["usage"], "--at/--arrive need --sbb")
+    if a.at and a.arrive:
+        raise Fail(EXIT["usage"], "--at (depart) or --arrive (be there by), not both")
+    if a.nav:
+        place = re.sub(r"\s+", " ", a.nav).strip()
+        shown = place
+        if place.lower() in HOME_WORDS:
+            place, shown = home_address(), "home"
+            if not place:
+                raise Fail(EXIT["usage"], "no home address in the profile (home.street/postcode/town)")
+        mode = a.mode or "d"
+        if mode == "r":                         # google.navigation has no transit: Maps directions, navigate
+            url = maps_url(place, "transit", go=True)
+        else:
+            url = "google.navigation:q=%s&mode=%s" % (urllib.parse.quote(place, safe=","), mode)
+        verb = {"d": "Navigation", "r": "Transit", "w": "Walking", "b": "Cycling"}[mode]
+        return "nav", url, None, "%s to %s" % (verb, shown), shown, "Navigate"
+    if a.sbb:
+        frm, to = (re.sub(r"\s+", " ", x).strip() for x in a.sbb)
+        if not to:
+            raise Fail(EXIT["usage"], "--sbb FROM TO: TO is required")
+        q = lambda x: urllib.parse.quote(x, safe="")  # noqa: E731
+        here = frm.lower() in ("", "here", "hier", "-")
+        url = SBB_APP + "?from=%s&to=%s&time=%d" % (SBB_HERE if here else q(frm), q(to), sbb_epoch(a.arrive or a.at))
+        shown = ("to %s" % to) if here else "%s to %s" % (frm, to)
+        if a.arrive:                            # SBB Mobile's link parser: timemode=arrival = "arrive by" search
+            url += "&timemode=arrival"
+            shown += ", arrive by %s" % a.arrive.strip()[-5:]
+        return "sbb", url, None, "SBB: " + shown, shown, "Open in SBB"
+    if a.app:
+        name = re.sub(r"\s+", " ", a.app).strip()
+        if not name or len(name) > 60:
+            raise Fail(EXIT["usage"], "--app NAME (1-60 chars)")
+        return "app", None, name, name, name, None
+    url = a.url.strip()
+    if not url.startswith("https://") or not safe_link(url):
+        raise Fail(EXIT["refused"], "only https:// links (no user@host, no spaces, <= 2048 chars)")
+    shown = urllib.parse.urlsplit(url).hostname or "link"
+    return "url", url, None, shown, shown, "Open"
+
+
+def open_usage(kind, route, ms, via):
+    """phone.open.<kind> (ids and counts only: never the place, url or app name). Off for test gateways."""
+    if not LIVE and not os.environ.get("USAGE_TEST"):
+        return
+    try:
+        sys.path.insert(0, os.path.join(HOME, "bin"))
+        from lib.usage import log as ulog
+        # outcome ok|failed (an exec counts as an error unless its outcome is ok); the route rides in attrs
+        ulog("phone.open." + kind, kind="exec", channel=via or "session", ms=ms, outcome="ok" if route else "failed",
+             attrs={"route": route} if route else None)
+    except Exception:
+        pass
+
+
+def c_open(a):
+    kind, url, app, label, shown, button = open_target(a)
+    t0 = time.time()
+    res = {"ok": False, "route": None, "kind": kind}
+    code, why = EXIT["down"], "gateway down"
+    body = {"kind": kind, "label": label[:80], "wait": a.wait, "direct": not a.tap}
+    body.update({"url": url} if url else {"app": app})
+    try:
+        r = api("POST", "/internal/open", body, timeout=a.wait + 10)
+        st = r.get("status")
+        res.update({"app": st, "how": r.get("how"), "direct": r.get("direct")})
+        for k in ("locked", "car"):
+            if k in r:
+                res[k] = r[k]
+        if st in ("opened", "notified"):
+            res.update({"ok": True, "route": st, "ms": int((time.time() - t0) * 1000)})
+            open_usage(kind, st, res["ms"], a.via)
+            out(a, res, "%s on the phone: %s (%s, %d ms)" % ("opened" if st == "opened" else "tap-to-open notification",
+                                                            label, r.get("how") or "-", res["ms"]))
+            return 0
+        code = {"offline": EXIT["offline"], "no_device": EXIT["offline"], "unsupported": EXIT["offline"],
+                "timeout": EXIT["timeout"], "stale": EXIT["timeout"], "refused": EXIT["refused"],
+                "no_handler": EXIT["refused"]}.get(st, EXIT["down"])
+        why = {"offline": "phone not connected", "no_device": "no paired phone", "unsupported": "app too old for open",
+               "timeout": "no answer within %ss (stale connection)" % a.wait, "stale": "arrived too late",
+               "refused": "the phone refused it", "no_handler": "nothing on the phone opens it"}.get(st, str(st))
+    except Fail as e:
+        if e.code != EXIT["down"]:
+            raise
+        res["app"] = "down"
+    if kind == "app" or a.no_telegram:                 # an app has no link form for Telegram
+        res.update({"why": why, "ms": int((time.time() - t0) * 1000)})
+        open_usage(kind, None, res["ms"], a.via)
+        if a.json:
+            print(json.dumps(res, ensure_ascii=False))
+        print("phone: not opened (%s)%s" % (why, "; --no-telegram" if a.no_telegram else ""), file=sys.stderr)
+        return code
+    web = web_link(url)
+    ok, detail = link_telegram("📍 " + label if kind == "nav" else ("🚆 " + label if kind == "sbb" else "🔗 " + label),
+                               button, web) if web else (False, "no https form")
+    res.update({"ok": ok, "route": "telegram" if ok else None, "why": why, "ms": int((time.time() - t0) * 1000)})
+    open_usage(kind, res["route"], res["ms"], a.via)
+    if not ok:
+        raise Fail(code, "not opened: app %s, Telegram %s" % (why, detail), res)
+    out(a, res, "sent to Telegram with a URL button (app: %s)" % why)
+    return 0
+
+
+def c_car(a):
+    """The driving fallback: one Android Auto message (timed level, lock-screen lint, 30 min ttl)."""
+    a2 = argparse.Namespace(level="timed", title="Claude", body=a.text, tag=a.tag or "car", private=True, sticky=False,
+                            full_screen=False, action=None, wait=a.wait, deep_link=None, ttl="30m", live=None, car=True,
+                            json=a.json)
+    return c_push(a2)
+
+
+def c_nfc(a):
+    if a.what == "list":
+        r = api("GET", "/internal/nfc")
+        seen = r.get("seen") or {}
+        lines = ["%-18s -> %-14s taps %s, last %s" % (t, r["map"].get(t, "(unknown)"), s.get("n"),
+                 time.strftime("%d.%m %H:%M", time.localtime(s.get("last") or 0))) for t, s in seen.items()]
+        lines += ["%-18s -> %-14s (never tapped)" % (t, act) for t, act in r["map"].items() if t not in seen]
+        out(a, r, "\n".join(lines) or "no tags yet (actions: %s)" % ", ".join(r["actions"]))
+        return 0
+    if not a.tag or (a.what == "map" and not a.action):
+        raise Fail(EXIT["usage"], "phone nfc map TAG ACTION | unmap TAG")
+    r = api("POST", "/internal/nfc", {"tag": a.tag, "action": a.action if a.what == "map" else None})
+    out(a, r, "nfc %s: %s" % (a.tag, r["map"].get(a.tag, "unmapped")))
+    return 0
+
+
+def c_trip(a):
+    if a.what in ("on", "off"):
+        if a.what == "on" and not a.trip:
+            raise Fail(EXIT["usage"], "phone trip on NAME (a-z first, max 16 chars) | phone trip off")
+        r = api("POST", "/internal/trip", {"mode": a.what, "name": a.trip})
+        out(a, r, "trip mode %s (config rev %s%s; sent to %s connected phone(s))" % (
+            r.get("trip"), r.get("rev"), "" if r.get("changed") else ", unchanged", r.get("sent")))
+        return 0 if r.get("ok") else 1
+    if a.what == "build":
+        if not a.trip:
+            raise Fail(EXIT["usage"], "phone trip build TRIP (a trip-pack trip name)")
+        r = api("POST", "/internal/trip", {"trip": a.trip}, timeout=330)
+        out(a, r, "trip %s: pack %s, conditions %s" % (r.get("trip"), r.get("pack"), r.get("conditions")))
+        return 0 if r.get("ok") else 1
+    r = api("GET", "/internal/trip")
+    c = r.get("cache") or {}
+    out(a, r, "trip cache: %s" % ("%s built %s (pack %s, conditions %s; files %s)" % (
+        c.get("trip"), time.strftime("%d.%m %H:%M", time.localtime(c.get("built") or 0)), c.get("pack"), c.get("conditions"),
+        r.get("files")) if c else "none"))
+    return 0
+
+
+def c_cancel(a):
+    r = api("POST", "/internal/push/cancel", {"tag": a.tag})
+    out(a, r, "cancel %s: sent to %d device(s), %d queued push(es) dropped" % (r["tag"], len(r["ids"]), r["dropped_unsent"]))
+    return 0
+
+
+def c_chat(a):
+    body = {"text": a.text, "reply_to": a.reply_to, "wait": a.wait}
+    if a.buttons:
+        try:
+            body["buttons"] = json.loads(a.buttons)
+        except ValueError:
+            raise Fail(EXIT["usage"], "--buttons must be JSON: [[{\"text\":\"Yes\",\"data\":\"y\"}]]")
+    r = api("POST", "/internal/chat", body, timeout=(a.wait or 0) + 15)
+    st = r.get("status")
+    out(a, r, "chat %s: %s" % (r.get("msg_id", "-"), st))
+    return {"acked": 0, "sent": 0, "queued": 4, "no_device": 4, "timeout": 5}.get(st, 2)
+
+
+RING_EXIT = {"answered": 0, "declined": 3, "missed": 3, "no_answer": 3, "offline": 4, "in_call": 6,
+             "rate_limited": 6, "unavailable": 6}
+
+
+def c_ring(a):
+    if not (a.reason or a.say):
+        raise Fail(EXIT["usage"], "phone ring --reason TEXT [--say WORDS]")
+    body = {"reason": a.reason or "", "timeout_s": a.timeout}
+    if a.say:
+        body["say"] = a.say
+    if a.show:
+        body["show"] = a.show
+    r = api("POST", "/internal/ring", body, timeout=a.timeout + 20)
+    st = r.get("status", "?")
+    msg = {"answered": "answered after %s s: he's talking with the voice relay" % r.get("ring_s"),
+           "declined": "declined" + ({"busy": " with \"Busy\"", "later": " with \"Call me later\"",
+                                       "text": " with \"Text me instead\""}.get(r.get("reply") or "", "")
+                                      + (" (his quick reply also reached the session)" if r.get("reply") else "")),
+           "missed": "rang %s s, not answered" % r.get("ring_s"),
+           "no_answer": "no answer within %s s" % r.get("ring_s"), "offline": "no paired phone online: nothing rang",
+           "in_call": "a call is already on: not rung", "rate_limited": "rate-limited: not rung",
+           "unavailable": "voice relay down: not rung"}.get(st, st)
+    out(a, r, "ring: " + msg + ("" if st not in ("answered", "declined", "missed", "no_answer") or r.get("reason_shown")
+                                else " (lock screen showed just \"Claude\")"))
+    return RING_EXIT.get(st, 1)
+
+
+def c_probe(a):
+    if a.idle:
+        marks = [int(x) for x in a.idle.split(",") if x.strip()]
+        r = api("POST", "/internal/probe", {"idle": marks})
+    else:
+        r = api("POST", "/internal/probe", {"n": a.n}, timeout=a.n * 11 + 10)
+    if r.get("status") == "offline":
+        out(a, r, "device offline: no probe sent")
+        return 4
+    if r["status"] == "scheduled":
+        out(a, r, "idle probes scheduled at %s min of socket idle; results in `phone status` (idle_probes)" % r["idle_min"])
+        return 0
+    out(a, r, "probe x%d: %s · p50 %s · p95 %s · lost %d" % (len(r["rtt_ms"]), ", ".join(ms(x) for x in r["rtt_ms"]),
+                                                            ms(r["p50_ms"]), ms(r["p95_ms"]), r["lost"]))
+    return 0 if not r["lost"] else 5
+
+
+def c_pushes(a):
+    q = "?limit=%d" % a.limit + ("&tag=" + urllib.parse.quote(a.tag) if a.tag else "") + \
+        ("&id=" + urllib.parse.quote(a.id) if a.id else "") + ("&probes=1" if a.probes else "")
+    r = api("GET", "/internal/pushes" + q)
+    out(a, r, "\n".join("%s %s %-8s %-20s delivered %s acked %s%s" % (
+        p["id"], time.strftime("%d.%m %H:%M:%S", time.localtime(p["at"] / 1000)), p["level"], p["tag"], ms(p["delivered_ms"]),
+        ms(p["acked_ms"]), " · tapped %s%s" % (p["verb"], " " + p["arg"] if p.get("arg") else "") if p["verb"] else "")
+        for p in r["pushes"]) or "no pushes")
+    return 0
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        print("phone: " + message, file=sys.stderr)
+        sys.exit(2)
+
+
+ASK_Q = ("now", "where", "car", "battery", "awake", "alarm", "dnd", "net", "activity", "steps", "sleep", "workouts", "near")
+ST_EXIT = {"sent": 0, "acked": 0, "answered": 0, "unchanged": 0, "stored": 4, "queued": 4, "no_device": 4, "offline": 4,
+           "timeout": 5, "schema": 2, "producer_failed": 1, "deck_failed": 1, "no_remind_store": 1}
+
+
+def c_ask(a):
+    q = a.q
+    body = {"q": q, "fresh": a.fresh, "timeout_s": a.timeout, "args": {}}
+    if q == "near":
+        if not a.arg:
+            raise Fail(EXIT["usage"], "usage: phone ask near PLACE")
+        body["args"]["place"] = a.arg
+    elif a.arg:
+        if not a.arg.isdigit():
+            raise Fail(EXIT["usage"], "DAYS must be a number")
+        body["args"]["days"] = int(a.arg)
+    if q == "now" and not a.fresh:
+        try:
+            v = api("GET", "/internal/now")
+        except Fail as e:
+            if e.data and "connection" in e.data:      # 404 = no device: still the key set, exit 4
+                print(json.dumps(e.data, ensure_ascii=False) if a.json else "phone: no paired device")
+                return EXIT["offline"]
+            raise
+        if a.json:
+            print(json.dumps(v, ensure_ascii=False))
+        else:
+            p = v.get("place") or {}
+            b = v.get("battery") or {}
+            print("%s · %s%s · battery %s%% %s · drive %s · activity %s · age %s min" % (
+                v.get("device"), p.get("zone") or p.get("kind") or "?", (" (%s)" % p["band"]) if p.get("band") else "",
+                b.get("level", "?"), b.get("band") or "", (v.get("drive") or {}).get("active"), v.get("activity"),
+                v.get("age_min")))
+        return 0
+    r = api("POST", "/internal/ask", body, timeout=a.timeout + 10)
+    st = r.get("status")
+    if st != "answered":
+        out(a, r, "ask %s: %s" % (q, st))
+        return ST_EXIT.get(st, 1)
+    out(a, r["result"] if q == "now" else r, "%s (%s%s): %s" % (q, r.get("source"), ", age %s min" % r["age_min"]
+                                                               if r.get("age_min") is not None else "",
+                                                               json.dumps(r.get("result"), ensure_ascii=False)))
+    return 0 if r.get("ok") else 5
+
+
+def c_widget(a):
+    body = {"kind": a.kind, "changed_only": a.changed}
+    if a.json_file:
+        if a.kind == "all":
+            raise Fail(EXIT["usage"], "--json-file needs one kind")
+        try:
+            with (sys.stdin if a.json_file == "-" else open(a.json_file)) as fh:
+                body["data"] = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise Fail(EXIT["usage"], "bad --json-file (%s)" % type(e).__name__)
+    r = api("POST", "/internal/widget", body, timeout=120)
+    res = r.get("results", [])
+    out(a, r, "\n".join("widget %s: %s" % (x["kind"], x["status"]) for x in res))
+    codes = [ST_EXIT.get(x["status"], 1) for x in res]
+    return max(codes) if codes else 1
+
+
+def c_card(a):
+    if a.what == "deck":
+        r = api("POST", "/internal/card", {"deck": True, "max": a.max}, timeout=60)
+        out(a, r, "deck: %s (%d card(s))" % (r.get("status"), len(r.get("cards", []))))
+        return ST_EXIT.get(r.get("status"), 1)
+    if a.what == "rm":
+        if not a.id:
+            raise Fail(EXIT["usage"], "usage: phone card rm CARD_ID")
+        r = api("POST", "/internal/card/remove", {"card_id": a.id})
+        out(a, r, "card %s removed (%s)" % (a.id, "online" if r.get("online") else "queued"))
+        return 0 if r.get("ok") else ST_EXIT.get(r.get("status"), 1)
+    try:
+        card = json.load(sys.stdin)
+    except ValueError:
+        raise Fail(EXIT["usage"], "card JSON on stdin: {title, text, options:[{id,label}], expires, card_id?}")
+    card["kind"] = a.what
+    r = api("POST", "/internal/card", card)
+    out(a, r, "card %s: %s" % (r.get("card_id", "-"), r.get("status")))
+    return ST_EXIT.get(r.get("status"), 1)
+
+
+def c_cards(a):
+    r = api("GET", "/internal/cards")
+    lines = ["%s  %-8s %s%s" % (c["card_id"], c["kind"], c.get("title") or "",
+                                "  → %s" % (c.get("answer_label") or c["answer"]) if c.get("answer") else "")
+             for c in r["cards"]]
+    out(a, r, "\n".join(lines) or "no cards in the last 7 days")
+    return 0
+
+
+def c_fence(a):
+    if a.what == "list":
+        r = api("GET", "/internal/geofences")
+        lines = ["%-22s %-8s r %5d m%s" % (f["name"], f["kind"], f["r_m"], "  until %s" % time.strftime(
+            "%d.%m %H:%M", time.localtime(f["until"])) if f.get("until") else "") for f in r["fences"]]
+        if r.get("missing"):
+            lines.append("not configured: " + ", ".join(r["missing"]))
+        out(a, r, "\n".join(lines) or "no fences (run `phone fence sync`)")
+        return 0
+    if a.what == "sync":
+        r = api("POST", "/internal/geofences", {"source": "auto", "force": a.force}, timeout=120)
+    elif a.what == "rm":
+        if not a.name:
+            raise Fail(EXIT["usage"], "usage: phone fence rm NAME")
+        r = api("POST", "/internal/geofences", {"remove": a.name})
+    else:
+        if not a.name or not a.at:
+            raise Fail(EXIT["usage"], "usage: phone fence add NAME --at LAT,LON [--r 150] [--kind K] [--until ISO]")
+        try:
+            lat, lon = (float(x) for x in a.at.split(","))
+        except ValueError:
+            raise Fail(EXIT["usage"], "--at LAT,LON")
+        f = {"name": a.name, "kind": a.kind or (a.name.split(":")[0] if a.name.split(":")[0] in (
+            "home", "office", "gym", "venue", "station", "airport") else "place"), "lat": lat, "lon": lon, "r_m": a.r}
+        if a.until:
+            try:
+                f["until"] = int(time.mktime(time.strptime(a.until.replace("T", " ")[:16], "%Y-%m-%d %H:%M")))
+            except ValueError:
+                raise Fail(EXIT["usage"], "--until YYYY-MM-DD HH:MM")
+        r = api("POST", "/internal/geofences", {"add": f})
+    out(a, r, "fences: %s (rev %s, %s fence(s))%s" % (r.get("status"), r.get("rev"), r.get("count"),
+                                                      "; not configured: " + ", ".join(r["missing"]) if r.get("missing") else ""))
+    return 0 if r.get("ok") and r.get("status") != "queued" else ST_EXIT.get(r.get("status"), 1)
+
+
+def c_alarms(a):
+    r = api("POST", "/internal/alarms", {"hours": a.hours, "force": a.force})
+    out(a, r, "alarms: %s (rev %s, %s alarm(s)%s)" % (r.get("status"), r.get("rev"), r.get("count"),
+                                                     ", %d private" % r["private"] if r.get("private") else ""))
+    return ST_EXIT.get(r.get("status"), 1)
+
+
+def c_geo(a):
+    r = api("POST", "/internal/geo", {"pack": "ch", "build": a.what == "build"}, timeout=240)
+    out(a, r, "geo ch: %s%s" % (r.get("status"), " (%s towns, %s stops, %s bytes)" % (r["towns"], r["stops"], r["bytes"])
+                                 if r.get("ok") else ""))
+    return 0 if r.get("ok") else 1
+
+
+def release_board(r, a):
+    """A release that waits on his install tap -> ONE "Install app X" Waiting item on the board that clears itself
+    (`board add … --when "app-installed CODE"`) and replaces an older one (--replace-title). Skipped for --no-board,
+    for a release no device needs, and against another gateway (PHONEGW_URL set, e.g. tests) unless BOARD_TODO points
+    the board somewhere. -> "added" | "skipped" | "failed"."""
+    if a.no_board or r.get("status") not in ("sent", "queued") or not str(r.get("code") or "").isdigit():
+        return "skipped"
+    if os.environ.get("PHONEGW_URL") and not os.environ.get("BOARD_TODO"):
+        return "skipped"
+    bd = os.path.join(os.path.dirname(os.path.realpath(__file__)), "board")
+    if not os.access(bd, os.X_OK):
+        bd = os.path.expanduser("~/bin/board")
+    try:
+        p = subprocess.run([bd, "add", "**📱 Install app %s** — tap Install on the update card in the app" % r.get("name"),
+                            "--section", "Waiting on you", "--when", "app-installed %d" % int(r["code"]),
+                            "--replace-title", r"install (the )?app v?\d"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+        return "added" if p.returncode == 0 else "failed"
+    except Exception:
+        return "failed"
+
+
+def c_file(a):
+    """One stored file of a share (or a Track ID clip) from the gateway -> --out (0600, written whole or not at all)."""
+    if not re.match(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}/[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$", a.id):
+        raise Fail(EXIT["usage"], "phone file get SHARE/NAME --out PATH")
+    try:
+        with open(TOKEN_FILE) as fh:
+            token = fh.read().strip()
+    except OSError:
+        raise Fail(EXIT["down"], no_token())
+    req = urllib.request.Request(URL + "/internal/file?id=" + urllib.parse.quote(a.id, safe="/"),
+                                 headers={"Authorization": "Bearer " + token})
+    tmp, n = a.out + ".part", 0
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                for chunk in iter(lambda: r.read(65536), b""):
+                    n += len(chunk)
+                    if n > 64 << 20:
+                        raise Fail(EXIT["usage"], "file: over 64 MiB")
+                    fh.write(chunk)
+        os.replace(tmp, a.out)
+    except urllib.error.HTTPError as e:
+        raise Fail(EXIT["usage"] if e.code in (400, 404) else EXIT["down"], "file: http %d" % e.code)
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail(EXIT["down"], "gateway down (%s)" % type(e).__name__)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    out(a, {"ok": True, "id": a.id, "bytes": n}, "%s: %d bytes -> %s" % (a.id, n, a.out))
+    return 0
+
+
+def c_release(a):
+    path = os.path.abspath(a.apk)
+    r = api("POST", "/internal/update", {"apk": path, "notes": a.notes or [], "code": a.code, "name": a.name}, timeout=120)
+    r["board"] = release_board(r, a)
+    out(a, r, "release %s (code %s): %s bytes, sha256 %s… -> %s device(s), %s%s" % (
+        r.get("name"), r.get("code"), r.get("size"), (r.get("sha256") or "")[:12], r.get("devices"), r.get("status"),
+        " · board: Waiting item added (clears itself once installed)" if r["board"] == "added" else
+        " · board: item NOT added (board add failed)" if r["board"] == "failed" else ""))
+    return ST_EXIT.get(r.get("status"), 1) if r.get("status") != "stored" else 0
+
+
+def main(argv):
+    p = Parser(prog="phone", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("pair")
+    s.add_argument("--name")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("devices")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("revoke")
+    s.add_argument("id")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("push")
+    s.add_argument("--level", required=True, choices=["urgent", "timed", "decision", "info"])
+    s.add_argument("--title", required=True)
+    s.add_argument("--body", default="")
+    s.add_argument("--action", action="append")
+    s.add_argument("--tag")
+    s.add_argument("--ttl")
+    s.add_argument("--private", action="store_true")
+    s.add_argument("--sticky", action="store_true")
+    s.add_argument("--full-screen", action="store_true")
+    s.add_argument("--live")
+    s.add_argument("--deep-link")
+    s.add_argument("--wait", type=float, default=0)
+    s.add_argument("--car", action="store_true")
+    s.add_argument("--night-ok", action="store_true")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--show-for")
+    g.add_argument("--show-until", type=int)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("link")
+    s.add_argument("url", nargs="?")
+    s.add_argument("--maps")
+    s.add_argument("--nav", choices=NAV_MODES)
+    s.add_argument("--go", action="store_true")
+    s.add_argument("--title")
+    s.add_argument("--body", default="")
+    s.add_argument("--label")
+    s.add_argument("--level", default="timed", choices=["urgent", "timed", "decision", "info"])
+    s.add_argument("--tag")
+    s.add_argument("--ttl", default="2h")
+    s.add_argument("--private", action="store_true")
+    s.add_argument("--wait", type=float, default=20)
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--no-telegram", action="store_true")
+    g.add_argument("--telegram", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("car")
+    s.add_argument("text")
+    s.add_argument("--tag")
+    s.add_argument("--wait", type=float, default=0)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("nfc")
+    s.add_argument("what", nargs="?", choices=["list", "map", "unmap"], default="list")
+    s.add_argument("tag", nargs="?")
+    s.add_argument("action", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("trip")
+    s.add_argument("what", nargs="?", choices=["status", "build", "on", "off"], default="status")
+    s.add_argument("trip", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("cancel")
+    s.add_argument("tag")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("chat")
+    s.add_argument("text")
+    s.add_argument("--buttons")
+    s.add_argument("--reply-to")
+    s.add_argument("--wait", type=float, default=0)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("ring")
+    s.add_argument("--reason", default="")
+    s.add_argument("--say", default="")
+    s.add_argument("--show", default="", help="lock-screen text (default: the reason); linted, else just Claude")
+    s.add_argument("--timeout", type=int, default=45)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("probe")
+    s.add_argument("--n", type=int, default=5)
+    s.add_argument("--idle")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("pushes")
+    s.add_argument("--tag")
+    s.add_argument("--id")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--probes", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("ask")
+    s.add_argument("q", choices=ASK_Q)
+    s.add_argument("arg", nargs="?")
+    s.add_argument("--fresh", action="store_true")
+    s.add_argument("--timeout", type=float, default=10)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("widget")
+    s.add_argument("kind", choices=["board", "leg", "trip", "tiles", "home", "all"])
+    s.add_argument("--from-tools", action="store_true")
+    s.add_argument("--json-file")
+    s.add_argument("--changed", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("card")
+    s.add_argument("what", choices=["decision", "info", "deck", "rm"])
+    s.add_argument("id", nargs="?")
+    s.add_argument("--max", type=int, default=8)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("cards")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("fence")
+    s.add_argument("what", choices=["sync", "list", "add", "rm"])
+    s.add_argument("name", nargs="?")
+    s.add_argument("--at")
+    s.add_argument("--r", type=int, default=150)
+    s.add_argument("--kind")
+    s.add_argument("--until")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("alarms")
+    s.add_argument("what", choices=["sync"])
+    s.add_argument("--hours", type=int, default=48)
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("geo")
+    s.add_argument("what", nargs="?", choices=["status", "build"], default="status")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("open")
+    s.add_argument("url", nargs="?")
+    s.add_argument("--nav")
+    s.add_argument("--mode", choices=sorted(OPEN_MODES))
+    s.add_argument("--sbb", nargs=2, metavar=("FROM", "TO"))
+    s.add_argument("--at")
+    s.add_argument("--arrive", metavar="HH:MM")
+    s.add_argument("--app")
+    s.add_argument("--label")
+    s.add_argument("--tap", action="store_true")
+    s.add_argument("--wait", type=float, default=6)
+    s.add_argument("--no-telegram", action="store_true")
+    s.add_argument("--via", choices=["voice", "drive", "session", "app"])
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("file")
+    s.add_argument("file_cmd", choices=("get",))
+    s.add_argument("id")
+    s.add_argument("--out", required=True)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("release")
+    s.add_argument("apk")
+    s.add_argument("--notes", action="append")
+    s.add_argument("--code", type=int)
+    s.add_argument("--name")
+    s.add_argument("--no-board", action="store_true")
+    s.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    fn = {"file": c_file, "geo": c_geo, "release": c_release, "status": c_status, "pair": c_pair, "devices": c_devices, "revoke": c_revoke, "push": c_push, "link": c_link, "open": c_open, "cancel": c_cancel, "car": c_car, "nfc": c_nfc, "trip": c_trip,
+          "chat": c_chat, "probe": c_probe, "ring": c_ring, "pushes": c_pushes, "ask": c_ask, "widget": c_widget, "card": c_card,
+          "cards": c_cards, "fence": c_fence, "alarms": c_alarms}[a.cmd]
+    try:
+        return fn(a)
+    except Fail as e:
+        if getattr(a, "json", False):
+            print(json.dumps({"ok": False, "exit": e.code, "error": e.msg.split(":")[0], "detail": e.data or {}}))
+        print("phone: " + e.msg, file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,490 @@
+#!/usr/local/bin/python3.13 -I
+"""missing-docs: monthly check for documents the owner should have in paperless but doesn't (metadata only).
+
+  missing-docs [--json] [--key KEY]          table: each expectation, its status, the last matching doc
+  missing-docs --cron                        ONE ~/inbox/missing-docs.md note only when something is overdue by more
+                                             than `alert_after_days` (14); a failed run writes missing-docs-error.md
+  missing-docs --mark-not-needed KEY [--forever] [--period P]
+                                             waive the overdue periods of KEY (or P: YYYY-MM / YYYY); --forever turns
+                                             the whole expectation off
+  missing-docs --snooze KEY DAYS [--no-remind]
+                                             keep KEY out of the cron note for DAYS; a `remind` note (tag mdoc:KEY)
+                                             brings it back when the snooze ends
+  missing-docs --reset KEY                   clear snooze / waivers / not-needed for KEY
+  missing-docs --validate                    check the config
+
+Expectations: ~/.config/missing-docs/expected.json (format in its _format key). Matching uses only what the privacy
+vault returns for `paperless recent --json`: id, created, title, type, tags, correspondent. Never content.
+State (snoozes, waivers): ~/.local/state/missing-docs/state.json.
+Env (tests): MDOC_CONFIG, MDOC_STATE_DIR, MDOC_INBOX, MDOC_PAPERLESS, MDOC_REMIND, MDOC_PROFILE, MDOC_NOW (YYYY-MM-DD).
+"""
+import argparse, calendar, datetime as dt, json, os, re, subprocess, sys
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("MDOC_CONFIG") or f"{HOME}/.config/missing-docs/expected.json"
+STATE_DIR = os.environ.get("MDOC_STATE_DIR") or f"{HOME}/.local/state/missing-docs"
+INBOX = os.environ.get("MDOC_INBOX") or f"{HOME}/inbox"
+PAPERLESS = os.environ.get("MDOC_PAPERLESS") or f"{HOME}/bin/paperless"
+REMIND = os.environ.get("MDOC_REMIND") or f"{HOME}/bin/remind"
+PROFILE = os.environ.get("MDOC_PROFILE") or f"{HOME}/.config/deadlines/profile.json"
+NOTE, ERR_NOTE = "missing-docs.md", "missing-docs-error.md"
+FETCH_N = 2000
+MMDD = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
+
+MONTHS = {
+    1: "januar|january|janvier|jan", 2: "februar|february|f[ée]vrier|feb", 3: "m[äa]rz|maerz|march|mars|mar",
+    4: "april|avril|apr", 5: "mai|may", 6: "juni|june|juin|jun", 7: "juli|july|juillet|jul",
+    8: "august|ao[uû]t|aug", 9: "september|septembre|sept|sep", 10: "oktober|october|octobre|okt|oct",
+    11: "november|novembre|nov", 12: "dezember|december|d[ée]cembre|dez|dec"}
+MONTH_RE = [(m, re.compile(rf"\b(?:{alts})\.?\s+(20\d\d)\b", re.I)) for m, alts in MONTHS.items()]
+NUM_RES = [re.compile(r"\b(20\d\d)-(0[1-9]|1[0-2])\b"), re.compile(r"\b(0?[1-9]|1[0-2])[./](20\d\d)\b")]
+
+
+def die(msg, code=2):
+    print(f"missing-docs: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def today():
+    v = os.environ.get("MDOC_NOW")
+    return dt.date.fromisoformat(v[:10]) if v else dt.date.today()
+
+
+def load_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        if default is not None:
+            return default
+        die(f"missing {path}")
+    except json.JSONDecodeError as e:
+        die(f"{path}: bad JSON ({e})")
+
+
+def write_atomic(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+# ---------- config ----------
+def validate(cfg):
+    errs, keys = [], set()
+    exp = cfg.get("expected")
+    if not isinstance(exp, list) or not exp:
+        return ["no 'expected' list"]
+    for i, e in enumerate(exp):
+        k = e.get("key") or f"#{i}"
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,23}", str(e.get("key", ""))):
+            errs.append(f"{k}: key must be a-z0-9- (max 24 chars, fits Telegram button data)")
+        if k in keys:
+            errs.append(f"{k}: duplicate key")
+        keys.add(k)
+        if e.get("cadence") not in ("monthly", "yearly"):
+            errs.append(f"{k}: cadence must be monthly or yearly")
+        if e.get("active") not in (True, False, "auto"):
+            errs.append(f"{k}: active must be true, false or \"auto\"")
+        if e.get("cadence") == "yearly":
+            for f in ("due", "window_start"):
+                if not MMDD.match(str(e.get(f, ""))):
+                    errs.append(f"{k}: {f} must be MM-DD")
+            if "window_end" in e and not MMDD.match(str(e["window_end"])):
+                errs.append(f"{k}: window_end must be MM-DD")
+        if e.get("cadence") == "monthly" and not isinstance(e.get("due_days_after_period", 0), int):
+            errs.append(f"{k}: due_days_after_period must be an integer")
+        groups = e.get("match")
+        if not isinstance(groups, list) or not groups:
+            errs.append(f"{k}: match must be a non-empty list of groups")
+            continue
+        for g in groups:
+            if not any(g.get(f) for f in ("types", "tags", "correspondents", "title_regex")):
+                errs.append(f"{k}: empty match group {g}")
+            if g.get("title_regex"):
+                try:
+                    re.compile(g["title_regex"])
+                except re.error as ex:
+                    errs.append(f"{k}: bad title_regex ({ex})")
+        if e.get("since"):
+            try:
+                dt.date.fromisoformat(e["since"])
+            except ValueError:
+                errs.append(f"{k}: since must be YYYY-MM-DD")
+    return errs
+
+
+def load_config():
+    cfg = load_json(CONFIG)
+    errs = validate(cfg)
+    if errs:
+        die("config errors:\n  " + "\n  ".join(errs))
+    return cfg
+
+
+def find_exp(cfg, key):
+    for e in cfg["expected"]:
+        if e["key"] == key:
+            return e
+    die(f"unknown key {key!r}; keys: {', '.join(e['key'] for e in cfg['expected'])}")
+
+
+# ---------- documents ----------
+def fetch_docs():
+    try:
+        r = subprocess.run([PAPERLESS, "recent", "-n", str(FETCH_N), "--json"], capture_output=True, text=True,
+                           timeout=200)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("paperless recent timed out")
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr.strip() or "paperless recent failed").splitlines()[-1][:300])
+    data = json.loads(r.stdout)
+    docs = data.get("results", data) if isinstance(data, dict) else data
+    out = []
+    for d in docs:
+        c = str(d.get("created") or "")[:10]
+        try:
+            created = dt.date.fromisoformat(c)
+        except ValueError:
+            continue
+        out.append({"id": d.get("id"), "created": created, "title": d.get("title") or "",
+                    "type": d.get("document_type") or "", "tags": [t for t in d.get("tags") or []],
+                    "correspondent": d.get("correspondent") or ""})
+    return out, len(docs) >= FETCH_N
+
+
+def _in(name, names):
+    return name.lower() in {n.lower() for n in names}
+
+
+def group_match(g, d):
+    if g.get("types") and not _in(d["type"], g["types"]):
+        return False
+    if g.get("tags") and not any(_in(t, g["tags"]) for t in d["tags"]):
+        return False
+    if g.get("correspondents") and not _in(d["correspondent"], g["correspondents"]):
+        return False
+    if g.get("title_regex") and not re.search(g["title_regex"], d["title"]):
+        return False
+    return True
+
+
+def matches(e, d):
+    return any(group_match(g, d) for g in e["match"])
+
+
+def title_period(title):
+    """(year, month) named in a title such as 'Lohnabrechnung fuer Juli 2024', else None."""
+    for m, rx in MONTH_RE:
+        x = rx.search(title)
+        if x:
+            return int(x.group(1)), m
+    x = NUM_RES[0].search(title)
+    if x:
+        return int(x.group(1)), int(x.group(2))
+    x = NUM_RES[1].search(title)
+    if x:
+        return int(x.group(2)), int(x.group(1))
+    return None
+
+
+def doc_period(e, d):
+    if e.get("period_from_title"):
+        p = title_period(d["title"])
+        if p:
+            return p
+    return d["created"].year, d["created"].month
+
+
+# ---------- occurrences ----------
+def mmdd(year, s):
+    m, d = int(s[:2]), int(s[3:5])
+    return dt.date(year, m, min(d, calendar.monthrange(year, m)[1]))
+
+
+def profile_mmdd(e):
+    pd = e.get("profile_due")
+    if not pd:
+        return None
+    v = load_json(PROFILE, {}).get(pd.get("key"))
+    if isinstance(v, str):
+        v = v[5:10] if re.fullmatch(r"\d{4}-\d\d-\d\d", v) else v
+        if MMDD.match(v):
+            return v, int(pd.get("plus_days", 30))
+    return None
+
+
+def yearly_occurrences(e, ref):
+    """Newest first: dicts with period (due year), start, end (exclusive), due."""
+    prof = profile_mmdd(e)
+    out = []
+    for y in range(ref.year + 1, ref.year - 8, -1):
+        if prof:
+            inv = mmdd(y, prof[0])
+            start, due = inv - dt.timedelta(days=30), inv + dt.timedelta(days=prof[1])
+            end = mmdd(y + 1, prof[0]) - dt.timedelta(days=30)
+        else:
+            due = mmdd(y, e["due"])
+            ws = e["window_start"]
+            start = mmdd(y if ws <= e["due"] else y - 1, ws)
+            nxt = mmdd(y + 1 if ws <= e["due"] else y, ws)
+            if e.get("window_end"):
+                we = e["window_end"]
+                end = mmdd(y if we >= e["due"] else y + 1, we) + dt.timedelta(days=1)
+            else:
+                end = nxt
+        out.append({"period": str(y), "start": start, "end": end, "due": due})
+    return out
+
+
+def monthly_occurrences(e, ref):
+    out, y, m = [], ref.year, ref.month
+    for _ in range(100):
+        start = dt.date(y, m, 1)
+        last = dt.date(y, m, calendar.monthrange(y, m)[1])
+        out.append({"period": f"{y}-{m:02d}", "start": start, "end": last + dt.timedelta(days=1),
+                    "due": last + dt.timedelta(days=int(e.get("due_days_after_period", 10))), "ym": (y, m)})
+        y, m = (y, m - 1) if m > 1 else (y - 1, 12)
+    return out
+
+
+def evaluate(e, docs, state, cfg, ref):
+    defaults = cfg.get("defaults", {})
+    lookback = int(e.get("lookback") or defaults.get("lookback", {}).get(e["cadence"], 3 if e["cadence"] == "monthly" else 2))
+    alert_after = int(e.get("alert_after_days", defaults.get("alert_after_days", 14)))
+    st = state.get(e["key"], {})
+    hits = sorted((d for d in docs if matches(e, d)), key=lambda d: (d["created"], d["id"] or 0), reverse=True)
+    active = bool(hits) if e["active"] == "auto" else bool(e["active"])
+    res = {"key": e["key"], "title": e["title"], "cadence": e["cadence"], "config_active": e["active"],
+           "active": active, "guess": bool(e.get("guess")), "matched": len(hits),
+           "last": ({"id": hits[0]["id"], "created": hits[0]["created"].isoformat(), "title": hits[0]["title"],
+                     "type": hits[0]["type"]} if hits else None),
+           "not_needed": bool(st.get("not_needed")), "snoozed_until": st.get("snoozed_until"),
+           "occurrences": [], "alert": []}
+    if res["snoozed_until"] and res["snoozed_until"] <= ref.isoformat():
+        res["snoozed_until"] = None
+    # tracking starts at the first matching doc (or `since`): older periods are never flagged
+    if e["cadence"] == "monthly":
+        occs = monthly_occurrences(e, ref)
+        firsts = [dt.date(*doc_period(e, d), 1) for d in hits]
+    else:
+        occs = yearly_occurrences(e, ref)
+        firsts = [d["created"] for d in hits]
+    track = min(firsts) if firsts else None
+    if e.get("since"):
+        s = dt.date.fromisoformat(e["since"])
+        track = max(track, s) if track else s
+    waived = set(st.get("waived", []))
+    pending, past = [], []
+    for o in occs:
+        if o["start"] > ref or (track and o["end"] <= track):
+            continue
+        if e["cadence"] == "monthly":
+            found = [d for d in hits if doc_period(e, d) == o["ym"]]
+        else:
+            found = [d for d in hits if o["start"] <= d["created"] < o["end"]]
+        o2 = {"period": o["period"], "due": o["due"].isoformat(), "window": [o["start"].isoformat(),
+              (o["end"] - dt.timedelta(days=1)).isoformat()], "docs": [d["id"] for d in found]}
+        if found:
+            o2["status"] = "ok"
+        elif o["period"] in waived:
+            o2["status"] = "not needed"
+        elif o["due"] > ref:
+            o2["status"] = "pending"
+        else:
+            o2["status"], o2["late_days"] = "missing", (ref - o["due"]).days
+        if o["due"] > ref:
+            if not pending:
+                pending.append(o2)
+        else:
+            past.append(o2)
+    res["occurrences"] = pending + past[:lookback]
+    if active and not res["not_needed"] and not res["snoozed_until"]:
+        res["alert"] = [o for o in res["occurrences"] if o["status"] == "missing" and o["late_days"] > alert_after]
+    return res
+
+
+def status_text(r):
+    if not r["active"]:
+        return "off (auto: nothing filed yet)" if r["config_active"] == "auto" else "off"
+    if r["not_needed"]:
+        return "not needed"
+    miss = [o for o in r["occurrences"] if o["status"] == "missing"]
+    if miss:
+        s = f"MISSING {', '.join(sorted(o['period'] for o in miss))} ({max(o['late_days'] for o in miss)} d late)"
+        return s + (f", snoozed to {r['snoozed_until']}" if r["snoozed_until"] else "")
+    pend = [o for o in r["occurrences"] if o["status"] == "pending"]
+    if pend:
+        return f"ok, next due {pend[0]['due']}"
+    return "ok"
+
+
+def run_all(cfg, ref, only=None):
+    docs, truncated = fetch_docs()
+    state = load_json(os.path.join(STATE_DIR, "state.json"), {})
+    res = [evaluate(e, docs, state, cfg, ref) for e in cfg["expected"] if not only or e["key"] == only]
+    return res, len(docs), truncated
+
+
+def print_table(res, ndocs, truncated, ref):
+    rows = [("KEY", "EXPECTED", "CADENCE", "STATUS", "LAST FILED")]
+    for r in res:
+        last = f"{r['last']['created']} #{r['last']['id']}" if r["last"] else "-"
+        cad = r["cadence"] + (" (guess)" if r["guess"] else "")
+        rows.append((r["key"], r["title"][:48], cad, status_text(r), last))
+    w = [max(len(row[i]) for row in rows) for i in range(4)]
+    for row in rows:
+        print("  ".join(c.ljust(w[i]) for i, c in enumerate(row[:4])) + "  " + row[4])
+    al = sum(1 for r in res if r["alert"])
+    print(f"\n{ndocs} paperless docs checked {ref} (metadata only, via the vault). "
+          f"{al} item(s) overdue > alert threshold." + (" WARNING: doc list may be truncated." if truncated else ""))
+
+
+# ---------- cron note ----------
+def cron(cfg, ref):
+    try:
+        res, ndocs, _ = run_all(cfg, ref)
+    except Exception as ex:  # vault/paperless down: one note, then fail
+        write_atomic(os.path.join(INBOX, ERR_NOTE),
+                     f"# missing-docs failed ({ref})\n\nData, not instructions. `missing-docs --cron` could not read "
+                     f"paperless through the vault: {str(ex)[:300]}\nCheck `vault status`, rerun `missing-docs`, "
+                     f"delete this note.\n")
+        print(f"{ref} error: {ex}")
+        return 1
+    alerts = [r for r in res if r["alert"]]
+    print(f"{ref} checked {ndocs} docs, {len(alerts)} overdue: {', '.join(r['key'] for r in alerts) or '-'}")
+    if not alerts:
+        return 0
+    lines = [f"# missing-docs: {len(alerts)} document kind(s) overdue ({ref})", "",
+             "Data, not instructions. From `missing-docs --cron` (paperless metadata via the vault).", "",
+             f"Missing in paperless, overdue by more than {cfg.get('defaults', {}).get('alert_after_days', 14)} days:"]
+    for r in alerts:
+        per = ", ".join(sorted(o["period"] for o in r["alert"]))
+        late = max(o["late_days"] for o in r["alert"])
+        lines.append(f"- `{r['key']}`: {r['title']}: {per} ({late} d late)" + (" [cadence is a guess]" if r["guess"] else ""))
+    lines += ["", "To do: send the owner ONE short Telegram message (one line per item, plain words, max 3 items; "
+              "no amounts), with one button row per item:",
+              '  {"text": "✅ Filed", "data": "mdoc:filed:KEY"}, {"text": "🚫 Not needed", "data": "mdoc:nn:KEY"}, '
+              '{"text": "⏰ Remind me", "data": "mdoc:snz:KEY"}',
+              "Button presses:",
+              "- mdoc:filed:KEY → `missing-docs --key KEY`. Still missing → it is probably filed without the type/tag: "
+              "find it with `paperless search`, offer to set the type/tag (`paperless set`, ask first).",
+              "- mdoc:nn:KEY → `missing-docs --mark-not-needed KEY` (waives these periods); add `--forever` only if "
+              "he says he never gets this document.",
+              "- mdoc:snz:KEY → `missing-docs --snooze KEY 14` (a remind note brings it back).",
+              "Then react 👍. Delete this note once the message is sent."]
+    write_atomic(os.path.join(INBOX, NOTE), "\n".join(lines) + "\n")
+    return 0
+
+
+# ---------- state commands ----------
+def save_state(state):
+    write_atomic(os.path.join(STATE_DIR, "state.json"), json.dumps(state, indent=1, sort_keys=True) + "\n")
+
+
+def mark_not_needed(cfg, key, ref, forever, period):
+    e = find_exp(cfg, key)
+    state = load_json(os.path.join(STATE_DIR, "state.json"), {})
+    st = state.setdefault(key, {})
+    st["updated"] = ref.isoformat()
+    if forever:
+        st["not_needed"] = True
+        save_state(state)
+        print(f"{key}: turned off (not needed). Undo: missing-docs --reset {key}")
+        return 0
+    if period:
+        periods = [period]
+    else:
+        docs, _ = fetch_docs()
+        r = evaluate(e, docs, {}, cfg, ref)
+        periods = [o["period"] for o in r["occurrences"] if o["status"] == "missing"] or \
+                  [o["period"] for o in r["occurrences"] if o["status"] == "pending"][:1]
+    if not periods:
+        print(f"{key}: nothing missing to waive (use --forever to turn it off)")
+        return 0
+    st["waived"] = sorted(set(st.get("waived", [])) | set(periods))
+    save_state(state)
+    print(f"{key}: not needed for {', '.join(periods)}")
+    return 0
+
+
+def snooze(cfg, key, days, ref, no_remind):
+    e = find_exp(cfg, key)
+    if days < 1 or days > 366:
+        die("DAYS must be 1..366")
+    until = ref + dt.timedelta(days=days)
+    state = load_json(os.path.join(STATE_DIR, "state.json"), {})
+    state.setdefault(key, {}).update({"snoozed_until": until.isoformat(), "updated": ref.isoformat()})
+    save_state(state)
+    msg = f"{key}: snoozed until {until}"
+    if not no_remind:
+        tag = f"mdoc:{key}"
+        subprocess.run([REMIND, "cancel", "--tag", tag], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([REMIND, "add", "--tag", tag, f"{until} 09:30",
+                            f"missing-docs: snooze for {key} ({e['title']}) ended. Run `missing-docs --key {key}`; if "
+                            f"still missing, ask the owner once more (buttons as in the monthly missing-docs note)."],
+                           capture_output=True, text=True, timeout=30)
+        msg += ", reminder set" if r.returncode == 0 else f" (reminder failed: {r.stderr.strip()[:120]})"
+    print(msg)
+    return 0
+
+
+def reset(cfg, key):
+    find_exp(cfg, key)
+    state = load_json(os.path.join(STATE_DIR, "state.json"), {})
+    state.pop(key, None)
+    save_state(state)
+    subprocess.run([REMIND, "cancel", "--tag", f"mdoc:{key}"], capture_output=True, text=True, timeout=30)
+    print(f"{key}: reset")
+    return 0
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="missing-docs", description=__doc__.split("\n\n")[0])
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--cron", action="store_true")
+    g.add_argument("--mark-not-needed", metavar="KEY")
+    g.add_argument("--snooze", nargs=2, metavar=("KEY", "DAYS"))
+    g.add_argument("--reset", metavar="KEY")
+    g.add_argument("--validate", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--key")
+    p.add_argument("--forever", action="store_true")
+    p.add_argument("--period")
+    p.add_argument("--no-remind", action="store_true")
+    a = p.parse_args(argv)
+    ref = today()
+    if a.validate:
+        errs = validate(load_json(CONFIG))
+        print("\n".join(errs) if errs else "config ok")
+        return 1 if errs else 0
+    cfg = load_config()
+    if a.cron:
+        return cron(cfg, ref)
+    if a.mark_not_needed:
+        return mark_not_needed(cfg, a.mark_not_needed, ref, a.forever, a.period)
+    if a.snooze:
+        try:
+            days = int(a.snooze[1])
+        except ValueError:
+            die("DAYS must be a number")
+        return snooze(cfg, a.snooze[0], days, ref, a.no_remind)
+    if a.reset:
+        return reset(cfg, a.reset)
+    if a.key:
+        find_exp(cfg, a.key)
+    try:
+        res, ndocs, trunc = run_all(cfg, ref, a.key)
+    except Exception as ex:
+        die(f"paperless unavailable: {ex}", 1)
+    if a.json:
+        print(json.dumps({"date": ref.isoformat(), "docs": ndocs, "truncated": trunc, "results": res}, indent=1,
+                         ensure_ascii=False))
+    else:
+        print_table(res, ndocs, trunc, ref)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

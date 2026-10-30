@@ -1,0 +1,253 @@
+#!/usr/bin/env -S python3 -I
+"""uwfix: underwater colour correction for clips and photos (local ffmpeg + OpenCV/numpy).
+
+Usage:
+  uwfix IN [-o OUT] [--mode auto|clip|scene] [--strength 0.8] [--still BEFORE_AFTER.jpg] [--still-at SEC]
+           [--scene-threshold 0.35] [--min-scene 1.5] [--json] [--analyze-only] [--quiet]
+
+How: frames are sampled (≤ 2 fps, small), split into scenes where the HSV histogram jumps (OpenCV,
+Bhattacharyya distance), and each scene gets its own correction computed with numpy:
+  1. red-channel restoration: red lost with depth is rebuilt from green (R' = R + k·G, k from the
+     green/red mean gap; a little blue from green too in greenish water),
+  2. gray-world white balance: per-channel gains so the scene averages to neutral gray,
+  3. a 1–99.5 % level stretch per channel (lifts the haze floor).
+--strength blends it with the original (0 = off, 1 = full). Each scene becomes one ffmpeg
+colorchannelmixer + colorlevels chain (trim/concat per scene; --mode clip = one chain for the clip).
+Video → H.264 MP4 (audio re-encoded to AAC), photo → JPG. Default OUT: IN with ".uw" before the extension.
+--still writes a side-by-side before/after JPG of one frame (middle of the longest scene, or --still-at),
+rendered through the same ffmpeg chain as the output. --analyze-only skips the render (with --json: the plan).
+Nothing leaves the machine.
+"""
+import argparse, json, os, subprocess, sys, tempfile
+
+PHOTO = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+VENV_PY = os.environ.get("UWFIX_PY") or os.path.expanduser("~/opt/dive-venv/bin/python")
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    if os.environ.get("UWFIX_REEXEC") or not os.path.exists(VENV_PY):
+        sys.exit(f"uwfix: needs numpy + opencv (venv {VENV_PY})")
+    os.environ["UWFIX_REEXEC"] = "1"
+    os.execv(VENV_PY, [VENV_PY, "-I", os.path.abspath(__file__)] + sys.argv[1:])
+
+AW, AH = 256, 144  # analysis frame size (aspect does not matter for colour statistics)
+MAX_SAMPLES = 600
+
+
+def run(cmd, binary=False):
+    r = subprocess.run(cmd, capture_output=True, text=not binary)
+    if r.returncode != 0:
+        err = r.stderr.decode(errors="replace") if binary else r.stderr
+        sys.exit(f"uwfix: ffmpeg failed: {' '.join(cmd[:6])}...\n{err[-1500:]}")
+    return r
+
+
+def probe(path):
+    r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
+             "-of", "json", path])
+    j = json.loads(r.stdout or "{}")
+    v = [s for s in j.get("streams", []) if s.get("codec_type") == "video"]
+    if not v:
+        sys.exit(f"uwfix: no video/image stream in {path}")
+    dur = float(j.get("format", {}).get("duration") or 0)
+    return {"duration": dur, "audio": any(s.get("codec_type") == "audio" for s in j["streams"]),
+            "width": v[0].get("width"), "height": v[0].get("height")}
+
+
+def sample(path, dur, photo):
+    fps = 1.0 if photo else min(2.0, MAX_SAMPLES / max(dur, 0.5))
+    vf = f"scale={AW}:{AH}" if photo else f"fps={fps:.4f},scale={AW}:{AH}"
+    r = run(["ffmpeg", "-v", "error", "-i", path, "-vf", vf, "-frames:v", "1" if photo else str(MAX_SAMPLES + 5),
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], binary=True)
+    n = len(r.stdout) // (AW * AH * 3)
+    if n == 0:
+        sys.exit(f"uwfix: could not decode frames from {path}")
+    frames = np.frombuffer(r.stdout[: n * AW * AH * 3], np.uint8).reshape(n, AH, AW, 3)
+    return frames, fps
+
+
+def scenes(frames, fps, dur, threshold, min_len):
+    """Cut where consecutive sampled frames' HSV histograms differ; merge scenes shorter than min_len."""
+    hists = []
+    for f in frames:
+        hsv = cv2.cvtColor(f, cv2.COLOR_RGB2HSV)
+        h = cv2.calcHist([hsv], [0, 1], None, [32, 16], [0, 180, 0, 256])
+        hists.append(cv2.normalize(h, h).flatten())
+    cuts = [0]
+    for i in range(1, len(frames)):
+        if cv2.compareHist(hists[i - 1], hists[i], cv2.HISTCMP_BHATTACHARYYA) > threshold:
+            cuts.append(i)
+    bounds = [[c / fps, (cuts[k + 1] / fps) if k + 1 < len(cuts) else dur, c,
+               cuts[k + 1] if k + 1 < len(cuts) else len(frames)] for k, c in enumerate(cuts)]
+    merged = []
+    for b in bounds:  # [start s, end s, first sample, end sample)
+        if merged and (b[1] - b[0] < min_len or merged[-1][1] - merged[-1][0] < min_len):
+            merged[-1][1], merged[-1][3] = b[1], b[3]
+        else:
+            merged.append(b)
+    return merged
+
+
+def correction(frames, strength):
+    px = frames.reshape(-1, 3).astype(np.float32) / 255.0
+    lum = px @ np.array([0.299, 0.587, 0.114], np.float32)
+    keep = (lum > 0.04) & (px.max(1) < 0.98)  # ignore black borders and blown highlights
+    if keep.sum() > 500:
+        px = px[keep]
+    if len(px) > 200_000:
+        px = px[np.random.default_rng(0).choice(len(px), 200_000, replace=False)]
+    m = px.mean(0)
+    mr, mg, mb = (float(x) for x in m)
+    kr = float(np.clip((mg - mr) / max(mg, 1e-3), 0, 0.9))          # red restoration from green
+    kb = float(np.clip(0.5 * (mg - mb) / max(mg, 1e-3), 0, 0.5))     # greenish water: some blue back too
+    mix = np.array([[1, kr, 0], [0, 1, 0], [0, kb, 1]], np.float32)
+    m2 = (px @ mix.T).mean(0)
+    gains = np.clip(m2.mean() / np.maximum(m2, 1e-3), 0.6, 3.0)      # gray world
+    full = np.diag(gains).astype(np.float32) @ mix
+    luma = np.array([0.299, 0.587, 0.114], np.float32)
+    full *= float(np.clip((m @ luma) / max(float(m @ full.T @ luma), 1e-3), 0.5, 1.5))  # keep the brightness:
+    # adding red on top of bright cyan water would otherwise wash the frame out to white
+    mat =np.eye(3, dtype=np.float32) + strength * (full - np.eye(3, dtype=np.float32))
+    out = np.clip(px @ mat.T, 0, 1)
+    lo = np.clip(np.percentile(out, 1, axis=0) * strength, 0, 0.35)  # hazy water: lift the haze floor
+    hi = 1 - np.clip((1 - np.percentile(out, 99.5, axis=0)) * strength, 0, 0.4)
+    hi = np.maximum(hi, lo + 0.2)
+    res = np.clip((out - lo) / (hi - lo), 0, 1)
+    return {"mean_in": [round(x, 4) for x in (mr, mg, mb)], "mean_out": [round(float(x), 4) for x in res.mean(0)],
+            "red_from_green": round(kr, 4), "blue_from_green": round(kb, 4),
+            "gains": [round(float(x), 4) for x in gains], "matrix": [[round(float(x), 4) for x in r] for r in mat],
+            "levels": {"min": [round(float(x), 4) for x in lo], "max": [round(float(x), 4) for x in hi]}}
+
+
+def chain(c):
+    (rr, rg, rb), (gr, gg, gb), (br, bg, bb) = c["matrix"]
+    lo, hi = c["levels"]["min"], c["levels"]["max"]
+    return (f"colorchannelmixer=rr={rr}:rg={rg}:rb={rb}:gr={gr}:gg={gg}:gb={gb}:br={br}:bg={bg}:bb={bb},"
+            f"colorlevels=rimin={lo[0]}:gimin={lo[1]}:bimin={lo[2]}:rimax={hi[0]}:gimax={hi[1]}:bimax={hi[2]}")
+
+
+def render(src, out, plan, info, photo, crf):
+    if photo:
+        run(["ffmpeg", "-y", "-v", "error", "-i", src, "-vf", chain(plan[0]["fix"]), "-frames:v", "1", "-q:v", "2", out])
+        return
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", src]
+    if len(plan) == 1:
+        cmd += ["-vf", chain(plan[0]["fix"]) + ",format=yuv420p", "-map", "0:v:0"]
+    else:
+        n = len(plan)
+        fc = [f"[0:v]split={n}" + "".join(f"[i{k}]" for k in range(n))]
+        for k, s in enumerate(plan):
+            end = "" if k == n - 1 else f":end={s['end']:.3f}"
+            fc.append(f"[i{k}]trim=start={s['start']:.3f}{end},setpts=PTS-STARTPTS,{chain(s['fix'])}[v{k}]")
+        fc.append("".join(f"[v{k}]" for k in range(n)) + f"concat=n={n}:v=1:a=0,format=yuv420p[vout]")
+        cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]"]
+    if info["audio"]:
+        cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "192k"]
+    run(cmd + ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-movflags", "+faststart", out])
+
+
+def still(src, path, panels, at, photo):
+    """panels: [(label, ffmpeg chain or None)] → one side-by-side JPG of the frame at `at`."""
+    seek = [] if photo else ["-ss", f"{at:.3f}"]
+    with tempfile.TemporaryDirectory(prefix="uwfix-") as tmp:
+        imgs = []
+        for k, (name, fx) in enumerate(panels):
+            vf = (fx + "," if fx else "") + "scale=-2:540"
+            p = os.path.join(tmp, f"p{k}.png")
+            run(["ffmpeg", "-y", "-v", "error"] + seek + ["-i", src, "-frames:v", "1", "-vf", vf, p])
+            img = cv2.imread(p)
+            if img is None:
+                sys.exit(f"uwfix: could not render the {name} still")
+            h, w = img.shape[:2]
+            cv2.rectangle(img, (0, 0), (w, 44), (0, 0, 0), -1)
+            cv2.putText(img, name, (14, 32), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+            imgs.append(img)
+        gap = np.full((imgs[0].shape[0], 8, 3), 255, np.uint8)
+        side = cv2.hconcat([x for img in imgs for x in (img, gap)][:-1])
+        tmp_out = path + ".tmp.jpg"
+        if not cv2.imwrite(tmp_out, side, [cv2.IMWRITE_JPEG_QUALITY, 90]):
+            sys.exit(f"uwfix: cannot write {path}")
+        os.replace(tmp_out, path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("input")
+    ap.add_argument("-o", "--out")
+    ap.add_argument("--mode", choices=["auto", "clip", "scene"], default="auto")
+    ap.add_argument("--strength", type=float, default=0.8)
+    ap.add_argument("--still")
+    ap.add_argument("--still-at", type=float)
+    ap.add_argument("--still-only", action="store_true", help="only the still (quick preview), no render")
+    ap.add_argument("--compare", help="extra still panels at these strengths, e.g. 0.5,1")
+    ap.add_argument("--scene-threshold", type=float, default=0.35)
+    ap.add_argument("--min-scene", type=float, default=1.5)
+    ap.add_argument("--crf", type=int, default=18)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--analyze-only", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    if not 0 <= a.strength <= 1:
+        sys.exit("uwfix: --strength must be 0–1")
+    if not os.path.isfile(a.input):
+        sys.exit(f"uwfix: no such file: {a.input}")
+    ext = os.path.splitext(a.input)[1].lower()
+    photo = ext in PHOTO
+    out = a.out or os.path.splitext(a.input)[0] + ".uw" + (".jpg" if photo else ".mp4")
+    try:
+        compare = [float(x) for x in a.compare.split(",")] if a.compare else []
+    except ValueError:
+        sys.exit("uwfix: --compare wants strengths like 0.5,1")
+    if any(not 0 <= x <= 1 for x in compare):
+        sys.exit("uwfix: --compare strengths must be 0–1")
+    if a.still_only and not a.still:
+        sys.exit("uwfix: --still-only needs --still FILE")
+    if not a.analyze_only:
+        if os.path.abspath(out) == os.path.abspath(a.input):
+            sys.exit("uwfix: output would overwrite the input")
+        for p in filter(None, (out, a.still)):
+            if not os.path.isdir(os.path.dirname(os.path.abspath(p))):
+                sys.exit(f"uwfix: output folder does not exist: {os.path.dirname(os.path.abspath(p))}")
+    info = probe(a.input)
+    frames, fps = sample(a.input, info["duration"], photo)
+    dur = info["duration"] if not photo and info["duration"] > 0 else len(frames) / fps
+    if photo or a.mode == "clip":
+        parts = [[0.0, dur, 0, len(frames)]]
+    else:
+        parts = scenes(frames, fps, dur, a.scene_threshold, a.min_scene)
+        if a.mode == "auto" and len(parts) > 12:  # flickery footage: many "scenes" would pump the colours
+            parts = [[0.0, dur, 0, len(frames)]]
+    plan = [{"start": round(s, 3), "end": round(e, 3), "samples": j - i, "fix": correction(frames[i:j], a.strength)}
+            for s, e, i, j in parts]
+    if a.still_only:
+        out = None
+    elif not a.analyze_only:
+        render(a.input, out, plan, info, photo, a.crf)
+    if a.still and not a.analyze_only:
+        longest = max(plan, key=lambda s: s["end"] - s["start"])
+        at = a.still_at if a.still_at is not None else (longest["start"] + longest["end"]) / 2
+        at = min(max(at, 0), max(dur - 0.05, 0))
+        k = next((n for n, s in enumerate(plan) if s["start"] <= at < s["end"]), len(plan) - 1)
+        i, j = parts[k][2], parts[k][3]
+        panels = [("before", None), ("after" if not compare else f"strength {a.strength:g}", chain(plan[k]["fix"]))]
+        panels += [(f"strength {x:g}", chain(correction(frames[i:j], x))) for x in compare]
+        still(a.input, a.still, panels, at, photo)
+    res = {"input": a.input, "output": None if a.analyze_only else out, "still": a.still if not a.analyze_only else None,
+           "photo": photo, "duration": round(dur, 3), "sample_fps": round(fps, 4), "scenes": plan}
+    if a.json:
+        print(json.dumps(res, indent=1))
+    elif not a.quiet:
+        for k, s in enumerate(plan, 1):
+            f = s["fix"]
+            print(f"scene {k}: {s['start']:.1f}–{s['end']:.1f}s  mean RGB {f['mean_in']} → {f['mean_out']}  "
+                  f"red+{f['red_from_green']}·G  gains {f['gains']}", file=sys.stderr)
+        if not a.analyze_only:
+            if out:
+                print(out)
+            if a.still:
+                print(a.still)
+
+
+if __name__ == "__main__":
+    main()

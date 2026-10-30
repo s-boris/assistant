@@ -1,0 +1,888 @@
+#!/usr/bin/env -S python3 -I
+"""trip-recap: an offline trip recap from a folder of photos and videos, made locally.
+
+Usage:
+  trip-recap DIR [-o OUT] [--config FILE] [--count 40] [--music FILE] [--title T] [--no-montage]
+                 [--size 1920x1080] [--photo-secs 3.5] [--uw-strength 0.8] [--dives auto|none|FILE.json]
+                 [--camera-tz TZ] [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--workers N] [--json]
+  trip-recap coast S,W,N,E -o FILE [--from OSM.json] [--tolerance-m 25]
+
+DIR (recursive): JPEG/PNG/WebP photos and videos. EXIF time (+ OffsetTimeOriginal) and GPS from photos,
+creation time and ISO 6709 location from videos (ffprobe); no time -> file mtime. Items are grouped by
+day (trip time zone) and island/region: nearest region anchor from the config; no GPS -> the island of
+the nearest GPS item that day, else the trip leg for that date (config "legs", else the divelog legs).
+OUT (default ~/jobs/trip-recap/<DIR name>) gets:
+  index.html   one self-contained page: vector map (coastline from the config's coast file, no tiles,
+               no network at view time; CSP forbids it), day timeline, thumbnails, dive markers (divelog)
+  picks.txt    the best --count photos: sharpness (Laplacian variance), exposure, faces (YuNet, local),
+               burst duplicates dropped, spread over the days; underwater = blue/green colour cast
+               (or taken during a logged dive)
+  montage.mp4  vidmontage of the picks in time order; underwater picks go through uwfix first
+  recap.json   everything above incl. GPS: private, stays in OUT
+`coast` builds a coast file once (Overpass natural=coastline in the box, stitched and simplified).
+Nothing about the photos leaves the machine; stdout carries counts only, never coordinates.
+"""
+import argparse, base64, bisect, colorsys, datetime as dt, html, io, json, math, os, pwd, re, shutil, subprocess, sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "bin", "lib"), os.path.expanduser("~/bin/lib"),
+             os.path.join(_here, "lib")):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, "lib", "core")) and os.path.isdir(os.path.join(_here, "..", "core")):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import http as web, jsonstate  # noqa: E402
+
+HOME = os.path.expanduser("~")
+VENV_PY = os.environ.get("TRIP_RECAP_PY") or os.path.join(HOME, "opt/dive-venv/bin/python")
+CONFIG = os.environ.get("TRIP_RECAP_CONFIG") or os.path.join(HOME, ".config/trip-recap/trip.json")
+FACE_MODEL = os.environ.get("TRIP_RECAP_FACE_MODEL") or os.path.join(HOME, "opt/trip-recap-models/face_detection_yunet_2023mar.onnx")
+VIDMONTAGE = os.environ.get("TRIP_RECAP_VIDMONTAGE") or shutil.which("vidmontage") or os.path.join(HOME, "bin/vidmontage")
+UWFIX = os.environ.get("TRIP_RECAP_UWFIX") or shutil.which("uwfix") or os.path.join(HOME, "bin/uwfix")
+DIVELOG = os.environ.get("TRIP_RECAP_DIVELOG") or shutil.which("divelog") or os.path.join(HOME, "bin/divelog")
+DIVELOG_CONFIG = os.environ.get("DIVELOG_CONFIG") or os.path.join(HOME, ".config/divelog/config.json")
+PHOTO = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
+SKIPPED = {".heic", ".heif", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".orf", ".rw2", ".raw"}
+VIDEO = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".mts", ".m2ts", ".mpg", ".mpeg", ".wmv"}
+OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter"]
+PALETTE = ["#0b7a75", "#c2571a", "#6d4bb3", "#2f6db5", "#a33a5b", "#4f7d2a", "#8a6d00", "#5a6470"]
+GREY = "#7a8288"
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+
+
+def reexec():
+    try:
+        import numpy, cv2, PIL  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("TRIP_RECAP_REEXEC") or not os.path.exists(VENV_PY):
+        sys.exit(f"trip-recap needs numpy, opencv and Pillow (venv {VENV_PY})")
+    os.environ["TRIP_RECAP_REEXEC"] = "1"
+    os.execv(VENV_PY, [VENV_PY, "-I", os.path.abspath(__file__), *sys.argv[1:]])
+
+
+# ---------- metadata ----------
+def _num(v):
+    try:
+        return float(v)
+    except Exception:
+        try:
+            return v[0] / v[1]
+        except Exception:
+            return None
+
+
+def _dms(v, ref):
+    try:
+        d, m, s = (_num(x) for x in v)
+    except Exception:
+        return None
+    if None in (d, m, s):
+        return None
+    x = d + m / 60 + s / 3600
+    if isinstance(ref, bytes):
+        ref = ref.decode(errors="ignore")
+    return -x if str(ref or "").strip().upper()[:1] in ("S", "W") else x
+
+
+def _clean(s):
+    if isinstance(s, bytes):
+        s = s.decode(errors="ignore")
+    return str(s or "").strip().strip("\x00").strip()
+
+
+def exif_time(s, off, cam_tz, trip_tz):
+    m = re.match(r"(\d{4})[:-](\d\d)[:-](\d\d)[ T](\d\d):(\d\d):(\d\d)", _clean(s))
+    if not m:
+        return None
+    try:
+        t = dt.datetime(*map(int, m.groups()))
+    except ValueError:
+        return None
+    if t.year < 1990:
+        return None
+    mo = re.match(r"([+-])(\d\d):?(\d\d)$", _clean(off))
+    if mo:
+        sign = 1 if mo.group(1) == "+" else -1
+        t = t.replace(tzinfo=dt.timezone(sign * dt.timedelta(hours=int(mo.group(2)), minutes=int(mo.group(3)))))
+    else:
+        t = t.replace(tzinfo=cam_tz)
+    return t.astimezone(trip_tz).replace(tzinfo=None)
+
+
+def iso_time(s, trip_tz):
+    s = _clean(s)
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    s = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", s)
+    try:
+        t = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)  # QuickTime creation_time is UTC
+    if t.year < 1990:
+        return None
+    return t.astimezone(trip_tz).replace(tzinfo=None)
+
+
+def iso6709(s):
+    m = re.match(r"\s*([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)", _clean(s))
+    if not m:
+        return None
+    lat, lon = float(m.group(1)), float(m.group(2))
+    return (lat, lon) if abs(lat) <= 90 and abs(lon) <= 180 and (lat, lon) != (0.0, 0.0) else None
+
+
+# ---------- per-file analysis (worker processes) ----------
+_FD = [None]
+
+
+def count_faces(arr):
+    if not os.path.exists(FACE_MODEL):
+        return None
+    import cv2
+    h, w = arr.shape[:2]
+    if _FD[0] is None:
+        _FD[0] = cv2.FaceDetectorYN.create(FACE_MODEL, "", (w, h), 0.8, 0.3, 50)
+    _FD[0].setInputSize((w, h))
+    _, faces = _FD[0].detect(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+    if faces is None:
+        return 0
+    mn = 0.04 * min(w, h)
+    return int(sum(1 for f in faces if f[2] >= mn and f[3] >= mn))
+
+
+def cast_score(arr):
+    """0..1: share of mid-tone pixels whose red is crushed against green/blue (underwater look)."""
+    import numpy as np
+    a = arr[::4, ::4].astype(np.float32)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    lum = (r + g + b) / 3
+    m = lum > 20  # clipped highlights stay in: big white areas mean sky/sand, not open water
+    if m.sum() < 50:
+        return 0.0
+    gb = np.maximum(g, b)
+    frac = float(((r < 0.62 * gb) & (gb - r > 25))[m].mean())
+    hi = float(np.percentile(r[m], 98)) / max(1.0, float(np.percentile(gb[m], 98)))
+    return round(frac if hi < 0.85 else frac * 0.5, 3)  # white clouds/sand keep red highs: sky, not sea
+
+
+def dhash(gray):
+    import cv2
+    s = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+    v = 0
+    for bit in (s[:, 1:] > s[:, :-1]).flatten():
+        v = (v << 1) | int(bit)
+    return v
+
+
+def jpeg_b64(im, side, q):
+    t = im.copy()
+    t.thumbnail((side, side))
+    buf = io.BytesIO()
+    t.convert("RGB").save(buf, "JPEG", quality=q, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def analyze_photo(path, thumb):
+    from PIL import Image, ImageOps
+    import numpy as np, cv2
+    out = {"path": path, "kind": "photo"}
+    try:
+        with Image.open(path) as im0:
+            ex = im0.getexif()
+            sub, gps = ex.get_ifd(0x8769), ex.get_ifd(0x8825)
+            out["exif_time"] = _clean(sub.get(0x9003) or sub.get(0x9004) or ex.get(0x0132))
+            out["exif_off"] = _clean(sub.get(0x9011) or sub.get(0x9010))
+            if gps.get(2) and gps.get(4):
+                lat, lon = _dms(gps.get(2), gps.get(1)), _dms(gps.get(4), gps.get(3))
+                if lat is not None and lon is not None and abs(lat) <= 90 and abs(lon) <= 180 and (lat, lon) != (0, 0):
+                    out["lat"], out["lon"] = lat, lon
+            if im0.format == "JPEG":
+                im0.draft("RGB", (1600, 1600))
+            im = ImageOps.exif_transpose(im0).convert("RGB")
+        im.thumbnail((1024, 1024))
+        arr = np.asarray(im)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        out["sharp"] = round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 2)
+        g = gray.astype(np.float32) / 255
+        mean, std = float(g.mean()), float(g.std())
+        clip = float((gray < 8).mean() + (gray > 247).mean())
+        exp = (1 - abs(mean - 0.48) / 0.42 - 2 * clip) * min(1.0, std / 0.12)
+        out["exposure"] = round(max(0.0, min(1.0, exp)), 3)
+        out["uw_cast"] = cast_score(arr)
+        out["faces"] = count_faces(arr)
+        out["dhash"] = dhash(gray)
+        out["thumb"] = jpeg_b64(im, thumb, 72)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"[:200]
+    return out
+
+
+def analyze_video(path, thumb):
+    out = {"path": path, "kind": "video"}
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:format_tags:stream_tags",
+                            "-of", "json", path], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        info = json.loads(r.stdout or "{}")
+        tags = {k.lower(): v for k, v in ((info.get("format") or {}).get("tags") or {}).items()}
+        for s in info.get("streams") or []:
+            for k, v in (s.get("tags") or {}).items():
+                tags.setdefault(k.lower(), v)
+        dur = float((info.get("format") or {}).get("duration") or 0)
+        out["duration"] = round(dur, 1)
+        out["video_time"] = tags.get("com.apple.quicktime.creationdate") or tags.get("creation_time") or ""
+        loc = iso6709(tags.get("com.apple.quicktime.location.iso6709") or tags.get("location") or tags.get("location-eng") or "")
+        if loc:
+            out["lat"], out["lon"] = loc
+        r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{min(1.0, dur / 2):.2f}", "-i", path, "-frames:v", "1",
+                            "-vf", f"scale=w={thumb}:h={thumb}:force_original_aspect_ratio=decrease",
+                            "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "-"],
+                           capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+        if r.returncode == 0 and r.stdout:
+            out["thumb"] = base64.b64encode(r.stdout).decode()
+            try:
+                from PIL import Image
+                import numpy as np
+                out["uw_cast"] = cast_score(np.asarray(Image.open(io.BytesIO(r.stdout)).convert("RGB")))
+            except Exception:
+                pass
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"[:200]
+    return out
+
+
+def analyze(job):
+    path, kind, thumb = job
+    return analyze_photo(path, thumb) if kind == "photo" else analyze_video(path, thumb)
+
+
+# ---------- grouping ----------
+def km(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 12742 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def trip_legs(cfg):
+    legs = cfg.get("legs") or jsonstate.load(DIVELOG_CONFIG, {}).get("legs") or []
+    out = []
+    for l in legs:
+        try:
+            out.append((dt.date.fromisoformat(l["from"]), dt.date.fromisoformat(l["to"]), l["area"]))
+        except (KeyError, ValueError, TypeError):
+            pass
+    return out
+
+
+def assign_regions(items, cfg):
+    regions, maxkm, auto = cfg.get("regions") or [], float(cfg.get("max_km", 40)), []
+    for it in items:
+        if it.get("lat") is None:
+            continue
+        p = (it["lat"], it["lon"])
+        best = min(((km(p, a), r["name"]) for r in regions for a in r.get("anchors") or []), default=None)
+        if best and best[0] <= maxkm:
+            it["island"] = best[1]
+        elif regions:
+            it["island"] = "Elsewhere"
+        else:
+            name = next((c[1] for c in auto if km(c[0], p) <= 20), None)
+            if name is None:
+                name = f"Area {len(auto) + 1}"
+                auto.append((p, name))
+            it["island"] = name
+        it["island_src"] = "gps"
+    legs = trip_legs(cfg)
+    by_day = {}
+    for it in items:
+        if it.get("island"):
+            by_day.setdefault(it["day"], []).append(it)
+    for it in items:
+        if it.get("island"):
+            continue
+        same = by_day.get(it["day"]) or []
+        if same:
+            near = min(same, key=lambda o: abs((o["t"] - it["t"]).total_seconds()))
+            it["island"], it["island_src"] = near["island"], "time"
+            continue
+        d = it["t"].date()
+        leg = next((l[2] for l in legs if l[0] <= d <= l[1]), None)
+        it["island"], it["island_src"] = (leg, "leg") if leg else ("Unknown", "none")
+
+
+def load_dives(spec):
+    if spec == "none":
+        return []
+    if spec == "auto":
+        if not os.access(DIVELOG, os.X_OK):
+            return []
+        try:
+            r = subprocess.run([DIVELOG, "list", "--json"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            data = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else []
+        except (subprocess.SubprocessError, ValueError, OSError):
+            data = []
+    else:
+        data = jsonstate.load(spec, None)
+        if data is None:
+            sys.exit(f"cannot read dives file {spec}")
+    dives = []
+    for x in data if isinstance(data, list) else []:
+        try:
+            t = dt.datetime.fromisoformat(x["when"]).replace(tzinfo=None)
+        except (KeyError, ValueError, TypeError):
+            continue
+        dives.append({"id": x.get("id"), "t": t, "minutes": x.get("time") or 60, "site": x.get("site") or "Dive",
+                      "lat": x.get("lat"), "lon": x.get("lon"), "depth": x.get("depth"), "area": x.get("area")})
+    return dives
+
+
+def select(photos, n):
+    c = [p for p in photos if "error" not in p]
+    if not c:
+        return []
+    ls = sorted(math.log1p(p["sharp"]) for p in c)
+    for p in c:
+        sr = bisect.bisect_left(ls, math.log1p(p["sharp"])) / max(1, len(c) - 1)
+        f = p.get("faces") or 0
+        face = 1.0 if 1 <= f <= 4 else 0.7 if f > 4 else 0.0
+        p["score"] = round(0.45 * sr + 0.35 * p["exposure"] + 0.20 * face, 4)
+    kept = []
+    for p in sorted(c, key=lambda p: -p["score"]):
+        dup = next((k for k in kept if abs((k["t"] - p["t"]).total_seconds()) <= 180
+                    and bin(k["dhash"] ^ p["dhash"]).count("1") <= 10), None)
+        if dup:
+            p["dup_of"] = dup["id"]
+        else:
+            kept.append(p)
+    if len(kept) > n:
+        good = [p for p in kept if p["exposure"] >= 0.2]
+        kept = good if len(good) >= n else kept
+    if len(kept) <= n:
+        return sorted(kept, key=lambda p: p["t"])
+    days = {}  # variety buckets: each day, with its underwater shots as their own bucket
+    for p in kept:
+        days.setdefault((p["day"], bool(p.get("underwater"))), []).append(p)
+    w = {d: math.sqrt(len(v)) for d, v in days.items()}
+    tot = sum(w.values())
+    picks = []
+    for d, v in days.items():
+        picks += sorted(v, key=lambda p: -p["score"])[:min(len(v), max(1, int(n * w[d] / tot)))]
+    picks = sorted(picks, key=lambda p: -p["score"])[:n]
+    have = {p["id"] for p in picks}
+    picks += sorted((p for p in kept if p["id"] not in have), key=lambda p: -p["score"])[:n - len(picks)]
+    return sorted(picks, key=lambda p: p["t"])
+
+
+# ---------- coast ----------
+def simplify(pts, tol_m):
+    if len(pts) < 3:
+        return pts
+    kx, ky = 111320 * math.cos(math.radians(pts[0][0])), 110540
+    xy = [(p[1] * kx, p[0] * ky) for p in pts]
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        (x1, y1), (x2, y2) = xy[i], xy[j]
+        dx, dy = x2 - x1, y2 - y1
+        L = math.hypot(dx, dy)
+        best, bi = -1.0, -1
+        for k in range(i + 1, j):
+            x, y = xy[k]
+            d = abs(dy * (x - x1) - dx * (y - y1)) / L if L > 0 else math.hypot(x - x1, y - y1)
+            if d > best:
+                best, bi = d, k
+        if best > tol_m:
+            keep[bi] = True
+            stack += [(i, bi), (bi, j)]
+    return [p for p, k in zip(pts, keep) if k]
+
+
+def coast_from_osm(osm, tol_m, bbox):
+    pool = [[(round(n["lat"], 6), round(n["lon"], 6)) for n in el["geometry"]]
+            for el in osm.get("elements", []) if el.get("type") == "way" and len(el.get("geometry") or []) >= 2]
+    rings, lines = [], []
+    while pool:
+        cur = pool.pop()
+        grown = True
+        while grown and cur[0] != cur[-1]:
+            grown = False
+            for i, w in enumerate(pool):
+                if w[0] == cur[-1]:
+                    cur, grown = cur + w[1:], True
+                elif w[-1] == cur[0]:
+                    cur, grown = w + cur[1:], True
+                if grown:
+                    pool.pop(i)
+                    break
+        s = [[round(a, 5), round(b, 5)] for a, b in simplify(cur, tol_m)]
+        if cur[0] == cur[-1]:
+            la, lo = [p[0] for p in cur], [p[1] for p in cur]
+            if km((min(la), min(lo)), (max(la), max(lo))) * 1000 < 250 or len(s) < 4:
+                continue  # rocks and islets: noise at map scale
+            rings.append(s)
+        elif len(s) >= 2:
+            lines.append(s)
+    return {"attribution": "© OpenStreetMap contributors (ODbL)", "bbox": list(bbox), "rings": rings, "lines": lines}
+
+
+def cmd_coast(argv):
+    ap = argparse.ArgumentParser(prog="trip-recap coast")
+    ap.add_argument("bbox", help="S,W,N,E in degrees")
+    num = r"-?\d+(?:\.\d+)?"
+    bb = [x for x in argv if re.fullmatch(",".join([num] * 4), x)]
+    if bb:  # a southern box starts with "-": keep argparse from reading it as an option
+        argv = [x for x in argv if x != bb[0]] + ["--", bb[0]]
+    ap.add_argument("-o", required=True)
+    ap.add_argument("--from", dest="src", help="saved Overpass JSON instead of fetching")
+    ap.add_argument("--tolerance-m", type=float, default=25)
+    a = ap.parse_args(argv)
+    try:
+        S, W, N, E = (float(x) for x in a.bbox.split(","))
+    except ValueError:
+        sys.exit("bbox must be S,W,N,E")
+    if a.src:
+        osm = jsonstate.load(a.src, None)
+        if osm is None:
+            sys.exit(f"cannot read {a.src}")
+    else:
+        import urllib.parse, urllib.request
+        q = f'[out:json][timeout:90];way["natural"="coastline"]({S},{W},{N},{E});out geom;'
+        osm = None
+        for url in OVERPASS:
+            try:
+                req = urllib.request.Request(url, data=urllib.parse.urlencode({"data": q}).encode(),
+                                             headers={"User-Agent": "trip-recap/1 (offline map build)"})
+                with web.open(req, timeout=100) as r:
+                    osm = json.loads(r.read())
+                break
+            except Exception as e:
+                print(f"overpass {url}: {type(e).__name__}", file=sys.stderr)
+        if osm is None:
+            sys.exit("all Overpass mirrors failed; retry later or pass --from")
+    data = coast_from_osm(osm, a.tolerance_m, (S, W, N, E))
+    tmp = a.o + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+    os.replace(tmp, a.o)
+    pts = sum(len(r) for r in data["rings"]) + sum(len(l) for l in data["lines"])
+    print(f"coast: {len(data['rings'])} islands, {len(data['lines'])} open lines, {pts} points -> {a.o}")
+
+
+# ---------- page ----------
+CSS = """
+:root{--bg:#f6f5f1;--fg:#1d2327;--muted:#5d6670;--card:#fff;--line:#d9dcd6;--sea:#d7e9f2;--land:#ece4cf;--coast:#8a9a8f;--accent:#0b7a75;--star:#c98a00}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121619;--fg:#e7eaec;--muted:#9aa4ad;--card:#1b2126;--line:#2c343a;--sea:#13252e;--land:#2d3128;--coast:#5d6c61;--accent:#4fc1b9;--star:#f0b429}}
+:root[data-theme="dark"]{--bg:#121619;--fg:#e7eaec;--muted:#9aa4ad;--card:#1b2126;--line:#2c343a;--sea:#13252e;--land:#2d3128;--coast:#5d6c61;--accent:#4fc1b9;--star:#f0b429}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:16px}h1{font-size:1.6rem;margin:.2rem 0}.sub{color:var(--muted);margin:0 0 12px}
+.map{width:100%;height:auto;display:block;background:var(--sea);border-radius:12px;border:1px solid var(--line)}
+.land{fill:var(--land);stroke:var(--coast);stroke-width:1}.coast{fill:none;stroke:var(--coast);stroke-width:1.2}
+.track{fill:none;stroke:var(--muted);stroke-width:1.3;stroke-dasharray:5 5;opacity:.55}
+.dot{stroke:var(--card);stroke-width:2;cursor:pointer}.dive{fill:var(--accent);stroke:var(--card);stroke-width:1.5}
+.lbl{font:600 30px system-ui,sans-serif;fill:var(--fg);opacity:.85;paint-order:stroke;stroke:var(--sea);stroke-width:6px}
+.legend{color:var(--muted);font-size:.82rem;margin:6px 0 0}
+.days{display:flex;gap:8px;overflow-x:auto;padding:12px 0}
+.day{flex:0 0 auto;border:1px solid var(--line);border-left:6px solid var(--c);border-radius:10px;padding:5px 10px;background:var(--card);color:var(--fg);text-decoration:none;font-size:.82rem}
+.day b{display:block}section{margin:24px 0}section h2{font-size:1.15rem;margin:0 0 2px}
+.chip{display:inline-block;border-radius:999px;padding:1px 9px;font-size:.78rem;background:var(--c);color:#fff;vertical-align:middle;margin-left:4px}
+.meta{color:var(--muted);margin:0 0 8px;font-size:.9rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:6px}
+figure{margin:0;position:relative;border-radius:8px;overflow:hidden;background:var(--line);cursor:zoom-in;aspect-ratio:1}
+figure img{width:100%;height:100%;object-fit:cover;display:block}
+figcaption{position:absolute;left:0;right:0;bottom:0;padding:2px 6px;font-size:.72rem;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.65))}
+.badge{position:absolute;top:4px;right:4px;font-size:.7rem;background:rgba(0,0,0,.6);color:#fff;border-radius:6px;padding:0 5px}
+.pick{outline:3px solid var(--star);outline-offset:-3px}.flash{animation:fl 1.8s}@keyframes fl{0%,60%{outline:4px solid var(--accent);outline-offset:-4px}}
+#lb{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;flex-direction:column;z-index:9}
+#lb.on{display:flex}#lb img{max-width:96vw;max-height:84vh;object-fit:contain}#lb p{color:#eee;margin:8px 16px;text-align:center;font-size:.9rem}
+footer{color:var(--muted);font-size:.8rem;margin:32px 0 12px}
+@media (max-width:600px){.grid{grid-template-columns:repeat(auto-fill,minmax(92px,1fr))}h1{font-size:1.3rem}}
+"""
+JS = """
+const figs=[...document.querySelectorAll('figure[data-i]')],full=JSON.parse(document.getElementById('full').textContent);
+const lb=document.getElementById('lb'),li=lb.querySelector('img'),lc=lb.querySelector('p');let cur=-1;
+function show(i){if(i<0||i>=figs.length)return;cur=i;const f=figs[i];li.src=full[f.dataset.i]||f.querySelector('img').src;lc.textContent=f.dataset.cap||'';lb.classList.add('on')}
+figs.forEach((f,i)=>f.addEventListener('click',()=>show(i)));
+lb.addEventListener('click',e=>{if(e.target!==li)lb.classList.remove('on')});
+document.addEventListener('keydown',e=>{if(!lb.classList.contains('on'))return;if(e.key==='Escape')lb.classList.remove('on');if(e.key==='ArrowRight')show(cur+1);if(e.key==='ArrowLeft')show(cur-1)});
+document.querySelectorAll('[data-go]').forEach(d=>d.addEventListener('click',()=>{const f=document.getElementById('p'+d.dataset.go);if(f){f.scrollIntoView({behavior:'smooth',block:'center'});f.classList.remove('flash');void f.offsetWidth;f.classList.add('flash')}}));
+"""
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+def day_colors(days):
+    n = max(1, len(days))
+    out = {}
+    for i, d in enumerate(days):
+        r, g, b = colorsys.hls_to_rgb((0.55 + 0.8 * i / n) % 1.0, 0.45, 0.65)
+        out[d] = "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
+    return out
+
+
+def render_map(items, dives, cfg, coast, island_color):
+    pts = [(it["lat"], it["lon"]) for it in items if it.get("lat") is not None]
+    bbox = cfg.get("map_bbox") or (coast or {}).get("bbox")
+    if not bbox:
+        if not pts:
+            return "", 0
+        la, lo = [p[0] for p in pts], [p[1] for p in pts]
+        pad = max(0.02, (max(la) - min(la)) * 0.12, (max(lo) - min(lo)) * 0.12)
+        bbox = [min(la) - pad, min(lo) - pad, max(la) + pad, max(lo) + pad]
+    S, W, N, E = bbox
+    kx = math.cos(math.radians((S + N) / 2))
+    width = 1000.0
+    sc = width / max(1e-9, (E - W) * kx)
+    height = (N - S) * sc
+
+    def xy(lat, lon):
+        return (lon - W) * kx * sc, (N - lat) * sc
+
+    def inside(lat, lon):
+        return S <= lat <= N and W <= lon <= E
+
+    def path(seq, close):
+        return "M" + " L".join("%.1f %.1f" % xy(a, b) for a, b in seq) + (" Z" if close else "")
+
+    o = [f'<svg class="map" viewBox="0 0 {width:.0f} {height:.0f}" role="img" aria-label="Map of photo locations">']
+    for r in (coast or {}).get("rings", []):
+        o.append(f'<path class="land" d="{path(r, True)}"/>')
+    for l in (coast or {}).get("lines", []):
+        o.append(f'<path class="coast" d="{path(l, False)}"/>')
+    geo = [it for it in items if it.get("lat") is not None and inside(it["lat"], it["lon"])]
+    if len(geo) >= 2:
+        o.append(f'<path class="track" d="{path([(it["lat"], it["lon"]) for it in geo], False)}"/>')
+    for r in cfg.get("regions") or []:
+        an = r.get("label") or ([sum(a[0] for a in r["anchors"]) / len(r["anchors"]), sum(a[1] for a in r["anchors"]) / len(r["anchors"])] if r.get("anchors") else None)
+        if an and inside(*an):
+            x, y = xy(*an)
+            o.append(f'<text class="lbl" x="{x + 14:.1f}" y="{y:.1f}" fill="{island_color.get(r["name"], GREY)}">{esc(r["name"])}</text>')
+    for d in dives:
+        if d.get("lat") is None or not inside(d["lat"], d["lon"]):
+            continue
+        x, y = xy(d["lat"], d["lon"])
+        tip = f"Dive · {d['site']} · {d['t']:%d.%m %H:%M}" + (f" · {d['depth']} m" if d.get("depth") else "")
+        o.append(f'<path class="dive" d="M{x:.1f} {y - 13:.1f} L{x + 10:.1f} {y:.1f} L{x:.1f} {y + 13:.1f} L{x - 10:.1f} {y:.1f} Z"><title>{esc(tip)}</title></path>')
+    for it in geo:
+        x, y = xy(it["lat"], it["lon"])
+        o.append(f'<circle class="dot" cx="{x:.1f}" cy="{y:.1f}" r="{9 if it.get("pick") else 7}" fill="{it["dcolor"]}" data-go="{it["id"]}">'
+                 f'<title>{esc(it["t"].strftime("%a %d.%m %H:%M"))} · {esc(it["island"])}</title></circle>')
+    o.append("</svg>")
+    return "\n".join(o), len([it for it in items if it.get("lat") is not None]) - len(geo)
+
+
+def figure(it, with_id):
+    cap = f"{it['t']:%a %d.%m %H:%M} · {it['island']}" + (" · underwater" if it.get("underwater") else "") + f" · {os.path.basename(it['path'])}"
+    badges = []
+    if it["kind"] == "video":
+        badges.append("▶ %d:%02d" % divmod(int(it.get("duration") or 0), 60))
+    if it.get("underwater"):
+        badges.append("🌊")
+    if it.get("pick"):
+        badges.append("★")
+    img = f'<img alt="" loading="lazy" src="data:image/jpeg;base64,{it["thumb"]}">' if it.get("thumb") else ""
+    return (f'<figure{" id=p" + str(it["id"]) if with_id else ""} class="{"pick" if it.get("pick") else ""}" data-i="{it["id"]}" data-cap="{esc(cap)}">'
+            f'{img}{"<span class=badge>" + " ".join(badges) + "</span>" if badges else ""}<figcaption>{it["t"]:%H:%M}</figcaption></figure>')
+
+
+def render_page(items, picks, dives, cfg, coast, title, previews, skipped):
+    islands = []
+    for it in items:
+        if it["island"] not in islands:
+            islands.append(it["island"])
+    reg_names = [r["name"] for r in cfg.get("regions") or []]
+    island_color = {name: PALETTE[i % len(PALETTE)] for i, name in enumerate(reg_names)}
+    for name in islands:
+        if name not in island_color:
+            island_color[name] = GREY if name in ("Elsewhere", "Unknown") else PALETTE[len(island_color) % len(PALETTE)]
+    days = sorted({it["day"] for it in items})
+    dcol = day_colors(days)
+    for it in items:
+        it["dcolor"] = dcol[it["day"]]
+    svg, outside = render_map(items, dives, cfg, coast, island_color)
+    by_day = {d: [it for it in items if it["day"] == d] for d in days}
+    dives_by_day = {}
+    for d in dives:
+        dives_by_day.setdefault(d["t"].date().isoformat(), []).append(d)
+
+    def main_island(v):
+        cnt = {}
+        for it in v:
+            cnt[it["island"]] = cnt.get(it["island"], 0) + 1
+        return [k for k, _ in sorted(cnt.items(), key=lambda kv: -kv[1])]
+
+    nph, nvid = sum(it["kind"] == "photo" for it in items), sum(it["kind"] == "video" for it in items)
+    span = f"{dt.date.fromisoformat(days[0]):%d.%m.%Y} – {dt.date.fromisoformat(days[-1]):%d.%m.%Y}" if days else ""
+    p = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
+         '<meta name="viewport" content="width=device-width,initial-scale=1">',
+         "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'\">",
+         f"<title>{esc(title)}</title><style>{CSS}</style></head><body><main>",
+         f"<h1>{esc(title)}</h1>",
+         f'<p class="sub">{esc(span)} · {len(days)} days · {nph} photos' + (f" · {nvid} video{'s' if nvid > 1 else ''}" if nvid else "")
+         + (f" · {len(dives)} dives" if dives else "") + " · " + " · ".join(
+             f'<span class="chip" style="--c:{island_color[i]}">{esc(i)} {sum(x["island"] == i for x in items)}</span>' for i in islands) + "</p>"]
+    if svg:
+        p.append(svg)
+        leg = "Dots = photos and videos with GPS, coloured by day (tap one to jump to it); dashed line = the route in time order"
+        leg += "; ◆ = dives" if any(d.get("lat") is not None for d in dives) else ""
+        leg += f"; {outside} more with GPS off this map" if outside else ""
+        p.append(f'<p class="legend">{leg}.</p>')
+    p.append('<nav class="days">')
+    for d in days:
+        isl = main_island(by_day[d])
+        nd = len(dives_by_day.get(d, []))
+        p.append(f'<a class="day" href="#d{d}" style="--c:{island_color[isl[0]]}"><b>{dt.date.fromisoformat(d):%a %d.%m}</b>'
+                 f'{esc(" / ".join(isl))} · {len(by_day[d])}' + (f" · {nd} dive{'s' if nd > 1 else ''}" if nd else "") + "</a>")
+    p.append("</nav>")
+    if picks:
+        p.append(f'<section><h2>Best of · {len(picks)} picks</h2><p class="meta">Chosen for sharpness, exposure and faces, spread over the days; '
+                 f'these went into the montage in this order.</p><div class="grid">')
+        p += [figure(it, False) for it in picks]
+        p.append("</div></section>")
+    for d in days:
+        v = by_day[d]
+        isl = main_island(v)
+        chips = "".join(f'<span class="chip" style="--c:{island_color[i]}">{esc(i)}</span>' for i in isl)
+        nphd = sum(x['kind'] == 'photo' for x in v)
+        meta = [f"{nphd} photo{'s' if nphd != 1 else ''}"]
+        nv = sum(x["kind"] == "video" for x in v)
+        if nv:
+            meta.append(f"{nv} video{'s' if nv > 1 else ''}")
+        for dv in dives_by_day.get(d, []):
+            meta.append(f"dive {dv['t']:%H:%M} {dv['site']}" + (f" {dv['depth']} m" if dv.get("depth") else "") + f" {dv['minutes']} min")
+        p.append(f'<section id="d{d}"><h2>{dt.date.fromisoformat(d):%A %d.%m}{chips}</h2><p class="meta">{esc(" · ".join(meta))}</p><div class="grid">')
+        p += [figure(it, True) for it in v]
+        p.append("</div></section>")
+    foot = f"Made locally by trip-recap on {dt.date.today():%d.%m.%Y}. This page loads nothing from the internet."
+    if coast:
+        foot += f" Coastline: {esc(coast.get('attribution', ''))}."
+    if skipped:
+        foot += f" Skipped {skipped} files (HEIC/RAW: export them as JPEG to include them)."
+    full = {str(k): "data:image/jpeg;base64," + v for k, v in previews.items()}
+    p.append(f"<footer>{foot}</footer></main>")
+    p.append('<div id="lb" role="dialog"><img alt=""><p></p></div>')
+    p.append('<script type="application/json" id="full">' + json.dumps(full).replace("</", "<\\/") + "</script>")
+    p.append(f"<script>{JS}</script></body></html>")
+    return "\n".join(p)
+
+
+# ---------- montage ----------
+def build_montage(picks, out, a, title, log):
+    from PIL import Image, ImageOps
+    if not os.access(VIDMONTAGE, os.X_OK):
+        log.append(f"montage skipped: vidmontage not found ({VIDMONTAGE})")
+        return None
+    src = os.path.join(out, "montage-src")
+    if os.path.isdir(src):
+        shutil.rmtree(src)
+    os.makedirs(src)
+    W, H = a.size
+    files, uw_ok = [], 0
+    for i, it in enumerate(picks, 1):
+        dst = os.path.join(src, f"{i:03d}.jpg")
+        with Image.open(it["path"]) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            im.thumbnail((W, H))
+            im.save(dst, "JPEG", quality=92)  # no EXIF: the montage inputs carry no GPS
+        if it.get("uwfix") and os.access(UWFIX, os.X_OK):
+            fixed = os.path.join(src, f"{i:03d}-uw.jpg")
+            r = subprocess.run([UWFIX, dst, "-o", fixed, "--quiet", "--strength", str(a.uw_strength)],
+                               capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+            if r.returncode == 0 and os.path.exists(fixed):
+                dst, uw_ok = fixed, uw_ok + 1
+            else:
+                log.append(f"uwfix failed on pick {i}; used it uncorrected: " + (r.stderr or "")[-200:].strip())
+        files.append(dst)
+    mp4 = os.path.join(out, "montage.mp4")
+    cmd = [VIDMONTAGE, "-o", mp4, "--photo-secs", str(a.photo_secs), "--size", f"{W}x{H}", "--title", title]
+    if a.music:
+        cmd += ["--music", a.music]
+    r = subprocess.run(cmd + files, capture_output=True, text=True, timeout=3600, stdin=subprocess.DEVNULL)
+    if r.returncode != 0 or not os.path.exists(mp4):
+        log.append("vidmontage failed: " + (r.stderr or r.stdout)[-400:].strip())
+        return None
+    return {"path": mp4, "uw_corrected": uw_ok}
+
+
+def size_arg(s):
+    try:
+        w, h = (int(x) for x in s.lower().split("x"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("want WxH, e.g. 1920x1080")
+    if w < 2 or h < 2 or w % 2 or h % 2:
+        raise argparse.ArgumentTypeError("width and height must be even")
+    return w, h
+
+
+def main(argv):
+    if argv[:1] == ["coast"]:
+        return cmd_coast(argv[1:])
+    ap = argparse.ArgumentParser(prog="trip-recap", description="Offline trip recap: map, day timeline, best photos, montage.")
+    ap.add_argument("dir")
+    ap.add_argument("-o", "--out")
+    ap.add_argument("--config", default=CONFIG)
+    ap.add_argument("--count", type=int, default=40)
+    ap.add_argument("--music")
+    ap.add_argument("--title")
+    ap.add_argument("--no-montage", action="store_true")
+    ap.add_argument("--size", type=size_arg, default=(1920, 1080))
+    ap.add_argument("--photo-secs", type=float, default=3.5)
+    ap.add_argument("--uw-strength", type=float, default=0.8)
+    ap.add_argument("--uw-threshold", type=float, default=0.75)
+    ap.add_argument("--dives", default="auto", help="auto (divelog), none, or a divelog list --json file")
+    ap.add_argument("--camera-tz", help="zone for EXIF times without an offset (default: trip zone)")
+    ap.add_argument("--since")
+    ap.add_argument("--until")
+    ap.add_argument("--workers", type=int, default=min(6, os.cpu_count() or 2))
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    reexec()
+    from zoneinfo import ZoneInfo
+    import concurrent.futures as cf, multiprocessing as mp
+    from PIL import Image, ImageOps
+
+    src_dir = os.path.abspath(a.dir)
+    if not os.path.isdir(src_dir):
+        sys.exit(f"not a directory: {a.dir}")
+    if a.music and not os.path.isfile(a.music):
+        sys.exit(f"music file not found: {a.music}")
+    cfg = jsonstate.load(a.config, {}) if a.config else {}
+    tzname = cfg.get("tz") or jsonstate.load(DIVELOG_CONFIG, {}).get("tz") or "UTC"
+    trip_tz = ZoneInfo(tzname)
+    cam_tz = ZoneInfo(a.camera_tz) if a.camera_tz else trip_tz
+    coast = None
+    if cfg.get("coast"):
+        cp = cfg["coast"] if os.path.isabs(cfg["coast"]) else os.path.join(os.path.dirname(os.path.abspath(a.config)), cfg["coast"])
+        coast = jsonstate.load(cp, None)
+    out = os.path.abspath(a.out or os.path.join(HOME, "jobs/trip-recap", os.path.basename(src_dir.rstrip("/")) or "trip"))
+    os.makedirs(out, exist_ok=True)
+    title = a.title or cfg.get("title") or os.path.basename(src_dir)
+
+    jobs, skipped = [], 0
+    for root, dirs, names in os.walk(src_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and os.path.abspath(os.path.join(root, d)) != out)
+        for n in sorted(names):
+            ext = os.path.splitext(n)[1].lower()
+            path = os.path.join(root, n)
+            if n.startswith("."):
+                continue
+            if ext in PHOTO:
+                jobs.append([path, "photo"])
+            elif ext in VIDEO:
+                jobs.append([path, "video"])
+            elif ext in SKIPPED:
+                skipped += 1
+    if not jobs:
+        sys.exit(f"no photos or videos in {a.dir}")
+    thumb = 280 if len(jobs) <= 400 else 220 if len(jobs) <= 1000 else 180
+    jobs = [(p, k, thumb) for p, k in jobs]
+    with cf.ProcessPoolExecutor(max_workers=max(1, a.workers), mp_context=mp.get_context("fork")) as ex:
+        res = list(ex.map(analyze, jobs, chunksize=4))
+
+    items, errors = [], []
+    for it in res:
+        if it.get("error"):
+            errors.append(it)
+            continue
+        t, src = None, "file"
+        if it["kind"] == "photo" and it.get("exif_time"):
+            t, src = exif_time(it["exif_time"], it.get("exif_off"), cam_tz, trip_tz), "exif"
+        elif it["kind"] == "video" and it.get("video_time"):
+            t, src = iso_time(it["video_time"], trip_tz), "video"
+        if t is None:
+            t, src = dt.datetime.fromtimestamp(os.path.getmtime(it["path"]), trip_tz).replace(tzinfo=None), "file"
+        it["t"], it["time_src"], it["day"] = t, src, t.date().isoformat()
+        items.append(it)
+    if a.since:
+        items = [it for it in items if it["day"] >= a.since]
+    if a.until:
+        items = [it for it in items if it["day"] <= a.until]
+    if not items:
+        sys.exit("no usable photos or videos (all unreadable or outside --since/--until)")
+    items.sort(key=lambda it: (it["t"], it["path"]))
+    for i, it in enumerate(items):
+        it["id"] = i
+    assign_regions(items, cfg)
+    dives = load_dives(a.dives)
+    for it in items:
+        dive = next((d for d in dives if d["t"] - dt.timedelta(minutes=10) <= it["t"] <= d["t"] + dt.timedelta(minutes=d["minutes"] + 20)), None)
+        cast = it.get("uw_cast") or 0
+        # underwater = blue/green cast, or shot during a logged dive without GPS (action cam, not the phone on the boat);
+        # uwfix only where the cast is there: flash or pre-corrected shots keep their colours
+        it["uwfix"] = bool(cast >= a.uw_threshold or (dive and cast >= 0.4))
+        it["underwater"] = bool(it["uwfix"] or (dive and it.get("lat") is None))
+        if dive:
+            it["dive"] = dive["id"]
+    picks = select([it for it in items if it["kind"] == "photo"], max(0, a.count))
+    for it in picks:
+        it["pick"] = True
+    previews = {}
+    for it in picks:
+        try:
+            with Image.open(it["path"]) as im:
+                if im.format == "JPEG":
+                    im.draft("RGB", (1600, 1600))
+                previews[it["id"]] = jpeg_b64(ImageOps.exif_transpose(im).convert("RGB"), 1024, 76)
+        except Exception:
+            pass
+
+    page = render_page(items, picks, dives, cfg, coast, title, previews, skipped)
+    html_path = os.path.join(out, "index.html")
+    with open(html_path + ".tmp", "w") as f:
+        f.write(page)
+    os.replace(html_path + ".tmp", html_path)
+    with open(os.path.join(out, "picks.txt"), "w") as f:
+        f.write("".join(it["path"] + ("\tunderwater" if it.get("underwater") else "") + ("\tuwfix" if it.get("uwfix") else "") + "\n" for it in picks))
+    log = []
+    montage = None
+    if not a.no_montage and len(picks) >= 2:
+        montage = build_montage(picks, out, a, title, log)
+    keep = ("id", "path", "kind", "day", "time_src", "lat", "lon", "island", "island_src", "sharp", "exposure", "faces",
+            "uw_cast", "underwater", "uwfix", "dive", "score", "dup_of", "pick", "duration")
+    recap = {"title": title, "tz": tzname, "items": [dict({k: it[k] for k in keep if k in it}, t=it["t"].isoformat(timespec="seconds")) for it in items],
+             "errors": [{"path": e["path"], "error": e["error"]} for e in errors], "skipped": skipped,
+             "dives": [dict(d, t=d["t"].isoformat(timespec="minutes")) for d in dives]}
+    with open(os.path.join(out, "recap.json"), "w") as f:
+        json.dump(recap, f, ensure_ascii=False, indent=1)
+
+    isl = {}
+    for it in items:
+        isl[it["island"]] = isl.get(it["island"], 0) + 1
+    src_n = {}
+    for it in items:
+        src_n[it["island_src"]] = src_n.get(it["island_src"], 0) + 1
+    summary = {
+        "photos": sum(it["kind"] == "photo" for it in items), "videos": sum(it["kind"] == "video" for it in items),
+        "skipped": skipped, "unreadable": len(errors), "days": len({it["day"] for it in items}), "islands": isl,
+        "island_source": src_n, "with_gps": sum(it.get("lat") is not None for it in items),
+        "picks": len(picks), "picks_underwater": sum(bool(it.get("underwater")) for it in picks), "picks_uwfix": sum(bool(it.get("uwfix")) for it in picks),
+        "picks_with_faces": sum(bool(it.get("faces")) for it in picks), "duplicates_dropped": sum("dup_of" in it for it in items),
+        "dives": len(dives), "faces_model": os.path.exists(FACE_MODEL),
+        "page": html_path, "page_mb": round(os.path.getsize(html_path) / 1e6, 2), "picks_file": os.path.join(out, "picks.txt"),
+        "montage": montage["path"] if montage else None, "montage_uw_corrected": montage["uw_corrected"] if montage else 0, "notes": log,
+    }
+    if a.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=1))
+    else:
+        print(f"trip-recap: {summary['photos']} photos, {summary['videos']} videos, {summary['days']} days"
+              + (f", {skipped} skipped (HEIC/RAW)" if skipped else "") + (f", {len(errors)} unreadable" if errors else ""))
+        print("islands: " + ", ".join(f"{k} {v}" for k, v in isl.items()) + f" (GPS on {summary['with_gps']})")
+        print(f"picks: {len(picks)} ({summary['picks_underwater']} underwater, {summary['picks_with_faces']} with faces) -> {summary['picks_file']}")
+        print(f"page: {html_path} ({summary['page_mb']} MB)")
+        if montage:
+            print(f"montage: {montage['path']}")
+        for line in log:
+            print(line)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

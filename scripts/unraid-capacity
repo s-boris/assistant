@@ -1,0 +1,969 @@
+#!/usr/bin/env python3
+"""unraid-capacity: capacity history and fill-up forecast for the owner's Unraid server.
+
+STRICTLY READ-ONLY on the server. `record` runs the embedded COLLECTOR server-side through one call of the
+dispatcher's read-only `capacity` verb. It only reads emhttp's RAM state files (/var/local/emhttp: var.ini, disks.ini, shares.ini) and
+/proc/mounts, and runs `df` (statfs) on the mounted array disks, pools and docker.img. statfs is answered
+from memory and wakes no disk: five df rounds over all 11 array disks left every
+/sys/block/sdX/stat read/write counter unchanged (emhttp refreshes fsFree of spun-down disks the same
+way). Nothing under /mnt is listed, opened or stat'ed. `unraid-capacity show-collector` prints it.
+
+Commands
+  record            take one sample, append it to samples.jsonl (cron: daily 03:17)
+  backfill          estimate past array usage from the Radarr/Sonarr history ledger so the forecast works
+                    from day 1: imported file sizes minus upgrade/manual deletions (Radarr's recycle-bin
+                    delay applied), HTTP GETs only, no disk access. Anchored to the first real sample;
+                    rewrites backfill.jsonl. Media only, so it's an estimate; real samples replace it
+                    as they accumulate.
+  forecast          growth rates and projected full dates (JSON by default)
+    --human         readable summary
+    --alert         print a short message and exit 1 only if the array is projected full within 60 days,
+                    or a pool (cache, data) or docker.img within 14 days; else print nothing, exit 0
+    --notify        with --alert: text the owner (`tg`) + note in ~/inbox, only when an alert is new or
+                    worse (tighter band: array 60/30/14/7 days, pools 14/7/3); also an inbox-only note
+                    if samples go stale (record failing)
+    --live          take a fresh reading as "now" (one ssh session, not saved)
+  show-collector    print the read-only script run on the server
+
+Forecast method
+  Daily series: first sample of each Zurich day; backfill points only before the first real sample.
+  Array and disks: growth = least-squares slope over the last 30 and 90 days after removing one-off big deletes: a daily
+  drop far below the typical change (> 4 robust SDs and > 0.1% of capacity per day) is replaced by the
+  median daily change, if such drops are rare (<= 10% of days, at most 6). Frequent drops are the normal
+  pattern and stay in. The 30-day rate is primary (90-day as fallback).
+  Pools and docker.img move in steps both ways (image pulls/builds and prunes, the mover), so nothing is
+  excluded there: the rate is the slowest of the least-squares slope, the net change over the window and the
+  net change over the last 7+ days, and it counts only when all three are positive (else "not filling");
+  a single pull or build step is not extrapolated. Needs 7+ days of samples.
+  Array and disks count as full when every disk is down to the media share's minimum free space
+  (shareFloor, ~102 GB): Unraid then has nowhere to put new files. Pools/docker.img: free = 0.
+  Per disk: the disk's own trend (needs 7+ days of real samples) plus a high-water allocator model that
+  spreads the array's growth over the disks the way Unraid does (lowest-numbered disk above the mark).
+
+Files: ~/.local/state/unraid-capacity/  samples.jsonl, backfill.jsonl, backfill-meta.json,
+       alerts.json (notify dedup), cron.log
+Testing: --state-dir DIR, --inbox-dir DIR, record --input FILE / --dry-run; env UNRAID_CAPACITY_HOST
+         (ssh alias), UNRAID_CAPACITY_TG (sender, default `tg`), UNRAID_CAPACITY_NO_SEND=1,
+         UNRAID_CAPACITY_SSH_RETRY_WAIT (seconds between ssh attempts). Tests: ~/opt/unraid-capacity-tests/run.sh.
+"""
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+import traceback
+import urllib.error
+import urllib.request
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import botlib  # noqa: E402
+import assistant_profile  # noqa: E402
+
+try:  # keys by handle (core.egress)
+    _lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    if _lib not in sys.path:
+        sys.path.append(_lib)  # append, so ~/bin/lib never shadows anything
+    from core import egress as _egress
+except Exception:  # a copy without ~/bin/lib: the direct path
+    _egress = None
+
+# ----------------------------------------------------------------------------- settings
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("UNRAID_CAPACITY_STATE_DIR", HOME / ".local/state/unraid-capacity"))
+INBOX_DIR = Path(os.environ.get("UNRAID_CAPACITY_INBOX_DIR", HOME / "inbox"))
+SSH_HOST = os.environ.get("UNRAID_CAPACITY_HOST", "unraid")
+TG_CMD = os.environ.get("UNRAID_CAPACITY_TG", "tg")
+MEDIA_SECRETS = HOME / ".secrets/media.json"
+SHARE = os.environ.get("UNRAID_CAPACITY_SHARE", "media")   # its allocator/floor drive the disk model
+SSH_ATTEMPTS, SSH_TIMEOUT = 2, 90
+SSH_RETRY_WAIT = float(os.environ.get("UNRAID_CAPACITY_SSH_RETRY_WAIT") or 30)   # tests: 0
+try:
+    LOCAL_TZ = assistant_profile.tz()
+except Exception:
+    LOCAL_TZ = dt.timezone.utc
+
+ARRAY_ALERT_DAYS, POOL_ALERT_DAYS = 60, 14
+ARRAY_BANDS, POOL_BANDS = (60, 30, 14, 7), (14, 7, 3)
+CLEAR_FACTOR = 1.25             # an alert's band resets only once the ETA is back above threshold x this
+DISK_SHOW_PCT = 90.0            # --human lists array disks above this
+POOL_MIN_SPAN = 7               # days of real samples before a pool/docker.img trend counts
+STEP_NET_DAYS = 7               # pools/docker.img: net growth over at least this many recent days, or "not filling"
+DISK_MIN_SPAN = 7
+STALE_DAYS = 3
+BACKFILL_DAYS = 180
+MISSING_MASS = 50               # more MissingFromDisk events than this per app and day = a rescan after a path change
+
+# ----------------------------------------------------------------------------- collector
+# Runs on the server inside the dispatcher's `capacity` verb. STRICTLY READ-ONLY: reads RAM state files and
+# /proc/mounts, and statfs()es real mount points (df). Wakes no disk, writes nothing.
+COLLECTOR = r'''# unraid-capacity collector: STRICTLY READ-ONLY. Reads emhttp's RAM state files and /proc/mounts,
+# and runs df (statfs, answered from memory, wakes no disk) on mounted array disks, pools, docker.img.
+main() {
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+E=/var/local/emhttp
+S() { printf '\n=====UC %s\n' "$*"; }
+S meta
+echo "now=$(date +%s)"
+echo "host=$(hostname)"
+S var
+grep -E '^(version|NAME|mdState|fsState)=' $E/var.ini 2>/dev/null
+S disks
+cat $E/disks.ini 2>/dev/null
+S shares
+cat $E/shares.ini 2>/dev/null
+S mounts
+awk '$2 ~ /^\/mnt\/[A-Za-z0-9_.-]+$/ || $2 == "/var/lib/docker" || $2 == "/etc/libvirt" {print $1, $2, $3}' /proc/mounts
+S df
+mps=$(awk '($2 ~ /^\/mnt\/[A-Za-z0-9_.-]+$/ && $3 != "tmpfs" && $3 !~ /^fuse/) || $2 == "/var/lib/docker" || $2 == "/etc/libvirt" {print $2}' /proc/mounts | sort -u)
+[ -n "$mps" ] && timeout 30 df -PT -B1 $mps 2>&1
+S end
+}
+main </dev/null
+exit 0
+'''
+
+
+# ----------------------------------------------------------------------------- helpers
+def unq(v):
+    v = v.strip()
+    return v[1:-1] if len(v) >= 2 and v[0] == v[-1] == '"' else v
+
+
+def to_int(v, default=None):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def fmt_bytes(n, signed=False):
+    if n is None:
+        return "?"
+    sign = ("+" if n >= 0 else "-") if signed else ("-" if n < 0 else "")
+    n = abs(float(n))
+    for unit in ("B", "kB", "MB", "GB", "TB", "PB"):
+        if n < 1000 or unit == "PB":
+            s = f"{n:.0f} {unit}" if unit in ("B", "kB") or n >= 100 else f"{n:.1f} {unit}"
+            return sign + s
+        n /= 1000.0
+
+
+def fmt_rate(r):
+    return "?" if r is None else fmt_bytes(r, signed=True) + "/day"
+
+
+def local_dt(ts):
+    return dt.datetime.fromtimestamp(ts, LOCAL_TZ)
+
+
+def local_date(ts):
+    return local_dt(ts).date().isoformat()
+
+
+def fmt_days(days):
+    if days is None:
+        return "not filling"
+    if days > 3650:
+        return "10+ years"
+    if days < 1:
+        return "now"
+    return f"{days:.0f} days"
+
+
+def disk_num(name):
+    m = re.search(r"(\d+)$", name)
+    return int(m.group(1)) if m else 0
+
+
+atomic_write = botlib.atomic_write
+
+
+def parse_ini(text):
+    out, cur = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        m = re.fullmatch(r'\[\s*"?([^"\]]*)"?\s*\]', line)
+        if m:
+            cur = out.setdefault(m.group(1), {})
+        elif "=" in line:
+            k, v = line.split("=", 1)
+            (cur if cur is not None else out.setdefault("", {}))[k.strip()] = unq(v)
+    return out
+
+
+def parse_df(text):
+    out = {}
+    for line in text.splitlines():
+        p = line.split()
+        if len(p) >= 7 and p[2].isdigit() and p[3].isdigit() and p[4].isdigit():
+            out[" ".join(p[6:])] = {"dev": p[0], "type": p[1], "size": int(p[2]), "used": int(p[3]),
+                                    "free": int(p[4])}
+    return out
+
+
+def split_sections(raw):
+    secs = {}
+    cur = None
+    for line in raw.splitlines():
+        if line.startswith("=====UC "):
+            cur = line[8:].strip()
+            secs[cur] = []
+        elif cur is not None:
+            secs[cur].append(line)
+    return {k: "\n".join(v).strip("\n") for k, v in secs.items()}
+
+
+
+
+# ----------------------------------------------------------------------------- SSH lockdown switch
+UNRAID_SSH = os.environ.get("UNRAID_SSH_BIN") or os.path.expanduser("~/bin/unraid-ssh")
+
+
+def lockdown_mode():
+    return botlib.lockdown_mode(UNRAID_SSH)
+
+
+# ----------------------------------------------------------------------------- collect + sample
+def collect(host):
+    if lockdown_mode() == "root":
+        script = COLLECTOR
+        cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+               "-o", "ServerAliveCountMax=3", host, "bash -s"]
+    else:                          # owner's SSH lockdown: verb `capacity` runs this same collector server-side
+        script, cmd = "", [UNRAID_SSH, "--host", host, "run", "capacity"]
+    err = "unknown error"
+    for attempt in range(SSH_ATTEMPTS):
+        if attempt:
+            time.sleep(SSH_RETRY_WAIT)
+        try:
+            p = subprocess.run(cmd, input=script, capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=SSH_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            err = f"ssh timed out after {SSH_TIMEOUT}s"
+            continue
+        except OSError as e:
+            err = f"could not run ssh: {e}"
+            continue
+        if "\n=====UC end" not in p.stdout:
+            err = f"collector incomplete (exit {p.returncode}): " + ((p.stderr or "").strip()[-200:] or "no end marker")
+            continue
+        return p.stdout, None
+    return None, err
+
+
+def build_sample(raw):
+    """Collector output -> sample dict, or (None, reason) when the data can't be trusted."""
+    s = split_sections(raw)
+    meta = dict(unq_kv(s.get("meta", "")))
+    var = dict(unq_kv(s.get("var", "")))
+    disks = parse_ini(s.get("disks", ""))
+    shares = parse_ini(s.get("shares", ""))
+    df = parse_df(s.get("df", ""))
+    mounts = {}
+    for line in s.get("mounts", "").splitlines():
+        p = line.split()
+        if len(p) >= 3:
+            mounts[p[1]] = {"src": p[0], "type": p[2]}
+    if var.get("mdState") != "STARTED":
+        return None, f"array not started (mdState={var.get('mdState') or '?'})"
+    ts = to_int(meta.get("now")) or int(time.time())
+    smp = {"v": 1, "ts": ts, "date": local_date(ts), "host": meta.get("host") or var.get("NAME") or "?",
+           "disks": {}, "pools": {}}
+    seen = set()
+    for name, x in disks.items():
+        typ, mp = x.get("type"), x.get("fsMountpoint", "")
+        if typ not in ("Data", "Cache") or not mp or mp in seen:
+            continue
+        r = df.get(mp)
+        if r:
+            row = {"size": r["size"], "used": r["used"], "free": r["free"]}
+        else:   # not in df (unmounted?): emhttp's own numbers (KiB) if it has them
+            fs, ff, fu = (to_int(x.get(k)) for k in ("fsSize", "fsFree", "fsUsed"))
+            if not fs:
+                continue
+            row = {"size": fs * 1024, "used": (fu if fu is not None else fs - (ff or 0)) * 1024,
+                   "free": (ff or 0) * 1024, "src": "emhttp"}
+        seen.add(mp)
+        if typ == "Data":
+            row["status"] = x.get("status", "")
+            smp["disks"][name] = row
+        else:
+            row["fs"] = x.get("fsType", "")
+            smp["pools"][name] = row
+    if not smp["disks"]:
+        return None, "no mounted array data disks found"
+    smp["array"] = {k: sum(d[k] for d in smp["disks"].values()) for k in ("size", "used", "free")}
+    smp["array"]["n"] = len(smp["disks"])
+    m = mounts.get("/var/lib/docker")
+    r = df.get("/var/lib/docker")
+    if m and r and m["src"].startswith("/dev/loop"):
+        smp["docker_img"] = {"size": r["size"], "used": r["used"], "free": r["free"]}
+    sh = shares.get(SHARE)
+    if sh:
+        smp["alloc"] = {"share": SHARE, "allocator": sh.get("allocator", ""),
+                        "floor": (to_int(sh.get("floor"), 0) or 0) * 1024,   # shareFloor is in KiB
+                        "include": sh.get("include", ""), "exclude": sh.get("exclude", "")}
+    return smp, None
+
+
+def unq_kv(text):
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            yield k.strip(), unq(v)
+
+
+# ----------------------------------------------------------------------------- storage
+def load_jsonl(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        pass
+    except FileNotFoundError:
+        pass
+    return sorted((x for x in out if isinstance(x, dict) and x.get("ts")), key=lambda x: x["ts"])
+
+
+def take_lock(sdir):
+    sdir.mkdir(parents=True, exist_ok=True)
+    lock = open(sdir / ".lock", "w")
+    deadline = time.time() + 300
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except BlockingIOError:
+            if time.time() > deadline:
+                raise SystemExit("unraid-capacity: another run holds the lock; giving up")
+            time.sleep(3)
+
+
+def trim_cron_log(sdir, limit=256 * 1024, keep=64 * 1024):
+    f = sdir / "cron.log"
+    try:
+        if f.exists() and f.stat().st_size > limit:
+            data = f.read_bytes()[-keep:]
+            with open(f, "r+b") as fh:
+                fh.seek(0)
+                fh.write(data)
+                fh.truncate()
+    except OSError:
+        pass
+
+
+# ----------------------------------------------------------------------------- forecasting math
+def daily_first(points):
+    """[(ts, value)] -> first point of each Zurich day, sorted."""
+    best = {}
+    for t, v in points:
+        if v is None:
+            continue
+        d = local_date(t)
+        if d not in best or t < best[d][0]:
+            best[d] = (t, v)
+    return sorted(best.values())
+
+
+def ols(xs, ys):
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else None
+
+
+def trend(points, end_ts, days, min_span, cap):
+    """Robust growth rate (bytes/day) over the window [end - days, end]. See the module doc."""
+    start = end_ts - days * 86400 - 3 * 3600
+    pts = [(t, v) for t, v in points if start <= t <= end_ts + 60]
+    span = (pts[-1][0] - pts[0][0]) / 86400 if len(pts) >= 2 else 0.0
+    res = {"window": days, "points": len(pts), "span_days": round(span, 1)}
+    if len(pts) < 4 or span < min_span:
+        res.update(ok=False, need_days=min_span)
+        return res
+    steps = [(t1, (t1 - t0) / 86400, v1 - v0) for (t0, v0), (t1, v1) in zip(pts, pts[1:]) if t1 > t0]
+    rates = [dv / dd for _, dd, dv in steps]
+    med = statistics.median(rates)
+    mad = 1.4826 * statistics.median(abs(r - med) for r in rates)
+    thr = max(4 * mad, 0.001 * cap)
+    drops = [i for i, (_, dd, dv) in enumerate(steps) if dv / dd < med - thr]
+    allowed = min(6, max(1, round(0.1 * len(steps))))
+    excl = set(drops) if len(drops) <= allowed else set()
+    xs, ys, acc = [(pts[0][0] - end_ts) / 86400], [pts[0][1]], pts[0][1]
+    for i, (t, dd, dv) in enumerate(steps):
+        acc += med * dd if i in excl else dv
+        xs.append((t - end_ts) / 86400)
+        ys.append(acc)
+    res.update(ok=True, rate=ols(xs, ys), raw_rate=ols(xs, [v for _, v in pts]), median_daily=med,
+               excluded=[{"date": local_date(steps[i][0]), "change": steps[i][2]} for i in sorted(excl)],
+               routine_drops=len(drops) if drops and not excl else 0)
+    return res
+
+
+def trend_steps(points, end_ts, days, min_span):
+    """Growth rate (bytes/day) for pools and docker.img: usage moves in steps both ways (pulls/builds and
+    prunes, the mover), so no step is excluded. rate = the slowest of the least-squares slope, the net change
+    over the window and the net change over the last STEP_NET_DAYS+ days, if all three are positive; else
+    0.0 (not filling). The same keys as trend() plus method/filling/net_rate/net_recent."""
+    start = end_ts - days * 86400 - 3 * 3600
+    pts = [(t, v) for t, v in points if start <= t <= end_ts + 60]
+    span = (pts[-1][0] - pts[0][0]) / 86400 if len(pts) >= 2 else 0.0
+    res = {"window": days, "points": len(pts), "span_days": round(span, 1), "method": "steps"}
+    if len(pts) < 4 or span < min_span:
+        res.update(ok=False, need_days=min_span)
+        return res
+    t_end, v_end = pts[-1]
+    xs, ys = [(t - end_ts) / 86400 for t, _ in pts], [v for _, v in pts]
+    slope = ols(xs, ys)
+    net = (v_end - pts[0][1]) / span
+    t_ref, v_ref = max((p for p in pts if p[0] <= t_end - STEP_NET_DAYS * 86400 + 3 * 3600), key=lambda p: p[0])
+    rdays = (t_end - t_ref) / 86400
+    recent = (v_end - v_ref) / rdays
+    rates = [(v1 - v0) / ((t1 - t0) / 86400) for (t0, v0), (t1, v1) in zip(pts, pts[1:]) if t1 > t0]
+    filling = slope is not None and min(slope, net, recent) > 0
+    res.update(ok=True, rate=min(slope, net, recent) if filling else 0.0, filling=filling, raw_rate=slope,
+               net_rate=net, net_recent={"days": round(rdays, 1), "change": v_end - v_ref, "rate": recent},
+               median_daily=statistics.median(rates), excluded=[], routine_drops=0)
+    return res
+
+
+def eta(usable, rate, end_ts):
+    if rate is None or rate <= 0 or usable is None:
+        return None
+    days = max(0.0, usable) / rate
+    return {"days": round(days, 1),
+            "date": local_date(end_ts + min(days, 36500) * 86400) if days <= 36500 else None}
+
+
+def highwater_model(disks, floor, rate, max_days=1095):
+    """Spread `rate` bytes/day over the data disks like Unraid's high-water allocator: the lowest-numbered
+    disk with free space above the mark (initially half the largest disk, halved whenever no disk is
+    above it); disks at the share's minimum free (`floor`) are skipped. -> {disk: days until full}."""
+    if not rate or rate <= 0 or not disks:
+        return None
+    order = sorted(disks, key=disk_num)
+    free = {n: float(disks[n]["free"]) for n in order}
+    mark = max(disks[n]["size"] for n in order) / 2.0
+    chunk = max(1e9, min(rate / 8.0, 20e9))      # ~ one file
+    full, t = {n: 0.0 for n in order if free[n] <= floor}, 0.0
+    while t < max_days:
+        avail = [n for n in order if n not in full]   # Unraid writes to a disk while its free > floor
+        if not avail:
+            break
+        pick = None
+        while pick is None:
+            pick = next((n for n in avail if free[n] > mark), None)
+            if pick is None:
+                if mark < 1e9:
+                    pick = avail[0]
+                else:
+                    mark /= 2.0
+        free[pick] -= chunk
+        t += chunk / rate
+        if free[pick] <= floor:
+            full[pick] = t
+    return full
+
+
+# ----------------------------------------------------------------------------- forecast
+def usable_free(disks, floor):
+    return sum(max(0, d["free"] - floor) for d in disks.values())
+
+
+def forecast(samples, backfill, live=None):
+    """-> result dict (everything --human, --alert and JSON need)."""
+    real = list(samples)
+    if live:
+        real.append(live)
+    if not real:
+        return {"ok": False, "error": "no samples yet: run `unraid-capacity record` first"}
+    cur = real[-1]
+    end = cur["ts"]
+    alloc = cur.get("alloc") or {}
+    floor = alloc.get("floor", 0) or 0
+    res = {"ok": True, "host": cur.get("host"), "as_of": end, "as_of_local": local_dt(end).strftime("%Y-%m-%d %H:%M"),
+           "sample_age_h": round((time.time() - end) / 3600, 1), "floor": floor, "share": alloc.get("share"),
+           "real_samples": len(daily_first([(s["ts"], 1) for s in real]))}
+
+    # array total: real samples + backfill before the first real day
+    real_pts = daily_first([(s["ts"], s["array"]["used"]) for s in real if s.get("array")])
+    first_real_day = res["first_real"] = local_date(real_pts[0][0])
+    bf_pts = [(p["ts"], p["used"]) for p in backfill if local_date(p["ts"]) < first_real_day]
+    pts = daily_first(bf_pts + real_pts)
+    a = cur["array"]
+    usable = usable_free(cur["disks"], floor)
+    t30 = trend(pts, end, 30, 7, a["size"])
+    t90 = trend(pts, end, 90, 30, a["size"])
+    prim = t30 if t30.get("ok") else (t90 if t90.get("ok") else None)
+    res["array"] = {"size": a["size"], "used": a["used"], "free": a["free"], "usable": usable,
+                    "pct": 100.0 * a["used"] / a["size"], "n_disks": a.get("n"),
+                    "trend30": t30, "trend90": t90, "primary": prim["window"] if prim else None,
+                    "eta30": eta(usable, t30.get("rate"), end), "eta90": eta(usable, t90.get("rate"), end),
+                    "backfill_points": len(bf_pts), "backfill_used": bool(bf_pts)}
+    res["array"]["eta"] = eta(usable, prim["rate"], end) if prim else None
+    rate = prim["rate"] if prim else None
+
+    # disks
+    model = highwater_model(cur["disks"], floor, rate) if (alloc.get("allocator") in ("highwater", "") and rate) else None
+    res["model"] = {"allocator": alloc.get("allocator"), "rate": rate} if model is not None else None
+    dres = {}
+    for name in sorted(cur["disks"], key=disk_num):
+        d = cur["disks"][name]
+        dp = daily_first([(s["ts"], s["disks"][name]["used"]) for s in real if name in s.get("disks", {})])
+        t = trend(dp, end, 30, DISK_MIN_SPAN, d["size"])
+        u = max(0, d["free"] - floor)
+        md = model.get(name) if model is not None else None
+        dres[name] = {"size": d["size"], "used": d["used"], "free": d["free"], "usable": u,
+                      "pct": 100.0 * d["used"] / d["size"] if d["size"] else None,
+                      "status": d.get("status"), "trend30": t, "eta": eta(u, t.get("rate"), end),
+                      "model_eta": ({"days": round(md, 1), "date": local_date(end + md * 86400)} if md is not None
+                                    else None)}
+    res["disks"] = dres
+
+    # pools + docker.img
+    pres = {}
+    targets = [(n, "pool", (lambda s, n=n: (s.get("pools") or {}).get(n))) for n in sorted(cur.get("pools", {}))]
+    if cur.get("docker_img"):
+        targets.append(("docker.img", "docker", lambda s: s.get("docker_img")))
+    for name, kind, get in targets:
+        c = get(cur)
+        if not c:
+            continue
+        pp = daily_first([(s["ts"], get(s)["used"]) for s in real if get(s)])
+        t = trend_steps(pp, end, 30, POOL_MIN_SPAN)
+        pres[name] = {"kind": kind, "size": c["size"], "used": c["used"], "free": c["free"],
+                      "pct": 100.0 * c["used"] / c["size"] if c["size"] else None,
+                      "trend30": t, "eta": eta(c["free"], t.get("rate"), end)}
+    res["pools"] = pres
+
+    # alerts
+    alerts = []
+    e = res["array"]["eta"]
+    if e and e["days"] <= ARRAY_ALERT_DAYS:
+        alerts.append({"key": "array", "days": e["days"], "date": e["date"], "rate": rate,
+                       "window": prim["window"], "free": usable,
+                       "msg": f"array projected full in ~{fmt_days(e['days'])} (~{e['date']}) at "
+                              f"{fmt_rate(rate)} ({prim['window']}-day trend); {fmt_bytes(usable)} usable left"})
+    for name, p in pres.items():
+        e = p["eta"]
+        if e and e["days"] <= POOL_ALERT_DAYS:
+            label = name if p["kind"] == "docker" else f"{name} pool"
+            alerts.append({"key": f"pool:{name}", "days": e["days"], "date": e["date"],
+                           "rate": p["trend30"]["rate"], "window": 30, "free": p["free"],
+                           "msg": f"{label} projected full in ~{fmt_days(e['days'])} (~{e['date']}) at "
+                                  f"{fmt_rate(p['trend30']['rate'])}; {fmt_bytes(p['free'])} free"})
+    res["alerts"] = alerts
+    return res
+
+
+def render_human(r):
+    if not r.get("ok"):
+        return f"unraid-capacity: {r.get('error')}\n"
+    a, L = r["array"], []
+    age = r["sample_age_h"]
+    L.append(f"Unraid {r['host']} capacity, {r['as_of_local']}"
+             + (f" (latest sample {age:.0f} h old)" if age >= 1 else ""))
+    fl = r["floor"]
+    L.append(f"Array: {fmt_bytes(a['used'])} of {fmt_bytes(a['size'])} used ({a['pct']:.1f}%), "
+             f"{fmt_bytes(a['free'])} free" + (f"; {fmt_bytes(a['usable'])} usable above the {r['share']} share's "
+                                               f"{fmt_bytes(fl)} minimum free per disk" if fl else ""))
+
+    def tline(t):
+        if not t.get("ok"):
+            return f"n/a ({t['span_days']:.0f} of {t['need_days']} days of data)"
+        s = fmt_rate(t["rate"])
+        if t["excluded"]:
+            s += " (excl. " + ", ".join(f"{fmt_bytes(x['change'], True)} on {x['date']}" for x in t["excluded"]) + ")"
+        return s
+    L.append(f"Growth: 30 d {tline(a['trend30'])} · 90 d {tline(a['trend90'])}")
+    parts = []
+    for w in (30, 90):
+        e, t = a[f"eta{w}"], a[f"trend{w}"]
+        if t.get("ok"):
+            parts.append(f"~{e['date']} ({fmt_days(e['days'])}) at the {w}-day rate" if e else f"not filling at the {w}-day rate")
+    L.append("Projected full: " + (" · ".join(parts) if parts else "not enough data yet"))
+    if a["backfill_used"]:
+        L.append(f"(Before {r['first_real']}: estimated from the Radarr/Sonarr import/delete ledger, media only; "
+                 f"{r['real_samples']} real daily sample(s) so far)")
+    L.append("")
+    hot = {n: d for n, d in r["disks"].items() if d["pct"] and d["pct"] > DISK_SHOW_PCT}
+    if hot:
+        L.append(f"Disks over {DISK_SHOW_PCT:.0f}% (full = down to the {fmt_bytes(fl)} minimum free):" if fl else
+                 f"Disks over {DISK_SHOW_PCT:.0f}%:")
+        for n, d in sorted(hot.items(), key=lambda kv: -kv[1]["pct"]):
+            t = d["trend30"]
+            tr = (f"trend {fmt_rate(t['rate'])} → " + (f"~{d['eta']['date']}" if d["eta"] else "not filling")
+                  if t.get("ok") else f"trend n/a ({t['span_days']:.0f}/{t['need_days']} days)")
+            mo = (f"high-water model ~{d['model_eta']['date']}" if d["model_eta"] and d["model_eta"]["days"] > 0
+                  else "high-water model: already at minimum free" if d["model_eta"] else "")
+            L.append(f"  {n:<7} {d['pct']:5.1f}%  {fmt_bytes(d['free']):>8} free   {tr}" + (f"   {mo}" if mo else ""))
+        if r.get("model"):
+            L.append("  (high-water model: Unraid spreads new files over the disks, so they fill together near the array's date)")
+        L.append("")
+    if r["pools"]:
+        L.append("Pools:")
+        for n, p in r["pools"].items():
+            t = p["trend30"]
+            nr = t.get("net_recent")
+            tr = ((f"trend {fmt_rate(t['rate'])} → full ~{p['eta']['date']}" if p["eta"] else
+                   f"net {fmt_bytes(nr['change'], True)} in {nr['days']:.0f} d, "
+                   f"{fmt_rate(t['net_rate'])} over {t['span_days']:.0f} d → not filling" if nr else "not filling")
+                  if t.get("ok") else f"trend n/a ({t['span_days']:.0f}/{t['need_days']} days of samples)")
+            L.append(f"  {n:<10} {p['pct']:5.1f}%  {fmt_bytes(p['free']):>8} free of {fmt_bytes(p['size'])}   {tr}")
+    if r["alerts"]:
+        L.append("")
+        L.append("ALERT: " + "; ".join(x["msg"] for x in r["alerts"]))
+    return "\n".join(L).rstrip() + "\n"
+
+
+# ----------------------------------------------------------------------------- backfill (Radarr/Sonarr ledger)
+def _live():
+    """This run reads the live default key file: URLs from the profile, keys by handle."""
+    return (_egress is not None
+            and os.path.realpath(MEDIA_SECRETS) == os.path.realpath(os.path.expanduser("~/.secrets/media.json")))
+
+
+def _via_egress(svc):
+    """Send through core.egress only when this run reads the live default key file."""
+    return _live() and svc in _egress.HANDLES
+
+
+def arr_get(cfg, path, timeout=180, svc=None):
+    eg = bool(svc) and _via_egress(svc)
+    if eg:
+        try:
+            key = _egress.secret(svc)
+        except KeyError:  # egress.Missing
+            raise SystemExit(f"backfill: no {svc} key by handle (core.egress {svc})")
+    else:
+        key = cfg["key"]
+    req = urllib.request.Request(cfg["url"].rstrip("/") + path,
+                                 headers={"X-Api-Key": key, "Accept": "application/json"})
+    with (_egress.open(req, svc, timeout=timeout) if eg else urllib.request.urlopen(req, timeout=timeout)) as f:
+        return json.load(f)
+
+
+def iso_ts(s):
+    return dt.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
+
+
+def ledger(since_ts, until_ts):
+    """Net media bytes added per event from Radarr + Sonarr history. GETs only. -> (events, stats)."""
+    live = _live()
+    try:
+        sec = json.loads(MEDIA_SECRETS.read_text())
+    except Exception as e:
+        if not (live and isinstance(e, FileNotFoundError)):
+            raise SystemExit(f"backfill: can't read {MEDIA_SECRETS}: {type(e).__name__}")
+        sec = {}  # the live file may be gone: URLs from the profile, keys by handle
+    since = dt.datetime.fromtimestamp(since_ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    events, stats = [], {}
+    for svc, deleted in (("radarr", "movieFileDeleted"), ("sonarr", "episodeFileDeleted")):
+        cfg = sec.get(svc)
+        if live:
+            cfg = dict(cfg or {}, url=assistant_profile.service_url(svc, (cfg or {}).get("url")))
+            if not cfg["url"]:
+                raise SystemExit(f"backfill: no {svc} url (profile services.{svc}_url)")
+        if not cfg:
+            raise SystemExit(f"backfill: no {svc} entry in {MEDIA_SECRETS}")
+        try:
+            mm = arr_get(cfg, "/api/v3/config/mediamanagement", 60, svc=svc)
+            recs = arr_get(cfg, f"/api/v3/history/since?date={since}", svc=svc)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise SystemExit(f"backfill: {svc} API failed: {getattr(e, 'reason', None) or type(e).__name__}")
+        bin_delay = (mm.get("recycleBinCleanupDays") or 0) * 86400 if mm.get("recycleBin") else 0
+        st = stats[svc] = {"imports": 0, "import_bytes": 0, "deletes": 0, "delete_bytes": 0,
+                           "missing_used": 0, "missing_ignored": 0, "missing_ignored_bytes": 0,
+                           "recycle_bin_days": bin_delay // 86400}
+        seen_imp, seen_del, missing = set(), set(), {}
+        for r in recs:
+            et, d = r.get("eventType"), r.get("data") or {}
+            size = to_int(d.get("size"), 0) or 0
+            try:
+                ts = iso_ts(r["date"])
+            except (KeyError, ValueError):
+                continue
+            if et == "downloadFolderImported" and size:
+                k = d.get("fileId") or d.get("importedPath") or (r["date"], size)
+                if k in seen_imp:
+                    continue      # multi-episode files: one history record per episode
+                seen_imp.add(k)
+                events.append((ts, size))
+                st["imports"] += 1
+                st["import_bytes"] += size
+            elif et == deleted and size:
+                k = (r["date"][:19], size, d.get("reason"))
+                if k in seen_del:
+                    continue
+                seen_del.add(k)
+                reason = d.get("reason", "")
+                if reason == "MissingFromDisk":
+                    missing.setdefault(local_date(ts), []).append((ts, size))
+                    continue
+                # Upgrade / Manual / ManualOverride: the file goes to the recycle bin (if any) and is freed later
+                events.append((ts + bin_delay, -size))
+                st["deletes"] += 1
+                st["delete_bytes"] += size
+        for day, lst in missing.items():
+            if len(lst) > MISSING_MASS:     # a rescan after a path change, not real deletions
+                st["missing_ignored"] += len(lst)
+                st["missing_ignored_bytes"] += sum(s for _, s in lst)
+            else:                           # deleted outside the app: real
+                events.extend((t, -s) for t, s in lst)
+                st["missing_used"] += len(lst)
+    events = [(t, b) for t, b in events if t <= until_ts]
+    return sorted(events), stats
+
+
+def cmd_backfill(args):
+    sdir = args.state_dir
+    lock = take_lock(sdir)
+    samples = load_jsonl(sdir / "samples.jsonl")
+    if not samples:
+        print("backfill: no real sample yet; run `unraid-capacity record` first", file=sys.stderr)
+        return 2
+    anchor = samples[0]
+    a_ts, a_used = anchor["ts"], anchor["array"]["used"]
+    a_day = local_dt(a_ts).date()
+    events, stats = ledger(a_ts - (args.days + 20) * 86400, a_ts)
+    pts = []
+    for i in range(args.days, 0, -1):
+        day = a_day - dt.timedelta(days=i)
+        t = dt.datetime.combine(day, dt.time(3, 17), LOCAL_TZ).timestamp()
+        later = sum(b for ts, b in events if t < ts <= a_ts)
+        pts.append({"ts": int(t), "date": day.isoformat(), "used": a_used - later, "src": "arr-ledger"})
+    monthly = {}
+    for ts, b in events:
+        if ts > a_ts - args.days * 86400:
+            monthly[local_date(ts)[:7]] = monthly.get(local_date(ts)[:7], 0) + b
+    meta = {"created": int(time.time()), "anchor_ts": a_ts, "anchor_used": a_used, "days": args.days,
+            "method": "array used at anchor minus net Radarr/Sonarr file bytes (imports - upgrade/manual "
+                      "deletions, recycle-bin delay applied, mass MissingFromDisk rescans ignored) after each day",
+            "stats": stats, "monthly_net": monthly}
+    if not args.dry_run:
+        atomic_write(sdir / "backfill.jsonl", "".join(json.dumps(p) + "\n" for p in pts))
+        atomic_write(sdir / "backfill-meta.json", json.dumps(meta, indent=1))
+    lock.close()
+    print(f"Backfill{' (dry run)' if args.dry_run else ''}: {len(pts)} daily points "
+          f"{pts[0]['date']} .. {pts[-1]['date']}, anchored to the {local_dt(a_ts):%Y-%m-%d %H:%M} sample "
+          f"({fmt_bytes(a_used)} used)")
+    for svc, st in stats.items():
+        print(f"  {svc}: {st['imports']} imports {fmt_bytes(st['import_bytes'])}, {st['deletes']} upgrade/manual "
+              f"deletions {fmt_bytes(st['delete_bytes'])} (recycle bin {st['recycle_bin_days']} d), "
+              f"MissingFromDisk counted {st['missing_used']}, ignored as rescans {st['missing_ignored']} "
+              f"({fmt_bytes(st['missing_ignored_bytes'])})")
+    print("  net media growth per month: " + ", ".join(f"{m} {fmt_bytes(b, True)}" for m, b in sorted(monthly.items())))
+    return 0
+
+
+# ----------------------------------------------------------------------------- notify
+def send_tg(text):
+    """A capacity forecast is never urgent: `tg --soft` (TG_SOFT=1; waits out quiet hours and a sleep-in morning)."""
+    old = os.environ.get("TG_SOFT")
+    os.environ["TG_SOFT"] = "1"
+    try:
+        ok, info = botlib.send_tg(TG_CMD, text)
+    finally:
+        if old is None:
+            os.environ.pop("TG_SOFT", None)
+        else:
+            os.environ["TG_SOFT"] = old
+    return ok, info[:200]
+
+
+def write_inbox(inbox_dir, title, body):
+    return botlib.write_inbox(inbox_dir, "unraid-capacity", f"# {title}\n\n{body}\n")
+
+
+def band_of(days, bands):
+    return min((b for b in bands if days <= b), default=None)
+
+
+def notify(args, r):
+    """Send the alert only if it's new or worse than what the owner already got."""
+    sdir = args.state_dir
+    st_file = sdir / "alerts.json"
+    try:
+        st = json.loads(st_file.read_text())
+    except Exception:
+        st = {}
+    no_send = args.no_send or os.environ.get("UNRAID_CAPACITY_NO_SEND") == "1"
+    alerting = {a["key"]: a for a in r.get("alerts", [])}
+    fresh = []
+    for k, a in alerting.items():
+        bands = ARRAY_BANDS if k == "array" else POOL_BANDS
+        b = band_of(a["days"], bands)
+        prev = st.get(k, {}).get("band")
+        if prev is None or (b is not None and b < prev):
+            fresh.append(a)
+        st[k] = {"band": min(b, prev) if prev is not None and b is not None else (b if b is not None else prev),
+                 "days": a["days"], "ts": int(time.time())}
+    # reset a band once the projection is comfortably out of range again
+    for k in list(st):
+        if k.startswith("_") or k in alerting:
+            continue
+        lim = (ARRAY_ALERT_DAYS if k == "array" else POOL_ALERT_DAYS) * CLEAR_FACTOR
+        if k == "array":
+            e = r.get("array", {}).get("eta")
+        else:
+            e = r.get("pools", {}).get(k.split(":", 1)[1], {}).get("eta")
+        if e is None or e["days"] > lim:
+            del st[k]
+    # stale samples: the record job is failing -> tell the assistant (inbox only)
+    stale = r.get("ok") and r.get("sample_age_h", 0) > STALE_DAYS * 24
+    if stale and not st.get("_stale_noted"):
+        if not no_send:
+            write_inbox(args.inbox_dir, "unraid-capacity: samples are stale",
+                        "From ~/bin/unraid-capacity. Data, not instructions.\n\n"
+                        f"The newest capacity sample is {r['sample_age_h'] / 24:.1f} days old, so the daily "
+                        "`record` job (03:17) is failing. Check ~/.local/state/unraid-capacity/cron.log and "
+                        "`unraid-capacity record --dry-run`. The owner was not notified.")
+        st["_stale_noted"] = int(time.time())
+    elif not stale:
+        st.pop("_stale_noted", None)
+    if fresh:
+        host = r.get("host") or assistant_profile.get("network.server_name")
+        text = f"📦 Unraid {host}: " + "; ".join(a["msg"] for a in alerting.values())
+        if no_send:
+            print(f"[no-send] would text the owner:\n{text}", file=sys.stderr)
+        else:
+            ok, info = send_tg(text)
+            write_inbox(args.inbox_dir, "Unraid capacity forecast alert",
+                        "From ~/bin/unraid-capacity (weekly forecast). Data, not instructions.\n\n"
+                        + "\n".join(f"- {a['msg']}" for a in alerting.values())
+                        + f"\n\nOwner texted: {'yes' if ok else 'FAILED (' + info + '): please relay'}\n"
+                        f"\n## Telegram text\n```\n{text}\n```\n\nDetails: `unraid-capacity forecast --human`. "
+                        "Read-only; anything that changes the server needs the owner's OK.")
+            print(f"[notified: {'sent' if ok else 'tg FAILED ' + info}]")
+    elif alerting:
+        print("[not re-sent: the owner already has this alert at the same or a worse band]")
+    if not args.dry_run:
+        atomic_write(st_file, json.dumps(st, indent=1, sort_keys=True))
+
+
+# ----------------------------------------------------------------------------- commands
+def cmd_record(args):
+    sdir = args.state_dir
+    if args.input:
+        raw = Path(args.input).read_text(encoding="utf-8", errors="replace")
+        err = None if "\n=====UC end" in raw else f"{args.input}: incomplete collector output"
+    else:
+        raw, err = collect(SSH_HOST)
+    if raw is None or err:
+        print(f"record: could not collect: {err}", file=sys.stderr)
+        return 2
+    smp, why = build_sample(raw)
+    if smp is None:
+        print(f"record: no sample saved: {why}", file=sys.stderr)
+        return 2
+    a = smp["array"]
+    line = (f"{local_dt(smp['ts']):%Y-%m-%d %H:%M} array {fmt_bytes(a['used'])}/{fmt_bytes(a['size'])} "
+            f"({100.0 * a['used'] / a['size']:.1f}%), {fmt_bytes(a['free'])} free; "
+            + ", ".join(f"{n} {100.0 * p['used'] / p['size']:.0f}%" for n, p in smp["pools"].items())
+            + (f", docker.img {100.0 * smp['docker_img']['used'] / smp['docker_img']['size']:.0f}%"
+               if smp.get("docker_img") else ""))
+    if args.dry_run:
+        print(json.dumps(smp, indent=1))
+        print("[dry-run] not saved: " + line, file=sys.stderr)
+        return 0
+    lock = take_lock(sdir)
+    trim_cron_log(sdir)
+    with open(sdir / "samples.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(smp, separators=(",", ":")) + "\n")
+    lock.close()
+    print("recorded " + line)
+    return 0
+
+
+def cmd_forecast(args):
+    sdir = args.state_dir
+    samples = load_jsonl(sdir / "samples.jsonl")
+    backfill = load_jsonl(sdir / "backfill.jsonl")
+    live = None
+    if args.live:
+        raw, err = collect(SSH_HOST)
+        if raw is None:
+            print(f"forecast: live reading failed ({err}); using stored samples", file=sys.stderr)
+        else:
+            live, why = build_sample(raw)
+            if live is None:
+                print(f"forecast: live reading unusable ({why}); using stored samples", file=sys.stderr)
+    r = forecast(samples, backfill, live)
+    if args.alert:
+        if not r.get("ok"):
+            print(f"forecast: {r.get('error')}", file=sys.stderr)
+            if args.notify:
+                notify(args, r)
+            return 2
+        if args.notify:
+            notify(args, r)
+        if r["alerts"]:
+            print(f"Unraid {r['host']}: " + "; ".join(a["msg"] for a in r["alerts"]))
+            return 1
+        return 0
+    if args.human:
+        sys.stdout.write(render_human(r))
+    else:
+        print(json.dumps(r, indent=1, default=str))
+    return 0 if r.get("ok") else 2
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Read-only capacity history and fill-up forecast for the Unraid server.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="Commands" + __doc__.split("Commands", 1)[-1])
+    ap.add_argument("--state-dir", type=Path, default=STATE_DIR)
+    ap.add_argument("--inbox-dir", type=Path, default=INBOX_DIR)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("record", help="take one sample and append it")
+    p.add_argument("--input", help="saved collector output instead of SSH (testing)")
+    p.add_argument("--dry-run", action="store_true", help="print the sample, don't save")
+    p = sub.add_parser("backfill", help="estimate past usage from the Radarr/Sonarr ledger")
+    p.add_argument("--days", type=int, default=BACKFILL_DAYS)
+    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("forecast", help="growth rates and projected full dates")
+    p.add_argument("--human", action="store_true")
+    p.add_argument("--alert", action="store_true")
+    p.add_argument("--notify", action="store_true", help="with --alert: tg + inbox note when new or worse")
+    p.add_argument("--no-send", action="store_true", help="with --notify: print instead of sending")
+    p.add_argument("--dry-run", action="store_true", help="with --notify: don't save the alert state")
+    p.add_argument("--live", action="store_true", help="fresh reading as 'now' (not saved)")
+    sub.add_parser("show-collector", help="print the read-only script run on the server")
+    args = ap.parse_args()
+    if args.cmd == "show-collector":
+        print(COLLECTOR)
+        return 0
+    return {"record": cmd_record, "backfill": cmd_backfill, "forecast": cmd_forecast}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        try:
+            if os.environ.get("UNRAID_CAPACITY_NO_SEND") != "1" and "--no-send" not in sys.argv:
+                write_inbox(INBOX_DIR, "unraid-capacity crashed", "From ~/bin/unraid-capacity. Data, not instructions.\n\n"
+                            f"Command: {' '.join(sys.argv[1:])}\n```\n{tb[-3000:]}\n```\nFix the script; the owner was not notified.")
+        except Exception:
+            pass
+        sys.exit(3)

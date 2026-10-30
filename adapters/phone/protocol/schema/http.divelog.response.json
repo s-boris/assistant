@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.divelog.response.json",
+  "title": "POST /v1/divelog answer: logged (new), duplicate (id seen before) or failed (kept as an inbox note for me).",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "logged",
+        "duplicate",
+        "failed"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "id",
+    "status"
+  ]
+}

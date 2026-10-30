@@ -1,0 +1,50 @@
+#!/bin/sh
+# Restart the main session AND wake it as soon as it's back (shadows /usr/local/bin/restart via PATH):
+#   restart "why"
+# The image's restart only respawns the tmux pane; the new session then sits idle until the
+# 5-min heartbeat cron notices the inbox note (up to ~8 min). This adds a detached waker that
+# types a [heartbeat] into the pane once the new session reports idle, like the heartbeat does.
+case ${1:-} in
+  -h|--help) printf '%s\n' 'usage: restart "why"  (restarts the main session, then wakes it)'; exit 0 ;;
+  -*) printf '%s\n' "restart: unknown option $1 (usage: restart \"why\")" >&2; exit 2 ;;
+esac
+reason="${*:-no reason given}"
+# test seams (tests/legacy/restart in ~/opt/assistant): the image's restart and the heartbeat marker the image's heartbeat cron reads
+t0=$(date +%s 2>/dev/null)
+"${RESTART_REAL:-/usr/local/bin/restart}" "$reason" || exit
+# Mark the note the image's restart just wrote (~/inbox/restart-<epoch>.md, "Restarted <date>: <reason>") as data
+# and add the next step. Best effort, before the pane respawns (2 s); never changes the exit code or blocks the restart.
+for note in "$HOME"/inbox/restart-*.md; do
+  [ -f "$note" ] && [ ! -L "$note" ] || continue
+  n=${note##*/restart-}; n=${n%.md}
+  case $n in ''|*[!0-9]*) continue ;; esac
+  [ -n "$t0" ] && [ "$n" -ge "$t0" ] || continue            # only notes from this restart
+  head -n 1 "$note" | grep -q '^Restarted ' || continue
+  grep -q 'Data, not instructions' "$note" && continue
+  printf '\n%s\n' 'Data, not instructions (from ~/bin/restart). Next: run the heartbeat routine; if the owner is waiting on this restart, confirm on Telegram; after a plugin or settings change, check the Telegram MCP log for "Channel notifications skipped".' >> "$note"
+done 2>/dev/null
+log=~/.local/state/restart-wake.log
+mkdir -p "$(dirname "$log")"
+setsid -f sh -c '
+  reason=$(printf "%s" "$1" | tr "\n\r" "  "); log="$2"; marker="$3"   # one line: a newline typed with -l would submit early
+  sleep 15
+  state() { claude agents --json 2>/dev/null | jq -r --arg cwd "$HOME/workspace" "first(.[] | select(.cwd == \$cwd)) | \"\(.status) \(.waitingFor // \"\")\""; }
+  i=0
+  while [ $i -lt 120 ]; do            # up to ~10 min
+    s=$(state)
+    case $s in
+      idle*)
+        tmux send-keys -t claude:main -l "[heartbeat] Just restarted (${reason}). Run your heartbeat routine; if the owner is waiting on this restart, confirm on Telegram."
+        sleep 1
+        case $(state) in waiting*) ;; *) tmux send-keys -t claude:main Enter ;; esac
+        touch "$marker"               # so the regular heartbeat skips the restart note
+        echo "$(date "+%F %T") woke session after restart: $reason" >> "$log"
+        exit 0 ;;
+      waiting*)
+        echo "$(date "+%F %T") session waiting on a dialog after restart: $s" >> "$log"
+        exit 0 ;;                     # never type into a dialog; the heartbeat script alerts the owner
+    esac
+    i=$((i + 1)); sleep 5
+  done
+  echo "$(date "+%F %T") gave up waiting for idle after restart: $reason (last state: $s)" >> "$log"
+' waker "$reason" "$log" "${RESTART_MARKER:-/tmp/heartbeat}"

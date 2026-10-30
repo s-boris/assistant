@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""dash-growth: daily growth points of my own codebase for the dashboard's Growth tab (line count
+and other size stats over time).
+
+  dash-growth              update TODAY's point from the working tree (+ merge activity counts); cheap, idempotent;
+                           on the first run of a new day (or after a gap) past days are rebuilt from git as well
+  dash-growth --backfill   rebuild every past day from git history: ~/.brain.git (last commit of each day; days
+                           without a commit carry the previous state forward), ~/opt/claude-vault's own repo
+                           (the vault source; brain's copy of it before that repo existed) and the monorepo
+                           ~/opt/assistant (its tests/ and hooks/ in those parts, the rest with the scripts; a ~/bin
+                           copy carrying the `# managed: ~/opt/assistant` header is not counted again), then today
+  dash-growth --if-stale N only update when today's point is older than N minutes (dash-data calls this)
+  dash-growth --stdout     print the JSON instead of writing it
+  dash-growth --show       one line per day
+
+Output: ~/.local/state/dash-growth.json (DASH_GROWTH_OUT). Numbers only, never file contents:
+  days[]: date, source (git|live), loc per part (non-blank lines; code files by extension/shebang, plus the .md of
+          skills, agents and workspace notes; blobs counted once per day; vault = app/ code only, never data),
+          counts (scripts, skills, agents, cron entries), claude_md_kb (workspace/CLAUDE.md size).
+  activity{date: {heartbeats, owner_msgs, subagents}}: copied from dash-data's own per-day counts
+          (~/.local/state/dash/data.json tokens.daily) so they outlive transcript cleanup.
+  langs{language: lines} per point (same files and dedupe as loc; .md prompts = "Markdown (prompts)"): the
+          Codebase tab's "Code by language" (dash-data ships only the last day's).
+This is the dashboard's ONE line count (one definition): the Codebase tab's Lines tile, the chart and
+"Code by language" all come from here. Plugins count with the monorepo's scripts (its plugins/, deployed to
+~/plugins) from the day they moved in; firefly-sync has no history in git, so it is left out everywhere (the page
+says so).
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+TZ = assistant_profile.tz()
+P = lambda *a: os.path.join(HOME, *a)  # noqa: E731
+OUT = os.environ.get('DASH_GROWTH_OUT', P('.local', 'state', 'dash-growth.json'))
+BRAIN = os.environ.get('DASH_GROWTH_BRAIN', P('.brain.git'))
+VAULT_REPO = os.environ.get('DASH_GROWTH_VAULT', P('opt', 'claude-vault'))
+MONO_REPO = os.environ.get('DASH_GROWTH_MONO', P('opt', 'assistant'))   # the monorepo: its scripts count with ~/bin's
+MANAGED = b'# managed: ~/opt/assistant'   # a ~/bin copy installed from the monorepo (counted there, not twice)
+TREE = os.environ.get('DASH_GROWTH_TREE', HOME)          # work tree root (tests point this at a fixture)
+DASH_DATA = os.environ.get('DASH_GROWTH_DASHDATA', P('.local', 'state', 'dash', 'data.json'))
+VERSION = 1
+MAX_BYTES = 2 * 1024 * 1024
+
+# Stack order (bottom → top) = the chart's series order.
+PARTS = [
+    ('scripts', 'Scripts (~/bin + monorepo)'),
+    ('vault', 'Privacy vault'),
+    ('tests', 'Tests'),
+    ('skills', 'Skills'),
+    ('agents', 'Subagents'),
+    ('hooks', 'Hooks'),
+    ('notes', 'Workspace notes'),
+    ('other', 'Dashboard + services'),
+]
+# same as dash-data
+LANG_EXT = {'.py', '.sh', '.bash', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.html', '.css'}
+LANG_NAME = {'.py': 'Python', '.sh': 'Shell', '.bash': 'Shell', '.js': 'JavaScript', '.mjs': 'JavaScript',
+             '.cjs': 'JavaScript', '.ts': 'TypeScript', '.tsx': 'TypeScript', '.html': 'HTML', '.css': 'CSS'}
+SKIP_DIRS = {'node_modules', '__pycache__', '.git', 'vendor', 'dist', 'build', '.venv', 'venv', 'data', 'state'}
+RX_TEST = re.compile(r'(test_|.*[._]test\.)')
+
+
+def now():
+    """Now in the owner's zone; DASH_GROWTH_NOW (ISO 8601 with offset) pins it for tests."""
+    pin = os.environ.get('DASH_GROWTH_NOW')
+    if pin:
+        return dt.datetime.fromisoformat(pin).astimezone(TZ)
+    return dt.datetime.now(TZ)
+
+
+def is_code(path, head):
+    """Code by extension, or an extensionless file with a python/shell/node shebang (dash-data's lang_of)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext:
+        return ext in LANG_EXT
+    first = head.split(b'\n', 1)[0][:200]
+    return first.startswith(b'#!') and bool(re.search(rb'python|\b(?:ba|da|z)?sh\b|\b(?:node|bun|deno)\b', first))
+
+
+def lang_of(path, head):
+    """Language label of a counted file (dash-data's names): extension, else shebang; .md = prompts."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.md':
+        return 'Markdown (prompts)'
+    if ext:
+        return LANG_NAME.get(ext, 'Other')
+    first = head.split(b'\n', 1)[0][:200]
+    if b'python' in first:
+        return 'Python'
+    if re.search(rb'\b(?:node|bun|deno)\b', first):
+        return 'JavaScript'
+    return 'Shell'
+
+
+def classify(rel):
+    """(part, kind) for a path relative to $HOME, or None. kind: 'code' (code files only) or 'md' (.md + code)."""
+    parts = rel.split('/')
+    if any(p in SKIP_DIRS or (p.startswith('.') and i > 0 and p != '.claude') for i, p in enumerate(parts[:-1])):
+        return None
+    if parts[-1].startswith('.'):
+        return None
+    if parts[0] == 'bin' and len(parts) == 2 and not parts[1].startswith('_'):
+        return 'scripts', 'code'
+    if parts[:2] == ['.claude', 'skills'] and len(parts) >= 4 and parts[2] != 'synced':
+        return 'skills', 'md'
+    if parts[:2] == ['.claude', 'agents'] and len(parts) == 3 and rel.endswith('.md'):
+        return 'agents', 'md'
+    if parts[:2] == ['.claude', 'hooks'] and len(parts) >= 3:
+        return ('tests' if RX_TEST.match(parts[-1]) else 'hooks'), 'code'
+    if parts[0] == 'workspace' and len(parts) == 2 and rel.endswith('.md'):
+        return 'notes', 'md'
+    if parts[0] == 'opt' and len(parts) >= 3:
+        if parts[1] == 'claude-vault':
+            if parts[2] == 'app':
+                return 'vault', 'code'
+            if parts[2] == 'tests':
+                return 'tests', 'code'
+            return None
+        if parts[1].endswith('-tests'):
+            return 'tests', 'code'
+        if parts[1] == 'assistant':   # the monorepo: tests and hooks in their parts, the rest with the scripts
+            return {'tests': 'tests', 'hooks': 'hooks'}.get(parts[2], 'scripts'), 'code'
+        if parts[1] == 'dash' and parts[2] == 'index.html':
+            return 'other', 'code'
+        if parts[1] == 'unraid-lockdown' and parts[2] in ('src', 'server'):
+            return 'other', 'code'
+    return None
+
+
+def nonblank(raw):
+    return sum(1 for l in raw.decode('utf-8', 'replace').splitlines() if l.strip())
+
+
+def cron_entries(raw):
+    return sum(1 for l in raw.decode('utf-8', 'replace').splitlines()
+               if l.strip() and not l.lstrip().startswith('#') and not re.match(r'^\s*[A-Z_]+\s*=', l))
+
+
+class Point:
+    """Accumulates one day's numbers. Each distinct content counts once (e.g. the vault's copies of my tests)."""
+
+    def __init__(self, mono=False):
+        self.mono = mono   # the monorepo is part of this point: managed ~/bin copies are not counted again
+        self.loc = {k: 0 for k, _ in PARTS}
+        self.files = {k: 0 for k, _ in PARTS}
+        self.counts = {'scripts': 0, 'skills': 0, 'agents': 0, 'cron': 0}
+        self.langs = {}
+        self.claude_md_kb = None
+        self.seen = set()
+
+    def add(self, rel, key, size, executable, get_raw, get_lines):
+        """key: a content id (blob sha / content hash) so identical files count once per point."""
+        if rel == 'crontab':
+            self.counts['cron'] = cron_entries(get_raw())
+            return
+        if rel == 'workspace/CLAUDE.md':
+            self.claude_md_kb = round(size / 1024, 1)
+        c = classify(rel)
+        if not c or size > MAX_BYTES:
+            return
+        part, kind = c
+        if part == 'skills' and rel.count('/') == 3 and rel.endswith('/SKILL.md'):
+            self.counts['skills'] += 1
+        if part == 'agents':
+            self.counts['agents'] += 1
+        lines, code, binary = get_lines()
+        if binary or not (code or (kind == 'md' and rel.endswith('.md'))):
+            return
+        if part == 'scripts' and executable and code and rel.startswith('bin/'):
+            self.counts['scripts'] += 1
+        if self.mono and rel.startswith('bin/') and MANAGED in get_raw()[:400]:
+            return
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        if lines:
+            self.loc[part] += lines
+            self.files[part] += 1
+            lg = lang_of(rel, get_raw()[:256])
+            self.langs[lg] = self.langs.get(lg, 0) + lines
+
+    def as_dict(self, date, source, at):
+        return {'date': date, 'source': source, 'at': at, 'loc_total': sum(self.loc.values()),
+                'loc': dict(self.loc), 'files': dict(self.files), 'counts': dict(self.counts),
+                'langs': dict(sorted(self.langs.items(), key=lambda x: -x[1])),
+                'claude_md_kb': self.claude_md_kb}
+
+
+# ---------------------------------------------------------------- live (working tree)
+def live_files(root):
+    """(rel, abs) of every file classify() or the special cases might want, without walking all of $HOME."""
+    out = []
+    for top, recurse in (('bin', False), ('.claude/skills', True), ('.claude/agents', False), ('.claude/hooks', True),
+                         ('workspace', False), ('opt/claude-vault/app', True), ('opt/claude-vault/tests', True),
+                         ('opt/dash', False), ('opt/unraid-lockdown/src', True), ('opt/unraid-lockdown/server', True),
+                         ('opt/assistant', True)):
+        base = os.path.join(root, top)
+        if not os.path.isdir(base):
+            continue
+        for dp, dirs, files in os.walk(base):
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+            for fn in sorted(files):
+                ap = os.path.join(dp, fn)
+                out.append((os.path.relpath(ap, root), ap))
+            if not recurse:
+                dirs[:] = []
+    opt = os.path.join(root, 'opt')
+    if os.path.isdir(opt):
+        for d in sorted(os.listdir(opt)):
+            if d.endswith('-tests') and os.path.isdir(os.path.join(opt, d)) and not os.path.islink(os.path.join(opt, d)):
+                for dp, dirs, files in os.walk(os.path.join(opt, d)):
+                    dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not x.startswith('.'))
+                    for fn in sorted(files):
+                        ap = os.path.join(dp, fn)
+                        out.append((os.path.relpath(ap, root), ap))
+    for rel in ('crontab',):
+        ap = os.path.join(root, rel)
+        if os.path.isfile(ap):
+            out.append((rel, ap))
+    return out
+
+
+def live_point(root=TREE):
+    pt = Point(mono=os.path.isdir(os.path.join(root, 'opt', 'assistant')))
+    for rel, ap in live_files(root):
+        if os.path.islink(ap) or not os.path.isfile(ap):
+            continue
+        try:
+            st = os.stat(ap)
+        except OSError:
+            continue
+        cache = {}
+
+        def raw(ap=ap, cache=cache):
+            if 'raw' not in cache:
+                try:
+                    with open(ap, 'rb') as f:
+                        cache['raw'] = f.read(MAX_BYTES + 1)
+                except OSError:
+                    cache['raw'] = b''
+            return cache['raw']
+
+        def lines(rel=rel):
+            r = raw()
+            if b'\0' in r[:4096]:
+                return 0, False, True
+            return nonblank(r), is_code(rel, r[:256]), False
+
+        key = None
+        if classify(rel) or rel == 'crontab':
+            key = hashlib.sha1(raw()).hexdigest() if st.st_size <= MAX_BYTES else rel
+        pt.add(rel, key, st.st_size, bool(st.st_mode & 0o111), raw, lines)
+    return pt
+
+
+# ---------------------------------------------------------------- git history
+class Git:
+    def __init__(self, git_dir):
+        self.base = ['git', '--git-dir', git_dir]
+        self.blob_cache = {}   # sha -> (lines, is_code_by_content, binary); is_code needs the path for the extension
+        self.raw_cache = {}
+
+    def run(self, *args, timeout=60):
+        r = subprocess.run(self.base + list(args), capture_output=True, timeout=timeout, cwd='/')
+        if r.returncode != 0:
+            raise RuntimeError(f'git {args[0]} failed: {r.stderr.decode(errors="replace")[:200]}')
+        return r.stdout
+
+    def commits_by_day(self):
+        """{date: last commit sha of that local day}, oldest first."""
+        out = self.run('log', '--reverse', '--format=%H %ct').decode()
+        days = {}
+        for line in out.splitlines():
+            sha, ct = line.split()
+            d = dt.datetime.fromtimestamp(int(ct), TZ).date().isoformat()
+            days[d] = (sha, int(ct))      # later commits of the same day overwrite → the last one wins
+        return dict(sorted(days.items()))
+
+    def tree(self, sha):
+        """[(mode, blob sha, size, path)]"""
+        out = self.run('ls-tree', '-r', '-l', '-z', '--full-tree', sha)
+        rows = []
+        for rec in out.split(b'\0'):
+            if not rec:
+                continue
+            meta, path = rec.split(b'\t', 1)
+            mode, typ, bsha, size = meta.split()
+            if typ != b'blob':
+                continue
+            rows.append((mode.decode(), bsha.decode(), int(size) if size.isdigit() else 0, path.decode('utf-8', 'replace')))
+        return rows
+
+    def fetch(self, shas):
+        """Read the given blobs (not yet cached) with one cat-file --batch process."""
+        need = [s for s in dict.fromkeys(shas) if s not in self.raw_cache]
+        if not need:
+            return
+        r = subprocess.run(self.base + ['cat-file', '--batch'], input=('\n'.join(need) + '\n').encode(),
+                           capture_output=True, timeout=120, cwd='/')
+        buf, i = r.stdout, 0
+        for s in need:
+            nl = buf.index(b'\n', i)
+            hdr = buf[i:nl].split()
+            if len(hdr) < 3 or hdr[1] == b'missing':
+                self.raw_cache[s] = b''
+                i = nl + 1
+                continue
+            n = int(hdr[2])
+            self.raw_cache[s] = buf[nl + 1:nl + 1 + n]
+            i = nl + 1 + n + 1
+
+
+def git_point(brain, brain_sha, vault=None, vault_sha=None, mono=None, mono_sha=None):
+    """One day from git: brain's tree, with opt/claude-vault/{app,tests} taken from the vault repo and
+    opt/assistant from the monorepo when given."""
+    rows = [(m, s, z, p) for m, s, z, p in brain.tree(brain_sha)]
+    srcs = [(brain, rows)]
+    if vault is not None and vault_sha:
+        rows = [r for r in rows if not r[3].startswith('opt/claude-vault/')]
+        srcs = [(brain, rows), (vault, [(m, s, z, 'opt/claude-vault/' + p) for m, s, z, p in vault.tree(vault_sha)])]
+    if mono is not None and mono_sha:
+        srcs[0] = (brain, [r for r in srcs[0][1] if not r[3].startswith('opt/assistant/')])
+        srcs.append((mono, [(m, s, z, 'opt/assistant/' + p) for m, s, z, p in mono.tree(mono_sha)]))
+    pt = Point(mono=bool(mono is not None and mono_sha))
+    for g, rs in srcs:
+        want = [s for m, s, z, p in rs if m != '120000' and z <= MAX_BYTES and (classify(p) or p == 'crontab')]
+        g.fetch(want)
+        for mode, bsha, size, path in rs:
+            if mode == '120000' or mode == '160000':
+                continue
+
+            def raw(g=g, bsha=bsha):
+                return g.raw_cache.get(bsha, b'')
+
+            def lines(g=g, bsha=bsha, path=path):
+                r = g.raw_cache.get(bsha, b'')
+                if b'\0' in r[:4096]:
+                    return 0, False, True
+                key = (bsha, os.path.splitext(path)[1].lower())
+                if key not in g.blob_cache:
+                    g.blob_cache[key] = nonblank(r)
+                return g.blob_cache[key], is_code(path, r[:256]), False
+            # blob sha of an identical file is the same in both repos, so it dedupes across them too
+            pt.add(path, bsha, size, mode == '100755', raw, lines)
+    return pt
+
+
+# ---------------------------------------------------------------- activity (dash-data's per-day counts)
+def activity_from_dash():
+    try:
+        with open(DASH_DATA) as f:
+            daily = (json.load(f).get('tokens') or {}).get('daily') or []
+    except (OSError, ValueError, AttributeError):
+        return {}
+    def n(x):
+        try:
+            return max(0, int(x or 0))
+        except (TypeError, ValueError):
+            return 0
+    out = {}
+    for d in daily if isinstance(daily, list) else []:
+        if not isinstance(d, dict) or not re.match(r'^\d{4}-\d{2}-\d{2}$', str(d.get('date', ''))):
+            continue
+        t = d.get('turns') if isinstance(d.get('turns'), dict) else {}
+        out[d['date']] = {
+            'heartbeats': n(t.get('heartbeat')),
+            'owner_msgs': n(t.get('telegram')) + n(t.get('you (app/terminal)')),
+            'subagents': n(d.get('subagent_runs')),
+        }
+    return out
+
+
+# ---------------------------------------------------------------- state
+def load():
+    try:
+        with open(OUT) as f:
+            d = json.load(f)
+        if d.get('version') == VERSION:
+            # a hand-edited or half-written file: keep only well-formed days and activity (else needs_backfill,
+            # backfill and --show crash on a null day or a day without a date)
+            days = d.get('days') if isinstance(d.get('days'), list) else []
+            d['days'] = [x for x in days if isinstance(x, dict) and re.match(r'^\d{4}-\d{2}-\d{2}$', str(x.get('date', '')))]
+            act = d.get('activity') if isinstance(d.get('activity'), dict) else {}
+            d['activity'] = {k: v for k, v in act.items() if isinstance(v, dict)}
+            return d
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return {'version': VERSION, 'days': [], 'activity': {}}
+
+
+def finish(state, today_pt, stamp):
+    today = stamp.date().isoformat()
+    days = {d['date']: d for d in state.get('days', []) if isinstance(d, dict) and d.get('date') and str(d['date']) <= today}
+    days[today] = today_pt.as_dict(today, 'live', stamp.strftime('%Y-%m-%d %H:%M'))
+    act = dict(state.get('activity') or {})
+    act.update(activity_from_dash())      # dash-data's counts for the days it still has; older days are kept
+    return {
+        'version': VERSION,
+        'updated': stamp.strftime('%Y-%m-%d %H:%M'),
+        'updated_epoch': int(stamp.timestamp()),
+        'parts': [{'key': k, 'label': l} for k, l in PARTS],
+        'days': [days[k] for k in sorted(days)],
+        'activity': {k: act[k] for k in sorted(act) if str(k) <= today},
+        'note': 'Non-blank lines of my own code and prompts. Past days from git (end-of-day state), today live. '
+                'Plugins count from their move into the harness repo; firefly-sync is left out.',
+    }
+
+
+def write(state):
+    text = json.dumps(state, ensure_ascii=False, separators=(',', ':'))
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(OUT), prefix='.dash-growth.')
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, OUT)
+
+
+def backfill(state, stamp):
+    today = stamp.date().isoformat()
+    brain = Git(BRAIN)
+    bdays = brain.commits_by_day()
+    vdays = {}
+    vault = None
+    if os.path.isdir(os.path.join(VAULT_REPO, '.git')):
+        vault = Git(os.path.join(VAULT_REPO, '.git'))
+        try:
+            vdays = vault.commits_by_day()
+        except RuntimeError:
+            vault, vdays = None, {}
+    mdays, mono = {}, None
+    if os.path.exists(os.path.join(MONO_REPO, '.git')):
+        mono = Git(os.path.join(MONO_REPO, '.git'))
+        try:
+            mdays = mono.commits_by_day()
+        except RuntimeError:
+            mono, mdays = None, {}
+    if not bdays:
+        return state
+    first = dt.date.fromisoformat(next(iter(bdays)))
+    days = []
+    cur_b = cur_v = cur_m = None
+    d = first
+    while d.isoformat() < today:
+        k = d.isoformat()
+        if k in bdays:
+            cur_b = bdays[k][0]
+        if k in vdays:
+            cur_v = vdays[k][0]
+        if k in mdays:
+            cur_m = mdays[k][0]
+        pt = git_point(brain, cur_b, vault if cur_v else None, cur_v, mono if cur_m else None, cur_m)
+        src = 'git' if k in bdays or k in vdays or k in mdays else 'git (carried)'
+        days.append(pt.as_dict(k, src, k + ' 23:59'))
+        d += dt.timedelta(days=1)
+    keep = [x for x in state.get('days', []) if x.get('date', '') == today]   # today's live point; never a later day
+    state = dict(state)
+    state['days'] = days + keep
+    return state
+
+
+def needs_backfill(state, today):
+    """True when a past day is missing or still holds a live (intra-day) point: then past days come from git."""
+    past = sorted({x.get('date') for x in state.get('days', []) if isinstance(x, dict) and str(x.get('date', '')) < today})
+    if not past or any(x.get('source') == 'live' for x in state.get('days', []) if str(x.get('date', '')) < today):
+        return True
+    span = (dt.date.fromisoformat(today) - dt.date.fromisoformat(past[0])).days
+    return len(past) < span
+
+
+def drop_future(state, stamp):
+    """A clock that ran ahead (a test under a fake clock writing this file) leaves points after today and an `updated`
+    in the future, which would look fresh for months. Drop those points; True = something was ahead (rebuild from git)."""
+    today = stamp.date().isoformat()
+    days, act = state.get('days', []), state.get('activity') or {}
+    keep = [x for x in days if str(x.get('date', '')) <= today]
+    kact = {k: v for k, v in act.items() if str(k) <= today}
+    try:
+        upd = float(state.get('updated_epoch', 0) or 0)
+    except (TypeError, ValueError):
+        upd = 0
+    ahead = upd > stamp.timestamp() + 300 or str(state.get('updated', ''))[:10] > today
+    if not ahead and len(keep) == len(days) and len(kact) == len(act):
+        return state, False
+    return dict(state, days=keep, activity=kact, updated_epoch=0), True
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--backfill', action='store_true')
+    ap.add_argument('--if-stale', type=int, metavar='MIN')
+    ap.add_argument('--stdout', action='store_true')
+    ap.add_argument('--show', action='store_true')
+    a = ap.parse_args()
+    state = load()
+    if a.show:
+        for x in state.get('days', []):
+            c = x.get('counts') if isinstance(x.get('counts'), dict) else {}
+            print(f"{x['date']} {str(x.get('source')):<13} loc {x.get('loc_total', 0):>6}  scripts {c.get('scripts')} skills {c.get('skills')} "
+                  f"agents {c.get('agents')} cron {c.get('cron')}  CLAUDE.md {x.get('claude_md_kb')} KB")
+        return 0
+    stamp = now()
+    state, ahead = drop_future(state, stamp)
+    if a.if_stale is not None and not a.backfill and not ahead:
+        last = next((x for x in reversed(state.get('days', [])) if x.get('date') == stamp.date().isoformat()), None)
+        age = stamp.timestamp() - float(state.get('updated_epoch', 0) or 0)
+        if last and 0 <= age < a.if_stale * 60:     # an `updated` in the future is stale, not fresh
+            return 0
+    t0 = time.time()
+    if a.backfill:
+        try:
+            state = backfill(state, stamp)
+        except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as e:
+            print(f'dash-growth: backfill failed, nothing written: {e}', file=sys.stderr)
+            return 1
+    elif ahead or needs_backfill(state, stamp.date().isoformat()):   # new day, a gap or a clock ahead: past days from git
+        try:
+            state = backfill(state, stamp)
+        except (RuntimeError, OSError, subprocess.SubprocessError, ValueError):
+            pass
+    state = finish(state, live_point(), stamp)
+    if a.stdout:
+        print(json.dumps(state, indent=1))
+        return 0
+    write(state)
+    if a.backfill:
+        ds = state['days']
+        print(f'dash-growth: {len(ds)} days {ds[0]["date"]} → {ds[-1]["date"]} in {time.time() - t0:.1f} s → {OUT}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,77 @@
+# claude-bot: the brain container (the assistant's own Claude box). REFERENCE definition, kept in the repo so a
+# rebuild can come from it. Nothing here applies it (no paste, no deploy target, no land step): applying it is the
+# owner's step on the server, below. tests/ops/test_brain_compose.py checks it.
+#
+# How it maps to the live container (read 29.10, read-only: the server's `containers` verb, /proc and cgroups inside):
+# - Not an Unraid (dockerMan) template: claude-bot is compose project `src`, service `bot`, from the host's
+#   claude-bot/src folder (docker-compose.yml + docker-compose.override.yml, env_file .env). This file keeps the same
+#   project, service, container and network names, so an `up` on it replaces the live container in place.
+# - Only /home/node survives a rebuild: one bind, BOT_HOME -> /home/node. Everything else (apt packages, runtime pins,
+#   start-claude, cron) is redone at each start by the image's entrypoint and ~/boot.sh in that home.
+# - No secrets here and none in the container env: the bot token lives in the home (the channel's .env, 0600) since
+#   14.10, other keys in ~/.secrets, so no compose secrets. Values are interpolated from the env file (the host's
+#   src/.env has every key) into `environment:` instead of `env_file:`, so a stray key in that file (the commented
+#   bot token line) can't reach the container. The image's entrypoint rewrites the token file whenever
+#   TELEGRAM_BOT_TOKEN is set: keep it out.
+# - The never-set Claude Code env vars of the owner's rules stay out (inbound Telegram drops); the test lists them.
+# - Nothing is published. The one network is the brain network (BRAIN_NETWORK in the hub's .env): the hub and the
+#   vault join it as external. Its key stays `default`, as live (compose refuses an existing network created under
+#   another key); the name is spelled out so it can't drift from the hub's value.
+# - Privileges: Docker's defaults (default capabilities and seccomp, as live) and no no-new-privileges, unlike the
+#   hub: the entrypoint and boot.sh need sudo (apt, cron, /usr/local/bin installs). No docker socket, no host path
+#   besides the home.
+#
+# Applying (the owner, on the server; never from inside the brain: the recreate would stop the shell running it):
+#   1. Back up the host's src/docker-compose.yml, docker-compose.override.yml and .env; settle the TODO: confirm lines
+#      against them (`docker compose config` in src shows the merged live definition).
+#   2. Copy this file into the src folder next to the Dockerfile (build context `.`), e.g. as compose.brain.yaml.
+#   3. `docker compose -f compose.brain.yaml --env-file .env config -q`, then at a quiet moment, detached:
+#      `docker compose -f compose.brain.yaml --env-file .env up -d bot` (the brain is offline 1-2 min, running jobs
+#      stop). Naming the file with -f keeps compose from merging the old override file.
+#   Undo: `docker compose up -d bot` in src (the old files).
+name: src
+
+services:
+  bot:
+    # Image: built on the host from the src folder's Dockerfile (Debian 12 + Node; ENTRYPOINT /usr/local/bin/entrypoint,
+    # seeds /opt/seed). Without an `image:` key compose names it `src-bot`, the live image's name.
+    # TODO: confirm the live build: keys; the Dockerfile is not in this repo yet.
+    build:
+      context: .
+    container_name: claude-bot
+    hostname: claude-bot
+    # TODO: confirm (notes from 13.10 say `restart: always`; the read verbs don't show the restart policy)
+    restart: always
+    # live: PID 1 is docker-init, the session runs as uid/gid 1000 (harmless if the image's USER already says node)
+    init: true
+    user: node
+    environment:
+      TZ: ${TZ:-UTC}
+      # the owner's chat id: the entrypoint writes the channel's allowlist from it only when the home has none
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID missing}
+      HEARTBEAT_MINUTES: ${HEARTBEAT_MINUTES:-10}
+      # the home's host path again: hubkit renders the hub's host-side paths from it
+      BOT_HOME: ${BOT_HOME:?BOT_HOME missing}
+    volumes:
+      # The only state that survives a rebuild. create_host_path false: a wrong path fails instead of booting a
+      # fresh, empty bot.
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}", target: /home/node, bind: {create_host_path: false}}
+    networks: [default]
+    # Host threads 0-3 stay free for the server's OS and Docker (the same list as claude-hub-ci). A
+    # comma list: the server's CPU pinning page only shows comma lists. The running container got it through a live
+    # update, so a recreate from a host file without it would drop it.
+    # TODO: confirm whether the host's file or override already carries it.
+    cpuset: "4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+    # No cpu, memory or pids caps (live cgroup: cpu.max, memory.max and pids.max all "max"); shm is Docker's default
+    # 64m. A cap is the owner's call: Chrome, whisper and the test suites all run in here.
+    # TODO: confirm what docker-compose.override.yml adds, and whether the live file has a healthcheck (the
+    # `containers` verb shows "running" only; the bot's own liveness is the channel's health file in the home).
+    # TODO: confirm logging (not readable live; the hub's rotation is used here, the daemon default applies today)
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+networks:
+  default:
+    # = BRAIN_NETWORK of the hub's .env (compose's own name for project src's default network)
+    name: ${BRAIN_NETWORK:-src_default}

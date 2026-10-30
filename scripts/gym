@@ -1,0 +1,3716 @@
+#!/usr/bin/env python3
+"""gym: workout log engine. Jefit CSV export or Open Training API -> local SQLite -> stats, review, charts.
+
+Usage:
+  gym import csv FILE [--unit kg|lb] [--dry-run] [--json]
+                                      import a Jefit CSV export (multi-section file: SETTING, PROFILE,
+                                      WORKOUT SESSIONS, EXERCISE LOGS, EXERCISE SET LOGS, CUSTOM EXERCISES, ...)
+  gym sync [--since YYYY-MM-DD] [--dry-run] [--json]
+                                      pull sessions through the Open Training API (read-only GETs, Bearer
+                                      token): the first run takes the whole history, later runs re-read from
+                                      7 days before the last stored session. Warm-up sets and cardio are skipped.
+  gym sync --probe                    read-only probe of the API with the token: status codes and JSON key
+                                      names only (never values, never the token) -> state dir probe.json;
+                                      exit 1 when the token or an endpoint fails
+  gym stats [--weeks N] [--end DATE] [--json]
+                                      sessions/week, hard sets + tonnage per muscle per week, balance,
+                                      PRs (e1RM), progression of the main lifts, streaks, gaps
+  gym review [--weeks N] [--end DATE] [--if-trained DAYS] [--json]
+                                      phone-sized card with 3 plan suggestions (not medical advice);
+                                      --if-trained DAYS prints nothing unless a session lies in the last DAYS days
+  gym chart [--weeks N] [--end DATE] [--out DIR]
+                                      PNG charts (volume.png, e1rm.png, sessions.png) via Pillow; skipped
+                                      when Pillow is missing. Prints one path per line.
+  gym recap [--date D] [--json] | --cron
+                                      post-workout recap: card of the last session; --cron (after sync) = one
+                                      cue note in ~/inbox when a new session settled (no values in the note)
+                                      (~/bin/lib/gymcoach.py)
+  gym exercises [--json]              exercises with muscle group, equipment, pattern, kind, set count
+  gym exercise NAME (--muscle M [--equipment E] | --reset)
+                                      fix a classification (kept across imports) or go back to automatic
+  gym status [--json]                 counts, date range, last import, token/API state (no workout values)
+  gym plan draft [--days 2|3|4] [--goal mixed|strength|hypertrophy|fitness] [--minutes M] [--swap OLD=NEW]
+                [--dry-run] [--json]
+                                      training plan from the log: slots filled with exercises he actually does,
+                                      start weights from recent e1RM, time budget per session -> plan state file
+  gym plan show [--travel] [--json]   the plan card, push state, review due after 4 weeks (--travel: the
+                                      travel plan's card)
+  gym plan next [--json]              phone card of the next session (local data only, for /gym): the day after
+                                      the one the last logged session matches, else the first; sets×reps @ weight,
+                                      last session, weekly streak; no plan: the review's summary line. --json = the
+                                      dashboard block (dash-data): sessions this week vs the plan's days/week, 8
+                                      weekly counts, streak, next day + lead exercise, e1RM of squat/bench/deadlift
+                                      (last + change vs 4 weeks before; per-session series), free evenings (or null),
+                                      other_activity (dance: shuffle/rave count + hours, this week and 8 weeks)
+  gym plan push [--travel] [--apply] [--rebuild] [--json]
+                                      write the plan to Jefit as ONE routine "Assistant plan". Default: dry run
+                                      printing the exact requests ({symbols} for ids). --apply: the first time a
+                                      safe test (create/read/delete "Assistant test", his routines unchanged),
+                                      then create or diff-update only that routine; read-back verified. Paced
+                                      (GYM_WRITE_DELAY s between requests, default 1), HTTP 429 retried with
+                                      Retry-After or 5-60 s backoff; a push that stopped half-way resumes from
+                                      the live routine; leftover "Assistant plan/test" routines this tool
+                                      created (journal) are deleted first. --rebuild: delete and recreate.
+                                      The phone app shows changes only after its Sync (Progress tab)
+  gym plan update [--write] [--apply] [--json]
+                                      double progression from the sessions since the last update, swaps for
+                                      lifts stalled or skipped 3 sessions; Jefit diff vs the last pushed version
+                                      (sessions of applied return weeks are not progression data)
+  gym plan travel [--from DATE --to DATE] [--days-per-week 2|3] [--minutes M] [--band] [--bar]
+                [--dry-run] [--json]
+                                      bodyweight plan for a trip (dates default to the trip under way or next
+                                      in trip-conditions' trips.json, GYM_TRIPS): Jefit catalogue exercises
+                                      standing in for his main lifts, 30-40 min, reps 1-2 short of failure;
+                                      --band / --bar add band moves / pull-ups -> plan-travel.json.
+                                      `gym plan push --travel` writes it as its own routine "Assistant travel"
+                                      (same paced, resumable, allowlisted push; never "Assistant plan")
+  gym plan return [--from DATE] [--apply [--week 1|2]] [--dry-run] [--json]
+                                      re-entry for the 2 weeks after a trip (from: the travel plan's end + 1):
+                                      week 1 -15 % of his last logged working weights and one set less, week 2
+                                      -10 %, then the plan -> plan-return.json. Draft only; --apply writes that
+                                      week into "Assistant plan" (default: the week under way, else 1);
+                                      `gym plan push --apply` puts the plan weights back
+
+Data model: sessions (date, start, duration) -> exercise logs -> sets (weight kg, reps, duration s, Epley
+e1RM). Body stats from the export's PROFILE section. Weights are stored in kg (lb converted on import;
+API set weights are always pounds, also for metric accounts).
+Dedupe: a session is the same when its source id matches, else its start time (+-2 min), else (no start
+time) the same date with a shared exercise. Re-importing unchanged sessions is a no-op; changed ones are
+replaced. Exercises are matched by Jefit id, else by normalized name; renamed exercises keep their id.
+
+Analysis rules: hard set = a working set: within 15 % of the session's best set for that exercise by Epley
+e1RM (so warm-ups drop out); >= 50 % of the top reps / duration for bodyweight / timed sets. Muscle volume counts fractional sets (primary muscle
+1, secondary muscles of compound lifts 0.5). e1RM = Epley on sets of 1-12 reps; bodyweight exercises use
+best reps, timed ones the longest hold. Main lifts = compound weighted lifts with >= 4 sessions in the window.
+Plateau = no e1RM PR for >= 4 weeks while still training the lift (>= 3 sessions since the PR).
+Targets: 10-20 hard sets per muscle per week (evidence-based range); suggestions are heuristics.
+
+Files (private health data; never into notes or public paths): DB ~/.local/state/gym/gym.db (0600),
+charts ~/.local/state/gym/charts/, probe ~/.local/state/gym/probe.json, API settings ~/.config/gym/api.json
+(0600; only values that differ from the defaults, e.g. the Jefit user id found through the token),
+token ~/.secrets/jefit-token (0600, never printed; by handle "gym" through core.egress: hub mode needs no file,
+local/shadow mode reads it). Body stats come from the CSV only.
+Plan: ~/.local/state/gym/plan.json, plan-pushed.json (last pushed target + Jefit ids), plan-push.log (every
+write), plan-history/; writes use ~/.secrets/jefit-token-rw when present (a Read + write token), else the token
+(by handle "gym" through core.egress, like the reads; the hub's gym binding has write rules for these paths).
+Other activity: shuffle dancing and rave nights from calcache titles (shuffle; rave/club/techno words or a
+rave-radar artist, 2+ h), kept per event (date, kind, hours; no titles) in ~/.local/state/gym/activity.json (0600)
+on every stats/review/plan next read, so past weeks keep them after they leave calcache's window. Shown next to
+the sessions; never counted as gym in the streak, but a week with dance and no gym is 'active', not 'missed'.
+Env (tests): GYM_DB, GYM_STATE_DIR, GYM_NOW (YYYY-MM-DD or YYYY-MM-DDTHH:MM), GYM_CALCACHE, GYM_RAVE_RADAR, GYM_TOKEN_FILE, GYM_TOKEN_RW_FILE, GYM_WRITE_DELAY,
+GYM_API_CONFIG, JEFIT_API_BASE,
+OWNER_TZ.
+Exit: 0 ok, 1 error (bad file, API/network), 2 usage, 3 no token, 4 API details pending.
+"""
+import argparse
+import csv
+import datetime as dt
+import email.utils
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
+
+try:  # keys by handle (core.egress)
+    _lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib')
+    if _lib not in sys.path:
+        sys.path.append(_lib)  # append, so ~/bin/lib never shadows anything
+    from core import egress as _egress
+except Exception:  # a copy without ~/bin/lib: the direct path
+    _egress = None
+
+HOME = os.path.expanduser('~')
+STATE = os.environ.get('GYM_STATE_DIR') or os.path.join(HOME, '.local/state/gym')
+DB_PATH = os.environ.get('GYM_DB') or os.path.join(STATE, 'gym.db')
+TOKEN_FILE = os.environ.get('GYM_TOKEN_FILE') or os.path.join(HOME, '.secrets/jefit-token')
+API_CONFIG = os.environ.get('GYM_API_CONFIG') or os.path.join(HOME, '.config/gym/api.json')
+LB = 0.45359237
+INCH = 2.54
+
+# ----------------------------------------------------------------------------- exercise classification
+MUSCLES = ['chest', 'back', 'shoulders', 'biceps', 'triceps', 'forearms', 'quads', 'hamstrings', 'glutes',
+           'calves', 'abs']
+# muscles held to the 10-20 hard sets/week range, with a weight for how much a shortfall matters
+TRACKED = {'chest': 1.0, 'back': 1.0, 'shoulders': 1.0, 'quads': 1.0, 'hamstrings': 1.0, 'glutes': 0.8,
+           'biceps': 0.7, 'triceps': 0.7, 'calves': 0.5}
+TARGET_LO, TARGET_HI = 10, 20
+PATTERN = {'chest': 'push', 'shoulders': 'push', 'triceps': 'push', 'back': 'pull', 'biceps': 'pull',
+           'forearms': 'pull', 'quads': 'legs', 'hamstrings': 'legs', 'glutes': 'legs', 'calves': 'legs',
+           'abs': 'core', 'other': 'other'}
+SIDE = {'chest': 'front', 'shoulders': 'front', 'biceps': 'front', 'quads': 'front', 'abs': 'front',
+        'back': 'back', 'triceps': 'back', 'hamstrings': 'back', 'glutes': 'back', 'calves': 'back'}
+# (regex on the normalized name, primary muscle, secondary muscles, pattern override, side override)
+RULES = [
+    (r'\b(wrist|forearm|gripper|hand grip|farmer)', 'forearms', [], None, None),
+    (r'\b(calf|calves)\b', 'calves', [], None, None),
+    (r'\b(skull ?crusher|triceps?|push ?down|french press|close grip bench|jm press|bench dip)', 'triceps', [],
+     None, None),
+    (r'\b(back extension|hyper ?extension|reverse hyper)', 'back', ['glutes', 'hamstrings'], 'legs', None),
+    (r'\b(hip thrust|glute|bridge|kickback|abduct)', 'glutes', ['hamstrings'], None, None),
+    (r'\b(leg curl|hamstring curl|nordic)', 'hamstrings', [], None, None),
+    (r'\b(romanian|rdl|stiff leg|good morning|hamstring|swing)', 'hamstrings', ['glutes'], None, None),
+    (r'\bdeadlift', 'hamstrings', ['glutes', 'back'], None, None),
+    (r'\b(leg extension|sissy)', 'quads', [], None, None),
+    (r'\b(squat|leg press|lunge|step up|hack)', 'quads', ['glutes'], None, None),
+    (r'\b(rear delt|reverse fly|reverse flye|face pull|reverse pec)', 'shoulders', ['back'], 'pull', 'back'),
+    (r'\b(lateral raise|side raise|front raise|upright row)', 'shoulders', [], None, None),
+    (r'\b(overhead press|shoulder press|military|arnold|push press|landmine press|delt)', 'shoulders',
+     ['triceps'], None, None),
+    (r'\bshrug', 'back', [], None, None),
+    (r'\b(pull ?ups?|chin ?ups?|pull ?down|lat|lats|row|pullover|rack pull|muscle up)\b', 'back', ['biceps'],
+     None, None),
+    (r'\bcurl', 'biceps', [], None, None),
+    (r'\b(fly|flye|flyes|crossover|pec deck)\b', 'chest', [], None, None),
+    (r'\b(bench press|chest|fly|flye|flyes|pec|push ?ups?|press ?ups?|crossover|dips?)\b', 'chest',
+     ['triceps', 'shoulders'], None, None),
+    (r'\b(incline|decline)\b.*\bpress|\bpress\b.*\b(incline|decline)\b', 'chest', ['triceps', 'shoulders'],
+     None, None),
+    (r'\b(crunch|sit ?ups?|plank|leg raise|knee raise|russian twist|rollout|ab wheel|hollow|woodchop|pallof|'
+     r'dead bug|v ups?|toes to bar|abs?|oblique|l sit)\b', 'abs', [], None, None),
+    (r'\bextension', 'triceps', [], None, None),
+    (r'\bpress\b', 'chest', ['triceps', 'shoulders'], None, None),
+]
+EQUIPMENT = [
+    (r'\b(trap bar|hex bar)', 'trap bar'), (r'\b(ez ?bar|ez curl|ez)\b', 'ez bar'),
+    (r'\b(barbell|bb)\b', 'barbell'), (r'\b(dumbbells?|db)\b', 'dumbbell'), (r'\b(kettlebells?|kb)\b', 'kettlebell'),
+    (r'\bsmith\b', 'machine'), (r'\b(cable|crossover|push ?down|face pull|pull ?down)', 'cable'),
+    (r'\b(machine|leg press|leg extension|leg curl|hack|pec deck|selectorized|hammer strength)', 'machine'),
+    (r'\bbands?\b', 'band'),
+    (r'\b(pull ?ups?|chin ?ups?|dips?|push ?ups?|press ?ups?|plank|hanging|sit ?ups?|crunch|bodyweight|burpee|'
+     r'muscle up|inverted row|back extension|hyper ?extension|leg raise|hollow|l sit|dead hang)\b', 'bodyweight'),
+    (r'^(back |front )?squat$|^(conventional |sumo |romanian )?deadlift$|^rdl$|^bench press$|'
+     r'^(overhead|military) press$', 'barbell'),
+]
+BODYWEIGHT_RE = re.compile(r'\b(pull ?ups?|chin ?ups?|dips?|push ?ups?|press ?ups?|hanging|sit ?ups?|crunch|'
+                           r'muscle up|inverted row|leg raise|knee raise|bodyweight|burpee|toes to bar|'
+                           r'back extension|hyper ?extension)\b')
+TIMED_RE = re.compile(r'\b(plank|hold|wall sit|dead hang|l sit|hollow|isometric|farmer|carry|static)\b')
+# Jefit body-part codes (exports and the API): 8 = upper legs (refined by name), 9 = lower legs
+JEFIT_BODYPART = {0: 'abs', 1: 'back', 2: 'biceps', 3: 'chest', 4: 'forearms', 5: 'glutes', 6: 'shoulders',
+                  7: 'triceps', 8: 'legs', 9: 'calves', 10: 'cardio', 11: 'other'}
+JEFIT_BODYPART_KEYS = {'abs': 'abs', 'back': 'back', 'biceps': 'biceps', 'chest': 'chest', 'forearms': 'forearms',
+                       'glutes': 'glutes', 'shoulders': 'shoulders', 'triceps': 'triceps', 'upper_legs': 'legs',
+                       'lower_legs': 'calves', 'cardio': 'cardio'}
+DEFAULT_PICK = {'chest': 'Incline Dumbbell Press', 'back': 'Seated Cable Row', 'shoulders': 'Dumbbell Lateral Raise',
+                'biceps': 'Dumbbell Curl', 'triceps': 'Cable Triceps Pushdown', 'quads': 'Leg Press',
+                'hamstrings': 'Romanian Deadlift', 'glutes': 'Hip Thrust', 'calves': 'Standing Calf Raise'}
+
+
+def norm_name(name):
+    s = (name or '').lower().replace('-', ' ')
+    s = re.sub(r'[^a-z0-9 ]+', ' ', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def classify(name, bodypart=None, equip_hint=None):
+    """-> dict(muscle, secondary list, equipment, pattern, side, kind) from the name (+ Jefit body part)."""
+    n = norm_name(name)
+    muscle, secondary, pattern, side = 'other', [], None, None
+    for rx, m, sec, pat, sd in RULES:
+        if re.search(rx, n):
+            muscle, secondary, pattern, side = m, list(sec), pat, sd
+            break
+    code = JEFIT_BODYPART.get(bodypart) if isinstance(bodypart, int) else JEFIT_BODYPART_KEYS.get(
+        str(bodypart or '').strip().lower())
+    if code == 'legs':
+        if muscle not in ('quads', 'hamstrings', 'glutes'):
+            muscle, secondary, pattern, side = 'quads', ['glutes'], None, None
+    elif code == 'cardio':
+        muscle, secondary, pattern, side = 'other', [], 'other', None
+    elif code and code != 'other' and code != muscle:
+        muscle, secondary, pattern, side = code, [], None, None
+    equipment = (equip_hint or '').strip().lower().replace('_', ' ') or None
+    if not equipment:
+        equipment = 'other'
+        for rx, eq in EQUIPMENT:
+            if re.search(rx, n):
+                equipment = eq
+                break
+    kind = 'timed' if TIMED_RE.search(n) else 'bodyweight' if BODYWEIGHT_RE.search(n) else 'weight'
+    return {'muscle': muscle, 'secondary': [s for s in secondary if s != muscle], 'equipment': equipment,
+            'pattern': pattern or PATTERN.get(muscle, 'other'), 'side': side or SIDE.get(muscle, ''),
+            'kind': kind}
+
+
+def epley(weight, reps):
+    if not weight or weight <= 0 or not reps or reps < 1 or reps > 12:
+        return None
+    return round(weight if reps == 1 else weight * (1 + reps / 30.0), 2)
+
+
+# ----------------------------------------------------------------------------- time helpers
+def owner_tz():
+    name = os.environ.get('OWNER_TZ')
+    if name:
+        return ZoneInfo(name)
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+        import assistant_profile
+        return assistant_profile.tz()
+    except Exception:
+        return ZoneInfo('UTC')
+
+
+def today():
+    if os.environ.get('GYM_NOW'):
+        return dt.date.fromisoformat(os.environ['GYM_NOW'][:10])
+    return dt.datetime.now(owner_tz()).date()
+
+
+def now_dt():
+    """Owner-local now; GYM_NOW = a date (end of that day) or a datetime (tests)."""
+    v, tz = os.environ.get('GYM_NOW'), owner_tz()
+    if v:
+        if len(v) > 10:
+            x = dt.datetime.fromisoformat(v)
+            return x if x.tzinfo else x.replace(tzinfo=tz)
+        return dt.datetime.combine(dt.date.fromisoformat(v[:10]), dt.time(23, 59, 59), tz)
+    return dt.datetime.now(tz)
+
+
+def ts_to_date(ts):
+    return dt.datetime.fromtimestamp(ts, owner_tz()).date().isoformat()
+
+
+def as_ts(v):
+    """unix seconds (or ms) / ISO datetime / date string -> int seconds or None."""
+    if v is None:
+        return None
+    s = str(v).strip().strip('"')
+    if not s or s in ('0', 'null', 'None'):
+        return None
+    try:
+        x = float(s)
+        if x <= 0:
+            return None
+        return int(x / 1000) if x > 1e11 else int(x)
+    except ValueError:
+        pass
+    try:
+        d = dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=owner_tz())
+        return int(d.timestamp())
+    except ValueError:
+        return None
+
+
+def as_date(v):
+    s = str(v or '').strip().strip('"')
+    m = re.match(r'(\d{4})-(\d{2})-(\d{2})', s)
+    return f'{m.group(1)}-{m.group(2)}-{m.group(3)}' if m else None
+
+
+def num(v, default=None):
+    try:
+        x = float(str(v).strip().strip('"'))
+        return x if math.isfinite(x) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def ddmm(iso):
+    d = dt.date.fromisoformat(iso)
+    return f'{d.day:02d}.{d.month:02d}.'
+
+
+def fmt_kg(x):
+    if x is None:
+        return '-'
+    return f'{x:.1f}'.rstrip('0').rstrip('.') if abs(x - round(x)) > 0.01 else f'{round(x):d}'
+
+
+def fmt_w(x):
+    return f'{x:.2f}'.rstrip('0').rstrip('.') if x is not None else '-'
+
+
+def fmt_n(x):
+    return f'{x:,.0f}'.replace(',', "'")
+
+
+# ----------------------------------------------------------------------------- sets from Jefit logs
+SET_RE = re.compile(r'^(-?\d+(?:\.\d+)?)\s*[xX*]\s*(\d+(?:\.\d+)?)(?:\s*(s|sec|secs)|:(\d{1,2}))?$')
+
+
+def parse_logs(text, timed=False, unit_factor=1.0):
+    """Jefit "40x8,40x8,40x5," -> (sets, status). status: ok | empty | cardio | bad.
+    Timed exercises (or "60s" / "1:30" reps) give duration_s instead of reps."""
+    toks = [t.strip() for t in str(text or '').split(',') if t.strip()]
+    if not toks:
+        return [], 'empty'
+    parsed = []
+    for t in toks:
+        m = SET_RE.match(t)
+        if not m:
+            return [], 'bad'
+        parsed.append(m)
+    if any('.' in m.group(2) for m in parsed) and not timed:
+        return [], 'cardio'   # Jefit cardio entries look like "0x0.0,0x10"
+    sets = []
+    for m in parsed:
+        w = float(m.group(1)) * unit_factor
+        r = float(m.group(2))
+        if m.group(4) is not None:      # m:ss
+            dur, reps = int(r) * 60 + int(m.group(4)), None
+        elif m.group(3) or timed:
+            dur, reps = int(round(r)), None
+        else:
+            dur, reps = None, int(round(r))
+        if not reps and not dur:
+            continue
+        sets.append({'w': round(w, 2) if w > 0 else 0.0, 'reps': reps, 'dur': dur})
+    return sets, ('ok' if sets else 'empty')
+
+
+# ----------------------------------------------------------------------------- CSV export parser
+def read_sections(text):
+    """Section name -> list of records (dicts keyed by their block's header row)."""
+    sections, cur, header = {}, None, None
+    for fields in csv.reader(io.StringIO(text.lstrip('﻿'))):
+        first = fields[0].strip() if fields else ''
+        if first.startswith('###') and all(not f.strip() for f in fields[1:]):
+            name = first.strip('#').strip()
+            cur = sections.setdefault(name.upper(), []) if name else None
+            header = None
+            continue
+        if not fields or all(not f.strip() for f in fields):
+            header = None
+            continue
+        if cur is None:
+            continue
+        if header is None:
+            header = [h.strip() for h in fields]
+            continue
+        cur.append({h: (fields[i] if i < len(fields) else '') for i, h in enumerate(header)})
+    return sections
+
+
+def parse_unit(v):
+    s = str(v or '').strip().lower()
+    if s.startswith('lb') or s.startswith('pound'):
+        return 'lb'
+    if s.startswith('kg') or s.startswith('kilo'):
+        return 'kg'
+    return None
+
+
+def parse_csv_export(text, unit=None):
+    """-> dict(sessions=[...], body=[...], unit, length_unit, report={...}); raises ValueError on a non-export."""
+    sec = read_sections(text)
+    if 'EXERCISE LOGS' not in sec:
+        raise ValueError('not a Jefit export: no "### EXERCISE LOGS ###" section')
+    setting = (sec.get('SETTING') or [{}])[0]
+    file_unit = parse_unit(setting.get('mass'))
+    rep = {'unit_source': 'option' if unit else ('file' if file_unit else 'default'), 'cardio': 0, 'empty': 0,
+           'bad': 0, 'orphan_logs': 0, 'logs': 0, 'sets': 0}
+    unit = unit or file_unit or 'kg'
+    f = LB if unit == 'lb' else 1.0
+    length_unit = 'in' if str(setting.get('length', '')).strip().lower().startswith('in') else 'cm'
+
+    # body parts / equipment hints: custom exercises and routine exercise blocks
+    bodypart = {}
+    for r in sec.get('CUSTOM EXERCISES', []):
+        k = f"0:{str(r.get('_id', '')).strip()}"
+        bp = num(r.get('bodypart'))
+        if bp is not None:
+            bodypart[k] = int(bp)
+    for r in sec.get('ROUTINES', []):
+        if 'exercise_id' in r and 'bodypart' in r:
+            k = f"{int(num(r.get('belongSys'), 1))}:{str(r.get('exercise_id', '')).strip()}"
+            bp = num(r.get('bodypart'))
+            if bp is not None and k not in bodypart:
+                bodypart[k] = int(bp)
+
+    # per-set durations from EXERCISE SET LOGS (recent workouts only)
+    set_dur = {}
+    for r in sec.get('EXERCISE SET LOGS', []):
+        d = num(r.get('duration'), 0) or 0
+        if d > 0:
+            set_dur.setdefault(str(r.get('exercise_log_id', '')).strip(), {})[int(num(r.get('set_index'), 0))] = int(d)
+
+    sessions = {}
+    for r in sec.get('WORKOUT SESSIONS', []):
+        sid = str(r.get('_id', '')).strip()
+        if not sid:
+            continue
+        start = as_ts(r.get('starttime')) or as_ts(r.get('starttimie'))
+        dur = num(r.get('total_time'), 0) or 0
+        if not dur and start and as_ts(r.get('endtime')):
+            dur = max(0, as_ts(r.get('endtime')) - start)
+        sessions[sid] = {'uid': f'jefit:{sid}', 'date': ts_to_date(start) if start else as_date(r.get('mydate')),
+                         'start_ts': start, 'duration_s': int(dur) or None, 'logs': {}}
+
+    # exercise display names: per id, the most recent non-empty name (Jefit renames exercises over time)
+    logs = sec['EXERCISE LOGS']
+    latest = {}
+    for r in logs:
+        k = exercise_key(r)
+        nm = str(r.get('ename', '')).strip()
+        when = as_date(r.get('mydate')) or ''
+        if nm and (k not in latest or when >= latest[k][0]):
+            latest[k] = (when, nm)
+
+    for r in logs:
+        k = exercise_key(r)
+        name = latest.get(k, ('', ''))[1] or str(r.get('ename', '')).strip()
+        if not name:
+            rep['empty'] += 1
+            continue
+        jkey = k if k.startswith('jefit:') else None
+        cls = classify(name, bodypart.get(k[6:]) if jkey else None)
+        log_id = str(r.get('_id', '')).strip()
+        timed = cls['kind'] == 'timed' or bool(set_dur.get(log_id))
+        sets, status = parse_logs(r.get('logs'), timed=timed, unit_factor=f)
+        if status != 'ok':
+            rep[status] += 1
+            continue
+        for i, d in (set_dur.get(log_id) or {}).items():
+            if 0 <= i < len(sets):
+                sets[i]['dur'], sets[i]['reps'] = d, None
+        sid = str(r.get('belongsession', '')).strip()
+        if sid not in sessions:
+            start = as_ts(r.get('logTime'))
+            date = as_date(r.get('mydate')) or (ts_to_date(start) if start else None)
+            if not date:
+                rep['bad'] += 1
+                continue
+            rep['orphan_logs'] += 1
+            sid = sid or f'{date}'
+            sessions.setdefault(sid, {'uid': f'jefit:{sid}', 'date': date, 'start_ts': start, 'duration_s': None,
+                                      'logs': {}})
+        s = sessions[sid]
+        if not s['date']:
+            s['date'] = as_date(r.get('mydate'))
+        lg = s['logs'].setdefault(k, {'xkey': k, 'name': name, 'bodypart': bodypart.get(k[6:]) if jkey else None,
+                                      'equip': None, 'record_kg': None, 'sets': []})
+        lg['sets'].extend(sets)
+        rec = num(r.get('record'))
+        if rec and rec > 0:
+            lg['record_kg'] = round(max(lg['record_kg'] or 0, rec * f), 2)
+        rep['logs'] += 1
+        rep['sets'] += len(sets)
+
+    out = []
+    for s in sessions.values():
+        if s['logs'] and s['date']:
+            s['logs'] = list(s['logs'].values())
+            out.append(s)
+    out.sort(key=lambda s: (s['date'], s['start_ts'] or 0))
+
+    body = []
+    lf = INCH if length_unit == 'in' else 1.0
+    for r in sec.get('PROFILE', []):
+        d = as_date(r.get('mydate'))
+        if not d:
+            continue
+        w = num(r.get('weight'), 0) or 0
+        fat = num(r.get('fatpercent'), 0) or 0
+        meas = {}
+        for c in ('chest', 'arms', 'waist', 'hips', 'thighs', 'calves', 'shoulders', 'neck', 'forearms'):
+            v = num(r.get(c), 0) or 0
+            if v > 0:
+                meas[c] = round(v * lf, 1)
+        if w > 0 or fat > 0 or meas:
+            body.append({'date': d, 'weight_kg': round(w * f, 2) if w > 0 else None,
+                         'fat_pct': fat if fat > 0 else None, 'measures': meas})
+    return {'sessions': out, 'body': body, 'unit': unit, 'length_unit': length_unit, 'report': rep}
+
+
+def exercise_key(r):
+    eid = str(r.get('eid', '')).strip()
+    if eid and re.fullmatch(r'\d+', eid):
+        return f"jefit:{int(num(r.get('belongSys'), 1))}:{eid}"
+    return 'name:' + norm_name(r.get('ename'))
+
+
+# ----------------------------------------------------------------------------- database
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY, date TEXT NOT NULL, start_ts INTEGER, duration_s INTEGER, total_kg REAL,
+  source TEXT, hash TEXT, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS sessions_date ON sessions(date);
+CREATE TABLE IF NOT EXISTS session_uids (uid TEXT PRIMARY KEY, session_id INTEGER NOT NULL
+  REFERENCES sessions(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS exercises (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, muscle TEXT, secondary TEXT, equipment TEXT, pattern TEXT,
+  side TEXT, kind TEXT, bodypart TEXT, manual INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS exercise_keys (key TEXT PRIMARY KEY, exercise_id INTEGER NOT NULL
+  REFERENCES exercises(id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS exercise_logs (
+  id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  exercise_id INTEGER NOT NULL REFERENCES exercises(id), pos INTEGER, record_kg REAL,
+  UNIQUE(session_id, exercise_id));
+CREATE TABLE IF NOT EXISTS sets (
+  id INTEGER PRIMARY KEY, log_id INTEGER NOT NULL REFERENCES exercise_logs(id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL, weight_kg REAL, reps INTEGER, duration_s INTEGER, e1rm_kg REAL, UNIQUE(log_id, idx));
+CREATE TABLE IF NOT EXISTS body_stats (
+  date TEXT PRIMARY KEY, weight_kg REAL, fat_pct REAL, measures TEXT, source TEXT);
+CREATE TABLE IF NOT EXISTS imports (
+  id INTEGER PRIMARY KEY, at TEXT, source TEXT, detail TEXT, new INTEGER, updated INTEGER, unchanged INTEGER);
+"""
+
+
+def connect(path=None):
+    path = path or DB_PATH
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fresh = not os.path.exists(path)
+    old = os.umask(0o077)
+    try:
+        conn = sqlite3.connect(path)
+    finally:
+        os.umask(old)
+    if fresh:
+        os.chmod(path, 0o600)
+    conn.execute('PRAGMA foreign_keys = ON')
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def session_hash(s):
+    body = [s['date'], s.get('start_ts'), s.get('duration_s'),
+            sorted([lg['xkey'], [[x['w'], x['reps'], x['dur']] for x in lg['sets']]] for lg in s['logs'])]
+    return hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
+def ensure_exercise(conn, lg):
+    """Exercise id for a log: by key, else by normalized name; reclassify unless fixed by hand."""
+    key, nkey = lg['xkey'], 'name:' + norm_name(lg['name'])
+    row = conn.execute('SELECT exercise_id FROM exercise_keys WHERE key=?', (key,)).fetchone() or \
+        conn.execute('SELECT exercise_id FROM exercise_keys WHERE key=?', (nkey,)).fetchone()
+    cls = classify(lg['name'], lg.get('bodypart'), lg.get('equip'))
+    has_dur = any(x['dur'] for x in lg['sets'])
+    if has_dur:
+        cls['kind'] = 'timed'
+    elif cls['kind'] == 'weight' and lg['sets'] and all(not x['w'] for x in lg['sets']):
+        cls['kind'] = 'bodyweight'
+    if cls['kind'] != 'weight' and cls['equipment'] == 'other':
+        cls['equipment'] = 'bodyweight'
+    bp = lg.get('bodypart')
+    vals = (lg['name'], cls['muscle'], ','.join(cls['secondary']), cls['equipment'], cls['pattern'], cls['side'],
+            cls['kind'], None if bp is None else str(bp))
+    if row:
+        xid = row[0]
+        manual = conn.execute('SELECT manual FROM exercises WHERE id=?', (xid,)).fetchone()[0]
+        if manual:
+            conn.execute('UPDATE exercises SET name=? WHERE id=?', (lg['name'], xid))
+        else:
+            conn.execute('UPDATE exercises SET name=?, muscle=?, secondary=?, equipment=?, pattern=?, side=?, '
+                         'kind=?, bodypart=COALESCE(?, bodypart) WHERE id=?', vals + (xid,))
+    else:
+        xid = conn.execute('INSERT INTO exercises (name, muscle, secondary, equipment, pattern, side, kind, bodypart) '
+                           'VALUES (?,?,?,?,?,?,?,?)', vals).lastrowid
+    for k in (key, nkey):
+        conn.execute('INSERT OR IGNORE INTO exercise_keys (key, exercise_id) VALUES (?,?)', (k, xid))
+    return xid
+
+
+def find_session(conn, s):
+    row = conn.execute('SELECT u.session_id, x.date, x.start_ts FROM session_uids u JOIN sessions x ON '
+                       'x.id=u.session_id WHERE u.uid=?', (s['uid'],)).fetchone()
+    if row and (row[1] == s['date'] or (row[2] and s.get('start_ts') and abs(row[2] - s['start_ts']) <= 120)):
+        return row[0]   # same source id on another day = an id from another export: match by time instead
+    if s.get('start_ts'):
+        row = conn.execute('SELECT id FROM sessions WHERE start_ts IS NOT NULL AND abs(start_ts-?) <= 120 '
+                           'ORDER BY abs(start_ts-?) LIMIT 1', (s['start_ts'], s['start_ts'])).fetchone()
+        if row:
+            return row[0]
+    keys = []
+    for lg in s['logs']:
+        keys += [lg['xkey'], 'name:' + norm_name(lg['name'])]
+    q = ('SELECT DISTINCT s.id FROM sessions s JOIN exercise_logs l ON l.session_id=s.id '
+         'JOIN exercise_keys k ON k.exercise_id=l.exercise_id WHERE s.date=? AND k.key IN (%s)'
+         % ','.join('?' * len(keys)))
+    if not s.get('start_ts'):
+        row = conn.execute(q, [s['date']] + keys).fetchone()
+    else:
+        row = conn.execute(q + ' AND s.start_ts IS NULL', [s['date']] + keys).fetchone()
+    return row[0] if row else None
+
+
+def store(conn, data, source, detail, dry_run=False):
+    counts = {'new': 0, 'updated': 0, 'unchanged': 0, 'body': 0}
+    for s in data['sessions']:
+        sid = find_session(conn, s)
+        h = session_hash(s)
+        if sid:
+            old = conn.execute('SELECT hash FROM sessions WHERE id=?', (sid,)).fetchone()[0]
+            if old == h:
+                counts['unchanged'] += 1
+                if not dry_run:
+                    conn.execute('INSERT OR IGNORE INTO session_uids (uid, session_id) VALUES (?,?)', (s['uid'], sid))
+                continue
+            counts['updated'] += 1
+        else:
+            counts['new'] += 1
+        if dry_run:
+            continue
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+        total = round(sum((x['w'] or 0) * (x['reps'] or 0) for lg in s['logs'] for x in lg['sets']), 1)
+        if sid:
+            conn.execute('UPDATE sessions SET date=?, start_ts=?, duration_s=?, total_kg=?, source=?, hash=?, '
+                         'updated_at=? WHERE id=?', (s['date'], s['start_ts'], s['duration_s'], total, source, h,
+                                                     now, sid))
+            conn.execute('DELETE FROM exercise_logs WHERE session_id=?', (sid,))
+        else:
+            sid = conn.execute('INSERT INTO sessions (date, start_ts, duration_s, total_kg, source, hash, updated_at) '
+                               'VALUES (?,?,?,?,?,?,?)', (s['date'], s['start_ts'], s['duration_s'], total, source,
+                                                          h, now)).lastrowid
+        conn.execute('INSERT OR IGNORE INTO session_uids (uid, session_id) VALUES (?,?)', (s['uid'], sid))
+        for pos, lg in enumerate(s['logs']):
+            xid = ensure_exercise(conn, lg)
+            row = conn.execute('SELECT id FROM exercise_logs WHERE session_id=? AND exercise_id=?', (sid, xid)).fetchone()
+            if row:   # two source exercises mapped to one (e.g. renamed): append the sets
+                lid = row[0]
+                base = conn.execute('SELECT COALESCE(MAX(idx)+1, 0) FROM sets WHERE log_id=?', (lid,)).fetchone()[0]
+            else:
+                lid = conn.execute('INSERT INTO exercise_logs (session_id, exercise_id, pos, record_kg) VALUES (?,?,?,?)',
+                                   (sid, xid, pos, lg.get('record_kg'))).lastrowid
+                base = 0
+            for i, x in enumerate(lg['sets']):
+                conn.execute('INSERT INTO sets (log_id, idx, weight_kg, reps, duration_s, e1rm_kg) VALUES (?,?,?,?,?,?)',
+                             (lid, base + i, x['w'], x['reps'], x['dur'], epley(x['w'], x['reps'])))
+    for b in data.get('body', []):
+        if dry_run:
+            counts['body'] += 1
+            continue
+        cur = conn.execute('SELECT weight_kg, fat_pct, measures FROM body_stats WHERE date=?', (b['date'],)).fetchone()
+        new = (b['weight_kg'], b['fat_pct'], json.dumps(b['measures'], sort_keys=True))
+        if cur != new:
+            conn.execute('INSERT OR REPLACE INTO body_stats (date, weight_kg, fat_pct, measures, source) '
+                         'VALUES (?,?,?,?,?)', (b['date'],) + new + (source,))
+            counts['body'] += 1
+    if not dry_run:
+        conn.execute('INSERT INTO imports (at, source, detail, new, updated, unchanged) VALUES (?,?,?,?,?,?)',
+                     (dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'), source, detail,
+                      counts['new'], counts['updated'], counts['unchanged']))
+        conn.commit()
+    return counts
+
+
+# ----------------------------------------------------------------------------- import csv
+def cmd_import_csv(a):
+    try:
+        with open(a.file, encoding='utf-8-sig', errors='replace', newline='') as fh:
+            text = fh.read()
+        data = parse_csv_export(text, unit=a.unit)
+    except (OSError, ValueError) as e:
+        print(f'gym import: {e}', file=sys.stderr)
+        return 1
+    conn = connect()
+    counts = store(conn, data, 'csv', os.path.basename(a.file), dry_run=a.dry_run)
+    rep = data['report']
+    out = {'file': os.path.basename(a.file), 'unit': data['unit'], 'unit_source': rep['unit_source'],
+           'sessions': len(data['sessions']), **counts, 'exercise_logs': rep['logs'], 'sets': rep['sets'],
+           'skipped': {k: rep[k] for k in ('cardio', 'empty', 'bad') if rep[k]},
+           'orphan_logs': rep['orphan_logs'], 'dry_run': a.dry_run}
+    if a.json:
+        print(json.dumps(out))
+        return 0
+    pre = 'Would import' if a.dry_run else 'Imported'
+    print(f"{pre} {out['file']}: {out['sessions']} sessions ({counts['new']} new, {counts['updated']} updated, "
+          f"{counts['unchanged']} unchanged), {rep['logs']} exercise logs, {rep['sets']} sets, "
+          f"{counts['body']} body-stat rows; unit {data['unit']} ({rep['unit_source']}).")
+    if out['skipped']:
+        print('Skipped logs: ' + ', '.join(f'{v} {k}' for k, v in out['skipped'].items()) + '.')
+    if rep['orphan_logs']:
+        print(f"{rep['orphan_logs']} logs had no session row; grouped by their date.")
+    if rep['unit_source'] == 'default':
+        print('No unit in the file: assumed kg (use --unit lb if the export is in pounds).')
+    return 0
+
+
+# ----------------------------------------------------------------------------- Open Training API adapter
+# Jefit Open Training API: a personal access token (Elite; jefit.com -> Settings -> Open Training API) sent as
+# "Authorization: Bearer <token>" to the /api/v2 REST surface of the web app. Token-readable GETs used here:
+#   /api/v2/user/routines                  token check (401 without a valid token)
+#   /api/v2/exercises                      system + the user's custom exercises; custom ones carry numeric_user_id,
+#                                          which gives {uid} (or set "user_id" in the API settings file)
+#   /api/v2/users/{uid}/sessions/calendar  every date with a session (first sync starts at the earliest one)
+#   /api/v2/users/{uid}/sessions?startDate=S&endDate=E
+#                                          sessions in [S, E) (local-midnight unix seconds) with inline logs and sets
+#   /api/v2/users/{uid}/exercises          the user's exercises: name, body_parts, equipment (logs carry ids only)
+# /api/v2/user and body stats refuse the token (401/403): body stats come from the CSV export only.
+API_DEFAULTS = {
+    'base': 'https://www.jefit.com',
+    'auth': 'bearer',        # 'bearer' | 'token' | 'x-api-key' (probe falls back through them)
+    'confirmed': True,
+    'unit': 'lb',            # unit of the API's plain set "weight"/"record": Jefit stores pounds whatever the
+                             # account's unit_system says ("metric" only changes the display)
+    'user_id': None,         # numeric Jefit user id; found once through the token, then kept here
+    'check_path': '/api/v2/user/routines',
+    'catalog_path': '/api/v2/exercises',
+    'calendar_path': '/api/v2/users/{uid}/sessions/calendar',
+    'sessions_path': '/api/v2/users/{uid}/sessions?startDate={start}&endDate={end}',
+    'exercises_path': '/api/v2/users/{uid}/exercises',
+    'chunk_days': 365,
+    'max_requests': 400,
+}
+AUTH_SCHEMES = [('bearer', 'Authorization', 'Bearer {t}'), ('token', 'Authorization', 'Token {t}'),
+                ('x-api-key', 'X-API-Key', '{t}')]
+PENDING = "API details pending: set \"confirmed\": true in the API settings once the endpoints are known."
+# Jefit equipment codes -> this tool's equipment names (others: from the exercise name)
+API_EQUIPMENT = {'barbell': 'barbell', 'dumbbell': 'dumbbell', 'ez_curl_bar': 'ez bar', 'kettlebell': 'kettlebell',
+                 'machine_strength': 'machine', 'smith_machine': 'machine', 'cable': 'cable', 'band': 'band',
+                 'body': 'bodyweight', 'pullup_bar': 'bodyweight', 'trap_bar': 'trap bar'}
+
+
+def api_config():
+    cfg = dict(API_DEFAULTS)
+    try:
+        with open(API_CONFIG) as fh:
+            cfg.update(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    if os.environ.get('JEFIT_API_BASE'):
+        cfg['base'] = os.environ['JEFIT_API_BASE']
+    return cfg
+
+
+def save_api_config(cfg):
+    """Keeps only the settings that differ from the defaults (the base URL never: env overrides stay out)."""
+    os.makedirs(os.path.dirname(API_CONFIG), mode=0o700, exist_ok=True)
+    try:
+        with open(API_CONFIG) as fh:
+            keep = {k: v for k, v in json.load(fh).items() if k in API_DEFAULTS}
+    except (OSError, ValueError):
+        keep = {}
+    keep.update({k: v for k, v in cfg.items() if k in API_DEFAULTS and k != 'base' and v != API_DEFAULTS[k]})
+    tmp = API_CONFIG + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(keep, fh, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, API_CONFIG)
+
+
+def read_token():
+    """-> token or None. Refuses a token file readable by others."""
+    try:
+        st = os.stat(TOKEN_FILE)
+    except OSError:
+        return None
+    if st.st_mode & 0o077:
+        raise PermissionError(f'{TOKEN_FILE} must be 0600 (chmod 600 it)')
+    with open(TOKEN_FILE) as fh:
+        tok = fh.read().strip()
+    return tok or None
+
+
+def egress_read():
+    """The read token goes by handle "gym" (core.egress) only while this run uses the live default file;
+    a test's own token (GYM_TOKEN_FILE) keeps the direct path. Plan writes with this token go by handle too; a
+    jefit-token-rw (TOKEN_RW_FILE) stays direct until it has a binding of its own."""
+    return _egress is not None and \
+        os.path.realpath(TOKEN_FILE) == os.path.realpath(os.path.expanduser('~/.secrets/jefit-token'))
+
+
+def read_api_token():
+    """-> the read token for Api, or None: by handle when egress_read(), else read_token()."""
+    if not egress_read():
+        return read_token()
+    try:
+        st = os.stat(TOKEN_FILE)
+    except OSError:
+        st = None
+    if st is not None and st.st_mode & 0o077:
+        raise PermissionError(f'{TOKEN_FILE} must be 0600 (chmod 600 it)')
+    try:
+        return _egress.secret('gym')
+    except _egress.Missing:
+        return None
+
+
+def token_state():
+    """-> 'present' | 'missing' | 'by handle (hub)' for status; PermissionError on a token file readable by others."""
+    if not read_api_token():
+        return 'missing'
+    return 'by handle (hub)' if egress_read() and _egress.mode('gym') == 'hub' else 'present'
+
+
+def no_token_hint():
+    """Why there is no token: the live file by handle (its egress mode) or a token file not set up yet."""
+    if egress_read():
+        return (f'no Jefit token by handle (core.egress gym, {_egress.mode("gym")} mode: {TOKEN_FILE} missing or '
+                f'empty; hub mode needs no file)')
+    return f'no Jefit token yet ({TOKEN_FILE}, 0600, via the console)'
+
+
+class Api:
+    def __init__(self, cfg, token, handle=None):
+        self.cfg, self._t, self.count, self.handle = cfg, token, 0, handle
+
+    def scrub(self, s):
+        return str(s).replace(self._t, '***') if self._t else str(s)
+
+    def get(self, path, scheme=None):
+        """Read-only GET -> (status, content_type, parsed JSON or None)."""
+        scheme = scheme or self.cfg.get('auth') or 'bearer'
+        if self.count >= int(self.cfg.get('max_requests') or 400):
+            raise RuntimeError('request cap reached; run again to continue')
+        self.count += 1
+        hdr = next((h, v) for n, h, v in AUTH_SCHEMES if n == scheme)
+        url = self.cfg['base'].rstrip('/') + path
+        req = urllib.request.Request(url, method='GET', headers={
+            hdr[0]: hdr[1].format(t=self._t), 'Accept': 'application/json', 'User-Agent': 'gym-sync/1 (read-only)'})
+        try:
+            with (_egress.open(req, self.handle, timeout=60) if self.handle else
+                  urllib.request.urlopen(req, timeout=60)) as r:
+                status, ctype, raw = r.status, r.headers.get('Content-Type', ''), r.read(50_000_000)
+        except urllib.error.HTTPError as e:
+            status, ctype, raw = e.code, e.headers.get('Content-Type', '') if e.headers else '', b''
+        except (urllib.error.URLError, OSError) as e:
+            raise RuntimeError(self.scrub(f'{url}: {getattr(e, "reason", e)}')) from None
+        body = None
+        if raw and 'json' in ctype.lower():
+            try:
+                body = json.loads(raw.decode('utf-8', 'replace'))
+            except ValueError:
+                body = None
+        return status, ctype.split(';')[0], body
+
+
+def shape(v, depth=0):
+    """JSON structure with key names and list lengths only, never values."""
+    if isinstance(v, dict):
+        if depth >= 3:
+            return '{...}'
+        return {k: shape(x, depth + 1) for k, x in list(v.items())[:40]}
+    if isinstance(v, list):
+        return [f'len={len(v)}'] + ([shape(v[0], depth + 1)] if v else [])
+    return type(v).__name__
+
+
+def fill(path, **kw):
+    return path.format(**{k: urllib.parse.quote(str(v), safe='') for k, v in kw.items()})
+
+
+def local_midnight(d):
+    return int(dt.datetime.combine(d, dt.time(), owner_tz()).timestamp())
+
+
+def find_uid(api, cfg):
+    """-> numeric Jefit user id: from the settings, else from the token's custom exercises (saved once found)."""
+    if cfg.get('user_id'):
+        return int(cfg['user_id'])
+    status, _, body = api.get(cfg['catalog_path'])
+    if status != 200:
+        raise RuntimeError(f'exercise catalog -> HTTP {status}')
+    ids = {int(x['numeric_user_id']) for x in (body or {}).get('data') or []
+           if isinstance(x, dict) and num(x.get('numeric_user_id'))}
+    if len(ids) != 1:
+        raise RuntimeError(f'cannot tell the Jefit user id from the token (custom exercises name {len(ids)} users); '
+                           f'set "user_id" in {API_CONFIG}')
+    cfg['user_id'] = ids.pop()
+    save_api_config(cfg)
+    return cfg['user_id']
+
+
+def cmd_probe(api, cfg):
+    """Token check with each auth scheme (configured first), then one GET per data endpoint: status + key names."""
+    results, scheme = [], None
+    known = cfg.get('auth') or 'bearer'
+    saved = cfg.get('auth')
+    for name in [known] + [n for n, _, _ in AUTH_SCHEMES if n != known]:
+        status, ctype, body = api.get(cfg['check_path'], name)
+        results.append({'path': cfg['check_path'], 'auth': name, 'status': status, 'type': ctype, 'shape': shape(body)})
+        if status < 400:
+            scheme = name
+            break
+        if status not in (401, 403):
+            break
+        time.sleep(0.5)
+    uid = None
+    if scheme:
+        api.cfg['auth'] = scheme
+        try:
+            uid = find_uid(api, cfg)
+        except RuntimeError as e:
+            results.append({'path': cfg['catalog_path'], 'auth': scheme, 'status': 'no user id', 'type': '',
+                            'shape': str(e)})
+    if uid:
+        end = today() + dt.timedelta(days=1)
+        for p in (cfg['calendar_path'], cfg['sessions_path'], cfg['exercises_path']):
+            time.sleep(0.5)
+            path = fill(p, uid=uid, start=local_midnight(end - dt.timedelta(days=14)), end=local_midnight(end))
+            status, ctype, body = api.get(path)
+            results.append({'path': p, 'auth': scheme, 'status': status, 'type': ctype, 'shape': shape(body)})
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    out = os.path.join(STATE, 'probe.json')
+    with open(out, 'w') as fh:
+        json.dump({'at': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'), 'base': cfg['base'],
+                   'results': results}, fh, indent=1)
+    os.chmod(out, 0o600)
+    for r in results:
+        keys = ', '.join(r['shape'].keys()) if isinstance(r['shape'], dict) else str(r['shape'])[:80]
+        print(f"GET {r['path']} [{r['auth']}] -> {r['status']} {r['type']} {keys}".rstrip())
+    ok = bool(uid) and all(isinstance(r['status'], int) and r['status'] < 400 for r in results[-3:])
+    if scheme and scheme != saved:
+        cfg['auth'] = scheme
+        save_api_config(cfg)
+        print(f'Auth header that works: {scheme} (saved to {API_CONFIG}).')
+    if not scheme:
+        print('The token was refused with every auth header (401/403): expired, revoked or not Elite?')
+    print(f"API {'OK' if ok else 'NOT OK'}. Shapes (key names only): {out}")
+    return 0 if ok else 1
+
+
+def pick(d, *names):
+    for n in names:
+        if isinstance(d, dict) and d.get(n) not in (None, ''):
+            return d[n]
+    return None
+
+
+def find_list(payload, want):
+    """The first list of dicts in payload whose items have one of the `want` keys."""
+    stack = [payload]
+    while stack:
+        v = stack.pop(0)
+        if isinstance(v, list) and v and isinstance(v[0], dict) and any(k in v[0] for k in want):
+            return v
+        if isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(x for x in v if isinstance(x, (dict, list)))
+    return []
+
+
+def first_code(v):
+    """Jefit list fields pad with 'none': ['upper_legs', 'glutes', 'none'] -> 'upper_legs'."""
+    if isinstance(v, list):
+        v = next((x for x in v if x not in (None, '', 'none')), None)
+    return None if v in (None, '', 'none') else v
+
+
+def api_sets(raw, unit):
+    if isinstance(raw, str):
+        return parse_logs(raw, unit_factor=LB if unit == 'lb' else 1.0)[0]
+    out = []
+    for x in raw or []:
+        if not isinstance(x, dict) or str(x.get('type') or '').lower() in ('warm-up', 'warmup', 'warm_up'):
+            continue
+        if x.get('weight_kg') is not None:
+            w = num(x['weight_kg'], 0)
+        elif x.get('weight_lbs') is not None or x.get('weight_lb') is not None:
+            w = num(pick(x, 'weight_lbs', 'weight_lb'), 0) * LB
+        else:
+            w = num(pick(x, 'weight', 'load'), 0) * (LB if unit == 'lb' else 1.0)
+        reps = num(pick(x, 'reps', 'rep', 'repetitions'))
+        dur = num(pick(x, 'duration', 'duration_s', 'seconds', 'time'))
+        if dur and dur > 0 and not reps:
+            out.append({'w': round(w or 0, 2), 'reps': None, 'dur': int(dur)})
+        elif reps and reps > 0:
+            out.append({'w': round(w or 0, 2), 'reps': int(round(reps)), 'dur': None})
+    return out
+
+
+def api_log(x, unit, catalog=None):
+    """One exercise log -> dict(xkey, name, bodypart, equip, record_kg, sets) or None (cardio, unnamed, no sets)."""
+    if str(x.get('record_type') or '').lower() == 'cardio':
+        return None     # like the CSV import: cardio entries carry no strength sets
+    eid = pick(x, 'exercise_id', 'eid')
+    ex = x.get('exercise') if isinstance(x.get('exercise'), dict) else (catalog or {}).get(str(eid), {})
+    eid = eid if eid is not None else pick(ex, 'id', 'exercise_id')
+    name = str(pick(x, 'exercise_name', 'ename', 'name') or pick(ex, 'name') or '').strip()
+    if not name:
+        return None
+    nid = pick(x, 'numeric_exercise_id')
+    if nid is not None and num(nid) is not None:
+        key = f"jefit:{0 if x.get('is_system_exercise') is False else 1}:{int(num(nid))}"
+    else:
+        bsys = pick(x, 'belongSys', 'belong_sys')
+        bsys = 1 if bsys is None else int(num(bsys, 1))
+        key = f'jefit:{bsys}:{int(num(eid))}' if eid is not None and num(eid) is not None else 'name:' + norm_name(name)
+    bp = first_code(pick(x, 'bodypart', 'body_part') or pick(ex, 'bodypart', 'body_part', 'body_parts'))
+    if isinstance(bp, (int, float)) or (isinstance(bp, str) and bp.isdigit()):
+        bp = int(bp)
+    eq = pick(x, 'equipment') or pick(ex, 'equipment', 'equipment_type')
+    if isinstance(eq, list):
+        # Jefit catalog codes: the name's own equipment wins (cable rows are "machine_strength" in Jefit);
+        # the first mapped code fills the gap, unmapped ones (bench, weight_plate) are ignored
+        eq = None if classify(name)['equipment'] != 'other' else next(
+            (API_EQUIPMENT[c] for c in eq if c in API_EQUIPMENT), None)
+    raw = pick(x, 'log_sets', 'sets', 'logs')
+    sets = api_sets(raw, unit)
+    if not sets:
+        return None
+    rec = num(pick(x, 'record', 'one_rep_max', '1rm'))
+    return {'xkey': key, 'name': name, 'bodypart': bp, 'equip': eq if isinstance(eq, str) else None,
+            'record_kg': round(rec * (LB if unit == 'lb' else 1.0), 2) if rec and rec > 0 else None, 'sets': sets}
+
+
+def api_session(x, unit):
+    sid = pick(x, 'id', '_id', 'session_id', 'local_id', 'row_id')
+    start = as_ts(pick(x, 'starttime', 'start_time', 'started_at', 'start'))
+    if start is None and isinstance(x.get('date'), (int, float)) and x['date'] > 1e8:
+        start = as_ts(x['date'])    # the API's session "date" is the start time in unix seconds
+    date = (ts_to_date(start) if start else None) or as_date(pick(x, 'date', 'mydate'))
+    if sid is None or not date:
+        return None
+    dur = num(pick(x, 'total_time', 'duration', 'workout_time', 'duration_seconds'))
+    logs_raw = pick(x, 'logs', 'exercise_logs', 'exercises', 'items')
+    return {'uid': f'jefit:{sid}', 'id': sid, 'date': date, 'start_ts': start, 'duration_s': int(dur) if dur else None,
+            'unit': unit,   # API weights are pounds even for metric accounts (see API_DEFAULTS['unit'])
+            'logs_raw': logs_raw if isinstance(logs_raw, list) else []}
+
+
+def cmd_sync(a):
+    try:
+        token = read_api_token()
+    except PermissionError as e:
+        print(f'gym sync: {e}', file=sys.stderr)
+        return 1
+    cfg = api_config()
+    if not token:
+        h = no_token_hint()
+        print(f'{h[0].upper()}{h[1:]}. Meanwhile: gym import csv FILE.')
+        return 3
+    api = Api(cfg, token, 'gym' if egress_read() else None)
+    try:
+        if a.probe:
+            return cmd_probe(api, cfg)
+        if not cfg.get('confirmed'):
+            print(PENDING)
+            print('Next step: `gym sync --probe` (read-only GETs; prints status codes and key names only).')
+            return 4
+        return run_sync(a, api, cfg)
+    except RuntimeError as e:
+        print(f'gym sync: {api.scrub(e)}', file=sys.stderr)
+        return 1
+
+
+def first_session_date(api, cfg, uid):
+    """Earliest calendar date with a session, or None."""
+    status, _, body = api.get(fill(cfg['calendar_path'], uid=uid))
+    if status != 200:
+        return None
+    dates = sorted(as_date(x.get('date')) for x in find_list(body, ('date',)) if as_date(x.get('date')))
+    return dates[0] if dates else None
+
+
+def run_sync(a, api, cfg):
+    conn = connect()
+    unit = cfg.get('unit') or 'lb'
+    uid = find_uid(api, cfg)
+    if a.since:
+        since = a.since
+    else:
+        last = conn.execute("SELECT MAX(date) FROM sessions").fetchone()[0]
+        since = ((dt.date.fromisoformat(last) - dt.timedelta(days=7)).isoformat() if last else
+                 first_session_date(api, cfg, uid) or '2010-01-01')
+    until = today() + dt.timedelta(days=1)
+    step = dt.timedelta(days=max(1, int(cfg.get('chunk_days') or 365)))
+    raw, start = {}, dt.date.fromisoformat(since)
+    while start < until:
+        end = min(start + step, until)
+        status, _, body = api.get(fill(cfg['sessions_path'], uid=uid, start=local_midnight(start),
+                                       end=local_midnight(end)))
+        if status != 200 or body is None:
+            print(f'gym sync: sessions request -> HTTP {status}', file=sys.stderr)
+            return 1
+        for x in find_list(body, ('starttime', 'start_time', 'started_at', 'date', 'mydate')):
+            k = pick(x, 'id', '_id', 'session_id', 'local_id', 'row_id')
+            raw.setdefault(str(k), x)       # chunk edges may repeat a session
+        start = end
+        time.sleep(0.2)
+    catalog, sessions, skipped = None, [], 0
+    for x in raw.values():
+        s = api_session(x, unit)
+        if not s:
+            skipped += 1
+            continue
+        lraw = s.pop('logs_raw')
+        if catalog is None:
+            need = {str(lx.get('exercise_id')) for y in raw.values() for lx in y.get('logs') or []
+                    if isinstance(lx, dict) and not pick(lx, 'exercise_name', 'ename', 'name', 'exercise')}
+            catalog = load_catalog(api, cfg, uid, need) if need else {}
+        logs = {}
+        for lx in lraw:
+            lg = api_log(lx, s['unit'], catalog) if isinstance(lx, dict) else None
+            if lg:
+                if lg['xkey'] in logs:
+                    logs[lg['xkey']]['sets'].extend(lg['sets'])
+                else:
+                    logs[lg['xkey']] = lg
+        s.pop('id')
+        s.pop('unit')
+        if logs:
+            s['logs'] = list(logs.values())
+            sessions.append(s)
+        else:
+            skipped += 1
+    counts = store(conn, {'sessions': sessions, 'body': []}, 'api', f'since {since}', dry_run=a.dry_run)
+    out = {'since': since, 'sessions': len(sessions), **counts, 'skipped': skipped, 'requests': api.count,
+           'dry_run': a.dry_run}
+    if a.json:
+        print(json.dumps(out))
+    else:
+        pre = 'Would sync' if a.dry_run else 'Synced'
+        print(f"{pre} since {since}: {len(sessions)} sessions ({counts['new']} new, {counts['updated']} updated, "
+              f"{counts['unchanged']} unchanged), {skipped} skipped (no strength sets); {api.count} requests.")
+    return 0
+
+
+def load_catalog(api, cfg, uid, need):
+    """exercise id -> catalog entry: the user's exercises, plus the full catalog when ids are still missing."""
+    catalog = {}
+    for path in (fill(cfg['exercises_path'], uid=uid), cfg['catalog_path']):
+        status, _, body = api.get(path)
+        for x in find_list(body, ('name',)) if status == 200 else []:
+            for k in ('id', 'local_id'):
+                if x.get(k) is not None:
+                    catalog.setdefault(str(x[k]), x)
+        if not need - set(catalog):
+            break
+    return catalog
+
+
+# ----------------------------------------------------------------------------- analysis
+def load(conn):
+    """-> sessions list (date-sorted) with logs and sets, plus the exercise table."""
+    ex = {}
+    for r in conn.execute('SELECT id, name, muscle, secondary, equipment, pattern, side, kind FROM exercises'):
+        ex[r[0]] = {'id': r[0], 'name': r[1], 'muscle': r[2] or 'other',
+                    'secondary': [s for s in (r[3] or '').split(',') if s], 'equipment': r[4], 'pattern': r[5],
+                    'side': r[6], 'kind': r[7]}
+    sess = {}
+    for r in conn.execute('SELECT id, date, start_ts, duration_s FROM sessions ORDER BY date, start_ts'):
+        sess[r[0]] = {'id': r[0], 'date': r[1], 'start_ts': r[2], 'duration_s': r[3], 'logs': {}}
+    q = ('SELECT l.session_id, l.id, l.exercise_id, s.idx, s.weight_kg, s.reps, s.duration_s, s.e1rm_kg '
+         'FROM exercise_logs l JOIN sets s ON s.log_id=l.id ORDER BY l.session_id, l.pos, s.idx')
+    for sid, lid, xid, idx, w, reps, dur, e1 in conn.execute(q):
+        lg = sess[sid]['logs'].setdefault(lid, {'ex': xid, 'sets': []})
+        lg['sets'].append({'w': w or 0, 'reps': reps, 'dur': dur, 'e1rm': e1})
+    out = sorted(sess.values(), key=lambda s: (s['date'], s['start_ts'] or 0))
+    for s in out:
+        s['logs'] = list(s['logs'].values())
+    return out, ex
+
+
+def mark_hard(lg, kind):
+    sets = lg['sets']
+    timed = [x for x in sets if x['dur']]
+    weighted = [x for x in sets if x['reps'] and x['w'] > 0]
+    bw = [x for x in sets if x['reps'] and not x['w']]
+    if kind == 'bodyweight':
+        bw, weighted = bw + weighted, []
+    for x in sets:
+        x['hard'] = False
+    if timed:
+        top = max(x['dur'] for x in timed)
+        for x in timed:
+            x['hard'] = x['dur'] >= 0.5 * top
+    if weighted:
+        rel = lambda x: x['w'] * (1 + x['reps'] / 30.0) if x['reps'] > 1 else x['w']
+        top = max(rel(x) for x in weighted)
+        for x in weighted:
+            x['hard'] = rel(x) >= 0.85 * top
+    if bw:
+        top = max(x['reps'] for x in bw)
+        for x in bw:
+            x['hard'] = x['reps'] >= 0.5 * top
+
+
+def iso_week(date):
+    y, w, _ = dt.date.fromisoformat(date).isocalendar()
+    return f'{y}-W{w:02d}'
+
+
+def week_start(d):
+    return d - dt.timedelta(days=d.weekday())
+
+
+def linreg(points):
+    if len(points) < 2:
+        return 0.0
+    n = len(points)
+    mx = sum(p[0] for p in points) / n
+    my = sum(p[1] for p in points) / n
+    den = sum((p[0] - mx) ** 2 for p in points)
+    return sum((p[0] - mx) * (p[1] - my) for p in points) / den if den else 0.0
+
+
+def analyze(conn, weeks=8, end=None):
+    end = end or today()
+    sessions, ex = load(conn)
+    sessions = [s for s in sessions if s['date'] <= end.isoformat()]
+    for s in sessions:
+        for lg in s['logs']:
+            mark_hard(lg, ex[lg['ex']]['kind'])
+    win_start = week_start(end) - dt.timedelta(weeks=weeks - 1)
+    recent_start = end - dt.timedelta(days=27)
+    in_win = [s for s in sessions if s['date'] >= win_start.isoformat()]
+    recent = [s for s in sessions if s['date'] >= recent_start.isoformat()]
+    res = {'end': end.isoformat(), 'weeks': weeks, 'window_start': win_start.isoformat(),
+           'total_sessions': len(sessions), 'first_date': sessions[0]['date'] if sessions else None,
+           'last_date': sessions[-1]['date'] if sessions else None}
+
+    # weekly table
+    wk = {}
+    for i in range(weeks):
+        ws = win_start + dt.timedelta(weeks=i)
+        wk[iso_week(ws.isoformat())] = {'week': iso_week(ws.isoformat()), 'start': ws.isoformat(), 'sessions': 0,
+                                        'hard_sets': 0, 'tonnage_kg': 0.0, 'minutes': 0}
+    for s in in_win:
+        row = wk.get(iso_week(s['date']))
+        if not row:
+            continue
+        row['sessions'] += 1
+        row['minutes'] += round((s['duration_s'] or 0) / 60)
+        for lg in s['logs']:
+            row['hard_sets'] += sum(1 for x in lg['sets'] if x['hard'])
+            row['tonnage_kg'] += sum(x['w'] * x['reps'] for x in lg['sets'] if x['reps'] and x['w'])
+    res['weekly'] = [dict(r, tonnage_kg=round(r['tonnage_kg'])) for r in wk.values()]
+    res['sessions_per_week'] = round(len(in_win) / weeks, 2)
+    res['sessions_per_week_4w'] = round(len(recent) / 4, 2)
+
+    # muscle volume (fractional sets) + tonnage (primary only)
+    def muscle_volume(ss, nweeks):
+        vol = {m: 0.0 for m in MUSCLES}
+        ton = {m: 0.0 for m in MUSCLES}
+        for s in ss:
+            for lg in s['logs']:
+                e = ex[lg['ex']]
+                hard = sum(1 for x in lg['sets'] if x['hard'])
+                if e['muscle'] in vol:
+                    vol[e['muscle']] += hard
+                    ton[e['muscle']] += sum(x['w'] * x['reps'] for x in lg['sets'] if x['reps'] and x['w'])
+                for m in e['secondary']:
+                    if m in vol:
+                        vol[m] += 0.5 * hard
+        return ({m: round(v / nweeks, 1) for m, v in vol.items()}, {m: round(v / nweeks) for m, v in ton.items()})
+    res['hard_sets_per_week_4w'], res['tonnage_per_week_4w'] = muscle_volume(recent, 4)
+    res['hard_sets_per_week'], res['tonnage_per_week'] = muscle_volume(in_win, weeks)
+    res['muscle_weekly'] = {}
+    for s in in_win:
+        w = iso_week(s['date'])
+        for lg in s['logs']:
+            e = ex[lg['ex']]
+            hard = sum(1 for x in lg['sets'] if x['hard'])
+            for m, f in [(e['muscle'], 1.0)] + [(m, 0.5) for m in e['secondary']]:
+                if m in MUSCLES:
+                    d = res['muscle_weekly'].setdefault(m, {})
+                    d[w] = round(d.get(w, 0) + f * hard, 1)
+
+    # balance (primary hard sets, last 4 weeks)
+    pat = {'push': 0, 'pull': 0, 'legs': 0, 'core': 0, 'other': 0}
+    side = {'front': 0, 'back': 0}
+    quad = post = 0
+    for s in recent:
+        for lg in s['logs']:
+            e = ex[lg['ex']]
+            hard = sum(1 for x in lg['sets'] if x['hard'])
+            pat[e['pattern'] if e['pattern'] in pat else 'other'] += hard
+            if e['side'] in side:
+                side[e['side']] += hard
+            if e['muscle'] == 'quads':
+                quad += hard
+            elif e['muscle'] in ('hamstrings', 'glutes'):
+                post += hard
+    tot = sum(pat.values()) or 1
+    ratio = lambda a, b: round(a / b, 2) if b else None
+    res['balance'] = {'share': {k: round(100 * v / tot) for k, v in pat.items()}, 'sets': pat,
+                      'push_pull': ratio(pat['push'], pat['pull']), 'front_back': ratio(side['front'], side['back']),
+                      'quad_posterior': ratio(quad, post)}
+
+    # per-exercise history: PRs, progression
+    hist = {}
+    for s in sessions:
+        for lg in s['logs']:
+            e = ex[lg['ex']]
+            h = hist.setdefault(e['id'], {'id': e['id'], 'name': e['name'], 'kind': e['kind'], 'muscle': e['muscle'],
+                                          'equipment': e['equipment'], 'points': [], 'dates': [], 'hard_win': 0,
+                                          'best': None, 'best_reps': None, 'best_dur': None, 'top_sets': []})
+            h['dates'].append(s['date'])
+            if s['date'] >= win_start.isoformat():
+                h['hard_win'] += sum(1 for x in lg['sets'] if x['hard'])
+            if e['kind'] == 'weight':
+                cands = [x for x in lg['sets'] if x['e1rm']]
+                if cands:
+                    b = max(cands, key=lambda x: x['e1rm'])
+                    h['points'].append((s['date'], b['e1rm'], b['w'], b['reps']))
+                    if not h['best'] or b['e1rm'] > h['best']['e1rm']:
+                        h['best'] = {'e1rm': b['e1rm'], 'w': b['w'], 'reps': b['reps'], 'date': s['date']}
+                top = max((x for x in lg['sets'] if x['reps'] and x['w']), key=lambda x: (x['w'], x['reps']), default=None)
+                if top:
+                    h['top_sets'].append((s['date'], top['w'], top['reps']))
+            reps = max((x['reps'] for x in lg['sets'] if x['reps']), default=None)
+            if reps and (not h['best_reps'] or reps > h['best_reps']['reps']):
+                h['best_reps'] = {'reps': reps, 'date': s['date']}
+            dur = max((x['dur'] for x in lg['sets'] if x['dur']), default=None)
+            if dur and (not h['best_dur'] or dur > h['best_dur']['dur']):
+                h['best_dur'] = {'dur': dur, 'date': s['date']}
+
+    prs = []
+    for h in hist.values():
+        if h['kind'] == 'weight' and h['best']:
+            prs.append({'exercise': h['name'], 'type': 'e1rm', 'value': h['best']['e1rm'], 'set': f"{fmt_w(h['best']['w'])}x{h['best']['reps']}",
+                        'date': h['best']['date'], 'in_window': h['best']['date'] >= win_start.isoformat()})
+        elif h['kind'] == 'timed' and h['best_dur']:
+            prs.append({'exercise': h['name'], 'type': 'seconds', 'value': h['best_dur']['dur'], 'set': '',
+                        'date': h['best_dur']['date'], 'in_window': h['best_dur']['date'] >= win_start.isoformat()})
+        elif h['best_reps']:
+            prs.append({'exercise': h['name'], 'type': 'reps', 'value': h['best_reps']['reps'], 'set': '',
+                        'date': h['best_reps']['date'], 'in_window': h['best_reps']['date'] >= win_start.isoformat()})
+    prs.sort(key=lambda p: (not p['in_window'], -(hist_hard(hist, p['exercise']))))
+    res['prs'] = prs
+
+    lifts = []
+    for h in hist.values():
+        pts_win = [p for p in h['points'] if p[0] >= win_start.isoformat()]
+        if h['kind'] != 'weight' or len(pts_win) < 4 or not ex[h['id']]['secondary']:
+            continue
+        running, last_pr = 0.0, None
+        for d, v, _, _ in h['points']:
+            if v > running + 0.01:
+                running, last_pr = v, d
+        sess_since = sum(1 for p in h['points'] if p[0] > last_pr)
+        weeks_since = (end - dt.date.fromisoformat(last_pr)).days / 7
+        d0 = dt.date.fromisoformat(pts_win[0][0])
+        slope = linreg([((dt.date.fromisoformat(d) - d0).days / 7, v) for d, v, _, _ in pts_win])
+        mean = sum(p[1] for p in pts_win) / len(pts_win)
+        last3 = [p[1] for p in h['points'][-3:]]
+        last_seen = dt.date.fromisoformat(h['points'][-1][0])
+        if (end - last_seen).days > 21:
+            status = 'inactive'
+        elif weeks_since >= 4 and sess_since >= 3:
+            status = 'plateau'
+        elif slope > 0.05:
+            status = 'progressing'
+        else:
+            status = 'flat'
+        declining = len(last3) == 3 and sum(last3) / 3 < 0.95 * running
+        top = h['top_sets'][-1] if h['top_sets'] else None
+        lifts.append({'exercise': h['name'], 'id': h['id'], 'muscle': h['muscle'], 'equipment': h['equipment'],
+                      'sessions': len(pts_win), 'hard_sets': h['hard_win'], 'first': pts_win[0][1],
+                      'last': pts_win[-1][1], 'best': running, 'kg_per_week': round(slope, 2),
+                      'pct_per_month': round(100 * slope * 4.345 / mean, 1) if mean else 0.0,
+                      'last_pr': last_pr, 'weeks_since_pr': round(weeks_since, 1), 'sessions_since_pr': sess_since,
+                      'status': status, 'declining': declining,
+                      'last_top_set': {'date': top[0], 'w': top[1], 'reps': top[2]} if top else None,
+                      'series': [(d, v) for d, v, _, _ in pts_win]})
+    big = re.compile(r'\b(squat|bench press|overhead press|military press)\b|^(barbell |conventional |sumo |trap bar )?'
+                     r'deadlift$')
+    lifts.sort(key=lambda x: -(x['hard_sets'] + 30 * bool(big.search(norm_name(x['exercise']))) +
+                               10 * (x['equipment'] in ('barbell', 'trap bar'))))
+    res['main_lifts'] = lifts[:5]
+
+    # consistency: weekly streaks, gaps
+    weeks_with = sorted({week_start(dt.date.fromisoformat(s['date'])) for s in sessions})
+    wset = set(weeks_with)
+    cur, w = 0, week_start(end)
+    if w not in wset:
+        w -= dt.timedelta(weeks=1)
+    while w in wset:
+        cur += 1
+        w -= dt.timedelta(weeks=1)
+    best = run = 0
+    prev = None
+    for w in weeks_with:
+        run = run + 1 if prev and (w - prev).days == 7 else 1
+        best = max(best, run)
+        prev = w
+    dates = sorted({s['date'] for s in sessions})
+    gaps = []
+    for a_, b_ in zip(dates, dates[1:]):
+        days = (dt.date.fromisoformat(b_) - dt.date.fromisoformat(a_)).days
+        if days >= 8 and b_ >= win_start.isoformat():
+            gaps.append({'from': a_, 'to': b_, 'days': days})
+    gaps.sort(key=lambda g: -g['days'])
+    res['consistency'] = {'streak_weeks': cur, 'longest_streak_weeks': best, 'gaps': gaps[:3],
+                          'days_since_last': (end - dt.date.fromisoformat(dates[-1])).days if dates else None}
+
+    # fatigue proxy: consecutive weeks without a low week (<= 60 % of the trailing 4-week mean, or no session)
+    allw = {}
+    for s in sessions:
+        k = week_start(dt.date.fromisoformat(s['date']))
+        allw[k] = allw.get(k, 0) + sum(1 for lg in s['logs'] for x in lg['sets'] if x['hard'])
+    hard_weeks, w = 0, week_start(end)
+    if allw.get(w, 0) == 0:
+        w -= dt.timedelta(weeks=1)
+    while True:
+        prevs = [allw.get(w - dt.timedelta(weeks=i), 0) for i in range(1, 5)]
+        trail = sum(prevs) / 4
+        if allw.get(w, 0) == 0 or (trail and allw[w] <= 0.6 * trail):
+            break
+        hard_weeks += 1
+        w -= dt.timedelta(weeks=1)
+    res['weeks_without_deload'] = hard_weeks
+
+    body = conn.execute('SELECT date, weight_kg FROM body_stats WHERE weight_kg IS NOT NULL AND date <= ? '
+                        'ORDER BY date', (end.isoformat(),)).fetchall()
+    res['body_weight'] = {'last': body[-1][1], 'date': body[-1][0]} if body else None
+    res['_hist'] = hist
+    return res
+
+
+def hist_hard(hist, name):
+    for h in hist.values():
+        if h['name'] == name:
+            return h['hard_win']
+    return 0
+
+
+# ----------------------------------------------------------------------------- stats text
+def cmd_stats(a):
+    conn = connect()
+    r = analyze(conn, a.weeks, a.end)
+    r.pop('_hist')
+    oa = r['other_activity'] = other_activity(a.end or today(), a.weeks)
+    if a.json:
+        print(json.dumps(r, indent=1))
+        return 0
+    if not r['total_sessions']:
+        print('No sessions yet. Import a Jefit CSV export: gym import csv FILE')
+        return 0
+    L = []
+    L.append(f"Gym stats: {r['weeks']} weeks, {ddmm(r['window_start'])}-{ddmm(r['end'])}{r['end'][:4]}")
+    c = r['consistency']
+    n_win = sum(w['sessions'] for w in r['weekly'])
+    L.append(f"Sessions: {n_win} ({r['sessions_per_week']}/week, last 4 wk {r['sessions_per_week_4w']}/week); "
+             f"last {ddmm(r['last_date'])} ({c['days_since_last']} d ago)")
+    L.append(f"Streak: {c['streak_weeks']} weeks with training (longest {c['longest_streak_weeks']}); "
+             f"{r['weeks_without_deload']} weeks since a lighter week")
+    if act_any(oa['total']):
+        L.append(f"Dance (not in the streak): {act_text(oa['total'], emoji=False, counts=True)} in {r['weeks']} wk"
+                 + (f"; this week {act_text(oa['this_week'], emoji=False)}" if act_any(oa['this_week']) else '')
+                 + (f"; tracked since {ddmm(oa['since'])}" if oa['since'] and oa['since'] > r['window_start'] else ''))
+    if c['gaps']:
+        L.append('Gaps: ' + ', '.join(f"{ddmm(g['from'])}-{ddmm(g['to'])} ({g['days']} d)" for g in c['gaps']))
+    L.append('')
+    L.append('Week      Sessions  Hard sets  Tonnage kg  Minutes')
+    for w in r['weekly']:
+        L.append(f"{w['week']:<9} {w['sessions']:>8}  {w['hard_sets']:>9}  {fmt_n(w['tonnage_kg']):>10}  {w['minutes']:>7}")
+    L.append('')
+    L.append(f'Hard sets per week by muscle (4 wk | {r["weeks"]} wk; target {TARGET_LO}-{TARGET_HI}), tonnage kg/wk (4 wk):')
+    for m in MUSCLES:
+        v4, vn = r['hard_sets_per_week_4w'][m], r['hard_sets_per_week'][m]
+        if not v4 and not vn:
+            continue
+        flag = ''
+        if m in TRACKED:
+            flag = 'low' if v4 < TARGET_LO else 'high' if v4 > TARGET_HI else 'ok'
+        L.append(f"  {m:<11} {v4:>5} | {vn:<5} {flag:<4}  {fmt_n(r['tonnage_per_week_4w'][m]):>7}")
+    b = r['balance']
+    sh = b['share']
+    L.append('')
+    L.append(f"Balance (hard sets, 4 wk): push {sh['push']}% / pull {sh['pull']}% / legs {sh['legs']}% / core {sh['core']}%")
+    L.append(f"  push:pull {b['push_pull'] or '-'} · front:back {b['front_back'] or '-'} · quads:hams+glutes "
+             f"{b['quad_posterior'] or '-'}")
+    L.append('')
+    L.append('Main lifts (e1RM, Epley):')
+    for x in r['main_lifts']:
+        tag = {'plateau': f"plateau: no PR in {x['weeks_since_pr']:.0f} wk", 'progressing': 'progressing',
+               'flat': 'flat', 'inactive': 'not trained lately'}[x['status']]
+        if x['declining']:
+            tag += ', trending down'
+        L.append(f"  {x['exercise']:<26} {fmt_kg(x['first'])} -> {fmt_kg(x['last'])} kg ({x['kg_per_week']:+.1f} kg/wk, "
+                 f"{x['pct_per_month']:+.1f} %/mo); best {fmt_kg(x['best'])} on {ddmm(x['last_pr'])}; {tag}")
+    if not r['main_lifts']:
+        L.append('  (none with 4+ weighted sessions in the window)')
+    L.append('')
+    L.append('PRs (* = set in this window):')
+    for p in r['prs'][:12]:
+        val = (f"{fmt_kg(p['value'])} kg e1RM ({p['set']})" if p['type'] == 'e1rm' else
+               f"{p['value']} s" if p['type'] == 'seconds' else f"{p['value']} reps")
+        L.append(f"  {'*' if p['in_window'] else ' '} {p['exercise']:<26} {val}, {ddmm(p['date'])}{p['date'][:4]}")
+    if r['body_weight']:
+        L.append('')
+        L.append(f"Body weight: {fmt_kg(r['body_weight']['last'])} kg ({ddmm(r['body_weight']['date'])}{r['body_weight']['date'][:4]})")
+    print('\n'.join(L))
+    return 0
+
+
+# ----------------------------------------------------------------------------- review
+def increment(lift):
+    lower = lift['muscle'] in ('quads', 'hamstrings', 'glutes')
+    if lift['equipment'] == 'dumbbell':
+        return 2.0
+    if lift['equipment'] in ('barbell', 'trap bar') and lower:
+        return 5.0
+    return 2.5
+
+
+def favourite_for(hist, muscle):
+    best = None
+    for h in hist.values():
+        if h['muscle'] == muscle and (not best or len(h['dates']) > len(best['dates'])):
+            best = h
+    return best['name'] if best else DEFAULT_PICK.get(muscle, 'an exercise for it')
+
+
+def suggestions(r):
+    hist = r['_hist']
+    c = r['consistency']
+    cand = []
+    v4 = r['hard_sets_per_week_4w']
+    plateaus = [x for x in r['main_lifts'] if x['status'] == 'plateau']
+    declining = [x for x in r['main_lifts'] if x['declining'] and x['status'] != 'inactive']
+    if c['days_since_last'] is not None and c['days_since_last'] >= 14:
+        cand.append((100, 'comeback', f"Back after {c['days_since_last']} days off: first week at ~80-90 % of your "
+                                      f"last working weights, then build back up."))
+    deload = (len(plateaus) >= 2 or (plateaus and declining)) and r['weeks_without_deload'] >= 6 and \
+        (c['days_since_last'] or 0) < 14
+    if deload:
+        names = ' and '.join(x['exercise'] for x in (plateaus + [d for d in declining if d not in plateaus])[:2])
+        cand.append((90, 'deload', f"Deload next week: same exercises, about half the sets at ~90 % of the weight. "
+                                   f"{r['weeks_without_deload']} weeks without a lighter week and {names} stalled."))
+    if r['sessions_per_week_4w'] < 2 and (c['days_since_last'] or 0) < 14:
+        cand.append((70, 'frequency', f"Train 2-3x a week (lately {r['sessions_per_week_4w']}/week): two fixed slots in "
+                                      f"the calendar make it stick; each muscle at least twice a week."))
+    pre = 'After the deload, ' if deload else ''
+    b = r['balance']
+    pull_short = bool(b['push_pull'] and b['push_pull'] > 1.3)
+    lows = sorted(((TARGET_LO - v4[m]) * w, m) for m, w in TRACKED.items()
+                  if v4[m] < TARGET_LO and not (pull_short and m == 'back'))
+    for score, m in sorted(lows, reverse=True):
+        need = min(6, max(2, math.ceil(TARGET_LO - v4[m])))
+        txt = (f"{m.capitalize()} at {fmt_kg(v4[m])} hard sets/week (target {TARGET_LO}-{TARGET_HI}): add {need} sets "
+               f"of {favourite_for(hist, m)} per week, spread over 2 sessions.")
+        cand.append((40 + score * 3, 'low', pre + txt[0].lower() + txt[1:] if pre else txt))
+    for x in plateaus:
+        cand.append((60 + x['weeks_since_pr'], 'plateau',
+                     f"{x['exercise']}: no e1RM gain in {x['weeks_since_pr']:.0f} weeks: change the rep range for 4-6 "
+                     f"weeks (e.g. 3x8 -> 4x5 heavier) or swap to a close variation; train it 2x a week."))
+    if pull_short:
+        back = f" (back {fmt_kg(v4['back'])} hard sets/week)" if v4['back'] < TARGET_LO else ''
+        cand.append((55 + 10 * (v4['back'] < TARGET_LO), 'balance',
+                     f"Push:pull is {b['push_pull']}:1{back}: add 3 sets of a pull "
+                     f"({favourite_for(hist, 'back')}) to each push day for shoulder balance."))
+    elif b['push_pull'] and b['push_pull'] < 0.6:
+        cand.append((50, 'balance', f"Push:pull is {b['push_pull']}:1: add a pressing exercise "
+                                    f"({favourite_for(hist, 'chest')}) to balance the upper body."))
+    if b['quad_posterior'] and b['quad_posterior'] > 1.6:
+        cand.append((52, 'balance', f"Quads get {b['quad_posterior']}x the sets of hamstrings+glutes: add "
+                                    f"{favourite_for(hist, 'hamstrings')} or a leg curl on leg days."))
+    for m, w in TRACKED.items():
+        if v4[m] > TARGET_HI + 2:
+            cand.append((45, 'high', f"{m.capitalize()} at {fmt_kg(v4[m])} hard sets/week: above ~{TARGET_HI} extra sets "
+                                     f"add more fatigue than growth; trim {math.ceil(v4[m] - TARGET_HI)}."))
+    for x in [l for l in r['main_lifts'] if l['status'] == 'progressing'][:2]:
+        t = x['last_top_set']
+        if not t:
+            continue
+        inc = increment(x)
+        cand.append((30 + x['pct_per_month'], 'overload',
+                     f"{x['exercise']} is progressing ({x['kg_per_week']:+.1f} kg/week e1RM): next time "
+                     f"{fmt_w(t['w'] + inc)} kg x {t['reps']} (+{fmt_w(inc)} kg), or +1 rep at {fmt_w(t['w'])} kg."))
+    cand.append((1, 'logging', 'Keep logging every set, warm-ups included, so trends and PRs stay accurate.'))
+    cand.append((0, 'filler', f"Keep each muscle in the {TARGET_LO}-{TARGET_HI} hard sets/week range and add weight or "
+                              f"reps when all sets reach the top of your rep range."))
+    limits = {'low': 2, 'plateau': 1, 'balance': 1, 'overload': 1, 'high': 1}
+    picked, used = [], {}
+    for score, kind, txt in sorted(cand, key=lambda c_: -c_[0]):
+        if used.get(kind, 0) >= limits.get(kind, 1):
+            continue
+        picked.append({'kind': kind, 'text': txt, 'score': round(score, 1)})
+        used[kind] = used.get(kind, 0) + 1
+        if len(picked) == 3:
+            break
+    return picked
+
+
+def cmd_review(a):
+    conn = connect()
+    end = a.end or today()
+    if a.if_trained is not None:
+        since = (end - dt.timedelta(days=a.if_trained - 1)).isoformat()
+        n = conn.execute('SELECT COUNT(*) FROM sessions WHERE date >= ? AND date <= ?', (since, end.isoformat())).fetchone()[0]
+        if not n:
+            return 0
+    r = analyze(conn, a.weeks, end)
+    if not r['total_sessions']:
+        print('No sessions yet. Import a Jefit CSV export: gym import csv FILE')
+        return 0
+    sug = suggestions(r)
+    c = r['consistency']
+    n4 = round(r['sessions_per_week_4w'] * 4)
+    L = [f"🏋️ Gym review · 4 weeks to {ddmm(r['end'])}"]
+    L.append(f"{n4} sessions ({r['sessions_per_week_4w']}/wk) · streak {c['streak_weeks']} wk · last {c['days_since_last']} d ago")
+    oa = other_activity(end, 4)
+    if act_any(oa['total']):
+        L.append(f"Also active: {act_text(oa['total'], emoji=False, counts=True)} dancing in 4 wk")
+    v4 = r['hard_sets_per_week_4w']
+    lows = sorted((m for m in TRACKED if v4[m] < TARGET_LO), key=lambda m: -(TARGET_LO - v4[m]) * TRACKED[m])
+    low = [f'{m} {fmt_kg(v4[m])}' for m in lows[:4]] + ([f'+{len(lows) - 4}'] if len(lows) > 4 else [])
+    high = [f'{m} {fmt_kg(v4[m])}' for m in TRACKED if v4[m] > TARGET_HI]
+    ok = [m for m in TRACKED if TARGET_LO <= v4[m] <= TARGET_HI]
+    parts = []
+    if low:
+        parts.append('low ' + ', '.join(low))
+    if high:
+        parts.append('high ' + ', '.join(high))
+    if ok:
+        parts.append(f'{len(ok)} in range')
+    L.append('Sets/wk: ' + ' · '.join(parts))
+    cutoff = (dt.date.fromisoformat(r['end']) - dt.timedelta(days=27)).isoformat()
+    main = {x['exercise'] for x in r['main_lifts']}
+    recent_prs = sorted((p for p in r['prs'] if p['date'] >= cutoff), key=lambda p: p['date'], reverse=True)
+    recent_prs.sort(key=lambda p: p['exercise'] not in main)
+    if recent_prs:
+        shown = []
+        for p in recent_prs[:2]:
+            val = (f"{fmt_kg(p['value'])} kg" if p['type'] == 'e1rm' else f"{p['value']} s" if p['type'] == 'seconds'
+                   else f"{p['value']} reps")
+            shown.append(f"{p['exercise']} {val} ({ddmm(p['date'])})")
+        more = f' +{len(recent_prs) - 2} more' if len(recent_prs) > 2 else ''
+        L.append('New PRs (e1RM): ' + ', '.join(shown) + more)
+    stalled = [x for x in r['main_lifts'] if x['status'] == 'plateau']
+    if stalled:
+        L.append('Stalled: ' + ', '.join(f"{x['exercise']} ({x['weeks_since_pr']:.0f} wk)" for x in stalled[:2]))
+    L.append('')
+    L.append('Suggestions (heuristics, not medical advice):')
+    for i, s in enumerate(sug, 1):
+        L.append(f"{i}. {s['text']}")
+    text = '\n'.join(L)
+    if a.json:
+        print(json.dumps({'text': text, 'suggestions': sug, 'end': r['end']}))
+    else:
+        print(text)
+    return 0
+
+
+# ----------------------------------------------------------------------------- charts (Pillow)
+C_SURFACE, C_TEXT, C_TEXT2, C_GRID, C_SERIES, C_BAND = '#fcfcfb', '#0b0b0b', '#52514e', '#e4e3df', '#2a78d6', '#e3eefb'
+
+
+def _font(size, bold=False):
+    from PIL import ImageFont
+    for p in ('/usr/share/fonts/truetype/dejavu/DejaVuSans%s.ttf' % ('-Bold' if bold else ''),
+              '/usr/share/fonts/truetype/liberation/LiberationSans-%s.ttf' % ('Bold' if bold else 'Regular')):
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
+
+
+def _canvas(w, h, title, subtitle):
+    from PIL import Image, ImageDraw
+    img = Image.new('RGB', (w, h), C_SURFACE)
+    d = ImageDraw.Draw(img)
+    d.text((48, 36), title, font=_font(40, True), fill=C_TEXT)
+    d.text((48, 92), subtitle, font=_font(26), fill=C_TEXT2)
+    return img, d
+
+
+def chart_volume(r, path):
+    v = r['hard_sets_per_week_4w']
+    rows = [(m, v[m]) for m in MUSCLES if m in TRACKED or v[m]]
+    W, top, rh = 1080, 170, 64
+    H = top + rh * len(rows) + 90
+    img, d = _canvas(W, H, 'Hard sets per week', f"By muscle, last 4 weeks to {ddmm(r['end'])} · band = "
+                                                  f"{TARGET_LO}-{TARGET_HI} target")
+    x0, x1 = 230, W - 110
+    vmax = max([TARGET_HI + 5] + [x for _, x in rows])
+    sx = lambda x: x0 + (x1 - x0) * x / vmax
+    d.rectangle([sx(TARGET_LO), top - 10, sx(TARGET_HI), top + rh * len(rows)], fill=C_BAND)
+    f, fs = _font(28), _font(24)
+    for t in range(0, int(vmax) + 1, 5):
+        d.line([sx(t), top - 10, sx(t), top + rh * len(rows)], fill=C_GRID, width=2)
+        d.text((sx(t), top + rh * len(rows) + 12), str(t), font=fs, fill=C_TEXT2, anchor='ma')
+    for i, (m, x) in enumerate(rows):
+        y = top + i * rh + rh // 2
+        d.text((x0 - 20, y), m, font=f, fill=C_TEXT, anchor='rm')
+        if x > 0:
+            d.rounded_rectangle([x0, y - 16, max(x0 + 8, sx(x)), y + 16], radius=4, fill=C_SERIES)
+        d.text((max(x0 + 8, sx(x)) + 12, y), fmt_kg(x), font=f, fill=C_TEXT, anchor='lm')
+    img.save(path)
+
+
+def chart_e1rm(r, path):
+    lifts = [x for x in r['main_lifts'] if len(x['series']) >= 2][:4]
+    if not lifts:
+        return False
+    W, ph, top = 1080, 300, 150
+    H = top + ph * len(lifts) + 30
+    img, d = _canvas(W, H, 'Estimated 1RM, main lifts', f"Best set per session (Epley), {ddmm(r['window_start'])}-"
+                                                         f"{ddmm(r['end'])}")
+    f, fb, fs = _font(26), _font(28, True), _font(22)
+    t0 = dt.date.fromisoformat(r['window_start'])
+    t1 = dt.date.fromisoformat(r['end'])
+    span = max(1, (t1 - t0).days)
+    for i, x in enumerate(lifts):
+        y0 = top + i * ph
+        d.text((48, y0), f"{x['exercise']} · {fmt_kg(x['last'])} kg", font=fb, fill=C_TEXT)
+        vals = [v for _, v in x['series']]
+        lo, hi = min(vals), max(vals)
+        pad = max(1.0, (hi - lo) * 0.15)
+        lo, hi = lo - pad, hi + pad
+        px0, px1, py0, py1 = 140, W - 60, y0 + 56, y0 + ph - 60
+        for yv in (lo + pad, hi - pad):
+            yy = py1 - (py1 - py0) * (yv - lo) / (hi - lo)
+            d.line([px0, yy, px1, yy], fill=C_GRID, width=2)
+            d.text((px0 - 14, yy), fmt_kg(yv), font=fs, fill=C_TEXT2, anchor='rm')
+        pts = [(px0 + (px1 - px0) * (dt.date.fromisoformat(dd) - t0).days / span, py1 - (py1 - py0) * (v - lo) / (hi - lo))
+               for dd, v in x['series']]
+        d.line(pts, fill=C_SERIES, width=4, joint='curve')
+        for px, py in pts:
+            d.ellipse([px - 6, py - 6, px + 6, py + 6], fill=C_SERIES, outline=C_SURFACE, width=2)
+        d.text((px0, py1 + 14), ddmm(r['window_start']), font=fs, fill=C_TEXT2, anchor='la')
+        d.text((px1, py1 + 14), ddmm(r['end']), font=fs, fill=C_TEXT2, anchor='ra')
+        if x['status'] == 'plateau':
+            d.text((px1, y0 + 4), f"no PR in {x['weeks_since_pr']:.0f} wk", font=f, fill=C_TEXT2, anchor='ra')
+    img.save(path)
+    return True
+
+
+def chart_sessions(r, path):
+    wk = r['weekly']
+    W, H, top = 1080, 620, 170
+    img, d = _canvas(W, H, 'Sessions per week', f"{len(wk)} weeks to {ddmm(r['end'])}")
+    f, fs = _font(26), _font(22)
+    x0, x1, y1 = 100, W - 48, H - 90
+    vmax = max([3] + [w['sessions'] for w in wk])
+    sy = lambda v: y1 - (y1 - top) * v / vmax
+    for t in range(0, vmax + 1):
+        d.line([x0, sy(t), x1, sy(t)], fill=C_GRID, width=2)
+        d.text((x0 - 16, sy(t)), str(t), font=fs, fill=C_TEXT2, anchor='rm')
+    slot = (x1 - x0) / len(wk)
+    bw = max(8, slot * 0.6)
+    for i, w in enumerate(wk):
+        cx = x0 + slot * (i + 0.5)
+        if w['sessions']:
+            d.rounded_rectangle([cx - bw / 2, sy(w['sessions']), cx + bw / 2, y1], radius=4, fill=C_SERIES)
+        if (len(wk) - 1 - i) % max(1, round(len(wk) / 6)) == 0:
+            d.text((cx, y1 + 14), ddmm(w['start']), font=fs, fill=C_TEXT2, anchor='ma')
+    img.save(path)
+
+
+def cmd_chart(a):
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        print('Charts skipped: Pillow is not installed (python3-pil).')
+        return 0
+    conn = connect()
+    r = analyze(conn, a.weeks, a.end)
+    if not r['total_sessions']:
+        print('No sessions yet. Import a Jefit CSV export: gym import csv FILE')
+        return 0
+    out = a.out or os.path.join(STATE, 'charts')
+    os.makedirs(out, mode=0o700, exist_ok=True)
+    paths = []
+    p = os.path.join(out, 'volume.png')
+    chart_volume(r, p)
+    paths.append(p)
+    p = os.path.join(out, 'e1rm.png')
+    if chart_e1rm(r, p):
+        paths.append(p)
+    p = os.path.join(out, 'sessions.png')
+    chart_sessions(r, p)
+    paths.append(p)
+    for p in paths:
+        os.chmod(p, 0o600)
+        print(p)
+    return 0
+
+
+# ----------------------------------------------------------------------------- exercises, status
+def cmd_exercises(a):
+    conn = connect()
+    rows = conn.execute('SELECT e.id, e.name, e.muscle, e.secondary, e.equipment, e.pattern, e.kind, e.manual, '
+                        'COUNT(s.id) FROM exercises e LEFT JOIN exercise_logs l ON l.exercise_id=e.id '
+                        'LEFT JOIN sets s ON s.log_id=l.id GROUP BY e.id ORDER BY e.muscle, e.name').fetchall()
+    items = [{'name': r[1], 'muscle': r[2], 'secondary': r[3], 'equipment': r[4], 'pattern': r[5], 'kind': r[6],
+              'manual': bool(r[7]), 'sets': r[8]} for r in rows]
+    if a.json:
+        print(json.dumps(items))
+        return 0
+    for x in items:
+        sec = f" (+{x['secondary']})" if x['secondary'] else ''
+        print(f"{x['muscle']:<11} {x['name']:<32} {x['equipment']:<10} {x['pattern']:<5} {x['kind']:<10} "
+              f"{x['sets']:>5} sets{sec}{' [fixed]' if x['manual'] else ''}")
+    return 0
+
+
+def cmd_exercise(a):
+    conn = connect()
+    n = norm_name(a.name)
+    row = conn.execute('SELECT exercise_id FROM exercise_keys WHERE key=?', ('name:' + n,)).fetchone()
+    if not row:
+        print(f'gym: no exercise named "{a.name}" (see gym exercises)', file=sys.stderr)
+        return 1
+    xid = row[0]
+    if a.reset:
+        name, bp = conn.execute('SELECT name, bodypart FROM exercises WHERE id=?', (xid,)).fetchone()
+        cls = classify(name, int(bp) if bp and bp.isdigit() else bp)
+        conn.execute('UPDATE exercises SET muscle=?, secondary=?, equipment=?, pattern=?, side=?, manual=0 WHERE id=?',
+                     (cls['muscle'], ','.join(cls['secondary']), cls['equipment'], cls['pattern'], cls['side'], xid))
+    else:
+        if a.muscle not in MUSCLES + ['other']:
+            print(f'gym: muscle must be one of {", ".join(MUSCLES)}, other', file=sys.stderr)
+            return 2
+        sets = ['muscle=?', 'pattern=?', 'side=?', 'secondary=?', 'manual=1']
+        vals = [a.muscle, PATTERN.get(a.muscle, 'other'), SIDE.get(a.muscle, ''), '']
+        if a.equipment:
+            sets.append('equipment=?')
+            vals.append(a.equipment)
+        conn.execute(f'UPDATE exercises SET {", ".join(sets)} WHERE id=?', vals + [xid])
+    conn.commit()
+    r = conn.execute('SELECT name, muscle, equipment, pattern, manual FROM exercises WHERE id=?', (xid,)).fetchone()
+    print(f"{r[0]}: {r[1]}, {r[2]}, {r[3]}{' (fixed)' if r[4] else ' (automatic)'}")
+    return 0
+
+
+def cmd_status(a):
+    conn = connect()
+    q = lambda s: conn.execute(s).fetchone()[0]
+    try:
+        tok = token_state()
+    except PermissionError:
+        tok = 'bad permissions'
+    last = conn.execute('SELECT at, source, detail, new, updated, unchanged FROM imports ORDER BY id DESC LIMIT 1').fetchone()
+    try:
+        import PIL  # noqa: F401
+        charts = 'pillow'
+    except ImportError:
+        charts = 'none'
+    st = {'db': DB_PATH, 'sessions': q('SELECT COUNT(*) FROM sessions'), 'exercises': q('SELECT COUNT(*) FROM exercises'),
+          'sets': q('SELECT COUNT(*) FROM sets'), 'body_stats': q('SELECT COUNT(*) FROM body_stats'),
+          'first': q('SELECT MIN(date) FROM sessions'), 'last': q('SELECT MAX(date) FROM sessions'),
+          'last_import': {'at': last[0], 'source': last[1], 'new': last[3], 'updated': last[4],
+                          'unchanged': last[5]} if last else None,
+          'token': tok, 'api_confirmed': bool(api_config().get('confirmed')), 'charts': charts}
+    if a.json:
+        print(json.dumps(st))
+        return 0
+    print(f"DB {st['db']}: {st['sessions']} sessions, {st['exercises']} exercises, {st['sets']} sets, "
+          f"{st['body_stats']} body-stat rows; {st['first'] or '-'} .. {st['last'] or '-'}")
+    if last:
+        print(f"Last import {last[0]} ({last[1]}): {last[3]} new, {last[4]} updated, {last[5]} unchanged")
+    print(f"Jefit token: {tok}; API endpoints confirmed: {'yes' if st['api_confirmed'] else 'no'}; charts: {charts}")
+    return 0
+
+
+# ----------------------------------------------------------------------------- plan: draft / show / push / update
+# A training plan built from the log, kept in a private state file and written to Jefit as ONE routine named
+# PLAN_NAME. Writes go only through PlanWriter: method + path allowlist, and every id in a write path must belong to
+# the plan routine (created in this run, or found under the name-and-marker-checked plan routine on a fresh GET).
+PLAN_FILE = os.path.join(STATE, 'plan.json')
+PUSHED_FILE = os.path.join(STATE, 'plan-pushed.json')
+PUSH_LOG = os.path.join(STATE, 'plan-push.log')
+PLAN_HISTORY = os.path.join(STATE, 'plan-history')
+TOKEN_RW_FILE = os.environ.get('GYM_TOKEN_RW_FILE') or os.path.join(HOME, '.secrets/jefit-token-rw')
+PLAN_NAME, TEST_NAME, PLAN_MARK = 'Assistant plan', 'Assistant test', '[gym-plan]'
+TRAVEL_FILE = os.path.join(STATE, 'plan-travel.json')
+TRAVEL_PUSHED_FILE = os.path.join(STATE, 'plan-travel-pushed.json')
+RETURN_FILE = os.path.join(STATE, 'plan-return.json')
+TRAVEL_NAME, TRAVEL_MARK = 'Assistant travel', '[gym-travel]'
+TRIPS_FILE = os.environ.get('GYM_TRIPS') or os.path.join(HOME, '.config/trip-conditions/trips.json')
+# The phone app keeps its own copy of the routines and pulls web/API changes only on its manual Sync (Jefit's web
+# dashboard says so); an app restart does not. API-made routines are the same as web-made ones (same endpoints).
+APP_SYNC = ('In the Jefit app, tap Sync on the Progress tab to pull it in (restarting the app does not); '
+            f'"{PLAN_NAME}" then shows under All Plans.')
+
+
+def app_sync(name=PLAN_NAME):
+    return APP_SYNC.replace(f'"{PLAN_NAME}"', f'"{name}"')
+
+
+def routine_profile(kind='plan'):
+    """The Jefit routine a push writes: its name, description marker, push state file and command."""
+    if kind == 'travel':
+        return {'kind': kind, 'name': TRAVEL_NAME, 'mark': TRAVEL_MARK, 'pushed': TRAVEL_PUSHED_FILE,
+                'cmd': 'gym plan push --travel'}
+    return {'kind': 'plan', 'name': PLAN_NAME, 'mark': PLAN_MARK, 'pushed': PUSHED_FILE, 'cmd': 'gym plan push'}
+ID_RE = r'u_\d{12}'
+WRITE_RULES = [('POST', r'/api/v2/user/routines'),
+               ('PATCH', rf'/api/v2/routines/{ID_RE}'), ('DELETE', rf'/api/v2/routines/{ID_RE}'),
+               ('POST', rf'/api/v2/routines/{ID_RE}/days'),
+               ('PATCH', rf'/api/v2/days/{ID_RE}'), ('DELETE', rf'/api/v2/days/{ID_RE}'),
+               ('POST', rf'/api/v2/days/{ID_RE}/day_exercises'),
+               ('PATCH', rf'/api/v2/day_exercises/{ID_RE}'), ('DELETE', rf'/api/v2/day_exercises/{ID_RE}')]
+EX_FIELDS = ('count', 'sets', 'number_of_reps', 'rest_time')     # PATCH order: count before the per-set values
+# HTTP 429: retries, first backoff and its cap (s) when Jefit sends no Retry-After; a longer Retry-After stops
+RETRY_TRIES, RETRY_BASE_S, RETRY_CAP_S, RETRY_AFTER_MAX_S = 6, 5.0, 60.0, 300.0
+# goal -> role -> (sets, low reps, high reps, rest s)
+GOALS = {
+    'mixed': {'main': (3, 4, 6, 150), 'acc': (3, 8, 12, 90), 'small': (2, 8, 12, 60)},
+    'strength': {'main': (4, 3, 5, 180), 'acc': (3, 6, 10, 120), 'small': (2, 8, 12, 60)},
+    'hypertrophy': {'main': (3, 6, 10, 120), 'acc': (3, 10, 15, 75), 'small': (3, 10, 15, 60)},
+    'fitness': {'main': (3, 8, 12, 90), 'acc': (3, 12, 15, 45), 'small': (2, 12, 15, 45)},
+}
+# slot -> how to recognise it in the log (regex on the normalized name and/or the classified muscle) and its role
+SLOTS = {
+    'squat': {'rx': r'\b(squat|hack)\b', 'not': r'\b(split|bulgarian|jump|goblet|sissy)\b', 'role': 'main',
+              'pref': ('barbell',)},
+    'hinge': {'rx': r'\b(deadlift|romanian|rdl|good morning)\b', 'role': 'main', 'pref': ('barbell', 'trap bar')},
+    'hpush': {'rx': r'\b(bench press|chest press)\b', 'not': r'\b(incline|decline|close grip)\b', 'role': 'main',
+              'pref': ('barbell',)},
+    'vpush': {'rx': r'\b(military|overhead press|shoulder press|arnold|push press)\b', 'role': 'main',
+              'pref': ('barbell',)},
+    'vpull': {'rx': r'\b(pull ?downs?|pull ?ups?|chin ?ups?)\b', 'not': r'\bknee raise\b', 'role': 'acc'},
+    'hpull': {'rx': r'\brows?\b', 'not': r'\bupright\b', 'role': 'acc'},
+    'quad2': {'rx': r'\b(leg press|lunge|split squat|leg extension|hack squat|step up)\b',
+              'not': r'\b(calf|single leg)\b', 'role': 'acc'},
+    'ham': {'muscle': 'hamstrings', 'role': 'acc'},
+    'incline': {'rx': r'\bincline\b.*\bpress\b|\bpress\b.*\bincline\b|\bdumbbell bench press\b|\bdips?\b',
+                'role': 'acc'},
+    'delt': {'rx': r'\b(lateral raise|side raise|rear delt|face pull|reverse fly)\b', 'role': 'acc'},
+    'triceps': {'muscle': 'triceps', 'role': 'small'},
+    'biceps': {'muscle': 'biceps', 'role': 'small'},
+    'calves': {'muscle': 'calves', 'role': 'small'},
+    'core': {'muscle': 'abs', 'role': 'small'},
+}
+# days/week -> [(key, title, items)]; an item is a slot or a tuple of slots done as a pair
+TEMPLATES = {
+    2: [('A', 'Full body A', ['squat', 'hpush', ('vpull', 'ham'), ('delt', 'triceps'), 'core']),
+        ('B', 'Full body B', ['hinge', 'vpush', 'quad2', 'calves', ('hpull', 'incline'), ('biceps', 'core')])],
+    3: [('A', 'Full body A', ['squat', 'hpush', ('vpull', 'ham'), ('delt', 'triceps'), 'core']),
+        ('B', 'Full body B', ['hinge', 'vpush', ('hpull', 'incline'), ('biceps', 'core')]),
+        ('C', 'Full body C', ['quad2', 'incline', ('vpull', 'ham'), ('delt', 'biceps'), 'calves'])],
+    4: [('U1', 'Upper 1', ['hpush', 'hpull', ('vpush', 'vpull'), ('triceps', 'biceps')]),
+        ('L1', 'Lower 1', ['squat', ('ham', 'core'), 'quad2', 'calves']),
+        ('U2', 'Upper 2', ['vpush', 'vpull', ('incline', 'hpull'), ('delt', 'triceps')]),
+        ('L2', 'Lower 2', ['hinge', ('quad2', 'core'), 'ham', 'calves'])],
+}
+TRIM_ORDER = ('calves', 'core', 'biceps', 'triceps')   # dropped first when a day runs past the time budget
+SET_WORK_S, PAIR_SWITCH_S, WARMUP_S, WARMUP2_S, TRANSITION_S = 40, 30, 180, 120, 60
+PLAN_RULE = ('Double progression: when every working set reaches the top of the range, add weight next session; '
+             'below the bottom of the range twice in a row, drop 10 % and build back. a/b = pair: alternate them, '
+             'rest after the pair.')
+
+
+class PlanError(Exception):
+    pass
+
+
+def jefit_ex_id(key):
+    m = re.match(r'jefit:([01]):(\d+)$', key or '')
+    return (('d_' if m.group(1) == '1' else 'u_') + m.group(2).zfill(12)) if m else None
+
+
+def short_name(name):
+    s = re.sub(r'\s*\([^)]*\)', '', name or '')
+    return re.sub(r'^(barbell|dumbbell|machine|cable|ez bar|kettlebell)\s+', '', s, flags=re.I).strip() or name
+
+
+def write_private_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + '.tmp'
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as fh:
+        json.dump(data, fh, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def plan_pool(conn, end):
+    """-> {exercise name: info} for every logged exercise: sessions in the last year, last date, recent e1RM/reps."""
+    keys = {}
+    for k, xid in conn.execute("SELECT key, exercise_id FROM exercise_keys WHERE key LIKE 'jefit:%' ORDER BY key"):
+        keys.setdefault(xid, jefit_ex_id(k))
+    ex = {}
+    q = ('SELECT e.id, e.name, e.muscle, e.secondary, e.equipment, e.kind, x.date, s.weight_kg, s.reps '
+         'FROM sets s JOIN exercise_logs l ON l.id=s.log_id JOIN exercises e ON e.id=l.exercise_id '
+         'JOIN sessions x ON x.id=l.session_id WHERE x.date <= ? ORDER BY x.date, x.start_ts, l.pos, s.idx')
+    for xid, name, mus, sec, eq, kind, date, w, reps in conn.execute(q, (end.isoformat(),)):
+        e = ex.setdefault(name, {'name': name, 'muscle': mus or 'other', 'jefit_id': keys.get(xid),
+                                 'secondary': [s for s in (sec or '').split(',') if s], 'equipment': eq or 'other',
+                                 'kind': kind or 'weight', 'days': {}})
+        e['days'].setdefault(date, []).append((w or 0.0, reps))
+    year = (end - dt.timedelta(days=365)).isoformat()
+    for e in ex.values():
+        dates = sorted(e['days'])
+        sets = [s for d in dates[-3:] for s in e['days'][d]]
+        e.update(n_year=sum(1 for d in dates if d >= year), last=dates[-1],
+                 idle_days=(end - dt.date.fromisoformat(dates[-1])).days,
+                 e1rm=max((epley(w, r) or 0 for w, r in sets if w > 0 and r and 1 <= r <= 15), default=0),
+                 best_reps=max((r for _, r in sets if r), default=0))
+    return ex
+
+
+def slot_match(slot, e):
+    s, n = SLOTS[slot], norm_name(e['name'])
+    if s.get('muscle') and e['muscle'] != s['muscle']:
+        return False
+    if s.get('rx') and not re.search(s['rx'], n):
+        return False
+    if s.get('not') and re.search(s['not'], n):
+        return False
+    return not (slot == 'core' and e['kind'] == 'timed')
+
+
+def slot_score(slot, e):
+    s = SLOTS[slot]
+    score = e['n_year'] - 0.25 * e['idle_days'] / 30.4
+    if s['role'] == 'main' and e['equipment'] in s.get('pref', ()):
+        score += 20
+    if slot != 'core' and e['kind'] == 'weight':
+        score += 5
+    return score
+
+
+def plan_pick(slot, pool, used, exclude=()):
+    """Best exercise from his own log for a slot: familiar (sessions in the last year), recent, loadable."""
+    for min_n in (2, 1):
+        c = [e for e in pool.values() if e['n_year'] >= min_n and e['jefit_id'] and e['name'] not in exclude
+             and slot_match(slot, e)]
+        c = [e for e in c if e['name'] not in used] or c       # reuse only when nothing else fits
+        if c:
+            return max(c, key=lambda e: (slot_score(slot, e), e['name']))
+    return None
+
+
+def plan_step(e):
+    return 5.0 if e['equipment'] in ('cable', 'machine') else 2.5
+
+
+def plan_inc(slot, e):
+    n, eq = norm_name(e['name']), e['equipment']
+    if eq in ('barbell', 'trap bar'):
+        return 5.0 if slot in ('squat', 'hinge') or e['muscle'] in ('quads', 'hamstrings', 'glutes') else 2.5
+    if eq == 'machine' and re.search(r'\b(leg press|calf press)\b', n):
+        return 10.0
+    return 5.0 if eq in ('cable', 'machine') else 2.5
+
+
+def start_weight(e, lo, hi):
+    """-> (kg or None, target reps, basis). Start where the middle of the range leaves ~2 reps in reserve:
+    e1RM (best Epley of the last 3 sessions) x detraining / (1 + (mid + 2) / 30), rounded down to the step."""
+    mid = (lo + hi) / 2
+    if not e['e1rm']:
+        t = min(hi, max(lo, int(e['best_reps'] * 0.75)))
+        return None, t, f"bodyweight, best {e['best_reps']} reps"
+    f = 1.0 if e['idle_days'] < 56 else 0.9 if e['idle_days'] < 183 else 0.85
+    step = plan_step(e)
+    w = math.floor(round(e['e1rm'] * f / (1 + (mid + 2) / 30) / step, 3)) * step
+    basis = f"e1RM {fmt_kg(e['e1rm'])} (last {ddmm(e['last'])})" + (f' x{f}' if f < 1 else '')
+    return max(w, step), int(mid), basis
+
+
+def plan_exercise(slot, e, role, goal, group):
+    sets, lo, hi, rest = GOALS[goal][role]
+    w, target, basis = start_weight(e, lo, hi)
+    return {'slot': slot, 'name': e['name'], 'jefit_id': e['jefit_id'], 'muscle': e['muscle'],
+            'secondary': e['secondary'], 'equipment': e['equipment'], 'role': role, 'group': group, 'sets': sets,
+            'lo': lo, 'hi': hi, 'reps': target, 'rest_s': rest, 'pair_rest_s': rest, 'weight_kg': w,
+            'inc_kg': plan_inc(slot, e) if w else 0.0, 'step_kg': plan_step(e), 'basis': basis,
+            'stalls': 0, 'fails': 0}
+
+
+def relabel(exs):
+    """Numbers per group (1, 2, 3a/3b ...); in a pair the first rests briefly, the last takes the pair's rest."""
+    groups = []
+    for x in exs:
+        if groups and groups[-1][0]['group'] == x['group']:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    for i, g in enumerate(groups, 1):
+        for j, x in enumerate(g):
+            x['label'] = f'{i}{"abcd"[j]}' if len(g) > 1 else str(i)
+            x['rest_s'] = PAIR_SWITCH_S if j < len(g) - 1 else max(y['pair_rest_s'] for y in g)
+    return groups
+
+
+def est_minutes(exs):
+    t, mains = 0, 0
+    for g in relabel(exs):
+        for r in range(max(x['sets'] for x in g)):
+            t += sum(SET_WORK_S + x['rest_s'] for x in g if x['sets'] > r)
+        for x in g:
+            if x['role'] == 'main':
+                t += WARMUP_S if mains == 0 else WARMUP2_S
+                mains += 1
+        t += TRANSITION_S
+    return round(t / 60)
+
+
+def plan_volume(days):
+    v = {m: 0.0 for m in MUSCLES}
+    for d in days:
+        for x in d['exercises']:
+            if x['muscle'] in v:
+                v[x['muscle']] += x['sets']
+            for s in x['secondary']:
+                if s in v:
+                    v[s] += 0.5 * x['sets']
+    return {k: round(x, 1) for k, x in v.items()}
+
+
+def build_plan(conn, days, goal, minutes, swaps, end):
+    pool = plan_pool(conn, end)
+    if not pool:
+        raise PlanError('no workout history yet: run `gym sync` (or import a CSV) first')
+    for old, new in swaps.items():
+        if new not in pool or not pool[new]['jefit_id']:
+            raise PlanError(f'--swap: "{new}" is not in your log (with a Jefit id); see `gym exercises`')
+    used, out, notes = set(), [], []
+    for key, title, items in TEMPLATES[days]:
+        exs = []
+        for gi, it in enumerate(items, 1):
+            for slot in (it if isinstance(it, tuple) else (it,)):
+                e = plan_pick(slot, pool, used)
+                if e and e['name'] in swaps:
+                    e = pool[swaps[e['name']]]
+                if not e:
+                    notes.append(f'{key}: nothing in your log fits the {slot} slot; left out')
+                    continue
+                used.add(e['name'])
+                exs.append(plan_exercise(slot, e, SLOTS[slot]['role'], goal, gi))
+        relabel(exs)
+        for slot in TRIM_ORDER:
+            if est_minutes(exs) <= minutes + 5:
+                break
+            drop = [x for x in exs if x['slot'] == slot]
+            if drop:
+                exs.remove(drop[-1])
+                notes.append(f'{key}: {drop[-1]["name"]} left out to stay near {minutes} min')
+                relabel(exs)
+        mains = [short_name(x['name']) for x in exs if x['role'] == 'main']
+        out.append({'key': key, 'name': f'{key} · ' + (' + '.join(mains) if mains else title), 'exercises': exs,
+                    'est_min': est_minutes(exs)})
+    r = analyze(conn, weeks=4, end=end)
+    for lift in r.get('main_lifts') or []:
+        if lift['status'] == 'plateau' and lift['exercise'] in used:
+            notes.append(f"{lift['exercise']}: no PR in {round(lift['weeks_since_pr'])} wk; new rep range in this plan")
+    now = r.get('hard_sets_per_week_4w') or {}
+    return {'version': 1, 'name': PLAN_NAME, 'created': end.isoformat(), 'updated': end.isoformat(), 'goal': goal,
+            'days_per_week': days, 'minutes': minutes, 'days': out, 'volume': plan_volume(out),
+            'volume_now': {k: round(v, 1) for k, v in now.items()}, 'notes': notes, 'rule': PLAN_RULE}
+
+
+def plan_card(plan):
+    lines = [f"Plan \"{plan['name']}\" v{plan['version']} · {plan['days_per_week']} days/week · goal {plan['goal']}"
+             f" · ~{plan['minutes']} min"]
+    for d in plan['days']:
+        lines.append(f"{d['name']} (~{d['est_min']} min)")
+        for x in d['exercises']:
+            w = f"{fmt_kg(x['weight_kg'])} kg" if x['weight_kg'] else \
+                'band' if x.get('equipment') == 'band' else 'bodyweight'
+            rest = f"rest {x['rest_s'] // 60}:{x['rest_s'] % 60:02d}" if x['rest_s'] > PAIR_SWITCH_S else '→ pair'
+            lines.append(f"  {x['label']:<3}{x['name']}  {x['sets']}×{x['lo']}–{x['hi']} @ {w}  {rest}"
+                         + (f"  (for {x['for']})" if x.get('for') else ''))
+            if x.get('cue'):
+                lines.append(f"       {x['cue']}")
+    vol, now = plan.get('volume') or {}, plan.get('volume_now') or {}
+    lines.append('Hard sets/week: ' + ', '.join(f"{m} {fmt_kg(vol[m])} ({fmt_kg(now.get(m, 0))})"
+                                                for m in MUSCLES if vol.get(m) or now.get(m)) + ' — (now)')
+    lines.append('Rule: ' + plan['rule'])
+    lines += [f'Note: {n}' for n in plan.get('notes') or []]
+    lines.append('Suggestions only, not medical advice.')
+    return '\n'.join(lines)
+
+
+def free_evenings(day, n=3):
+    """Free evenings (18-23) in the next n days from calcache's cache (token-free): ['today', 'Wed', ...];
+    None without a cache, on any error, or with GYM_CALCACHE=off."""
+    import subprocess
+    bin_ = os.environ.get('GYM_CALCACHE') or os.path.join(HOME, 'bin/calcache')
+    if bin_ == 'off' or not os.path.exists(bin_):
+        return None
+    try:
+        r = subprocess.run([bin_, 'busy', day.isoformat(), '--days', str(n), '--json'], capture_output=True,
+                           text=True, timeout=15)
+        rows = [x for x in json.loads(r.stdout) if x.get('covered')] if r.returncode in (0, 4) else []
+        if not rows:
+            return None
+        return ['today' if x['date'] == day.isoformat() else dt.date.fromisoformat(x['date']).strftime('%a')
+                for x in rows if not x.get('evening_busy')]
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, AttributeError):
+        return None
+
+
+def evenings_line(day, n=3):
+    """Optional /gym card line: free evenings from free_evenings(); '' when that has nothing."""
+    free = free_evenings(day, n)
+    if free is None:
+        return ''
+    return '\n📅 Free evenings: ' + (', '.join(free) if free else f'none in the next {n} days')
+
+
+def next_day(conn, plan, end):
+    """-> (index of the plan day the last logged session matches or None, the next plan day): the day after the
+    match (largest share of its exercises, no tie), else the first day."""
+    days = plan['days']
+    done = None
+    sessions, ex = load(conn)
+    sessions = [s for s in sessions if s['date'] <= end.isoformat()]
+    if sessions:
+        names = {norm_name(ex[lg['ex']]['name']) for lg in sessions[-1]['logs']}
+        scores = [len(names & {norm_name(x['name']) for x in d['exercises']}) / max(1, len(d['exercises']))
+                  for d in days]
+        if max(scores) and scores.count(max(scores)) == 1:
+            done = scores.index(max(scores))
+    return done, days[(done + 1) % len(days)] if done is not None else days[0]
+
+
+# the three main lifts on the dashboard: first matching exercise name (normalized) wins, in this order
+MAIN_LIFTS = (('squat', ('barbell squat', 'squat', 'barbell back squat', 'back squat')),
+              ('bench', ('barbell bench press', 'bench press')),
+              ('deadlift', ('barbell deadlift', 'deadlift', 'conventional deadlift')))
+
+
+def lift_trends(conn, end, weeks=4):
+    """e1RM trend of squat, bench and deadlift from the local log: per lift the best e1RM of each session up to
+    `end`; last = the newest value, change = last minus the newest value on or before end - weeks; None when the
+    lift was not done in those weeks or has no older value. series = the sessions of the last 12 weeks (date, e1RM)."""
+    sessions, ex = load(conn)
+    by_name = {}
+    for s in sessions:
+        if s['date'] > end.isoformat():
+            continue
+        for lg in s['logs']:
+            e = ex[lg['ex']]
+            vals = [x['e1rm'] for x in lg['sets'] if x['e1rm']]
+            if e['kind'] == 'weight' and vals:
+                pts = by_name.setdefault(norm_name(e['name']), {'name': e['name'], 'pts': {}})
+                pts['pts'][s['date']] = max(pts['pts'].get(s['date'], 0), max(vals))
+    out = []
+    for key, names in MAIN_LIFTS:
+        hit = next((by_name[n] for n in names if n in by_name), None)
+        if not hit:
+            out.append({'lift': key, 'exercise': None, 'last': None, 'last_date': None, 'change': None,
+                        'series': []})
+            continue
+        pts = sorted(hit['pts'].items())
+        last_d, last_v = pts[-1]
+        cut = (end - dt.timedelta(weeks=weeks)).isoformat()
+        base = [v for d, v in pts if d <= cut] if last_d > cut else []
+        since = (end - dt.timedelta(weeks=12)).isoformat()
+        out.append({'lift': key, 'exercise': hit['name'], 'last': round(last_v, 1), 'last_date': last_d,
+                    'change': round(last_v - base[-1], 1) if base else None,
+                    'series': [[d, round(v, 1)] for d, v in pts if d >= since]})
+    return out
+
+
+# ----------------------------------------------------------------------------- other activity (dance, from calcache)
+ACTIVITY_FILE = os.path.join(STATE, 'activity.json')
+ACTIVITY_KEEP_DAYS = 400
+SHUFFLE_RE = re.compile(r'\bshuffle', re.I)
+RAVE_RE = re.compile(r'\brave|\bclub|techno|festival|open[- ]?air|afterhour|warehouse|boiler room', re.I)
+RAVE_MIN_H, ACT_MAX_H = 2.0, 12.0
+ACT_KINDS = (('shuffle', '🕺'), ('rave', '🪩'))
+
+
+def rave_artists():
+    """rave-radar's artist names + aliases (lowercase, 3+ letters); [] when missing, off or failing."""
+    import subprocess
+    bin_ = os.environ.get('GYM_RAVE_RADAR') or os.path.join(HOME, 'bin/rave-radar')
+    if bin_ == 'off' or not os.path.exists(bin_):
+        return []
+    try:
+        r = subprocess.run([bin_, 'artists', 'list', '--json'], capture_output=True, text=True, timeout=10)
+        rows = json.loads(r.stdout) if r.returncode == 0 else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    names = []
+    for a in rows if isinstance(rows, list) else []:
+        if isinstance(a, dict):
+            names += [n.strip().lower() for n in [a.get('name'), *(a.get('aliases') or [])]
+                      if isinstance(n, str) and len(n.strip()) >= 3]
+    return names
+
+
+def artist_hit(text, names):
+    """An artist named in text: whole words, or close enough for a typo when the name is 6+ letters."""
+    import difflib
+    low = text.lower()
+    toks = re.findall(r"[\w'&.-]+", low)
+    for n in names:
+        if re.search(r'(?<!\w)' + re.escape(n) + r'(?!\w)', low):
+            return True
+        k = len(n.split())
+        if len(n) >= 6 and any(difflib.SequenceMatcher(None, ' '.join(toks[i:i + k]), n).ratio() >= 0.85
+                               for i in range(len(toks) - k + 1)):
+            return True
+    return False
+
+
+def activity_kind(ev, artists):
+    """(kind, hours) for one calcache event: 'shuffle' (title says shuffle) or 'rave' (rave/club words or a rave-radar
+    artist, 2+ h); timed events only, travel legs never; hours capped at 12. artists() is called lazily. Else None."""
+    if not isinstance(ev, dict) or ev.get('all_day') or (ev.get('flags') or {}).get('travel'):
+        return None
+    try:
+        hours = (dt.datetime.fromisoformat(ev['end']) - dt.datetime.fromisoformat(ev['start'])).total_seconds() / 3600
+    except (KeyError, TypeError, ValueError):
+        return None
+    title = str(ev.get('title') or '')
+    if not 0 < hours <= 24:
+        return None
+    if SHUFFLE_RE.search(title):
+        return 'shuffle', round(min(hours, ACT_MAX_H), 2)
+    if hours >= RAVE_MIN_H and (RAVE_RE.search(title) or artist_hit(title, artists())):
+        return 'rave', round(min(hours, ACT_MAX_H), 2)
+    return None
+
+
+def activity_sync(now):
+    """Merge calcache's events (today on) into activity.json: per event id {date, start, end, kind, hours}, no titles.
+    Entries dated today or later that left the cache are dropped (cancelled/renamed); past days stay as observed.
+    Writes only on change. Returns the store; a missing/failed calcache (or GYM_CALCACHE=off) only reads it."""
+    import subprocess
+    store = read_json(ACTIVITY_FILE)
+    store = store if isinstance(store, dict) and isinstance(store.get('events'), dict) else {'events': {}}
+    bin_ = os.environ.get('GYM_CALCACHE') or os.path.join(HOME, 'bin/calcache')
+    if bin_ == 'off' or not os.path.exists(bin_):
+        return store
+    try:
+        r = subprocess.run([bin_, 'show', '--days', '21', '--json'], capture_output=True, text=True, timeout=15)
+        evs = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        evs = None
+    if not isinstance(evs, list):
+        return store
+    tz, today_s = owner_tz(), now.date().isoformat()
+    cache = {}
+
+    def artists():
+        if 'a' not in cache:
+            cache['a'] = rave_artists()
+        return cache['a']
+    seen = {}
+    for ev in evs:
+        k = activity_kind(ev, artists)
+        if k and ev.get('id'):
+            start = dt.datetime.fromisoformat(ev['start'])
+            start = start.astimezone(tz) if start.tzinfo else start
+            seen[str(ev['id'])] = {'date': start.date().isoformat(), 'start': ev['start'], 'end': ev['end'],
+                                   'kind': k[0], 'hours': k[1]}
+    keep = (now.date() - dt.timedelta(days=ACTIVITY_KEEP_DAYS)).isoformat()
+    events = {i: v for i, v in store['events'].items()
+              if isinstance(v, dict) and keep <= str(v.get('date', '')) < today_s}
+    events.update(seen)
+    new = {'version': 1, 'since': store.get('since') or today_s, 'events': events}
+    if new != store:
+        try:
+            os.makedirs(STATE, mode=0o700, exist_ok=True)
+            tmp = f'{ACTIVITY_FILE}.{os.getpid()}.tmp'
+            with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as fh:
+                json.dump(new, fh, indent=1)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, ACTIVITY_FILE)
+        except OSError:
+            pass
+    return new
+
+
+def other_activity(end, weeks=8, now=None):
+    """Dance per week for the `weeks` weeks to `end` (same Monday weeks as analyze): {since, this_week, total, weeks:
+    [{start, shuffle: {count, hours}, rave: {...}}]}; events count once they are over (end <= now, or within `end`)."""
+    now = now or now_dt()
+    try:
+        store = activity_sync(now)
+    except Exception:          # never break the card over the calendar
+        store = read_json(ACTIVITY_FILE) or {}
+    cutoff = min(now, dt.datetime.combine(end + dt.timedelta(days=1), dt.time(), now.tzinfo or owner_tz()))
+    win0 = week_start(end) - dt.timedelta(weeks=weeks - 1)
+    blank = lambda: {k: {'count': 0, 'hours': 0.0} for k, _ in ACT_KINDS}
+    rows = {(win0 + dt.timedelta(weeks=i)).isoformat(): dict(start=(win0 + dt.timedelta(weeks=i)).isoformat(), **blank())
+            for i in range(weeks)}
+    evs = store.get('events') if isinstance(store.get('events'), dict) else {}
+    for v in evs.values():
+        try:
+            e_ = dt.datetime.fromisoformat(v['end'])
+            e_ = e_ if e_.tzinfo else e_.replace(tzinfo=owner_tz())
+            row = rows.get(week_start(dt.date.fromisoformat(v['date'])).isoformat())
+            b = row and row.get(v['kind'])
+            if not b or e_ > cutoff:
+                continue
+            b['count'] += 1
+            b['hours'] = round(b['hours'] + float(v['hours']), 1)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    wl = list(rows.values())
+    total = blank()
+    for w in wl:
+        for k, _ in ACT_KINDS:
+            total[k]['count'] += w[k]['count']
+            total[k]['hours'] = round(total[k]['hours'] + w[k]['hours'], 1)
+    return {'since': store.get('since'), 'this_week': {k: wl[-1][k] for k, _ in ACT_KINDS}, 'total': total,
+            'weeks': wl}
+
+
+def act_any(b):
+    return any((b.get(k) or {}).get('count') for k, _ in ACT_KINDS)
+
+
+def act_h(h):
+    return f'{h:.0f} h' if abs(h - round(h)) < 0.05 else f'{h:.1f} h'
+
+
+def act_text(b, emoji=True, counts=False):
+    """'🕺 shuffle 1 h · 🪩 rave 6 h' for a {shuffle, rave} block ('' when empty); counts=True: 'shuffle 4× 4 h'."""
+    out = []
+    for k, emo in ACT_KINDS:
+        x = b.get(k) or {}
+        if x.get('count'):
+            n = f"{x['count']}× " if counts or x['count'] > 1 else ''
+            out.append((f'{emo} ' if emoji else '') + f'{k} {n}{act_h(x["hours"])}')
+    return (' · ' if emoji else ', ').join(out)
+
+
+def act_line(oa):
+    """One /gym line: 'Dance: 🕺 shuffle 1 h this week · 8 wk: shuffle 4× 4 h, rave 1× 8 h'; '' when 8 weeks empty."""
+    if not oa or not act_any(oa['total']):
+        return ''
+    tot = act_text(oa['total'], emoji=False, counts=True)
+    wk = act_text(oa['this_week'])
+    return f'Dance: {wk} this week · {len(oa["weeks"])} wk: {tot}' if wk else f'Dance ({len(oa["weeks"])} wk): {tot}'
+
+
+def week_status(sessions, dance, current):
+    """'gym' | 'active' (dance, no gym) | 'missed' | 'open' (this week, nothing yet)."""
+    return 'gym' if sessions else 'active' if dance else 'open' if current else 'missed'
+
+
+def plan_next_json(conn, plan, end):
+    """The dashboard block (`gym plan next --json`): numbers and exercise names only, local data only."""
+    r = analyze(conn, 8, end)
+    c = r['consistency']
+    has_plan = bool(plan and plan.get('days'))
+    target = plan.get('days_per_week') if has_plan else None
+    wk = week_start(end).isoformat()
+    this = next((w for w in r['weekly'] if w['start'] == wk), None)
+    res = {'schema': 1, 'date': end.isoformat(),
+           'plan': ({'name': plan.get('name'), 'version': plan.get('version'), 'days_per_week': target,
+                     'in_jefit': (read_json(PUSHED_FILE) or {}).get('status') == 'complete'} if has_plan else None),
+           'week': {'start': wk, 'sessions': this['sessions'] if this else 0, 'target': target},
+           'weeks': [{'start': w['start'], 'sessions': w['sessions']} for w in r['weekly']],
+           'other_activity': other_activity(end, 8),
+           'streak_weeks': c['streak_weeks'], 'longest_streak_weeks': c['longest_streak_weeks'],
+           'sessions_per_week_4w': r['sessions_per_week_4w'], 'total_sessions': r['total_sessions'],
+           'last_session': None, 'next': None, 'lifts': lift_trends(conn, end), 'free_evenings': free_evenings(end)}
+    dance = {w['start']: act_any(w) for w in res['other_activity']['weeks']}
+    for w in res['weeks']:
+        w['status'] = week_status(w['sessions'], dance.get(w['start']), w['start'] == wk)
+    res['week']['status'] = week_status(res['week']['sessions'], dance.get(wk), True)
+    done = None
+    if has_plan:
+        done, d = next_day(conn, plan, end)
+        lead = (d.get('exercises') or [{}])[0]
+        res['next'] = {'key': d.get('key'), 'name': d.get('name'), 'est_min': d.get('est_min'),
+                       'lead': lead.get('name'), 'lead_sets': lead.get('sets'), 'lead_reps': [lead.get('lo'), lead.get('hi')],
+                       'lead_kg': lead.get('weight_kg')}
+    if r['last_date']:
+        res['last_session'] = {'date': r['last_date'], 'days_ago': c['days_since_last'],
+                               'day': plan['days'][done].get('key') if done is not None else None}
+    return res
+
+
+def plan_next(conn, plan, end):
+    """Phone card of the next session, from local data only (the DB as of the last sync/import): the plan day
+    after the one the last logged session matches (largest share of its exercises, no tie), else the first day; each
+    exercise with sets×reps @ weight; last session date and the weekly streak. No plan: the review's summary line."""
+    r = analyze(conn, 4, end)
+    c = r['consistency']
+    last = r['last_date']
+    ago = c['days_since_last']
+    ago_txt = None if ago is None else 'today' if ago == 0 else 'yesterday' if ago == 1 else f'{ago} d ago'
+    if not plan or not plan.get('days'):
+        if not r['total_sessions']:
+            dl = act_line(other_activity(end, 8))
+            return '🏋️ Gym · no plan and no sessions logged yet' + (f'\n{dl}' if dl else '')
+        n4 = round(r['sessions_per_week_4w'] * 4)
+        dl = act_line(other_activity(end, 8))
+        return ('🏋️ Gym · no plan yet\n'
+                f"{n4} sessions in 4 wk ({r['sessions_per_week_4w']}/wk) · streak {c['streak_weeks']} wk"
+                f" · last {ddmm(last)} ({ago_txt})" + (f'\n{dl}' if dl else ''))
+    days = plan['days']
+    done, d = next_day(conn, plan, end)
+    L = [f"🏋️ Next: {d['name']} (~{d['est_min']} min)"]
+    if last:
+        L.append(f"Last session {ddmm(last)}" + (f" ({days[done]['key']}, {ago_txt})" if done is not None
+                                                  else f" ({ago_txt})") + f" · streak {c['streak_weeks']} wk")
+    else:
+        L.append('No session logged yet')
+    dl = act_line(other_activity(end, 8))
+    if dl:
+        L.append(dl)
+    L.append('')
+    for x in d['exercises']:
+        w = f"{fmt_kg(x['weight_kg'])} kg" if x['weight_kg'] else 'bodyweight'
+        L.append(f"{x['label']:<3}{x['name']}  {x['sets']}×{x['lo']}–{x['hi']} @ {w}")
+    if any(x['label'][-1:] in 'ab' and not x['label'].isdigit() for x in d['exercises']):
+        L.append('a/b = pair: alternate them, rest after the pair')
+    pushed = read_json(PUSHED_FILE) or {}
+    if pushed.get('status') == 'complete':
+        jf = ('in Jefit' if pushed.get('plan_version') == plan.get('version')
+              else f"Jefit has v{pushed.get('plan_version')}")
+    else:
+        jf = 'not in Jefit yet'
+    row = conn.execute('SELECT at FROM imports ORDER BY id DESC LIMIT 1').fetchone()
+    synced = ''
+    try:
+        at = dt.datetime.fromisoformat(row[0])
+        at = at.astimezone(owner_tz()) if at.tzinfo else at
+        synced = f" · log synced {ddmm(at.date().isoformat())} {at:%H:%M}"
+    except (TypeError, ValueError):
+        pass
+    L += ['', f"Plan v{plan.get('version')} · {jf}{synced}"]
+    return '\n'.join(L)
+
+
+def plan_description(plan, mark=PLAN_MARK):
+    parts = [d['key'] + ': ' + ', '.join(f"{x['label']} {short_name(x['name'])} {x['sets']}x{x['lo']}-{x['hi']}"
+                                         for x in d['exercises']) for d in plan['days']]
+    return (f"{mark} {plan['days_per_week']} days/week, goal {plan['goal']}. " + ' | '.join(parts) + '. '
+            + plan['rule'])[:1000]
+
+
+def plan_target(plan, prof=None):
+    """The Jefit routine the plan should be (weights as weight_lbs: Jefit stores pounds)."""
+    prof = prof or routine_profile()
+    days = []
+    for i, d in enumerate(plan['days']):
+        exs = []
+        for x in d['exercises']:
+            lbs = round(x['weight_kg'] / LB, 4) if x.get('weight_kg') else None
+            one = {'reps': x['reps'], 'weight_lbs': lbs, 'rest_time': x['rest_s'], 'duration': 0, 'type': 'default'}
+            exs.append({'exercise_id': x['jefit_id'], 'name': x['name'], 'count': x['sets'],
+                        'number_of_reps': [x['reps']] * x['sets'], 'rest_time': x['rest_s'],
+                        'sets': [dict(one) for _ in range(x['sets'])]})
+        days.append({'name': d['name'], 'index': i + 1, 'day_of_week': 7, 'exercises': exs})
+    return {'routine': {'name': prof['name'], 'description': plan_description(plan, prof['mark']),
+                        'day_indexing_style': 'number',
+                        'focus': 'general', 'difficulty': 'intermediate', 'day_count': len(days)}, 'days': days}
+
+
+def ex_add_ops(dk, ek, x):
+    """Add an exercise, then ONE PATCH with all its fields (Jefit takes several fields per call; read back 19.10)."""
+    return [('add_ex', dk, ek, x['exercise_id']), ('patch_ex', ek, {f: x[f] for f in EX_FIELDS})]
+
+
+def field_eq(f, a, b):
+    """Same value for a day_exercise field; per-set values compare reps, rest and weight (0.01 lb)."""
+    if f != 'sets':
+        return a == b
+    if not isinstance(a, list) or not isinstance(b, list) or len(a) != len(b):
+        return False
+    return all(isinstance(s, dict) and s.get('reps') == w.get('reps') and s.get('rest_time') == w.get('rest_time')
+               and abs((s.get('weight_lbs') or 0) - (w.get('weight_lbs') or 0)) <= 0.01 for s, w in zip(a, b))
+
+
+def live_target(r):
+    """A live Jefit routine in plan_target()'s shape, to resume a push that stopped half-way."""
+    days = []
+    for d in sorted_days(r):
+        exs = []
+        for e in sorted_exs(d):
+            sets = sorted(e.get('sets') or [], key=lambda s: s.get('index') or 0)
+            exs.append({'exercise_id': str((e.get('exercise') or {}).get('id')), 'count': e.get('count'),
+                        'number_of_reps': e.get('number_of_reps'), 'rest_time': e.get('rest_time'),
+                        'sets': [{k: st.get(k) for k in ('reps', 'weight_lbs', 'rest_time')} for st in sets]})
+        days.append({'name': d.get('name'), 'index': d.get('index'), 'day_of_week': d.get('day_of_week'),
+                     'exercises': exs})
+    return {'routine': {k: r.get(k) for k in ('name', 'description', 'day_indexing_style', 'focus', 'difficulty',
+                                              'day_count')}, 'days': days}
+
+
+def plan_ops(target, pushed, rebuild=False, live=None):
+    """Abstract writes (symbols R, D1, D1E1 ... stand for Jefit ids). The diff base is `live` (resume, from
+    live_target), else the last complete push; with neither, or --rebuild, a full build."""
+    pushed = pushed or {}
+    old = live if live is not None else (pushed.get('target') if pushed.get('status') == 'complete' else None)
+    if rebuild or old is None:
+        ops = [('delete_routine', 'R_old')] if rebuild and pushed.get('routine_id') else []
+        ops += [('create_routine', 'R'), ('patch_routine', 'R', target['routine'])]
+        for i, d in enumerate(target['days']):
+            dk = f'D{i + 1}'
+            f = {k: d[k] for k in ('name', 'index', 'day_of_week')}
+            ops.append(('patch_day', dk, f) if i == 0 else ('add_day', dk, f))
+            for j, x in enumerate(d['exercises']):
+                ops += ex_add_ops(dk, f'{dk}E{j + 1}', x)
+        return ops
+    ops = []
+    ch = {k: v for k, v in target['routine'].items() if old['routine'].get(k) != v}
+    if ch:
+        ops.append(('patch_routine', 'R', ch))
+    for i, d in enumerate(target['days']):
+        dk = f'D{i + 1}'
+        if i >= len(old['days']):
+            ops.append(('add_day', dk, {k: d[k] for k in ('name', 'index', 'day_of_week')}))
+            for j, x in enumerate(d['exercises']):
+                ops += ex_add_ops(dk, f'{dk}E{j + 1}', x)
+            continue
+        od = old['days'][i]
+        dch = {k: d[k] for k in ('name', 'index', 'day_of_week') if od.get(k) != d[k]}
+        if dch:
+            ops.append(('patch_day', dk, dch))
+        oe, ne = od['exercises'], d['exercises']
+        k = 0
+        while k < min(len(oe), len(ne)) and oe[k]['exercise_id'] == ne[k]['exercise_id']:
+            k += 1
+        for j in range(k):
+            fields = {f: ne[j][f] for f in EX_FIELDS if not field_eq(f, oe[j].get(f), ne[j][f])}
+            if fields:
+                ops.append(('patch_ex', f'{dk}E{j + 1}', fields))
+        ops += [('delete_ex', f'{dk}E{j + 1}') for j in range(len(oe) - 1, k - 1, -1)]
+        for j in range(k, len(ne)):
+            ops += ex_add_ops(dk, f'{dk}E{j + 1}', ne[j])
+    ops += [('delete_day', f'D{i + 1}') for i in range(len(old['days']) - 1, len(target['days']) - 1, -1)]
+    return ops
+
+
+def op_request(op):
+    """-> (method, path with {SYMBOL}s, body)."""
+    k = op[0]
+    if k == 'create_routine':
+        return 'POST', '/api/v2/user/routines', {'create_day': True}
+    if k in ('patch_routine', 'patch_day'):
+        return 'PATCH', ('/api/v2/routines/{%s}' if k == 'patch_routine' else '/api/v2/days/{%s}') % op[1], \
+            {'data': op[2]}
+    if k == 'add_day':
+        return 'POST', '/api/v2/routines/{R}/days', {'data': op[2]}
+    if k == 'add_ex':
+        return 'POST', '/api/v2/days/{%s}/day_exercises' % op[1], {'data': {'exercise': {'id': op[3]}}}
+    if k == 'patch_ex':
+        return 'PATCH', '/api/v2/day_exercises/{%s}' % op[1], {'data': op[2]}
+    return 'DELETE', {'delete_routine': '/api/v2/routines/{%s}', 'delete_day': '/api/v2/days/{%s}',
+                      'delete_ex': '/api/v2/day_exercises/{%s}'}[k] % op[1], None
+
+
+def test_requests(first_ex_id):
+    lbs = round(80 / LB, 4)
+    return [('GET', '/api/v2/user/routines', None), ('POST', '/api/v2/user/routines', {'create_day': True}),
+            ('PATCH', '/api/v2/routines/{T}', {'data': {'name': TEST_NAME}}), ('GET', '/api/v2/routines/{T}', None),
+            ('POST', '/api/v2/days/{T_D1}/day_exercises', {'data': {'exercise': {'id': first_ex_id}}}),
+            ('PATCH', '/api/v2/day_exercises/{T_E1}', {'data': {'sets': [
+                {'reps': 5, 'weight_lbs': lbs, 'rest_time': 150, 'duration': 0, 'type': 'default'}]}}),
+            ('GET', '/api/v2/day_exercises/{T_E1}', None), ('DELETE', '/api/v2/routines/{T}', None),
+            ('GET', '/api/v2/user/routines', None)]
+
+
+def retry_after_s(v):
+    """Retry-After header (seconds or an HTTP date) -> seconds, or None."""
+    v = (v or '').strip()
+    if not v:
+        return None
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        pass
+    try:
+        t = email.utils.parsedate_to_datetime(v)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (t - dt.datetime.now(dt.timezone.utc)).total_seconds())
+
+
+class PlanWriter:
+    """HTTP for plan pushes. Refuses any write outside WRITE_RULES or touching an id it does not own.
+    Paces every request (`delay` s apart) and retries HTTP 429 (Retry-After, else 5-60 s backoff)."""
+
+    def __init__(self, cfg, token, delay=None, sleep=None, backoff=None, handle=None):
+        self.cfg, self._t, self.count, self.sent, self.handle = cfg, token, 0, [], handle
+        self.owned, self.deletable = set(), set()
+        self.delay = float(os.environ.get('GYM_WRITE_DELAY', '1.0') if delay is None else delay)
+        self.backoff = float(os.environ.get('GYM_RETRY_BASE', RETRY_BASE_S) if backoff is None else backoff)
+        self.sleep = sleep or time.sleep
+        self.retries, self.waited, self._last = 0, 0.0, None
+
+    def scrub(self, s):
+        return str(s).replace(self._t, '***') if self._t else str(s)
+
+    def allowed(self, method, path):
+        if method == 'GET':
+            return path.startswith('/api/v2/')
+        for m, rx in WRITE_RULES:
+            if m == method and re.fullmatch(rx, path):
+                ids = re.findall(ID_RE, path)
+                if method == 'DELETE' and path.startswith('/api/v2/routines/'):
+                    return ids[0] in self.deletable
+                return all(i in self.owned for i in ids)
+        return False
+
+    def _pace(self):
+        if self.delay and self._last is not None:
+            wait = self._last + self.delay - time.monotonic()
+            if wait > 0:
+                self.sleep(wait)
+        self._last = time.monotonic()
+
+    def _send(self, method, path, body):
+        url = self.cfg['base'].rstrip('/') + path
+        data = json.dumps(body).encode() if body is not None else None
+        hdr = {'Authorization': f'Bearer {self._t}', 'Accept': 'application/json', 'User-Agent': 'gym-plan/1'}
+        if data is not None:
+            hdr['Content-Type'] = 'application/json'
+        req = urllib.request.Request(url, data=data, method=method, headers=hdr)
+        try:
+            with (_egress.open(req, self.handle, timeout=60) if self.handle else
+                  urllib.request.urlopen(req, timeout=60)) as r:
+                status, raw, after = r.status, r.read(20_000_000), None
+        except urllib.error.HTTPError as e:
+            status, raw = e.code, e.read(200_000) if e.fp else b''
+            after = retry_after_s(e.headers.get('Retry-After') if e.headers else None)
+        except (urllib.error.URLError, OSError) as e:
+            raise PlanError(self.scrub(f'{method} {path}: {getattr(e, "reason", e)}')) from None
+        try:
+            payload = json.loads(raw.decode('utf-8', 'replace')) if raw.strip() else {}
+        except ValueError:
+            payload = {}
+        return status, payload, after
+
+    def _journal(self, method, path, status, payload):
+        self.sent.append((method, path, status))
+        line = {'at': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'), 'method': method, 'path': path,
+                'status': status}
+        data = payload.get('data') if isinstance(payload, dict) else None
+        if method == 'POST' and path == '/api/v2/user/routines' and 200 <= status < 300 and isinstance(data, dict) \
+                and re.fullmatch(ID_RE, str(data.get('id'))):
+            line['new_id'] = data['id']             # created by this tool: a leftover may be deleted later
+        os.makedirs(os.path.dirname(PUSH_LOG), mode=0o700, exist_ok=True)
+        with open(os.open(PUSH_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), 'a') as fh:
+            fh.write(json.dumps(line) + '\n')
+
+    def call(self, method, path, body=None):
+        if not self.allowed(method, path):
+            raise PlanError(f'refused {method} {path}: outside the plan routine')
+        for attempt in range(RETRY_TRIES + 1):
+            if self.count >= 400:
+                raise PlanError('request cap reached')
+            self.count += 1
+            self._pace()
+            status, payload, after = self._send(method, path, body)
+            if method != 'GET':
+                self._journal(method, path, status, payload)
+            if status != 429 or attempt == RETRY_TRIES:
+                break
+            wait = after if after is not None else min(RETRY_CAP_S, self.backoff * 2 ** attempt)
+            if wait > RETRY_AFTER_MAX_S:
+                raise PlanError(f'Jefit rate limit: it asks to wait {wait / 60:.0f} min; run `gym plan push --apply` '
+                                'again later (it resumes)')
+            self.retries += 1
+            self.waited += wait
+            self.sleep(wait)
+        if not 200 <= status < 300:
+            err = payload.get('error') or payload.get('message') if isinstance(payload, dict) else None
+            if method != 'GET' and status in (401, 403):
+                raise PlanError(f'Jefit refused {method} {path} (HTTP {status}): the token has no write scope? '
+                                f'Create a "Read + write" token and put it in {TOKEN_RW_FILE} (0600, console only).')
+            if status == 429:
+                raise PlanError(f'Jefit still rate-limited after {RETRY_TRIES} retries; run `gym plan push --apply` '
+                                'again later (it resumes)')
+            raise PlanError(self.scrub(f'{method} {path} -> HTTP {status}' + (f': {err}' if err else '')))
+        return payload.get('data') if isinstance(payload, dict) and 'data' in payload else payload
+
+    def snapshot(self):
+        rows = self.call('GET', '/api/v2/user/routines') or []
+        return {r['id']: (r.get('name'), r.get('last_updated')) for r in rows if isinstance(r, dict)}
+
+    def routine(self, rid):
+        r = self.call('GET', f'/api/v2/routines/{rid}')
+        if not isinstance(r, dict) or not re.fullmatch(ID_RE, str(r.get('id'))):
+            raise PlanError('unexpected routine response')
+        return r
+
+    def adopt(self, r, name, mark=None):
+        """Own a routine and everything under it, only when name (and marker) match."""
+        if r.get('name') != name or (mark and mark not in (r.get('description') or '')):
+            raise PlanError(f'routine {r.get("id")} is not "{name}" with the plan marker any more; not touching it')
+        self.owned.add(r['id'])
+        self.deletable.add(r['id'])
+        for d in r.get('days') or []:
+            self.owned.add(d['id'])
+            self.owned.update(e['id'] for e in d.get('day_exercises') or [])
+
+
+def sorted_days(r):
+    return sorted(r.get('days') or [], key=lambda d: (d.get('week') or 0, d.get('index') or 0, d.get('sort_order') or 0))
+
+
+def sorted_exs(d):
+    return sorted(d.get('day_exercises') or [], key=lambda e: (e.get('index') or 0, e.get('sort_order') or 0))
+
+
+def live_ids(r):
+    ids = {'R': r['id']}
+    for i, d in enumerate(sorted_days(r), 1):
+        ids[f'D{i}'] = d['id']
+        for j, e in enumerate(sorted_exs(d), 1):
+            ids[f'D{i}E{j}'] = e['id']
+    return ids
+
+
+def verify_live(r, target, mark=PLAN_MARK):
+    """-> list of differences between the live routine and the target (empty = matches)."""
+    diff = []
+    if r.get('name') != target['routine']['name'] or mark not in (r.get('description') or ''):
+        diff.append('name/description')
+    days = sorted_days(r)
+    if len(days) != len(target['days']):
+        return diff + [f'{len(days)} days, want {len(target["days"])}']
+    for d, t in zip(days, target['days']):
+        exs = sorted_exs(d)
+        if d.get('name') != t['name']:
+            diff.append(f'day name {d.get("name")!r}')
+        got = [str((e.get('exercise') or {}).get('id')) for e in exs]
+        if got != [x['exercise_id'] for x in t['exercises']]:
+            diff.append(f'{t["name"]}: exercises differ')
+            continue
+        for e, x in zip(exs, t['exercises']):
+            sets = sorted(e.get('sets') or [], key=lambda s: s.get('index') or 0)
+            if e.get('count') != x['count'] or len(sets) != x['count']:
+                diff.append(f'{x["name"]}: {len(sets)} sets, want {x["count"]}')
+            elif any(s.get('reps') != w['reps'] or abs((s.get('weight_lbs') or 0) - (w['weight_lbs'] or 0)) > 0.01
+                     for s, w in zip(sets, x['sets'])):
+                diff.append(f'{x["name"]}: set values differ')
+    return diff
+
+
+def run_test_sequence(w, first_ex_id, keep=(), names=(TEST_NAME, PLAN_NAME)):
+    """Create "Assistant test", read it back, write one set, delete it, and check his routines are unchanged."""
+    before = w.snapshot()
+    if any(n in names and rid not in keep for rid, (n, _) in before.items()):
+        raise PlanError(f'a routine named "{names[0]}" or "{names[1]}" already exists that this tool did not '
+                        'record; not touching it (rename or delete it in Jefit first)')
+    t = w.call('POST', '/api/v2/user/routines', {'create_day': True}) or {}
+    tid = str(t.get('id'))
+    if not re.fullmatch(ID_RE, tid) or tid in before:
+        raise PlanError('create did not return a new routine id')
+    w.owned.add(tid)
+    w.deletable.add(tid)
+    w.call('PATCH', f'/api/v2/routines/{tid}', {'data': {'name': TEST_NAME}})
+    r = w.routine(tid)
+    w.adopt(r, TEST_NAME)
+    days = sorted_days(r)
+    if not days:
+        raise PlanError('test routine came back without a day')
+    reqs = test_requests(first_ex_id)
+    de = w.call('POST', f'/api/v2/days/{days[0]["id"]}/day_exercises', reqs[4][2]) or {}
+    if not re.fullmatch(ID_RE, str(de.get('id'))):
+        raise PlanError('adding an exercise did not return an id')
+    w.owned.add(de['id'])
+    w.call('PATCH', f'/api/v2/day_exercises/{de["id"]}', reqs[5][2])
+    got = w.call('GET', f'/api/v2/day_exercises/{de["id"]}') or {}
+    sets = got.get('sets') or []
+    want = reqs[5][2]['data']['sets'][0]['weight_lbs']
+    if len(sets) != 1 or abs((sets[0].get('weight_lbs') or 0) - want) > 0.01 or sets[0].get('reps') != 5:
+        raise PlanError('test set did not read back as written (1 x 5 @ 80 kg); test routine left for inspection')
+    w.call('DELETE', f'/api/v2/routines/{tid}')
+    after = w.snapshot()
+    if tid in after:
+        raise PlanError('test routine still listed after DELETE')
+    if after != before:
+        raise PlanError('his routine list changed during the test (not by this tool?); stopping')
+    return before
+
+
+def plan_load():
+    plan = read_json(PLAN_FILE)
+    if not plan:
+        raise PlanError('no plan yet: run `gym plan draft` first')
+    return plan
+
+
+def created_routine_ids(path=None):
+    """Routine ids this tool created, from its journal: `new_id` on the create line; older lines without it:
+    the routine PATCHed right after a successful create (the naming PATCH)."""
+    ids, after_create = set(), False
+    try:
+        with open(path or PUSH_LOG) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return ids
+    for ln in lines:
+        try:
+            j = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(j, dict):
+            continue
+        if re.fullmatch(ID_RE, str(j.get('new_id'))):
+            ids.add(j['new_id'])
+        m = re.fullmatch(rf'/api/v2/routines/({ID_RE})', str(j.get('path')))
+        if after_create and j.get('method') == 'PATCH' and m:
+            ids.add(m.group(1))
+        after_create = (j.get('method') == 'POST' and j.get('path') == '/api/v2/user/routines'
+                        and 200 <= (j.get('status') or 0) < 300)
+    return ids
+
+
+def req_rows(ops, step='plan'):
+    return [dict(zip(('method', 'path', 'body'), op_request(o)), step=step) for o in ops]
+
+
+def push_plan(plan, apply=False, rebuild=False, out=None, kind='plan'):
+    """Dry run (default): the exact requests, no HTTP. --apply: delete leftover routines this tool created, the
+    test sequence on the first write, then the diff (or the rest of a push that stopped half-way). `kind` picks
+    the routine (routine_profile): a push only ever names, adopts, deletes or diffs that routine (and its own test
+    routine); "Assistant plan" and "Assistant travel" never touch each other."""
+    prof = routine_profile(kind)
+    rname, mark = prof['name'], prof['mark']
+    target, pushed = plan_target(plan, prof), read_json(prof['pushed']) or {}
+    if not all(x['exercise_id'] for d in target['days'] for x in d['exercises']):
+        raise PlanError('an exercise has no Jefit id (CSV-only history); swap it or run `gym sync`')
+    needs_test = not any((read_json(f) or {}).get('verified') for f in (PUSHED_FILE, TRAVEL_PUSHED_FILE))
+    resume = bool(pushed.get('routine_id')) and pushed.get('status') != 'complete' and not rebuild
+    first_ex = target['days'][0]['exercises'][0]['exercise_id']
+    ops = plan_ops(target, pushed, rebuild)
+    tests = [{'method': m, 'path': p, 'body': b, 'step': 'test'} for m, p, b in test_requests(first_ex)]
+    res = {'dry_run': not apply, 'routine': rname, 'cmd': prof['cmd'], 'test_sequence': needs_test, 'resume': resume,
+           'requests': (tests if needs_test else []) + req_rows(ops)}
+    if not apply:
+        return res
+    try:
+        token, handle = read_token_file(TOKEN_RW_FILE), None
+        if not token:                               # the read token (it has write scope): by handle when live
+            token, handle = (read_api_token(), 'gym') if egress_read() else (read_token(), None)
+    except PermissionError as e:
+        raise PlanError(str(e))
+    if not token:
+        raise PlanError(f'no Jefit token ({TOKEN_RW_FILE} or {TOKEN_FILE})' if not egress_read() else
+                        f'{no_token_hint()} (and no {TOKEN_RW_FILE})')
+    w = PlanWriter(api_config(), token, handle=handle)
+    rid = pushed.get('routine_id')
+    cleaned, done = [], []
+    res.update(cleaned=cleaned, requests=done)
+    try:
+        before = w.snapshot()
+        mine = created_routine_ids() | ({rid} if rid else set())
+        for oid, (name, _) in before.items():          # leftovers of earlier runs: only ones this tool created
+            if name in (rname, TEST_NAME) and oid != rid and oid not in mine:
+                raise PlanError(f'a routine named "{name}" exists that this tool did not create; not touching it '
+                                '(rename or delete it in Jefit first)')
+        for oid, (name, _) in before.items():
+            if name in (rname, TEST_NAME) and oid != rid:
+                w.adopt(w.routine(oid), name, mark if name == rname else None)
+                w.call('DELETE', f'/api/v2/routines/{oid}')
+                cleaned.append(name)
+                done.append({'method': 'DELETE', 'path': '/api/v2/routines/{leftover}', 'body': None,
+                             'step': 'cleanup'})
+        gone = {oid for oid, (n, _) in before.items() if n in (rname, TEST_NAME) and oid != rid}
+        state = dict(pushed)
+        if needs_test:
+            run_test_sequence(w, first_ex, keep={rid} if rid else (), names=(TEST_NAME, rname))
+            done.extend(tests)
+            state['verified'] = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+            write_private_json(prof['pushed'], state)
+        ids = {}
+        if rid and rid in before:
+            r = w.routine(rid)
+            w.adopt(r, rname, mark)
+            if rebuild:
+                ids['R_old'] = rid
+            elif pushed.get('status') == 'complete':
+                ids = live_ids(r)
+                if [k for k, v in (pushed.get('ids') or {}).items() if ids.get(k) != v]:
+                    raise PlanError(f'the routine "{rname}" was changed in Jefit since the last push; '
+                                    f'run `{prof["cmd"]} --rebuild --apply`')
+            else:                                       # stopped half-way: diff against what is really there
+                ids = live_ids(r)
+                ops = plan_ops(target, pushed, live=live_target(r))
+        elif rid and pushed.get('status') == 'complete' and not rebuild:
+            raise PlanError(f'the routine "{rname}" is gone in Jefit; run `{prof["cmd"]} --rebuild --apply`')
+        else:
+            resume = False
+            ops = [o for o in plan_ops(target, {}) if o[0] != 'delete_routine']
+        res['resume'] = resume
+        for op in ops:
+            m, p, body = op_request(op)
+            path = re.sub(r'\{(\w+)\}', lambda x: ids[x.group(1)], p)
+            data = w.call(m, path, body)
+            done.extend(req_rows([op]))
+            if op[0] == 'create_routine':
+                nid = str((data or {}).get('id'))
+                if not re.fullmatch(ID_RE, nid) or nid in before:
+                    raise PlanError('create did not return a new routine id')
+                ids['R'] = nid
+                w.owned.add(nid)
+                w.deletable.add(nid)
+                state.update(status='incomplete', routine_id=nid)
+                write_private_json(prof['pushed'], state)
+                days = sorted_days(data) or sorted_days(w.routine(nid))
+                if not days:
+                    raise PlanError('new routine came back without a day')
+                ids['D1'] = days[0]['id']
+                w.owned.add(days[0]['id'])
+            elif op[0] in ('add_day', 'add_ex'):
+                nid = str((data or {}).get('id'))
+                if not re.fullmatch(ID_RE, nid):
+                    raise PlanError(f'{m} {p} did not return an id')
+                ids[op[1] if op[0] == 'add_day' else op[2]] = nid
+                w.owned.add(nid)
+            elif op[0] == 'delete_routine':
+                state.update(status='incomplete', routine_id=None)
+                write_private_json(prof['pushed'], state)
+        live = w.routine(ids['R'])
+        diff = verify_live(live, target, mark)
+        if diff:
+            state.update(status='mismatch', routine_id=ids['R'])
+            write_private_json(prof['pushed'], state)
+            raise PlanError('Jefit routine does not match the plan after the push: ' + '; '.join(diff[:5]))
+        after = w.snapshot()
+        ours = {ids.get('R'), ids.get('R_old')} | gone
+        others = {k: v for k, v in after.items() if k not in ours}
+        mine_before = {k: v for k, v in before.items() if k not in ours}
+        state.update(status='complete', routine_id=ids['R'], ids=live_ids(live), target=target,
+                     plan_version=plan['version'], pushed_at=dt.datetime.now(dt.timezone.utc).isoformat(
+                         timespec='seconds'))
+        write_private_json(prof['pushed'], state)
+        res['others_unchanged'] = others == mine_before
+        if others != mine_before:
+            raise PlanError('pushed, but his other routines changed meanwhile (not by this tool?); please check')
+    finally:
+        res.update(sent=len(w.sent), retries=w.retries, waited_s=round(w.waited, 1))
+    res['created'] = resume or any(o[0] == 'create_routine' for o in ops)
+    res['app_sync'] = any(m != 'GET' for m, _, _ in w.sent)      # changed in Jefit: the phone needs a Sync
+    return res
+
+
+def read_token_file(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if st.st_mode & 0o077:
+        raise PermissionError(f'{path} must be 0600 (chmod 600 it)')
+    with open(path) as fh:
+        return fh.read().strip() or None
+
+
+def print_requests(res):
+    reqs = res['requests']
+    head = (f"Dry run: nothing sent. `{res.get('cmd', 'gym plan push')} --apply` would send" if res['dry_run']
+            else 'Sent')
+    print(f"{head} {len(reqs)} requests for the Jefit routine \"{res['routine']}\" (ids shown as {{symbols}}).")
+    if res['dry_run'] and res.get('resume'):
+        print('Resume: the last push stopped half-way. --apply reads that routine and sends only what is still '
+              'missing or different (at most the list below, without the create).')
+    step = None
+    for r in reqs:
+        if r['step'] != step:
+            step = r['step']
+            print({'test': 'First write only: safe test (create "Assistant test", read back, delete, compare his '
+                           'routines):',
+                   'cleanup': 'Leftover routines this tool created earlier:'}.get(step, 'Plan routine:'))
+        body = '' if r['body'] is None else ' ' + json.dumps(r['body'], ensure_ascii=False, separators=(',', ':'))
+        print(f"  {r['method']:<6} {r['path']}{body}")
+    if not reqs:
+        print('  (Jefit already matches the plan)')
+
+
+def exposures(conn, name, since):
+    out = {}
+    q = ('SELECT x.date, s.weight_kg, s.reps FROM sets s JOIN exercise_logs l ON l.id=s.log_id JOIN exercises e '
+         'ON e.id=l.exercise_id JOIN sessions x ON x.id=l.session_id WHERE e.name=? AND x.date > ? '
+         'ORDER BY x.date, x.start_ts, s.idx')
+    for date, w, reps in conn.execute(q, (name, since)):
+        out.setdefault(date, []).append((w or 0.0, reps))
+    return sorted(out.items())
+
+
+def progress(x, exps):
+    """Double progression over the sessions since the last update -> (changes, new x)."""
+    x, why = dict(x), []
+    for date, sets in exps:
+        if x.get('weight_kg'):
+            first = [r or 0 for w, r in sets if w >= 0.95 * x['weight_kg'] - 0.01][:x['sets']]
+            full = len(first) >= x['sets']
+            if full and all(r >= x['hi'] for r in first):
+                x['weight_kg'] = round(x['weight_kg'] + x['inc_kg'], 2)
+                x.update(reps=x['lo'], fails=0, stalls=0)
+                why.append(f"{ddmm(date)} top of the range on every set: +{fmt_kg(x['inc_kg'])} kg")
+            elif full and first[0] >= x['lo'] and all(r >= x['reps'] for r in first):
+                x.update(reps=min(x['hi'], x['reps'] + 1), fails=0, stalls=0)
+            else:
+                x['fails'] = x.get('fails', 0) + 1 if (not first or first[0] < x['lo']) else 0
+                x['stalls'] = x.get('stalls', 0) + 1
+                if x['fails'] >= 2:
+                    step = x.get('step_kg') or 2.5
+                    x['weight_kg'] = max(step, math.floor(round(x['weight_kg'] * 0.9 / step, 3)) * step)
+                    x.update(reps=x['lo'], fails=0, stalls=0)
+                    why.append(f'{ddmm(date)} below {x["lo"]} reps twice: -10 %')
+        else:
+            first = [r or 0 for _, r in sets][:x['sets']]
+            if len(first) >= x['sets'] and all(r >= x['reps'] for r in first) and x['reps'] < x['hi']:
+                x.update(reps=x['reps'] + 1, stalls=0)
+            else:
+                x['stalls'] = x.get('stalls', 0) + 1
+    return why, x
+
+
+def update_plan(conn, plan, end):
+    """New plan version from the sessions since the last update: progression, swaps for stalls and skips."""
+    since, new, changes = plan['updated'], json.loads(json.dumps(plan)), []
+    ret = read_json(RETURN_FILE) or {}
+    if ret.get('applied') and str(ret.get('to') or '') > since:     # reduced weights on purpose: not a stall
+        since = min(str(ret['to']), end.isoformat())
+    pool = plan_pool(conn, end)
+    used = {x['name'] for d in plan['days'] for x in d['exercises']}
+    sess = conn.execute('SELECT id, date, duration_s FROM sessions WHERE date > ? ORDER BY date', (since,)).fetchall()
+    names_by_session = {}
+    for sid, name in conn.execute('SELECT l.session_id, e.name FROM exercise_logs l JOIN exercises e ON '
+                                  'e.id=l.exercise_id JOIN sessions x ON x.id=l.session_id WHERE x.date > ?',
+                                  (since,)):
+        names_by_session.setdefault(sid, set()).add(name)
+    for d in new['days']:
+        day_names = {x['name'] for x in d['exercises']}
+        for i, x in enumerate(d['exercises']):
+            exps = exposures(conn, x['name'], since)
+            why, nx = progress(x, exps)
+            changes += [f"{x['name']}: {w}" for w in why]
+            if (nx['reps'], nx.get('weight_kg')) != (x['reps'], x.get('weight_kg')) and not why:
+                changes.append(f"{x['name']}: target {nx['reps']} reps")
+            skipped = sum(1 for sid, _, _ in sess if x['name'] not in names_by_session.get(sid, set())
+                          and len(names_by_session.get(sid, set()) & (day_names - {x['name']})) >= 2)
+            reason = 'stalled 3 sessions' if nx.get('stalls', 0) >= 3 else 'skipped 3 sessions' \
+                if not exps and skipped >= 3 else None
+            if reason:
+                alt = plan_pick(x['slot'], pool, used, exclude=used)
+                if alt:
+                    used.add(alt['name'])
+                    nx = dict(plan_exercise(x['slot'], alt, x['role'], plan['goal'], x['group']))
+                    changes.append(f"{x['name']} → {alt['name']} ({reason})")
+                else:
+                    changes.append(f"{x['name']}: {reason}, no alternative in your log; keep it")
+                    nx['stalls'] = 0
+            d['exercises'][i] = nx
+        relabel(d['exercises'])
+        d['est_min'] = est_minutes(d['exercises'])
+    durs = sorted(s[2] / 60 for s in sess if s[2])
+    notes = []
+    if len(durs) >= 3:
+        med = durs[len(durs) // 2]
+        if med > plan['minutes'] + 10:
+            notes.append(f'sessions run ~{round(med)} min (budget {plan["minutes"]}): consider dropping a set')
+    weeks = (end - dt.date.fromisoformat(plan['created'])).days // 7
+    if weeks and weeks % 6 == 5:
+        notes.append('next week: deload (2 sets per exercise at -10 %)')
+    new['volume'] = plan_volume(new['days'])
+    new['notes'] = notes
+    if changes:
+        new['version'] = plan['version'] + 1
+    new['updated'] = end.isoformat()
+    return new, changes, len(sess)
+
+
+# ----------------------------------------------------------------------------- plan: travel / return
+# Travel plan: no equipment (a band or a bar only when he has one), Jefit catalogue exercises (ids checked against the
+# live GET /api/v2/exercises) standing in for the slots of his main plan. Stored apart (TRAVEL_FILE) and pushed as
+# its own routine TRAVEL_NAME; "Assistant plan" stays as it is.
+# slot -> candidates (name, Jefit id, kit or None, muscle, secondary, sets, lo, hi, rest s, role, cue); the first whose
+# kit he has wins, the next one when it is already on that day
+TRAVEL_EX = {
+    'squat': [('Split Squat', 'd_000000001341', None, 'quads', ('glutes', 'hamstrings'), 3, 8, 12, 90, 'main',
+               'per leg; rear foot on a chair or the bed = Bulgarian, 3-s lowering')],
+    'lunge': [('Bodyweight Rear Lunge', 'd_000000001219', None, 'quads', ('glutes',), 3, 10, 15, 60, 'acc',
+               'per leg; step back long, knee just above the floor')],
+    'quad2': [('Jump Squat', 'd_000000000476', None, 'quads', ('glutes', 'calves'), 3, 6, 8, 60, 'acc',
+               'crisp jumps, soft landings: keeps the power')],
+    'hinge': [('Single-Leg Glute Bridge', 'd_000000000865', None, 'glutes', ('hamstrings',), 3, 10, 15, 60, 'acc',
+               'per leg; 2-s squeeze at the top, heel on the bed edge = harder')],
+    'hpush': [('Push-Up', 'd_000000000047', None, 'chest', ('triceps', 'shoulders'), 3, 8, 15, 90, 'main',
+               'too easy: feet on the bed, then 3-s lowering')],
+    'vpush': [('Band Shoulder Press', 'd_000000000445', 'band', 'shoulders', ('triceps',), 3, 8, 15, 60, 'main',
+               'stand on the band'),
+              ('Handstand Push-Up', 'd_000000000875', None, 'shoulders', ('triceps',), 3, 4, 8, 90, 'main',
+               'pike version first (feet on the bed, hips high), wall-supported when that is easy')],
+    'vpull': [('Pull-Up', 'd_000000000083', 'bar', 'back', ('biceps',), 3, 4, 8, 90, 'main',
+               'any bar: playground, beach gym, door-frame bar'),
+              ('Back Extension (Prone)', 'd_000000000337', None, 'back', ('glutes',), 3, 12, 15, 60, 'acc',
+               'arms in a Y, 2-s hold at the top')],
+    'hpull': [('Band Reverse Fly', 'd_000000000053', 'band', 'back', ('shoulders',), 3, 12, 20, 60, 'acc',
+               'band at chest height, squeeze the shoulder blades'),
+              ('Back Extension (Prone)', 'd_000000000337', None, 'back', ('glutes',), 3, 12, 15, 60, 'acc',
+               'arms in a Y, 2-s hold at the top')],
+    'triceps': [('Bench Dip', 'd_000000000229', None, 'triceps', ('chest', 'shoulders'), 2, 10, 15, 60, 'small',
+                 'hands on a chair or the bed edge')],
+    'biceps': [('Band Alternating Bicep Curl', 'd_000000000283', 'band', 'biceps', (), 2, 12, 20, 45, 'small', '')],
+    'delt': [('Band Lateral Raise', 'd_000000000422', 'band', 'shoulders', (), 2, 12, 20, 45, 'small', '')],
+    'calves': [('Single-Leg Calf Raise', 'd_000000001236', None, 'calves', (), 2, 12, 20, 45, 'small',
+                'on a step, full stretch at the bottom')],
+    'core': [('Reverse Crunch', 'd_000000000338', None, 'abs', (), 2, 12, 20, 45, 'small', ''),
+             ('V-Up', 'd_000000000686', None, 'abs', (), 2, 10, 15, 45, 'small', '')],
+}
+# travel slot -> (slot of his main plan whose lift it stands in for, generic name without a plan)
+TRAVEL_FOR = {'squat': ('squat', 'squat'), 'lunge': ('quad2', 'leg press'), 'quad2': ('quad2', 'leg press'),
+              'hinge': ('hinge', 'deadlift'), 'hpush': ('hpush', 'bench press'), 'vpush': ('vpush', 'overhead press'),
+              'vpull': ('vpull', 'pulldown'), 'hpull': ('hpull', 'row'), 'triceps': ('triceps', 'triceps'),
+              'biceps': ('biceps', 'biceps'), 'delt': ('delt', 'lateral raise'), 'calves': ('calves', 'calves'),
+              'core': ('core', 'core')}
+# days/week -> [(key, title, items)]; a tuple = circuit (a/b/c, rest after the round); slots without a fitting
+# exercise for his kit are left out
+TRAVEL_TEMPLATES = {
+    2: [('A', 'Travel A', ['squat', 'hpush', ('vpull', 'hinge'), ('triceps', 'delt', 'core')]),
+        ('B', 'Travel B', ['vpush', 'quad2', ('hpull', 'lunge'), ('hinge', 'calves', 'biceps', 'core')])],
+    3: [('A', 'Travel A', ['squat', 'hpush', ('vpull', 'hinge'), ('triceps', 'delt', 'core')]),
+        ('B', 'Travel B', ['vpush', 'quad2', ('hpull', 'lunge'), ('calves', 'biceps')]),
+        ('C', 'Travel C', ['squat', 'hpush', ('vpull', 'hinge'), ('calves', 'core')])],
+}
+TRAVEL_TRIM = ('calves', 'delt', 'biceps', 'core', 'triceps')
+TRAVEL_RULE = ('Maintenance: every set stops 1-2 reps short of failure. At the top of the range on every set, make '
+               'it harder next time (3-s lowering, a pause, feet raised, single-leg) instead of adding reps. a/b/c = '
+               'circuit: go straight through, rest after the round. A few weeks like this keep strength; '
+               '`gym plan return` rebuilds the load after.')
+# week, share of his last logged working weight, sets vs the plan (at least 2)
+RETURN_WEEKS = ((1, 0.85, -1), (2, 0.90, 0))
+
+
+def next_trip(day):
+    """-> {name, from, to} of the trip under way or next in trip-conditions' trips.json (GYM_TRIPS), or None."""
+    data = read_json(TRIPS_FILE)
+    trips = data.get('trips') if isinstance(data, dict) else data
+    found = []
+    for t in (trips.values() if isinstance(trips, dict) else trips or []):
+        if not isinstance(t, dict):
+            continue
+        try:
+            a = dt.date.fromisoformat(str(t.get('from')))
+            b = dt.date.fromisoformat(str(t.get('to') or t.get('from')))
+        except ValueError:
+            continue
+        if b >= day:
+            found.append((a, b, str(t.get('name') or 'trip')))
+    if not found:
+        return None
+    a, b, n = min(found)
+    return {'name': n, 'from': a.isoformat(), 'to': b.isoformat()}
+
+
+def travel_exercise(slot, t, group, pool_by_id, lifts):
+    name, jid, kit, mus, sec, sets, lo, hi, rest, role, cue = t
+    e = pool_by_id.get(jid)
+    if e and e.get('best_reps'):
+        reps, basis = min(hi, max(lo, int(e['best_reps'] * 0.75))), f"your best {e['best_reps']} reps ({ddmm(e['last'])})"
+    else:
+        reps, basis = lo, 'new: start at the bottom of the range'
+    plan_slot, generic = TRAVEL_FOR[slot]
+    return {'slot': slot, 'name': name, 'jefit_id': jid, 'muscle': mus, 'secondary': list(sec),
+            'equipment': kit or 'bodyweight', 'role': role, 'group': group, 'sets': sets, 'lo': lo, 'hi': hi,
+            'reps': reps, 'rest_s': rest, 'pair_rest_s': rest, 'weight_kg': None, 'inc_kg': 0.0, 'step_kg': 0.0,
+            'basis': basis, 'cue': cue, 'for': lifts.get(plan_slot) or generic, 'stalls': 0, 'fails': 0}
+
+
+def build_travel(conn, start, end, days, minutes, kit, day, trip_name=None):
+    """Bodyweight plan for a trip: TRAVEL_TEMPLATES filled from TRAVEL_EX for his kit, trimmed to the time budget;
+    reps from his own log when he has done the exercise, else the bottom of the range."""
+    pool = plan_pool(conn, day)
+    by_id = {e['jefit_id']: e for e in pool.values() if e.get('jefit_id')}
+    lifts = {}
+    for d in (read_json(PLAN_FILE) or {}).get('days') or []:
+        for x in d.get('exercises') or []:
+            lifts.setdefault(x.get('slot'), short_name(x.get('name')))
+    out, notes = [], []
+    for key, title, items in TRAVEL_TEMPLATES[days]:
+        exs = []
+        for gi, it in enumerate(items, 1):
+            for slot in (it if isinstance(it, tuple) else (it,)):
+                fits = [t for t in TRAVEL_EX[slot] if t[2] is None or t[2] in kit]
+                t = next((t for t in fits if t[0] not in {x['name'] for x in exs}), None)
+                if t:
+                    exs.append(travel_exercise(slot, t, gi, by_id, lifts))
+        relabel(exs)
+        for slot in TRAVEL_TRIM:
+            if est_minutes(exs) <= minutes + 5:
+                break
+            drop = [x for x in exs if x['slot'] == slot]
+            if drop:
+                exs.remove(drop[-1])
+                notes.append(f'{key}: {drop[-1]["name"]} left out to stay near {minutes} min')
+                relabel(exs)
+        mains = [short_name(x['name']) for x in exs if x['role'] == 'main']
+        out.append({'key': key, 'name': f'{key} · ' + (' + '.join(mains) if mains else title), 'exercises': exs,
+                    'est_min': est_minutes(exs)})
+    n_days = (end - start).days + 1
+    sessions = max(1, round(n_days / 7 * days))
+    if 'band' not in kit:
+        notes.append('a resistance band (pocket-sized) adds rows, curls, laterals and presses: `--band`')
+    if 'bar' not in kit:
+        notes.append('a pull-up bar nearby (playground, beach gym): `--bar` puts Pull-Ups in for the back extensions')
+    now = (analyze(conn, weeks=4, end=day).get('hard_sets_per_week_4w') or {}) if pool else {}
+    return {'version': 1, 'kind': 'travel', 'name': TRAVEL_NAME, 'created': day.isoformat(),
+            'updated': day.isoformat(), 'goal': 'maintain', 'days_per_week': days, 'minutes': minutes,
+            'kit': sorted(kit), 'trip': {'name': trip_name, 'from': start.isoformat(), 'to': end.isoformat(),
+                                         'days': n_days, 'sessions': sessions},
+            'days': out, 'volume': plan_volume(out), 'volume_now': {k: round(v, 1) for k, v in now.items()},
+            'notes': notes, 'rule': TRAVEL_RULE}
+
+
+def travel_card(plan):
+    t = plan['trip']
+    keys = [d['key'] for d in plan['days']]
+    order = ' '.join(keys[i % len(keys)] for i in range(t['sessions']))
+    lines = plan_card(plan).split('\n')
+    lines.insert(1, f"{(t.get('name') or 'Trip')} {ddmm(t['from'])}–{ddmm(t['to'])} ({t['days']} days): "
+                    f"~{t['sessions']} sessions {order}, 2+ days apart · kit: {', '.join(plan['kit']) or 'none'}")
+    return '\n'.join(lines)
+
+
+def travel_load():
+    plan = read_json(TRAVEL_FILE)
+    if not plan:
+        raise PlanError('no travel plan yet: run `gym plan travel` first')
+    return plan
+
+
+def last_working(conn, name, end):
+    """-> (date, top weight kg, its reps) of the last logged session of an exercise on or before `end`."""
+    exps = [(d, s) for d, s in exposures(conn, name, '0000-00-00') if d <= end.isoformat()]
+    if not exps:
+        return None
+    date, sets = exps[-1]
+    w, r = max(sets, key=lambda s: (s[0] or 0, s[1] or 0))
+    return date, w or 0.0, r
+
+
+def build_return(conn, plan, start):
+    """Re-entry after a trip: week 1 at -15 % of his last logged working weight (best e1RM of his last 3 sessions
+    before the trip, at the plan's reps) with one set less, week 2 at -10 %, never above the plan's weight;
+    week 3 = the plan itself."""
+    weeks, rows = [], {}
+    pool = plan_pool(conn, start - dt.timedelta(days=1))
+    for wk, f, dsets in RETURN_WEEKS:
+        p = json.loads(json.dumps(plan))
+        for d in p['days']:
+            for x in d['exercises']:
+                last = last_working(conn, x['name'], start - dt.timedelta(days=1))
+                e1rm = (pool.get(x['name']) or {}).get('e1rm')
+                plan_w = x.get('weight_kg')
+                x['sets'] = max(2, x['sets'] + dsets)
+                if plan_w:      # his last 3 sessions' best e1RM at the plan's mid-range reps, 2 in reserve
+                    ref = e1rm / (1 + ((x['lo'] + x['hi']) / 2 + 2) / 30) if e1rm else plan_w
+                    step = x.get('step_kg') or 2.5
+                    x['weight_kg'] = max(step, min(plan_w, math.floor(round(ref * f / step, 3)) * step))
+                if wk == 1:
+                    x['reps'] = x['lo']
+                basis = (f"e1RM {fmt_kg(e1rm)}, last {fmt_kg(last[1])} × {last[2]} {ddmm(last[0])}"
+                         if last and last[1] and e1rm and plan_w else
+                         f"last {last[2]} reps ({ddmm(last[0])})" if last else 'not logged: plan weight')
+                rows.setdefault((d['key'], x['label'], x['name']), {'plan_w': plan_w, 'plan_sets': None,
+                                                                   'basis': basis, 'weeks': []})
+                rows[(d['key'], x['label'], x['name'])]['weeks'].append((x['sets'], x['reps'], x.get('weight_kg')))
+            relabel(d['exercises'])
+            d['est_min'] = est_minutes(d['exercises'])
+        a = start + dt.timedelta(days=7 * (wk - 1))
+        p['volume'] = plan_volume(p['days'])
+        p['notes'] = []
+        p['rule'] = (f'Return week {wk} of {len(RETURN_WEEKS)} ({int(round((1 - f) * 100))} % under the last '
+                     'working weights). ' + plan['rule'])
+        weeks.append({'week': wk, 'from': a.isoformat(), 'to': (a + dt.timedelta(days=6)).isoformat(), 'share': f,
+                      'plan': p})
+    for d in plan['days']:
+        for x in d['exercises']:
+            r = rows.get((d['key'], x['label'], x['name']))
+            if r:
+                r['plan_sets'], r['plan_reps'] = x['sets'], x['reps']
+    return {'version': 1, 'created': today().isoformat(), 'from': start.isoformat(),
+            'to': (start + dt.timedelta(days=7 * len(RETURN_WEEKS) - 1)).isoformat(),
+            'base_version': plan['version'], 'weeks': weeks, 'applied': {},
+            'rows': [{'day': k[0], 'label': k[1], 'name': k[2], **v} for k, v in rows.items()]}
+
+
+def return_card(ret, plan):
+    def w(s, r, kg):
+        return f"{s}×{r}" + (f" @ {fmt_kg(kg)}" if kg else '')
+    lines = [f"Return after the trip: {ddmm(ret['from'])}–{ddmm(ret['to'])}, then \"{PLAN_NAME}\" v{plan['version']}"
+             ' as it is']
+    for x in ret['weeks']:
+        lines.append(f"Week {x['week']} ({ddmm(x['from'])}–{ddmm(x['to'])}): -{int(round((1 - x['share']) * 100))} %"
+                     f" on the last working weights" + (', one set less' if x['week'] == 1 else ', full sets'))
+    day = None
+    for r in ret['rows']:
+        if r['day'] != day:
+            day = r['day']
+            lines.append(next(d['name'] for d in plan['days'] if d['key'] == day))
+        wk = ' · '.join(f"wk{i} {w(*v)}" for i, v in enumerate(r['weeks'], 1))
+        lines.append(f"  {r['label']:<3}{r['name']}  {wk} → plan {w(r['plan_sets'], r['plan_reps'], r['plan_w'])}"
+                     f"  ({r['basis']})")
+    lines.append('Week 3: the plan weights; double progression resumes (`gym plan update` skips applied return '
+                 'weeks).')
+    applied = ', '.join(f'week {k} {v[:10]}' for k, v in sorted((ret.get('applied') or {}).items()))
+    lines.append(f'Jefit: applied {applied}.' if applied else
+                 f'Draft only. `gym plan return --apply --week 1` writes week 1 into "{PLAN_NAME}" (his OK first); '
+                 'week 2 the same; `gym plan push --apply` puts the plan back.')
+    lines.append('Suggestions only, not medical advice.')
+    return '\n'.join(lines)
+
+
+def cmd_travel(a):
+    start, end, name = a.from_, a.to, None
+    if not (start and end):
+        trip = next_trip(today())
+        if not trip:
+            raise PlanError('no trip dates: give --from and --to (no trip ahead in ' + TRIPS_FILE + ')')
+        start = start or dt.date.fromisoformat(trip['from'])
+        end = end or dt.date.fromisoformat(trip['to'])
+        name = trip['name']
+    if end < start:
+        raise PlanError('trip dates: --to is before --from')
+    if not 20 <= a.minutes <= 60:
+        raise PlanError('--minutes must be 20-60')
+    kit = {k for k, on in (('band', a.band), ('bar', a.bar)) if on}
+    plan = build_travel(connect(), start, end, a.days_per_week, a.minutes, kit, today(), name)
+    if not a.dry_run:
+        old = read_json(TRAVEL_FILE)
+        if old:
+            plan['version'] = old.get('version', 0) + 1
+        write_private_json(TRAVEL_FILE, plan)
+    print(json.dumps(plan) if a.json else travel_card(plan) + ('' if a.dry_run else f'\nSaved: {TRAVEL_FILE}'))
+    return 0
+
+
+def cmd_return(a):
+    plan = plan_load()
+    start = a.from_
+    if not start:
+        t = (read_json(TRAVEL_FILE) or {}).get('trip') or next_trip(today()) or {}
+        if not t.get('to'):
+            raise PlanError('no trip dates: give --from (the first day back)')
+        start = dt.date.fromisoformat(t['to']) + dt.timedelta(days=1)
+    ret = build_return(connect(), plan, start)
+    old = read_json(RETURN_FILE) or {}
+    if old.get('from') == ret['from'] and old.get('base_version') == ret['base_version']:
+        ret['applied'] = old.get('applied') or {}
+    res = None
+    if a.apply:
+        wk = a.week or next((x['week'] for x in ret['weeks'] if x['from'] <= today().isoformat() <= x['to']), 1)
+        res = push_plan(next(x['plan'] for x in ret['weeks'] if x['week'] == wk), apply=True, kind='plan')
+        ret['applied'][str(wk)] = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+    if not a.dry_run or a.apply:
+        write_private_json(RETURN_FILE, ret)
+    if a.json:
+        print(json.dumps(dict(ret, push=res)))
+        return 0
+    print(return_card(ret, plan))
+    if res:
+        print_requests(res)
+        print(f"Done: {res['sent']} writes. Jefit routine \"{PLAN_NAME}\" holds return week {wk}; "
+              'his other routines unchanged.')
+        if res.get('app_sync'):
+            print(app_sync(PLAN_NAME))
+    return 0
+
+
+def cmd_plan(a):
+    try:
+        if a.plan_cmd == 'draft':
+            swaps = {}
+            for s in a.swap or []:
+                old, sep, newn = s.partition('=')
+                if not sep or not old.strip() or not newn.strip():
+                    print('gym plan draft: --swap takes "Old name=New name"', file=sys.stderr)
+                    return 2
+                swaps[old.strip()] = newn.strip()
+            plan = build_plan(connect(), a.days, a.goal, a.minutes, swaps, today())
+            if not a.dry_run:
+                old = read_json(PLAN_FILE)
+                if old:
+                    write_private_json(os.path.join(PLAN_HISTORY, f"plan-v{old.get('version', 0)}-"
+                                                                  f"{old.get('updated', 'x')}.json"), old)
+                    plan['version'] = old.get('version', 0) + 1
+                write_private_json(PLAN_FILE, plan)
+            print(json.dumps(plan) if a.json else plan_card(plan) + ('' if a.dry_run else
+                                                                      f'\nSaved: {PLAN_FILE}'))
+            return 0
+        if a.plan_cmd == 'next':
+            if a.json:
+                print(json.dumps(plan_next_json(connect(), read_json(PLAN_FILE), today())))
+                return 0
+            print(plan_next(connect(), read_json(PLAN_FILE), today()) + evenings_line(today()))
+            return 0
+        if a.plan_cmd == 'travel':
+            return cmd_travel(a)
+        if a.plan_cmd == 'return':
+            return cmd_return(a)
+        if a.plan_cmd == 'show' and a.travel:
+            plan, pushed = travel_load(), read_json(TRAVEL_PUSHED_FILE) or {}
+            if a.json:
+                print(json.dumps({'plan': plan, 'pushed': {k: pushed.get(k) for k in
+                                                           ('status', 'plan_version', 'pushed_at')}}))
+                return 0
+            st = pushed.get('status')
+            print(travel_card(plan) + '\nJefit: ' + (
+                f"pushed v{pushed.get('plan_version')} {pushed['pushed_at'][:10]}" if st == 'complete' else
+                'push stopped half-way (`gym plan push --travel --apply` resumes it)' if st in ('incomplete', 'mismatch')
+                else 'not pushed yet (`gym plan push --travel`)'))
+            return 0
+        if a.plan_cmd == 'show':
+            plan = plan_load()
+            pushed = read_json(PUSHED_FILE) or {}
+            if a.json:
+                print(json.dumps({'plan': plan, 'pushed': {k: pushed.get(k) for k in
+                                                           ('status', 'plan_version', 'pushed_at', 'verified')}}))
+                return 0
+            print(plan_card(plan))
+            age = (today() - dt.date.fromisoformat(plan['updated'])).days
+            st = pushed.get('status')
+            jf = ('pushed v' + str(pushed.get('plan_version')) + ' ' + pushed['pushed_at'][:10] if st == 'complete'
+                  else 'push stopped half-way (`gym plan push --apply` resumes it)' if st in ('incomplete', 'mismatch')
+                  else 'not pushed yet')
+            print(f"Jefit: {jf}"
+                  f"; last update {ddmm(plan['updated'])}" + ('; review due (`gym plan update`)' if age >= 28 else ''))
+            return 0
+        if a.plan_cmd == 'push':
+            kind = 'travel' if a.travel else 'plan'
+            res = push_plan(travel_load() if a.travel else plan_load(), apply=a.apply, rebuild=a.rebuild, kind=kind)
+            rname = res['routine']
+            if a.json:
+                print(json.dumps(res))
+            else:
+                print_requests(res)
+                if a.travel and not a.apply:
+                    print('After --apply: ' + app_sync(rname))
+                if a.apply:
+                    extra = [f"resumed the half-done push" if res.get('resume') else '',
+                             f"deleted leftover {', '.join(res['cleaned'])}" if res.get('cleaned') else '',
+                             f"{res['retries']} rate-limit retries ({res['waited_s']:.0f} s)" if res.get('retries')
+                             else '']
+                    extra = [x for x in extra if x]
+                    print(f"Done: {res['sent']} writes" + (f" ({'; '.join(extra)})" if extra else '')
+                          + f". Jefit routine \"{rname}\" matches the {'travel ' if a.travel else ''}plan; "
+                          + 'his other routines unchanged.'
+                          + ((f' Set it as the current plan in the app for the trip; switch back to "{PLAN_NAME}" '
+                              'after.' if a.travel else ' Set it as the current plan once in the app.')
+                             if res.get('created') else ''))
+                    if res.get('app_sync'):
+                        print(app_sync(rname))
+            return 0
+        if a.plan_cmd == 'update':
+            plan = plan_load()
+            new, changes, n = update_plan(connect(), plan, today())
+            if a.write or a.apply:
+                write_private_json(os.path.join(PLAN_HISTORY, f"plan-v{plan['version']}-{plan['updated']}.json"), plan)
+                write_private_json(PLAN_FILE, new)
+            res = push_plan(new, apply=a.apply)
+            if a.json:
+                print(json.dumps({'sessions': n, 'changes': changes, 'notes': new['notes'],
+                                  'version': new['version'], 'saved': bool(a.write or a.apply), 'push': res}))
+                return 0
+            print(f"Plan update from {n} sessions since {ddmm(plan['updated'])}: "
+                  + (f"{len(changes)} changes (v{plan['version']} → v{new['version']})" if changes else 'no changes'))
+            for c in changes + [f'Note: {x}' for x in new['notes']]:
+                print(f'  {c}')
+            if not (a.write or a.apply):
+                print('Not saved (add --write to keep it, --apply to keep it and push it).')
+            print_requests(res)
+            if res.get('app_sync'):
+                print(APP_SYNC)
+            return 0
+    except PlanError as e:
+        print(f'gym plan: {e}', file=sys.stderr)
+        return 2 if 'plan yet' in str(e) or '--swap' in str(e) or 'trip dates' in str(e) \
+            or '--minutes' in str(e) else 1
+    print('gym plan: draft | show | next | push | update | travel | return (see --help)', file=sys.stderr)
+    return 2
+
+
+# ----------------------------------------------------------------------------- CLI
+def date_arg(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError('use YYYY-MM-DD')
+
+
+COACH_CMDS = ('recap',)     # the recap layer: ~/bin/lib/gymcoach.py
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in COACH_CMDS:
+        import types
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+        import gymcoach
+        return gymcoach.main(types.SimpleNamespace(**globals()), argv)
+    p = argparse.ArgumentParser(prog='gym', description='Workout log engine (see the header of this file).')
+    sub = p.add_subparsers(dest='cmd')
+    pi = sub.add_parser('import')
+    pi.add_argument('kind', choices=['csv'])
+    pi.add_argument('file')
+    pi.add_argument('--unit', choices=['kg', 'lb'])
+    pi.add_argument('--dry-run', action='store_true')
+    pi.add_argument('--json', action='store_true')
+    ps = sub.add_parser('sync')
+    ps.add_argument('--probe', action='store_true')
+    ps.add_argument('--since', type=lambda s: date_arg(s).isoformat())
+    ps.add_argument('--dry-run', action='store_true')
+    ps.add_argument('--json', action='store_true')
+    for name in ('stats', 'review', 'chart'):
+        x = sub.add_parser(name)
+        x.add_argument('--weeks', type=int, default=8 if name != 'chart' else 12)
+        x.add_argument('--end', type=date_arg)
+        if name == 'chart':
+            x.add_argument('--out')
+        else:
+            x.add_argument('--json', action='store_true')
+        if name == 'review':
+            x.add_argument('--if-trained', type=int, metavar='DAYS')
+    pe = sub.add_parser('exercises')
+    pe.add_argument('--json', action='store_true')
+    px = sub.add_parser('exercise')
+    px.add_argument('name')
+    px.add_argument('--muscle')
+    px.add_argument('--equipment')
+    px.add_argument('--reset', action='store_true')
+    pp = sub.add_parser('plan')
+    psub = pp.add_subparsers(dest='plan_cmd')
+    pd = psub.add_parser('draft')
+    pd.add_argument('--days', type=int, choices=sorted(TEMPLATES), default=2)
+    pd.add_argument('--goal', choices=sorted(GOALS), default='mixed')
+    pd.add_argument('--minutes', type=int, default=50)
+    pd.add_argument('--swap', action='append', metavar='OLD=NEW')
+    pd.add_argument('--dry-run', action='store_true')
+    pd.add_argument('--json', action='store_true')
+    psh = psub.add_parser('show')
+    psh.add_argument('--travel', action='store_true')
+    psh.add_argument('--json', action='store_true')
+    pnx = psub.add_parser('next')
+    pnx.add_argument('--json', action='store_true')
+    ppu = psub.add_parser('push')
+    ppu.add_argument('--travel', action='store_true')
+    ppu.add_argument('--apply', action='store_true')
+    ppu.add_argument('--rebuild', action='store_true')
+    ppu.add_argument('--json', action='store_true')
+    pup = psub.add_parser('update')
+    pup.add_argument('--write', action='store_true')
+    pup.add_argument('--apply', action='store_true')
+    pup.add_argument('--json', action='store_true')
+    ptr = psub.add_parser('travel')
+    ptr.add_argument('--from', dest='from_', type=date_arg)
+    ptr.add_argument('--to', type=date_arg)
+    ptr.add_argument('--days-per-week', type=int, choices=sorted(TRAVEL_TEMPLATES), default=2)
+    ptr.add_argument('--minutes', type=int, default=35)
+    ptr.add_argument('--band', action='store_true')
+    ptr.add_argument('--bar', action='store_true')
+    ptr.add_argument('--dry-run', action='store_true')
+    ptr.add_argument('--json', action='store_true')
+    prt = psub.add_parser('return')
+    prt.add_argument('--from', dest='from_', type=date_arg)
+    prt.add_argument('--apply', action='store_true')
+    prt.add_argument('--week', type=int, choices=[w for w, _, _ in RETURN_WEEKS])
+    prt.add_argument('--dry-run', action='store_true')
+    prt.add_argument('--json', action='store_true')
+    pst = sub.add_parser('status')
+    pst.add_argument('--json', action='store_true')
+    a = p.parse_args(argv)
+    if not a.cmd:
+        p.print_help()
+        return 2
+    if a.cmd in ('stats', 'review', 'chart') and not 1 <= a.weeks <= 104:
+        print('gym: --weeks must be 1-104', file=sys.stderr)
+        return 2
+    if a.cmd == 'exercise' and not a.reset and not a.muscle:
+        print('gym exercise: give --muscle M (and optionally --equipment E) or --reset', file=sys.stderr)
+        return 2
+    fn = {'import': cmd_import_csv, 'sync': cmd_sync, 'stats': cmd_stats, 'review': cmd_review, 'chart': cmd_chart,
+          'exercises': cmd_exercises, 'exercise': cmd_exercise, 'status': cmd_status, 'plan': cmd_plan}[a.cmd]
+    return fn(a)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

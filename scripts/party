@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""party: WLED party lights that follow the tempo of the music playing in Home Assistant; `party off` restores.
+
+Usage:
+  party on [--hours H] [-n]        snapshot every available WLED (light.wled*, or the config's "lights"), then
+                                   WLED's "Bpm" effect with speed = the playing track's BPM and a palette per
+                                   tempo band; lights that were off come on at the config "bri"; follows every
+                                   track change until H hours (default 4, max 8) are up, then restores silently
+  party off [-n]                   restore the snapshot, forget the party
+  party status [--json]            on/off, until when, lights, last BPM and where it came from
+  party tick [--cron] [--loop S]   cron every minute: returns at once unless a party is on; then polls the
+                                   player every PARTY_POLL s (10) for up to S s (default 0 = one pass),
+                                   applies a new track's BPM, restores after the end time
+  party bpm ARTIST TITLE [--json]  BPM lookup only (cache, then the public API)
+  -n / --dry-run                   reads only (HA, WLED GETs, BPM lookup); prints what it would send
+
+Tempo: the playing track's media_artist + media_title from `ha list media_player --json` (the config's
+"players" first, then media_player.spotify*, then any playing player). BPM from Deezer's public API (no key,
+no account): /search/track by artist + title, then /track/ID "bpm" of the best matching candidates (0 there =
+unknown). Halved/doubled into 70-200. Unknown or nothing playing: "default_bpm" (125). Cache by a hash of
+artist|title (no names stored): known BPMs kept, unknown ones retried after a day.
+Lights: each WLED's own JSON API (its address from `ha device-url`, like wled-sync); HA's allowlist has no
+number/select services for WLED speed and palette. Start: POST /json/state {on, bri (only if it was off),
+seg: [{id, on, fx: Bpm, sx: BPM, pal, frz: false}]}; track change: seg sx + pal only (an off light stays
+off); a light whose effect he changed during the party is left alone (released) until `party off`.
+Restore: per light the snapshot's bri and per segment on/bri/col/fx/sx/ix/pal/c1-c3/o1-o3/frz/cct, read back;
+a light that is off now stays off (no lights back on at the end of the night); a running playlist restarts.
+A failed restore is retried every tick; after 5 failures one ~/inbox note and the light is dropped.
+Config (optional, private): ~/.config/party/config.json {"lights": [...], "players": [...], "effect": "Bpm",
+"bri": 128, "hours": 4, "default_bpm": 125, "palettes": [[upper_bpm, "Name"], ...], "fallback_palette": "Party"}.
+State ~/.local/state/party/state.json (0600; snapshot + track hash), log party.log there (no track names).
+Exit: 0 ok, 1 HA/WLED failure (message printed), 2 usage.
+Env (tests): PARTY_HA, PARTY_STATE_DIR, PARTY_CACHE, PARTY_CONFIG, PARTY_INBOX, PARTY_BPM_API, PARTY_NOW, PARTY_POLL.
+Tests: ~/opt/party-tests/run.sh (fake ha + fake WLED/BPM server; PARTY_BIN=/copy).
+"""
+import argparse
+import hashlib
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import jsonstate, locks  # noqa: E402
+
+HA = os.environ.get('PARTY_HA') or os.path.expanduser('~/bin/ha')
+STATE_DIR = os.path.expanduser(os.environ.get('PARTY_STATE_DIR') or '~/.local/state/party')
+STATE = os.path.join(STATE_DIR, 'state.json')
+LOG = os.path.join(STATE_DIR, 'party.log')
+CACHE = os.path.expanduser(os.environ.get('PARTY_CACHE') or '~/.cache/party/bpm.json')
+CONFIG = os.path.expanduser(os.environ.get('PARTY_CONFIG') or '~/.config/party/config.json')
+INBOX = os.path.expanduser(os.environ.get('PARTY_INBOX') or '~/inbox')
+BPM_API = (os.environ.get('PARTY_BPM_API') or 'https://api.deezer.com').rstrip('/')
+POLL = float(os.environ.get('PARTY_POLL') or 10)
+DEFAULTS = {
+    'lights': None, 'players': None, 'effect': 'Bpm', 'bri': 128, 'hours': 4, 'default_bpm': 125,
+    'palettes': [[100, 'Ocean'], [118, 'Sunset'], [130, 'Party'], [145, 'Red & Blue'], [165, 'Fire'], [999, 'Rainbow']],
+    'fallback_palette': 'Party', 'tt': 7,
+}
+SEG_KEYS = ('on', 'bri', 'col', 'fx', 'sx', 'ix', 'pal', 'c1', 'c2', 'c3', 'o1', 'o2', 'o3', 'frz', 'cct')
+MAX_RESTORE_FAILS = 5
+UNKNOWN_RETRY = 86400
+
+
+class Fail(Exception):
+    pass
+
+
+def now():
+    return float(os.environ.get('PARTY_NOW') or time.time())
+
+
+def hhmm(t):
+    return time.strftime('%H:%M', time.localtime(t))
+
+
+def config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as fh:
+            cfg.update({k: v for k, v in json.load(fh).items() if k in DEFAULTS})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        raise Fail(f'config {CONFIG} unreadable ({type(e).__name__})')
+    return cfg
+
+
+def log(action, **kw):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    with open(LOG, 'a') as fh:
+        fh.write(json.dumps({'t': time.strftime('%Y-%m-%dT%H:%M:%S'), 'action': action, **kw}) + '\n')
+
+
+def write_json(path, data):
+    """Private JSON (0600 in a 0700 dir), atomic (core.jsonstate)."""
+    jsonstate.save(path, data, mode=0o600, dir_mode=0o700, indent=1)
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            st = json.load(fh)
+        return st if st.get('active') else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(st):
+    if st and st.get('lights'):
+        write_json(STATE, st)
+    else:
+        try:
+            os.remove(STATE)
+        except FileNotFoundError:
+            pass
+
+
+class Lock:
+    """Exclusive flock on STATE_DIR/NAME; blocking up to `wait` s (0 = try once)."""
+
+    def __init__(self, name='lock', wait=30):
+        self.name, self.wait, self.fd = name, wait, None
+
+    def __enter__(self):
+        self.fd = locks.acquire(os.path.join(STATE_DIR, self.name), wait=self.wait, poll=0.2, dir_mode=0o700,
+                                mode=0o666 & ~jsonstate.current_umask())      # core.locks; same file mode as open('a')
+        if self.fd is None:
+            raise TimeoutError(self.name)
+        return self
+
+    def __exit__(self, *a):
+        locks.release(self.fd)
+
+
+# ---------------------------------------------------------------- HA (through ~/bin/ha only)
+
+def ha(*argv, timeout=25):
+    try:
+        p = subprocess.run([HA, *argv], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Fail(f'ha {argv[0]}: {type(e).__name__}')
+    if p.returncode != 0:
+        last = next((l for l in reversed(p.stderr.strip().splitlines()) if l.strip()), f'exit {p.returncode}')
+        raise Fail(f'ha {argv[0]}: {re.sub(r"^ha: ", "", last.strip())[:120]}')
+    return p.stdout
+
+
+def ha_json(*argv):
+    try:
+        return json.loads(ha(*argv))
+    except ValueError:
+        raise Fail(f'ha {argv[0]}: unreadable answer')
+
+
+def short_name(name, eid):
+    n = re.sub(r'^\s*WLED\s+', '', name or '', flags=re.I).strip()
+    return n or eid.split('.', 1)[1]
+
+
+def pick_lights(cfg):
+    rows = {r.get('entity_id'): r for r in ha_json('list', 'light', '--json') if isinstance(r, dict)}
+    wanted = cfg['lights'] or sorted(e for e in rows if e and e.startswith('light.wled'))
+    return [(e, short_name(rows[e].get('name'), e)) for e in wanted
+            if e in rows and rows[e].get('state') not in ('unavailable', 'unknown', None)]
+
+
+def now_playing(cfg):
+    """{'artist', 'title', 'player'} of the first playing player with both fields, else None."""
+    rows = [r for r in ha_json('list', 'media_player', '--json') if isinstance(r, dict)]
+    pref = list(cfg['players'] or [])
+
+    def rank(r):
+        e = r.get('entity_id') or ''
+        return (pref.index(e) if e in pref else len(pref), 0 if e.startswith('media_player.spotify') else 1, e)
+    for r in sorted(rows, key=rank):
+        a = r.get('attributes') or {}
+        artist, title = str(a.get('media_artist') or '').strip(), str(a.get('media_title') or '').strip()
+        if r.get('state') == 'playing' and artist and title:
+            return {'artist': artist, 'title': title, 'player': r.get('entity_id')}
+    return None
+
+
+# ---------------------------------------------------------------- HTTP (WLED JSON API, BPM API)
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def http(url, body=None, what='http', timeout=6):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json',
+                                                          'User-Agent': 'party-lights/1'})
+    try:
+        with _OPENER.open(req, timeout=timeout) as r:
+            return json.loads(r.read().decode() or 'null')
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise Fail(f'{what}: {type(e).__name__}')
+
+
+_BASES = {}
+
+
+def wled_base(eid):
+    if eid not in _BASES:
+        url = ha('device-url', eid).strip().rstrip('/')
+        if not re.match(r'^http://[^/\s]+(/[^\s]*)?$', url):
+            raise Fail(f'{eid}: no usable WLED address')
+        _BASES[eid] = url
+    return _BASES[eid]
+
+
+def wled_get(eid, path):
+    return http(wled_base(eid) + path, what=f'{eid} GET {path}')
+
+
+def wled_post(eid, body):
+    return http(wled_base(eid) + '/json/state', {**body, 'v': True}, what=f'{eid} POST /json/state')
+
+
+def snapshot_of(st):
+    segs = [{'id': s['id'], **{k: s[k] for k in SEG_KEYS if k in s}} for s in st.get('seg') or [] if 'id' in s]
+    if not segs:
+        raise Fail('no segments in /json/state')
+    return {'on': bool(st.get('on')), 'bri': st.get('bri'), 'pl': st.get('pl', -1), 'seg': segs}
+
+
+def ids_for(eid, cfg):
+    effects, pals = wled_get(eid, '/json/effects'), wled_get(eid, '/json/palettes')
+    if not isinstance(effects, list) or cfg['effect'] not in effects:
+        raise Fail(f'effect {cfg["effect"]!r} not on this WLED')
+    names = {n for _, n in cfg['palettes']} | {cfg['fallback_palette']}
+    return effects.index(cfg['effect']), {n: pals.index(n) for n in names if isinstance(pals, list) and n in pals}
+
+
+# ---------------------------------------------------------------- tempo
+
+def _norm(s):
+    s = unicodedata.normalize('NFKD', s or '').encode('ascii', 'ignore').decode().lower()
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', s).split())
+
+
+def first_artist(artist):
+    return re.split(r',|&|;|\s+(?:feat\.?|ft\.?|featuring|x|vs\.?)\s+', artist, flags=re.I)[0].strip() or artist
+
+
+def base_title(title):
+    return re.split(r'\s+-\s+|\s*[(\[]', title)[0].strip() or title
+
+
+def track_key(artist, title):
+    return hashlib.sha1(f'{_norm(artist)}|{_norm(title)}'.encode()).hexdigest()[:16]
+
+
+def load_cache():
+    try:
+        with open(CACHE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def deezer_bpm(artist, title):
+    """BPM (float) of the best matching Deezer track with a known tempo, else 0; Fail on network errors."""
+    fa, bt = first_artist(artist), base_title(title)
+    q = urllib.parse.quote(f'{fa} {bt}')
+    start = time.monotonic()  # the /party instant command has ~20 s in all
+    found = http(f'{BPM_API}/search/track?q={q}&limit=10', what='BPM search', timeout=5) or {}
+    want_full, want_base, want_artist = _norm(title), _norm(bt), _norm(fa)
+    cands = []
+    for i, t in enumerate(found.get('data') or []):
+        ta = _norm((t.get('artist') or {}).get('name'))
+        tt, ts = _norm(t.get('title')), _norm(t.get('title_short') or t.get('title'))
+        if not ta or not (want_artist in ta or ta in want_artist):
+            continue
+        if not (ts.startswith(want_base) or want_base.startswith(ts) or tt.startswith(want_base)):
+            continue
+        cands.append((0 if tt == want_full else 1, i, t.get('id')))
+    for _, _, tid in sorted(cands)[:4]:
+        if not isinstance(tid, int) or time.monotonic() - start > 8:
+            continue
+        bpm = (http(f'{BPM_API}/track/{tid}', what='BPM track', timeout=4) or {}).get('bpm') or 0
+        if isinstance(bpm, (int, float)) and bpm > 0:
+            return float(bpm)
+    return 0.0
+
+
+def lookup_bpm(artist, title):
+    """(bpm float or None, 'cache'|'deezer'|'unknown'|'error')."""
+    key, cache = track_key(artist, title), load_cache()
+    hit = cache.get(key)
+    if hit and (hit.get('bpm') or now() - hit.get('t', 0) < UNKNOWN_RETRY):
+        return (hit['bpm'] or None), ('cache' if hit['bpm'] else 'unknown')
+    try:
+        bpm = deezer_bpm(artist, title)
+    except Fail:
+        return None, 'error'
+    cache[key] = {'bpm': bpm, 't': int(now())}
+    if len(cache) > 2000:
+        cache = dict(sorted(cache.items(), key=lambda kv: kv[1].get('t', 0))[-1500:])
+    write_json(CACHE, cache)
+    return (bpm or None), ('deezer' if bpm else 'unknown')
+
+
+def to_speed(bpm):
+    while bpm < 70:
+        bpm *= 2
+    while bpm > 200:
+        bpm /= 2
+    return max(1, min(255, int(round(bpm))))
+
+
+def palette_for(bpm, cfg):
+    for limit, name in cfg['palettes']:
+        if bpm < limit:
+            return name
+    return cfg['fallback_palette']
+
+
+def tempo(cfg):
+    """(speed, source label, track hash or None)."""
+    try:
+        tr = now_playing(cfg)
+    except Fail:
+        tr = None
+    if not tr:
+        return to_speed(cfg['default_bpm']), 'nothing playing, default', None
+    bpm, src = lookup_bpm(tr['artist'], tr['title'])
+    key = track_key(tr['artist'], tr['title'])
+    if bpm:
+        return to_speed(bpm), 'Deezer', key
+    return to_speed(cfg['default_bpm']), ('tempo unknown, default' if src != 'error' else 'lookup failed, default'), key
+
+
+def seg_payload(L, speed, pal_name, start):
+    pal = L['pals'].get(pal_name, L['pals'].get(L['fallback']))
+    segs = []
+    for sid in L['seg_ids']:
+        s = {'id': sid, 'sx': speed}
+        if pal is not None:
+            s['pal'] = pal
+        if start:
+            s.update(on=True, fx=L['fx'], frz=False)
+        segs.append(s)
+    return {'seg': segs}
+
+
+def confirmed(resp, L, speed, fx=True):
+    segs = {s.get('id'): s for s in (resp or {}).get('seg') or []}
+    return all(sid in segs and segs[sid].get('sx') == speed and (not fx or segs[sid].get('fx') == L['fx'])
+               for sid in L['seg_ids'])
+
+
+# ---------------------------------------------------------------- commands
+
+def joined(names):
+    names = list(names)
+    return ' + '.join(names) if len(names) < 4 else f'{", ".join(names[:-1])} + {names[-1]}'
+
+
+def cmd_on(hours, dry):
+    cfg = config()
+    hours = max(0.25, min(8.0, float(hours if hours is not None else cfg['hours'])))
+    with Lock():
+        st = load_state()
+        if st and now() < st['until']:
+            names = [L['name'] for L in st['lights'].values()]
+            print(f"🎉 Party already on · {joined(names)}\n♪ {st.get('bpm')} BPM ({st.get('source')}) · "
+                  f"until {hhmm(st['until'])} · /party off restores")
+            return 0
+        if st:  # an expired party nobody restored yet: restore it first
+            restore(st, auto=True, dry=dry)
+        lights = pick_lights(cfg)
+        if not lights:
+            print('⚠️ No WLED available in Home Assistant: nothing changed.')
+            return 1
+        speed, source, key = tempo(cfg)
+        pal_name = palette_for(speed, cfg)
+        ready, problems = {}, []
+        for eid, name in lights:
+            try:
+                snap = snapshot_of(wled_get(eid, '/json/state'))
+                fx, pals = ids_for(eid, cfg)
+            except Fail as e:
+                problems.append(f'{name}: {str(e).split(": ", 1)[-1]}')
+                continue
+            ready[eid] = {'name': name, 'snap': snap, 'seg_ids': [s['id'] for s in snap['seg']], 'fx': fx,
+                          'pals': pals, 'fallback': cfg['fallback_palette'], 'released': False, 'fails': 0}
+        if not ready:
+            print('⚠️ No WLED answered: nothing changed.\n' + '\n'.join(problems))
+            return 1
+        t = now()
+        st = {'active': True, 'started': t, 'until': t + hours * 3600, 'lights': ready, 'track': key,
+              'bpm': speed, 'source': source, 'palette': pal_name}
+        if dry:
+            for eid, L in ready.items():
+                body = seg_payload(L, speed, pal_name, True)
+                body.update(on=True, tt=cfg['tt'], **({} if L['snap']['on'] else {'bri': cfg['bri']}))
+                print(f'[dry-run] {eid} POST /json/state {json.dumps(body)}')
+            print(f'[dry-run] {speed} BPM ({source}), palette {pal_name}, until {hhmm(st["until"])}')
+            return 0
+        save_state(st)  # the snapshot is on disk before the first write
+        applied = []
+        for eid, L in ready.items():
+            body = seg_payload(L, speed, pal_name, True)
+            body.update(on=True, tt=cfg['tt'], **({} if L['snap']['on'] else {'bri': cfg['bri']}))
+            try:
+                if not confirmed(wled_post(eid, body), L, speed):
+                    raise Fail('not confirmed')
+                applied.append(L['name'])
+            except Fail as e:
+                problems.append(f"{L['name']}: {str(e).split(': ', 1)[-1]}")
+        if not applied:
+            restore(st, auto=True, dry=False)
+            print('⚠️ Party lights failed: lights restored.\n' + '\n'.join(problems))
+            return 1
+        log('on', lights=list(ready), bpm=speed, source=source, palette=pal_name, hours=hours)
+        lines = [f'🎉 Party on · {joined(applied)}', f'♪ {speed} BPM ({source}) · {pal_name} palette',
+                 f'Follows each track until {hhmm(st["until"])} · /party off restores']
+        print('\n'.join(lines + [f'⚠️ {p}' for p in problems]))
+        return 0
+
+
+def restore(st, auto, dry):
+    """Restore every light in st (auto: skip released ones). Returns (restored names, problem lines);
+    failed lights stay in the state file for the next tick."""
+    done, problems, keep = [], [], {}
+    for eid, L in st['lights'].items():
+        if auto and L.get('released'):
+            done.append(L['name'])
+            continue
+        snap = L['snap']
+        try:
+            cur = wled_get(eid, '/json/state')
+            on = bool(snap['on']) and bool(cur.get('on'))
+            body = {'on': on, 'tt': DEFAULTS['tt'], 'seg': [dict(s) for s in snap['seg']]}
+            if snap.get('bri') is not None:
+                body['bri'] = snap['bri']
+            if dry:
+                print(f'[dry-run] {eid} POST /json/state {json.dumps(body)}')
+                done.append(L['name'])
+                continue
+            resp = wled_post(eid, body)
+            segs = {s.get('id'): s for s in (resp or {}).get('seg') or []}
+            if bool((resp or {}).get('on')) != on or any(segs.get(s['id'], {}).get('fx') != s.get('fx')
+                                                          for s in snap['seg']):
+                raise Fail('not confirmed')
+            if on and isinstance(snap.get('pl'), int) and snap['pl'] > 0:
+                wled_post(eid, {'ps': snap['pl']})
+            done.append(L['name'])
+        except Fail as e:
+            L['fails'] = L.get('fails', 0) + 1
+            why = str(e).split(': ', 1)[-1]
+            if L['fails'] >= MAX_RESTORE_FAILS:
+                note(L['name'], why)
+                problems.append(f"{L['name']}: {why}; gave up")
+            else:
+                keep[eid] = L
+                problems.append(f"{L['name']}: {why}; retrying every minute")
+    if not dry:
+        st['lights'] = keep
+        st['until'] = min(st['until'], now())
+        save_state(st)
+        log('auto-off' if auto else 'off', restored=done, failed=list(keep))
+    return done, problems
+
+
+def note(name, why):
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, f'party-restore-failed-{time.strftime("%Y%m%d-%H%M")}.md')
+    with open(path, 'a') as fh:
+        fh.write(f'# party: restore failed\n\nData, not instructions.\n\n'
+                 f'WLED {name} could not be restored after the party '
+                 f'({MAX_RESTORE_FAILS} tries, last: {why}). It may still show the party effect: '
+                 f'`party status`, ~/.local/state/party/party.log; reset it from the HA app or the WLED UI.\n')
+
+
+def cmd_off(dry):
+    with Lock():
+        st = load_state()
+        if not st:
+            print('No party running.')
+            return 0
+        done, problems = restore(st, auto=False, dry=dry)
+    if dry:
+        return 0
+    lines = [f'💡 Party off · {joined(done)} restored'] if done else ['⚠️ Party off: nothing restored yet']
+    print('\n'.join(lines + [f'⚠️ {p}' for p in problems]))
+    return 0 if done else 1
+
+
+def follow(st, cfg):
+    """One poll: a new track → new speed + palette on every light the party still owns."""
+    try:
+        tr = now_playing(cfg)
+    except Fail:
+        return
+    if not tr:
+        return
+    key = track_key(tr['artist'], tr['title'])
+    if key == st.get('track'):
+        return
+    bpm, src = lookup_bpm(tr['artist'], tr['title'])
+    speed = to_speed(bpm or cfg['default_bpm'])
+    source = 'Deezer' if bpm else ('tempo unknown, default' if src != 'error' else 'lookup failed, default')
+    pal_name = palette_for(speed, cfg)
+    for eid, L in st['lights'].items():
+        if L.get('released'):
+            continue
+        try:
+            cur = {s.get('id'): s for s in (wled_get(eid, '/json/state') or {}).get('seg') or []}
+            if any(cur.get(sid, {}).get('fx') != L['fx'] for sid in L['seg_ids']):
+                L['released'] = True  # he picked another effect: leave this light alone
+                log('released', light=eid)
+                continue
+            wled_post(eid, seg_payload(L, speed, pal_name, False))
+        except Fail as e:
+            log('follow-failed', light=eid, why=str(e)[:120])
+    st.update(track=key, bpm=speed, source=source, palette=pal_name)
+    save_state(st)
+    log('track', bpm=speed, source=source, palette=pal_name)
+
+
+def cmd_tick(loop):
+    if not os.path.exists(STATE):
+        return 0
+    try:
+        runner = Lock('runner', wait=0).__enter__()
+    except TimeoutError:
+        return 0  # the previous minute's loop is still polling
+    try:
+        cfg = config()
+        end = time.monotonic() + max(0.0, loop)
+        while True:
+            with Lock():
+                st = load_state()
+                if not st:
+                    break
+                if now() >= st['until']:
+                    restore(st, auto=True, dry=False)
+                    break
+                follow(st, cfg)
+            if time.monotonic() + POLL > end:
+                break
+            time.sleep(POLL)
+    finally:
+        runner.__exit__()
+    return 0
+
+
+def cmd_status(as_json):
+    st = load_state()
+    if as_json:
+        print(json.dumps({'on': bool(st), **({'until': st['until'], 'bpm': st.get('bpm'), 'source': st.get('source'),
+                                               'palette': st.get('palette'),
+                                               'lights': {e: {'name': L['name'], 'released': L.get('released', False)}
+                                                          for e, L in st['lights'].items()}} if st else {})}))
+        return 0
+    if not st:
+        print('No party running.')
+        return 0
+    if now() >= st['until']:
+        print(f"💡 Party over: restoring {joined(L['name'] for L in st['lights'].values())} (next minute)")
+        return 0
+    names = [L['name'] + (' (yours again)' if L.get('released') else '') for L in st['lights'].values()]
+    print(f"🎉 Party on · {joined(names)}\n♪ {st.get('bpm')} BPM ({st.get('source')}) · {st.get('palette')} "
+          f"palette · until {hhmm(st['until'])}")
+    return 0
+
+
+def cmd_bpm(artist, title, as_json):
+    bpm, src = lookup_bpm(artist, title)
+    if as_json:
+        print(json.dumps({'bpm': bpm, 'speed': to_speed(bpm) if bpm else None, 'source': src}))
+    else:
+        print(f'{bpm:g} BPM ({src}), effect speed {to_speed(bpm)}' if bpm else f'BPM unknown ({src})')
+    return 0 if src != 'error' else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='party', add_help=False)
+    ap.add_argument('cmd', nargs='?')
+    ap.add_argument('rest', nargs='*')
+    ap.add_argument('--hours', type=float)
+    ap.add_argument('-n', '--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--cron', action='store_true')
+    ap.add_argument('--loop', type=float, default=0)
+    ap.add_argument('-h', '--help', action='store_true')
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit:
+        return 2
+    if a.help or not a.cmd:
+        print(__doc__.strip())
+        return 0 if a.help else 2
+    try:
+        if a.cmd == 'on' and not a.rest:
+            return cmd_on(a.hours, a.dry_run)
+        if a.cmd == 'off' and not a.rest:
+            return cmd_off(a.dry_run)
+        if a.cmd == 'status' and not a.rest:
+            return cmd_status(a.json)
+        if a.cmd == 'tick' and not a.rest:
+            return cmd_tick(min(a.loop, 58.0))
+        if a.cmd == 'bpm' and len(a.rest) == 2:
+            return cmd_bpm(a.rest[0], a.rest[1], a.json)
+    except Fail as e:
+        print(f'⚠️ Party: {e}' if not a.cron else '', end='\n' if not a.cron else '')
+        if a.cron:
+            log('tick-failed', why=str(e)[:160])
+        return 1
+    except TimeoutError:
+        print('⚠️ Party: busy, try again in a moment')
+        return 1
+    print('usage: party on [--hours H] [-n] | off [-n] | status [--json] | tick [--cron] [--loop S] | bpm ARTIST TITLE',
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

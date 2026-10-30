@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""pack: the /pack packing list (tg-cmd's), optionally copied into a Home Assistant to-do list "Packing".
+
+  pack [TYPE|WORDS|list]                 the same card as the instant /pack (≤ 10 lines)
+  pack --todo [TYPE|WORDS] [--dry-run]   add the list's items to HA's to-do list "Packing" via `ha todo add`
+                                         (items already open there are skipped; --dry-run only shows them)
+
+The HA list is never created here: when HA has no to-do entity named "Packing" (or todo.packing), pack says so and
+exits 4; when it exists but `ha` may not write it, pack names the line for ~/.config/ha/todo-lists.json and exits 5.
+Exit: 0 ok, 2 usage, 3 a data source failed, 4 no Packing list in HA, 5 list not allowed for ha.
+Env (tests): PACK_TG_CMD (path of tg-cmd); tg-cmd's TG_CMD_BIN (dir with ha, calcache, rave-radar), TG_CMD_NOW,
+TG_CMD_PACK_TEMPLATES and the trip-file variables.
+"""
+import importlib.util
+import json
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+
+LIST_NAMES = ("packing", "packing list", "packliste")
+
+
+def load_tg_cmd():
+    path = os.environ.get("PACK_TG_CMD") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "tg-cmd")
+    loader = SourceFileLoader("tg_cmd", path)
+    spec = importlib.util.spec_from_loader("tg_cmd", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def packing_list(tg):
+    code, out, err = tg.run(["ha", "list", "todo", "--json"], 20, "HA", full=True)
+    if code != 0:
+        raise tg.Fail("HA: to-do lists not readable")
+    for r in json.loads(out or "[]"):
+        if not isinstance(r, dict):
+            continue
+        eid, name = str(r.get("entity_id") or ""), str(r.get("name") or "").strip().lower()
+        if eid == "todo.packing" or name in LIST_NAMES:
+            return eid
+    return None
+
+
+def main(argv):
+    args = [a for a in argv[1:]]
+    if any(a in ("-h", "--help") for a in args):
+        print(__doc__.strip())
+        return 0
+    todo, dry = "--todo" in args, "--dry-run" in args
+    rest = [a for a in args if a not in ("--todo", "--dry-run")]
+    if len(rest) > 1 or any(a.startswith("--") for a in rest) or (dry and not todo):
+        print("usage: pack [--todo [--dry-run]] [TYPE|WORDS|list]", file=sys.stderr)
+        return 2
+    tg = load_tg_cmd()
+    try:
+        head, items = tg.pack_build(rest[0] if rest else None)
+        if items is None or not todo:
+            print(head if items is None else tg.pack_card(head, items))
+            return 0 if items is not None or not todo else 2
+        eid = packing_list(tg)
+        if not eid:
+            print("No HA to-do list \"Packing\" exists, so nothing was added (pack never creates HA entities).\n"
+                  "Create it in HA (Settings › Devices & services › Add integration › Local To-do, name \"Packing\").")
+            return 4
+        code, out, err = tg.run(["ha", "todo", "items", "--list", eid, "--json"], 20, "HA", full=True)
+        if code != 0:
+            if "not an allowed" in err:
+                print(f"HA has {eid}, but ha may not write it yet: add it to ~/.config/ha/todo-lists.json "
+                      f"({{\"lists\": [\"{eid}\"]}}), then rerun.")
+                return 5
+            raise tg.Fail("HA: Packing list not readable")
+        have = {str(i.get("summary") or "").strip().lower() for i in json.loads(out or "[]") if isinstance(i, dict)}
+        new = [x for x in items if x.lower() not in have]
+        for x in new if not dry else ():
+            tg.run(["ha", "todo", "add", x, "--list", eid], 20, "HA")
+        verb = "would add" if dry else "added"
+        print(f"🧳 {head.removeprefix('🎒 ')}\n{eid}: {verb} {len(new)}, {len(items) - len(new)} already there.")
+        return 0
+    except tg.Fail as e:
+        print(f"pack: {e}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

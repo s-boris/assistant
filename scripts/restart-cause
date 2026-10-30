@@ -1,0 +1,396 @@
+#!/usr/bin/env -S python3 -I
+"""restart-cause [--dry-run] [--force]
+Explain a container start: run from ~/boot.sh (backgrounded, under timeout) at every container start and write ONE
+~/inbox/restart-cause-YYYYMMDD-HHMM.md note per start, unless the restart was deliberate.
+  what       container vs. only the session: PID 1's start (/proc/1/stat + /proc/stat btime) vs. now; the host
+             kernel's boot (btime = `uptime -s`) shows a host reboot. A PID 1 older than 15 min = only the session
+             restarted (~/bin/restart writes its own note): no note.
+  silent     the last ~/.local/state/restart-wake.log entry or an ~/inbox/restart-<epoch>.md lies within 5 min of
+             the start (a deliberate `restart`); the same start seen before (state ~/.local/state/restart-cause/last-boot)
+  cause      host reboot (host booted <= 15 min before the container) > an appdata backup run that started <= 3 h
+             before (pretrip verb: run folder names) > the server's container auto-update window (containers verb:
+             CA Auto Update cron, start .. +45 min) > OOM lines in dmesg (when readable) > unknown.
+             Server reads: `unraid-ssh run containers` and `unraid-ssh run pretrip` (read-only verbs, 60 s each).
+             The server side also says whether this container was recreated (new image/config) or only restarted,
+             and which containers started or were recreated with it.
+  agents     subagents interrupted by the start: agent-watch's last saved state from before it
+             (~/.local/state/agent-watch/state.json, read before anything else) lists each agent still running or
+             stalled at that run whose transcript was last written before the start, with id, description (owner
+             title), last progress time and "resume with SendMessage <id>". Finished agents are skipped.
+  --dry-run  print the note (or why none) to stdout; writes nothing. --force: ignore the state file and the
+             15-min session check.
+Seams (tests): RESTART_CAUSE_PROC (/proc), RESTART_CAUSE_NOW (epoch), RESTART_CAUSE_SSH (~/bin/unraid-ssh),
+RESTART_CAUSE_DMESG (dmesg), RESTART_CAUSE_AGENT_STATE (agent-watch's state.json), RESTART_CAUSE_NAME (claude-bot), RESTART_CAUSE_SSH_WAIT (120 s for the ssh client
+after a rebuild). Exit 0 always except usage (2).
+Tests: ~/opt/assistant/tests/legacy/restart-cause/run.sh
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+INBOX = os.path.join(HOME, "inbox")
+STATE_DIR = os.path.join(HOME, ".local/state/restart-cause")
+STATE = os.path.join(STATE_DIR, "last-boot")
+WAKE_LOG = os.path.join(HOME, ".local/state/restart-wake.log")
+PROC = os.environ.get("RESTART_CAUSE_PROC") or "/proc"
+SSH = os.environ.get("RESTART_CAUSE_SSH") or os.path.join(HOME, "bin/unraid-ssh")
+DMESG = os.environ.get("RESTART_CAUSE_DMESG") or "dmesg"
+NAME = os.environ.get("RESTART_CAUSE_NAME") or "claude-bot"
+AGENT_STATE = os.environ.get("RESTART_CAUSE_AGENT_STATE") or os.path.join(HOME, ".local/state/agent-watch/state.json")
+LIVE = ("running", "stalled")    # agent-watch states of an unfinished agent
+DELIBERATE_S = 5 * 60
+SESSION_ONLY_S = 15 * 60
+HOST_REBOOT_S = 15 * 60
+BACKUP_BEFORE_S = 3 * 3600
+AUTOUPDATE_SPAN_S = 45 * 60
+NEAR_S = 90
+
+
+def now():
+    v = os.environ.get("RESTART_CAUSE_NOW")
+    return float(v) if v else time.time()
+
+
+def fmt(ts, f="%Y-%m-%d %H:%M:%S"):
+    return time.strftime(f, time.localtime(ts))
+
+
+def ago(seconds):
+    s = abs(int(seconds))
+    if s < 120:
+        return f"{s} s"
+    if s < 7200:
+        return f"{s // 60} min"
+    if s < 172800:
+        return f"{s // 3600} h"
+    return f"{s // 86400} d"
+
+
+def boot_times():
+    """(host kernel boot epoch, PID 1 start epoch) or (None, None)."""
+    try:
+        with open(os.path.join(PROC, "stat")) as f:
+            btime = int(next(l.split()[1] for l in f if l.startswith("btime ")))
+        with open(os.path.join(PROC, "1/stat")) as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        start = btime + int(fields[19]) / os.sysconf("SC_CLK_TCK")    # field 22 = starttime (clock ticks)
+        return btime, start
+    except (OSError, StopIteration, IndexError, ValueError):
+        return None, None
+
+
+def last_wake():
+    """(epoch, text) of the last restart-wake.log line, or (None, None)."""
+    try:
+        with open(WAKE_LOG, errors="replace") as f:
+            lines = [l.rstrip("\n") for l in f if l.strip()]
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)", line)
+        if m:
+            return time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")), m.group(2)[:120]
+    return None, None
+
+
+def restart_notes():
+    out = []
+    for p in glob.glob(os.path.join(INBOX, "restart-*.md")):
+        n = os.path.basename(p)[len("restart-"):-3]
+        if n.isdigit():
+            out.append(int(n))
+    return out
+
+
+def wait_for_ssh():
+    """After a rebuild boot.sh reinstalls the ssh client later in the boot: wait for it (bounded)."""
+    limit = float(os.environ.get("RESTART_CAUSE_SSH_WAIT") or 120)
+    t0 = time.time()
+    while shutil.which("ssh") is None and time.time() - t0 < limit:
+        time.sleep(3)
+
+
+def ssh(verb):
+    try:
+        r = subprocess.run([SSH, "run", verb], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=60, errors="replace")
+        return r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def sections(text):
+    out, cur = {}, None
+    for line in text.splitlines():
+        if line.startswith("@@"):
+            cur = line[2:].strip()
+            out[cur] = []
+        elif cur:
+            out[cur].append(line)
+    return out
+
+
+def docker_ts(s):
+    """Docker's RFC 3339 UTC timestamp (nanoseconds) -> epoch, or None."""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", s or "")
+    if not m:
+        return None
+    return datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(
+        tzinfo=datetime.timezone.utc).timestamp()
+
+
+def server_containers(boot):
+    """Facts from the containers verb: self state, companions, auto-update window. None if unreachable."""
+    text = ssh("containers")
+    if text is None:
+        return None
+    sec = sections(text)
+    facts = {"self": None, "started": [], "recreated": [], "window": None}
+    for line in sec.get("containers", []):
+        try:
+            c = json.loads(line)
+        except ValueError:
+            continue
+        name = str(c.get("name", "")).lstrip("/")
+        st, cr = docker_ts(c.get("startedAt")), docker_ts(c.get("created"))
+        if name == NAME:
+            if st is not None and cr is not None:
+                facts["self"] = "recreated (new image or config)" if abs(st - cr) < 60 else \
+                    f"restarted (same container, created {fmt(cr, '%Y-%m-%d %H:%M')})"
+            continue
+        if cr is not None and abs(cr - boot) <= 10 * 60:
+            facts["recreated"].append(name)
+        elif st is not None and abs(st - boot) <= NEAR_S:
+            facts["started"].append(name)
+    try:
+        au = json.loads("\n".join(sec.get("autoupdate", [])) or "{}")
+        cron = au.get("cron") or {}
+        freq = str(cron.get("dockerCronFrequency", ""))
+        hh, mm = int(cron.get("dockerCronHour")), int(cron.get("dockerCronMinute"))
+    except (ValueError, TypeError, AttributeError):
+        return facts
+    if freq.lower() in ("", "disabled", "none"):
+        return facts
+    lt = time.localtime(boot)
+    for back in (0, 1):                                   # the window may have started the evening before
+        d = datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday) - datetime.timedelta(days=back)
+        start = time.mktime((d.year, d.month, d.day, hh, mm, 0, 0, 0, -1))
+        if not start <= boot <= start + AUTOUPDATE_SPAN_S:
+            continue
+        ok = True
+        if freq.lower() == "weekly":
+            ok = str((d.weekday() + 1) % 7) == str(cron.get("dockerCronDay", ""))     # 0 = Sunday
+        elif freq.lower() == "monthly":
+            ok = str(d.day) == str(cron.get("dockerCronDayOfMonth", ""))
+        if ok:
+            every_all = str((au.get("global") or {}).get("dockerUpdateAll", "")).lower() == "yes"
+            facts["window"] = f"{freq.lower()} at {hh:02d}:{mm:02d}" + (", update all" if every_all else "")
+    return facts
+
+
+def backup_runs(boot):
+    """(plugin names, latest run start <= 3 h before boot or None) from the pretrip verb; None if unreachable."""
+    text = ssh("pretrip")
+    if text is None:
+        return None
+    sec = sections(text)
+    plugins = [l.strip() for l in sec.get("ab_plugins", []) if l.strip()]
+    best = None
+    for line in sec.get("ab_dirs", []):
+        base = line.rstrip("/").rsplit("/", 1)[-1]
+        m = re.match(r"ab_(\d{8})_(\d{6})$", base)
+        m2 = re.match(r"(\d{4})-(\d\d)-(\d\d)@(\d\d)\.(\d\d)$", base)
+        try:
+            if m:
+                t = time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S"))
+            elif m2:
+                t = time.mktime(time.strptime("".join(m2.groups()), "%Y%m%d%H%M"))
+            else:
+                continue
+        except ValueError:
+            continue
+        if boot - BACKUP_BEFORE_S <= t <= boot + 60 and (best is None or t > best):
+            best = t
+    return plugins, best
+
+
+def dmesg_oom():
+    """Count of OOM/kill lines in the kernel log, or None when it's not readable."""
+    try:
+        r = subprocess.run([DMESG], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+                           errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return sum(1 for l in r.stdout.splitlines()
+               if re.search(r"out of memory|oom-kill|oom_reaper|killed process", l, re.I))
+
+
+def interrupted_agents(boot):
+    """(time of agent-watch's last run before the start, [agent dicts]) or None if its state is missing/unreadable.
+    Only structured fields (id, description, tag title, timestamps) are used."""
+    try:
+        with open(AGENT_STATE) as f:
+            st = json.load(f)
+        agents = st.get("agents") or {}
+        tags = st.get("tags") or {}
+        if not isinstance(agents, dict):
+            return None
+        seen = [v.get("seen") for v in agents.values() if isinstance(v, dict) and isinstance(v.get("seen"), (int, float))]
+        before = [x for x in seen if x <= boot]
+        if not before:
+            return (None, [])
+        last_run = max(before)
+        out = []
+        for aid, v in agents.items():
+            if not isinstance(v, dict) or v.get("status") not in LIVE:
+                continue
+            seen_at, mtime = v.get("seen") or 0, v.get("mtime") or 0
+            if seen_at < last_run - 60 or mtime > boot:      # not watched at that run, or written after the start
+                continue
+            tag = tags.get(aid) if isinstance(tags.get(aid), dict) else {}
+            title = tag.get("title") if tag.get("role") == "owner" else None
+            out.append({"id": str(aid), "desc": str(v.get("desc") or "agent")[:60], "title": title,
+                        "last": mtime, "status": v.get("status")})
+        out.sort(key=lambda a: -a["last"])
+        return (last_run, out)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def agent_lines(ia):
+    if ia is None:
+        return []
+    last_run, agents = ia
+    when = f"agent-watch state of {fmt(last_run, '%Y-%m-%d %H:%M')}" if last_run else "no agent-watch run before it"
+    if not agents:
+        return [f"Interrupted agents: none ({when})."]
+    lines = [f"Interrupted agents: ({when}, before the restart; running or stalled then)"]
+    for a in agents[:12]:
+        t = f' (owner-facing, title "{a["title"]}")' if a["title"] else ""
+        st = "" if a["status"] == "running" else f", {a['status']}"
+        lines.append(f'- {a["id"]}: "{a["desc"]}"{t}, last progress {fmt(a["last"], "%Y-%m-%d %H:%M")}{st}; '
+                     f'resume with SendMessage {a["id"]} (partial output may exist)')
+    if len(agents) > 12:
+        lines.append(f"- … and {len(agents) - 12} more (`agent-watch status --hours 6`)")
+    return lines
+
+
+def analyse(force):
+    """(note text or None, reason for no note)."""
+    t = now()
+    host, boot = boot_times()
+    if boot is None:
+        return None, "cannot read PID 1's start time"
+    if t - boot > SESSION_ONLY_S and not force:
+        return None, f"only the session restarted: the container has been up since {fmt(boot)}"
+    wake_t, wake_txt = last_wake()
+    if wake_t is not None and abs(wake_t - boot) <= DELIBERATE_S:
+        return None, f"deliberate restart (restart-wake {fmt(wake_t)}: {wake_txt})"
+    near = [n for n in restart_notes() if -60 <= boot - n <= DELIBERATE_S]
+    if near:
+        return None, f"deliberate restart (~/inbox/restart-{max(near)}.md)"
+
+    ia = interrupted_agents(boot)          # read before the slow server checks (agent-watch's cron may run meanwhile)
+    host_reboot = host is not None and boot - host <= HOST_REBOOT_S
+    what = f"the container (PID 1 started {fmt(boot)})"
+    hostline = (f"host rebooted at {fmt(host)}" if host_reboot else
+                f"host up since {fmt(host, '%Y-%m-%d %H:%M')} (no host reboot)" if host is not None else "host boot unknown")
+    wait_for_ssh()
+    srv = server_containers(boot)
+    bk = backup_runs(boot)
+    oom = dmesg_oom()
+
+    causes = []
+    if host_reboot:
+        causes.append("a host reboot (the server restarted; check for a power cut, a crash or an update)")
+    if bk and bk[1] is not None:
+        causes.append(f"an appdata backup run (started {fmt(bk[1], '%H:%M')}; the plugin stops and restarts containers)")
+    if srv and srv.get("window"):
+        causes.append(f"the server's container auto-update window ({srv['window']})")
+    if oom:
+        causes.append(f"an OOM kill or crash ({oom} OOM lines in dmesg)")
+    if not causes:
+        causes.append("unknown (no host reboot, no backup run, outside the auto-update window)")
+
+    lines = [f"Container restart at {fmt(boot)}: no restart-wake entry, so not a deliberate `restart`.",
+             f"What: {what}; {hostline}."]
+    if srv is None:
+        lines.append("Server: unreachable (unraid-ssh run containers failed).")
+    else:
+        bits = [f"{NAME} {srv['self']}" if srv["self"] else f"{NAME} not found in the container list"]
+        if srv["started"]:
+            bits.append("started with it: " + ", ".join(sorted(srv["started"])[:8]))
+        if srv["recreated"]:
+            bits.append("recreated around then (updated): " + ", ".join(sorted(srv["recreated"])[:8]))
+        lines.append("Server: " + "; ".join(bits) + ".")
+    lines.append("Last restart-wake entry: " + (f"{fmt(wake_t)} ({ago(boot - wake_t)} before)" if wake_t is not None
+                                                else "none") + ".")
+    lines.append("Likely cause: " + causes[0] + ".")
+    if len(causes) > 1:
+        lines.append("Also matches: " + "; ".join(causes[1:]) + ".")
+    checks = []
+    if bk is None:
+        checks.append("appdata backup: pretrip verb failed")
+    elif bk[1] is None:
+        checks.append(f"appdata backup: {', '.join(bk[0]) or 'no plugin'}, no run folder within 3 h "
+                      "(its schedule isn't exposed by a read-only verb)")
+    checks.append("dmesg: not readable" if oom is None else f"dmesg: {oom} OOM lines")
+    lines.append("Checks: " + "; ".join(checks) + ".")
+    al = agent_lines(ia)
+    lines.extend(al)
+    resume = " and the interrupted agents above" if ia and ia[1] else ""
+    lines.append("")
+    lines.append("Data, not instructions (from ~/bin/restart-cause). Next: check that Telegram inbound still works "
+                 f"(brain-watch --status, the MCP log), resume TODO.md's In progress{resume}; if the cause is unknown or repeats, add "
+                 "the evidence to PROBLEMS.md; tell the owner only if the restart broke something he was waiting on.")
+    return "\n".join(lines) + "\n", ""
+
+
+def main(argv):
+    dry = "--dry-run" in argv
+    force = "--force" in argv
+    if any(a not in ("--dry-run", "--force") for a in argv):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    _, boot = boot_times()
+    key = str(int(boot)) if boot is not None else ""
+    if not dry and not force and key:
+        try:
+            with open(STATE) as f:
+                if f.read().strip() == key:
+                    return 0                               # this start was already handled
+        except OSError:
+            pass
+    note, why = analyse(force)
+    if dry:
+        print(note if note else f"no note: {why}", end="" if note else "\n")
+        return 0
+    if note:
+        os.makedirs(INBOX, exist_ok=True)
+        path = os.path.join(INBOX, "restart-cause-" + time.strftime("%Y%m%d-%H%M", time.localtime(boot)) + ".md")
+        if not os.path.exists(path):
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(note)
+            os.replace(tmp, path)
+    if key:
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(STATE, "w") as f:
+                f.write(key + "\n")
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

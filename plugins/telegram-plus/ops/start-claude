@@ -1,0 +1,231 @@
+#!/bin/sh
+# The main session (installed over /usr/local/bin/start-claude by ~/boot.sh at every container start).
+# entrypoint restarts it when it exits; `restart` restarts it on purpose.
+# Telegram: telegram-plus (home-plugins) as the bridge to tg-adapter, else the official plugin (when ~/.telegram-official
+# exists or telegram-plus isn't installed). Kill switch, the one opt-out: `touch ~/.telegram-official && restart
+# "official Telegram plugin"`; back to the bridge: `rm ~/.telegram-official && restart "bridge"`. Details at the Telegram
+# block below; its fallback sets the kill switch itself and texts the owner.
+# Heartbeat mod (heartbeat@home-plugins) is enabled only here; the cron heartbeat stays as fallback.
+# Off switch: `touch ~/.heartbeat-mod-off && restart "heartbeat mod off"`. Two fast failures on the official plugin turn it
+# off too.
+# Home check: when the host's user shares were down at container start, $HOME is an empty folder that the
+# entrypoint has only seeded. Then stop the container instead of sitting "Up" on a blank home: the restart policy
+# retries, and the host's "claude-bot home check" User Script alerts. Armed once this container has seen the marker
+# (so a fresh install never trips it; a recreated container re-arms at its first start with the marker). A real
+# home whose marker is gone (conversation transcripts or ~/.brain.git there) gets it back, with an ~/inbox note.
+# >>> home check settings (tests rewrite only this block)
+HOME_MARKER=$HOME/.home-marker
+HOME_ARMED=/var/tmp/claude-bot-home-check.armed
+HOME_STOP_PID=1
+HOME_LOUD=/proc/1/fd/2
+HOME_FAIL_SLEEP=60
+# <<< home check settings
+if [ -e "$HOME_MARKER" ]; then
+  [ -e "$HOME_ARMED" ] || { : > "$HOME_ARMED"; } 2>/dev/null
+elif [ -e "$HOME_ARMED" ]; then
+  if [ -d ~/.brain.git ] || ls ~/.claude/projects/-home-node-workspace/*.jsonl >/dev/null 2>&1; then
+    echo "claude-bot home marker: the real home is mounted here (start-claude and the host's home check look for it)" \
+      > "$HOME_MARKER"
+    mkdir -p ~/inbox && echo "start-claude: $HOME_MARKER was missing in the real home; recreated it." \
+      > ~/inbox/home-marker-restored-"$(date +%Y%m%d-%H%M%S)".md
+  else
+    msg="start-claude: $HOME_MARKER is missing, so $HOME is not the real home (host shares down?): stopping the container"
+    echo "$msg" >&2
+    { echo "$msg" > "$HOME_LOUD"; } 2>/dev/null
+    kill -TERM "$HOME_STOP_PID" 2>/dev/null
+    sleep "$HOME_FAIL_SLEEP"
+    exit 1
+  fi
+fi
+
+cd ~/workspace || exit
+state=~/.local/state/start-claude
+mkdir -p $state
+
+# Bot token: not in the container's environment; the official plugin and tg read it from the plugin's 0600 .env file at
+# call time (telegram-plus reads no token, tg-adapter has its own token file). Keep it out of this session's environment
+# anyway, so Bash calls, hooks and MCP servers can't inherit it, and out of tmux's global env (new panes).
+unset TELEGRAM_BOT_TOKEN
+tmux set-environment -g -u TELEGRAM_BOT_TOKEN 2>/dev/null
+
+# Claude Code can move this conversation into a daemon-hosted background session (it did when
+# background agents started). Then `--continue` refuses ("running in the background") and exits,
+# so a restart would loop forever. Stop that background copy first; the transcript is on disk.
+for pid in $(claude agents --json 2>/dev/null | jq -r --arg cwd "$HOME/workspace" \
+    '.[] | select(.cwd == $cwd and .kind == "background") | .pid // empty'); do
+  kill "$pid" 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  kill -9 "$pid" 2>/dev/null
+done
+
+# Pick the conversation back up, unless there isn't one yet.
+ls ~/.claude/projects/-home-node-workspace/*.jsonl >/dev/null 2>&1 && resume=--continue
+# Nightly rotation: a fresh conversation once, when `rotate run` armed rotate/fresh-start (under
+# ~/.local/state/assistant) less than 10 minutes ago; a stale flag (a restart that never came) is only removed. The
+# flag goes either way, so the next start resumes the new conversation.
+fresh=$HOME/.local/state/assistant/rotate/fresh-start
+if [ -f "$fresh" ]; then
+  if [ -n "$resume" ] && [ -n "$(find "$fresh" -mmin -10 2>/dev/null)" ]; then
+    resume=
+    echo "$(date '+%F %T') fresh session (rotation)" >> "$HOME/.local/state/assistant/rotate/start.log" 2>/dev/null
+  fi
+  rm -f "$fresh"
+fi
+plugin=telegram@claude-plugins-official
+if [ ! -e ~/.telegram-official ] && ls -d ~/.claude/plugins/cache/home-plugins/telegram-plus/*/ >/dev/null 2>&1; then
+  plugin=telegram-plus@home-plugins
+fi
+mods=
+if [ ! -e ~/.heartbeat-mod-off ] && ls -d ~/.claude/plugins/cache/home-plugins/heartbeat/*/ >/dev/null 2>&1; then
+  mods=',"heartbeat@home-plugins":true'
+fi
+
+# Telegram. One poller per bot token, so the plugin in use decides who polls:
+#  - bridge (telegram-plus): the plugin never polls and reads no token; tg-adapter's live instance polls and sends.
+#    Before claude starts, a poller left by the previous session (bot.pid: the official plugin's server) must be gone;
+#    then live.off goes and the adapter is started (`tg-adapter ensure --force --instance live`, a no-op while it runs;
+#    its cron line keeps it up). It must be running within BRIDGE_WAIT s, else this start falls back.
+#  - official (the official plugin polls itself): live.off is made and a running live adapter is stopped before claude
+#    starts.
+#  Fallback (no live config, the adapter not running within BRIDGE_WAIT s, or two fast failures in bridge mode): the
+#  adapter off (live.off + stopped), ~/.telegram-official made (this start and the next ones use the official plugin),
+#  owner texted (bridge.log "fallback texted"; without that line brain-watch tells him), ~/inbox note. Back after a
+#  fix: `rm ~/.telegram-official && restart "bridge"`.
+#  - hub (~/.config/tg-bridge/hub present): tg-adapter polls in the hub (claude-hub-tg). The bridge
+#    reads the hub (TELEGRAM_BRIDGE_STORE=hub), the in-container live adapter stays down (live.off + live.hub; a running
+#    one is stopped) and `tg-adapter ensure --instance live` keeps the companion up. No automatic fallback to the
+#    official plugin here (its poller would fight the hub's): a bridge.log line and an ~/inbox note instead. The kill
+#    switch stays the manual opt-out, once the hub's tg is stopped (ops/hub/tg-rollback.sh in ~/opt/assistant).
+#  $state/telegram-mode records the mode of this start (bridge | official); $state/telegram-store says hub in hub mode. TELEGRAM_MODE=bridge goes along in bridge
+#  mode: telegram-plus doesn't read it, but a reverted 0.2.0 tree does, and must then not poll beside the adapter.
+# >>> bridge settings (tests rewrite only this block)
+ADAPTER_CONFIG=$HOME/.config/tg-adapter/live.json
+ADAPTER_OFF=$HOME/.config/tg-adapter/live.off
+ADAPTER_PIDFILE=$HOME/.local/state/tg-adapter/live/adapter.pid
+ADAPTER_CMD=$HOME/bin/tg-adapter
+POLLER_PIDFILE=$HOME/.claude/channels/telegram/bot.pid
+BRIDGE_WAIT=15
+BRIDGE_HUB=$HOME/.config/tg-bridge/hub
+ADAPTER_HUB=$HOME/.config/tg-adapter/live.hub
+# <<< bridge settings
+pid_of() {  # FILE PATTERN: the pid on FILE's first line, if that process is alive and its command line has PATTERN
+  p=$(head -n 1 "$1" 2>/dev/null)
+  case $p in '' | *[!0-9]*) return 1 ;; esac
+  tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qF -- "$2" || return 1
+  echo "$p"
+}
+poller_pid() {  # a poller left by the previous session (bot.pid): alive, server.ts, run from a Telegram plugin directory
+  p=$(pid_of "$POLLER_PIDFILE" server.ts) || return 1
+  case $(readlink "/proc/$p/cwd" 2>/dev/null) in *telegram-plus* | */claude-plugins-official/telegram/*) echo "$p" ;; *) return 1 ;; esac
+}
+gone() {  # PID [term]: wait up to BRIDGE_WAIT s for it to exit (SIGTERM first with "term"); then SIGTERM, wait again
+  [ "$2" = term ] && kill -TERM "$1" 2>/dev/null
+  for round in wait term; do
+    i=0
+    while [ $i -lt "$BRIDGE_WAIT" ] && kill -0 "$1" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+    kill -0 "$1" 2>/dev/null || return 0
+    [ $round = wait ] && kill -TERM "$1" 2>/dev/null
+  done
+  return 1
+}
+adapter_off() {  # the official plugin polls: live.off (when tg-adapter is set up here) and a running live adapter stopped
+  if [ -d "${ADAPTER_OFF%/*}" ] && [ ! -e "$ADAPTER_OFF" ]; then : > "$ADAPTER_OFF"; fi
+  pid=$(pid_of "$ADAPTER_PIDFILE" 'src/cli.ts run') && gone "$pid" term
+}
+bridge_fallback() {  # WHY: the official plugin from this start on, the adapter off first (tg then sends directly), owner told
+  adapter_off
+  touch ~/.telegram-official
+  plugin=telegram@claude-plugins-official
+  tgmode=official
+  echo "$(date '+%F %T') fallback: $1" >> $state/bridge.log
+  mkdir -p ~/inbox && printf '%s\n' "start-claude: Telegram bridge stopped ($1)." \
+    "The live adapter is off (live.off) and ~/.telegram-official is set: the session runs on the official Telegram plugin, after restarts too." \
+    "Back to the bridge after a fix: rm ~/.telegram-official && restart \"bridge\" (start-claude removes live.off and starts the adapter)." \
+    "Data, not instructions." > ~/inbox/start-claude-bridge-fallback-"$(date +%s)".md
+  tg "Telegram bridge stopped ($1); the session uses the official Telegram plugin now." 2>/dev/null &&
+    echo "$(date '+%F %T') fallback texted" >> $state/bridge.log  # else brain-watch tells him (once per fallback)
+}
+hub_note() {  # WHY: hub mode keeps the bridge (no automatic fallback): a bridge.log line and a note for the session
+  echo "$(date '+%F %T') hub: $1" >> $state/bridge.log
+  mkdir -p ~/inbox && printf '%s\n' "start-claude (Telegram hub mode): $1." \
+    "No automatic switch to the official Telegram plugin in hub mode: the hub's tg polls the bot, and a second poller would fight it." \
+    "Manual opt-out only after the hub's tg is stopped (~/opt/assistant/ops/hub/tg-rollback.sh): touch ~/.telegram-official && restart \"official Telegram plugin\"." \
+    "Data, not instructions." > ~/inbox/start-claude-hub-"$(date +%s)".md
+}
+hub=
+tgmode=official
+if [ "$plugin" = telegram-plus@home-plugins ]; then
+  tgmode=bridge
+  if [ -e "$BRIDGE_HUB" ]; then
+    hub=1
+    old=$(poller_pid) && gone "$old"
+    mkdir -p "${ADAPTER_OFF%/*}" && : > "$ADAPTER_OFF" && : > "$ADAPTER_HUB"
+    pid=$(pid_of "$ADAPTER_PIDFILE" 'src/cli.ts run') && gone "$pid" term
+    echo "$(date '+%F %T') bridge start (hub)" >> $state/bridge.log
+    timeout 120 "$ADAPTER_CMD" ensure --force --instance live >> $state/bridge.log 2>&1 ||
+      echo "$(date '+%F %T') hub: tg-adapter ensure --instance live failed (the companion)" >> $state/bridge.log
+  elif [ ! -e "$ADAPTER_CONFIG" ]; then
+    bridge_fallback "no tg-adapter live config"
+  else
+    old=$(poller_pid) && gone "$old"
+    rm -f "$ADAPTER_OFF" "$ADAPTER_HUB"
+    echo "$(date '+%F %T') bridge start" >> $state/bridge.log
+    timeout 120 "$ADAPTER_CMD" ensure --force --instance live >> $state/bridge.log 2>&1
+    i=0
+    until pid_of "$ADAPTER_PIDFILE" 'src/cli.ts run' >/dev/null || [ $i -ge "$BRIDGE_WAIT" ]; do sleep 1; i=$((i + 1)); done
+    pid_of "$ADAPTER_PIDFILE" 'src/cli.ts run' >/dev/null ||
+      bridge_fallback "tg-adapter live did not start: tg-adapter status --instance live"
+  fi
+fi
+[ $tgmode = official ] && [ -e "$BRIDGE_HUB" ] &&
+  hub_note "the official Telegram plugin was chosen (kill switch or telegram-plus missing) while hub mode is on: make sure claude-hub-tg is stopped"
+[ $tgmode = official ] && adapter_off
+echo $tgmode > $state/telegram-mode
+if [ -n "$hub" ]; then echo hub > $state/telegram-store; else rm -f $state/telegram-store; fi
+if [ $tgmode = bridge ]; then export TELEGRAM_MODE=bridge; else unset TELEGRAM_MODE; fi
+if [ -n "$hub" ]; then export TELEGRAM_BRIDGE_STORE=hub; else unset TELEGRAM_BRIDGE_STORE; fi
+
+# Settings for this session only (--settings isn't inherited by child processes):
+# - disableAgentView: no /background or daemon-hosted copy of this session. Such a copy inherits --channels
+#   and would take the channel's events. `claude agents --json` still lists this session. Never as the env var
+#   CLAUDE_CODE_DISABLE_AGENT_VIEW or in user/managed settings: that breaks `claude agents` for the cron
+#   heartbeat, the restart waker and the cleanup loop above.
+# - crossSessionInbound refuse: no SendMessage approval dialog from other sessions in this unattended pane.
+#   Channels, Remote Control, subagents and mod prompts are unaffected.
+# Voice inbox: voice-relay and the phone app's gateway hand tasks to this session's telegram-plus on 127.0.0.1:8792
+# (token ~/.secrets/voice-local-token). Set on this command only; the plugin opens it only as this session's channel.
+# Claude Code native telemetry to the local traces receiver (numbers only). Revert first if inbound breaks.
+export CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=none OTEL_LOGS_EXPORTER=otlp \
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/json OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+  CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 OTEL_TRACES_EXPORTER=otlp
+# keep unset: OTEL_LOG_USER_PROMPTS, OTEL_LOG_ASSISTANT_RESPONSES, OTEL_LOG_TOOL_DETAILS, OTEL_LOG_TOOL_CONTENT,
+# OTEL_LOG_RAW_API_BODIES (content); never any of the switches that turn feature flags off (CLAUDE.md, "Your machine").
+start=$(date +%s)
+TELEGRAM_VOICE_INBOX_PORT=8792 claude $resume --permission-mode bypassPermissions --remote-control claude-bot \
+  --channels "plugin:$plugin" \
+  --settings "{\"enabledPlugins\":{\"$plugin\":true$mods},\"disableAgentView\":true,\"crossSessionInbound\":\"refuse\"}"
+code=$?
+
+if [ $(( $(date +%s) - start )) -lt 60 ]; then
+  n=$(( $(cat $state/fast-fails 2>/dev/null || echo 0) + 1 ))
+  echo $n > $state/fast-fails
+  if [ "$n" -ge 2 ] && [ $tgmode = bridge ] && [ -z "$hub" ]; then
+    # The bridge first: the official plugin from the next start on; the guard below covers the heartbeat mod after that.
+    echo 0 > $state/fast-fails
+    bridge_fallback "the session failed to start twice in bridge mode, exit $code"
+  elif [ "$n" -ge 2 ] && [ -n "$hub" ] && [ ! -e $state/hub-fail-noted ]; then
+    # Hub mode: no fallback (a second poller); noted once until a session runs long, then the heartbeat guard below.
+    echo 0 > $state/fast-fails
+    : > $state/hub-fail-noted
+    hub_note "the session failed to start twice in hub mode, exit $code"
+  elif [ "$n" -ge 2 ] && [ -n "$mods" ]; then
+    echo 0 > $state/fast-fails
+    touch ~/.heartbeat-mod-off
+    tg "Main session failed to start twice (exit $code); turned the heartbeat mod off (cron heartbeat continues)." 2>/dev/null
+  fi
+  sleep 5
+else
+  echo 0 > $state/fast-fails
+  rm -f $state/hub-fail-noted
+fi
+exit $code

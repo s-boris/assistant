@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.card.json",
+  "title": "in-app card (decision = pick one option -> card.answer; info = read only); notify=true: also post a private notification with the card text (tap opens Cards)",
+  "type": "object",
+  "properties": {
+    "card_id": {
+      "type": "string",
+      "pattern": "^c_[A-Za-z0-9_-]{1,40}$"
+    },
+    "kind": {
+      "enum": [
+        "decision",
+        "info"
+      ]
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 80
+    },
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 400
+    },
+    "options": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9_-]{1,16}$"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 40
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "label"
+        ]
+      }
+    },
+    "confirm": {
+      "enum": [
+        "none",
+        "bio"
+      ]
+    },
+    "expires": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z0-9_-]{1,24}$"
+    },
+    "notify": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "card_id",
+    "kind",
+    "title"
+  ]
+}

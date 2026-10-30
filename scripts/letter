@@ -1,0 +1,700 @@
+#!/usr/local/bin/python3.13
+"""letter: Swiss business letters as print-ready PDF (+ .txt copy), window-envelope layout (SN 010130 style).
+
+  letter new --to "Name\\nStreet\\nPLZ Ort" [--type kuendigung|einsprache|widerruf|generic]
+             [--subject S] [--body-file F | --body TEXT] [--lang de|en] [--ref "Policen-Nr. 123"]...
+             [--sign] [--out X.pdf] [--window right|left] [--encl "Kopie Police"]... [--draft] [--preview]
+             [--file [--create-tag]] [--send-by YYYY-MM-DD]
+             template facts: kuendigung  --contract C [--effective YYYY-MM-DD|next] [--notice-months N]
+                             einsprache  --decision D --decision-date YYYY-MM-DD [--received YYYY-MM-DD]
+                                         [--antrag TEXT] [--reasons-file F]
+                             widerruf    --contract C [--contract-date YYYY-MM-DD] [--basis "Art. 40a ff. OR"]
+  letter template TYPE [same template facts] [--lang]   print the body text to edit and pass as --body-file
+  letter signature status | import PHOTO               signature image (~/.config/letter/signature.png, 0600)
+
+Body text: paragraphs separated by blank lines, single newlines kept, **bold**, a line that is only
+**Heading** becomes a bold heading, a paragraph of "- " lines becomes a bullet list.
+With a template type and no body, the template's body is used; with a body file, a Kündigung still gets the
+"bitte bestätigen Sie mir die Kündigung schriftlich" sentence if it's missing.
+[Bracketed placeholders] block the final PDF; --draft renders anyway with an ENTWURF watermark.
+--preview prints the whole letter as text and writes nothing.
+--file uploads the PDF to paperless (tag Korrespondenz if it exists); --send-by adds an owner reminder
+2 days earlier. Nothing is ever sent by mail or post.
+Default output: ~/reports/letters/<date>-<type>-<subject>.pdf (+ .txt).
+"""
+import argparse, os, re, sys
+from datetime import timedelta
+
+# Runs in ~/opt/letter-venv (reportlab, pypdf, pikepdf, Pillow; ops/requirements/letter.txt, built by boot.sh or
+# ops/install.sh --venvs letter): re-exec there when started by another interpreter.
+_VENV = os.path.join(os.path.expanduser("~"), "opt", "letter-venv")
+if os.path.realpath(sys.prefix) != os.path.realpath(_VENV):
+    if os.access(os.path.join(_VENV, "bin", "python"), os.X_OK):
+        os.execv(os.path.join(_VENV, "bin", "python"), [os.path.join(_VENV, "bin", "python"), os.path.realpath(__file__), *sys.argv[1:]])
+    if {"-h", "--help"} & set(sys.argv[1:]):
+        print(__doc__.strip())
+        sys.exit(0)
+    try:
+        import pypdf, reportlab  # noqa: F401, E401
+    except ImportError:
+        sys.exit(f"{os.path.basename(__file__)}: needs ~/opt/letter-venv: sh ~/opt/assistant/ops/install.sh --venvs letter")
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _admindesk as ad  # noqa: E402
+
+LETTER_DIR = os.path.join(ad.HOME, "reports", "letters")
+TYPES = ("kuendigung", "einsprache", "widerruf", "generic")
+PLACEHOLDER = re.compile(r"\[[^\[\]\n]{2,}\]")
+
+# Layout in mm, measured from the top-left corner of the A4 sheet. Window positions fit Swiss C5/6 and DL
+# window envelopes (window 100x45 mm, 15-20 mm from the side, 15 mm from the bottom): the address lines sit
+# at 64-88 mm from the top, which stays inside the window whichever way the tri-folded sheet slides.
+LAYOUT = {
+    "margin_left": 25, "margin_right": 20, "margin_bottom": 20,
+    "sender_top": 20,
+    "window_right": {"x": 118, "y": 50, "w": 80, "h": 42},
+    "window_left": {"x": 25, "y": 50, "w": 80, "h": 42},
+    "date_y": 100,          # baseline of "Ort, Datum"
+    "body_top": 107,        # top of the subject line
+    "later_top": 30,        # body top on page 2+
+    "fold_marks": (99, 198),  # tri-fold for C5/6 and DL
+    "punch_mark": 148.5,
+}
+
+T = {
+    "de": {"salutation": "Sehr geehrte Damen und Herren", "closing": "Freundliche Grüsse",
+           "registered": "Einschreiben", "encl": "Beilagen", "encl1": "Beilage", "page": "Seite",
+           "draft": "ENTWURF"},
+    "en": {"salutation": "Dear Sir or Madam,", "closing": "Kind regards",
+           "registered": "Registered mail", "encl": "Enclosures", "encl1": "Enclosure", "page": "Page",
+           "draft": "DRAFT"},
+}
+
+
+# ------------------------------------------------------------------------------------------ templates
+
+def article_de(phrase):
+    """'Veranlagungsverfügung 2025' -> 'die Veranlagungsverfügung 2025' (keeps an article if given)."""
+    first = phrase.split()[0].lower() if phrase.split() else ""
+    if first in ("die", "den", "das", "der", "meine", "meinen", "mein"):
+        return phrase
+    if re.search(r"(entscheid|bescheid|beschluss|rechnungsbescheid)$", first):
+        return "den " + phrase
+    if re.search(r"(urteil|schreiben)$", first):
+        return "das " + phrase
+    return "die " + phrase
+
+
+def tpl_kuendigung(a, lang, sender):
+    contract = a.contract
+    eff = None if (not a.effective or a.effective.lower() in ("next", "naechstmoeglich", "nächstmöglich")) \
+        else ad.parse_date(a.effective, "--effective")
+    notes, send_by = [], None
+    if lang == "en":
+        subject = f"Termination of {contract}" if contract else "Termination of contract [contract]"
+        obj = f"my contract “{contract}”" if contract else "the above-mentioned contract"
+        when = f"as of {ad.fmt_date(eff, 'en')}" if eff else "at the next possible date, observing the contractual notice period"
+        paras = [f"I hereby give notice to terminate {obj} {when}."]
+        if eff:
+            paras.append("Should termination on this date not be possible, please treat this notice as effective "
+                         "at the next possible date.")
+        paras += ["Please confirm the termination in writing and let me know the exact end date of the contract.",
+                  "Thank you for taking care of this."]
+    else:
+        subject = f"Kündigung {contract}" if contract else "Kündigung [Vertrag]"
+        obj = f"meinen Vertrag «{contract}»" if contract else "den oben genannten Vertrag"
+        when = f"fristgerecht per {ad.fmt_date(eff)}" if eff else \
+            "unter Einhaltung der vertraglichen Kündigungsfrist auf den nächstmöglichen Termin"
+        paras = [f"Hiermit kündige ich {obj} {when}."]
+        if eff:
+            paras.append("Sollte eine Kündigung auf diesen Termin nicht möglich sein, gilt sie auf den "
+                         "nächstmöglichen Termin.")
+        paras += ["Bitte bestätigen Sie mir die Kündigung schriftlich und teilen Sie mir dabei das genaue "
+                  "Vertragsende mit.",
+                  "Besten Dank für die Erledigung."]
+    if eff and a.notice_months is not None:
+        arrive = ad.add_months(eff + timedelta(days=1), -a.notice_months) - timedelta(days=1)
+        send_by = ad.prev_workday(arrive - timedelta(days=3))
+        if arrive < ad.today():
+            notes.append(f"DEADLINE PASSED: with {a.notice_months} months' notice, termination per "
+                         f"{eff:%d.%m.%Y} had to arrive by {arrive:%d.%m.%Y}. The letter then takes effect at the "
+                         f"next possible date (the fallback sentence covers this).")
+            send_by = None
+        else:
+            notes.append(f"Must ARRIVE at the recipient by {ad.fmt_date(arrive, 'en', weekday=True)} "
+                         f"({a.notice_months} months' notice to {eff:%d.%m.%Y}); for private contracts receipt "
+                         f"counts, not the postmark. Post it by Einschreiben by {ad.fmt_date(send_by, 'en', True)}.")
+    elif eff:
+        notes.append("Check the notice period in the contract/AGB (--notice-months N computes the date it must "
+                     "arrive by).")
+    else:
+        notes.append("No date given: the letter cancels at the next possible date. Check the notice period in "
+                     "the contract/AGB.")
+    notes.append("Send by registered mail (Einschreiben) and keep the receipt / tracking number.")
+    return subject, "\n\n".join(paras), notes, send_by, True
+
+
+def tpl_einsprache(a, lang, sender):
+    dec = a.decision or ("[decision, e.g. assessment for tax year 2025]" if lang == "en"
+                         else "Veranlagungsverfügung [Steuerperiode]")
+    ddate = ad.parse_date(a.decision_date, "--decision-date") if a.decision_date else None
+    recv = ad.parse_date(a.received, "--received") if a.received else None
+    reasons = open(a.reasons_file).read().strip() if a.reasons_file else None
+    notes, send_by = [], None
+    if lang == "en":
+        dd = f" of {ad.fmt_date(ddate, 'en')}" if ddate else " of [date]"
+        subject = f"Objection to the {dec}{dd}"
+        rc = f", received on {ad.fmt_date(recv, 'en')}," if recv else ""
+        paras = [f"I hereby lodge an objection, within the time limit, to the {dec}{dd}{rc}.",
+                 "**Request**",
+                 a.antrag or "[Request: exactly what should change, e.g. “The taxable income shall be reduced "
+                             "by CHF … to CHF ….”]",
+                 "**Grounds**",
+                 reasons or "[Grounds: which item, why, with reference to the enclosed evidence]"]
+        if a.encl:
+            paras.append("The supporting documents are enclosed.")
+        paras.append("I kindly ask you to uphold my objection and am happy to answer any questions.")
+    else:
+        dd = f" vom {ad.fmt_date(ddate)}" if ddate else " vom [Datum]"
+        subject = f"Einsprache gegen {article_de(dec)}{dd}"
+        rc = f", zugestellt am {ad.fmt_date(recv)}," if recv else ""
+        paras = [f"Gegen {article_de(dec)}{dd}{rc} erhebe ich hiermit fristgerecht Einsprache.",
+                 "**Antrag**",
+                 a.antrag or "[Antrag: was genau geändert werden soll, z. B. «Das steuerbare Einkommen sei um "
+                             "CHF … auf CHF … herabzusetzen.»]",
+                 "**Begründung**",
+                 reasons or "[Begründung: welche Position, warum, mit Verweis auf die Beilagen]"]
+        if a.encl:
+            paras.append("Die entsprechenden Belege liegen bei.")
+        paras.append("Ich bitte Sie, meine Einsprache gutzuheissen, und stehe Ihnen für Rückfragen gerne zur "
+                     "Verfügung.")
+    if recv:
+        last = ad.next_workday(recv + timedelta(days=30))
+        send_by = ad.prev_workday(last - timedelta(days=1))
+        if last < ad.today():
+            notes.append(f"DEADLINE PASSED? 30 days from receipt ({recv:%d.%m.%Y}) ended {last:%d.%m.%Y}. Check "
+                         f"the Rechtsmittelbelehrung; a late objection needs a Fristwiederherstellung request.")
+            send_by = None
+        else:
+            notes.append(f"Objection period: 30 days from receipt, last day {ad.fmt_date(last, 'en', True)} "
+                         f"(Sat/Sun move it to Monday; holidays not modelled). For an authority, handing it to "
+                         f"Swiss Post on the last day is enough (postmark counts).")
+    else:
+        notes.append("Deadline: usually 30 days from receipt of the decision (--received YYYY-MM-DD computes it).")
+    notes += ["Address it to the authority named in the decision's Rechtsmittelbelehrung, and check the deadline "
+              "there.",
+              "An Einsprache needs a concrete Antrag and a Begründung; list evidence as --encl and enclose copies. "
+              "Sign by hand; send by registered mail (Einschreiben) for proof."]
+    return subject, "\n\n".join(paras), notes, send_by, True
+
+
+def tpl_widerruf(a, lang, sender):
+    contract = a.contract
+    cdate = ad.parse_date(a.contract_date, "--contract-date") if a.contract_date else None
+    notes, send_by = [], None
+    if lang == "en":
+        subject = f"Withdrawal from {contract}" if contract else "Withdrawal from contract [contract]"
+        if cdate:
+            subject += f" of {ad.fmt_date(cdate, 'en')}"
+        obj = f"my contract “{contract}”" if contract else "the above-mentioned contract"
+        dc = f" concluded on {ad.fmt_date(cdate, 'en')}" if cdate else ""
+        bc = f" pursuant to {a.basis}" if a.basis else ""
+        paras = [f"I hereby withdraw from {obj}{dc}{bc}, within the time limit.",
+                 "Please confirm the withdrawal in writing and refund any payments already made without delay.",
+                 "Thank you."]
+    else:
+        subject = f"Widerruf {contract}" if contract else "Widerruf [Vertrag]"
+        if cdate:
+            subject += f" vom {ad.fmt_date(cdate)}"
+        obj = f"meinen Vertrag «{contract}»" if contract else "den oben genannten Vertrag"
+        dc = f" vom {ad.fmt_date(cdate)}" if cdate else ""
+        bc = f" gestützt auf {a.basis}" if a.basis else ""
+        paras = [f"Hiermit widerrufe ich fristgerecht {obj}{dc}{bc}.",
+                 "Bitte bestätigen Sie mir den Widerruf schriftlich und erstatten Sie mir allfällige bereits "
+                 "geleistete Zahlungen umgehend zurück.",
+                 "Besten Dank."]
+    if cdate:
+        last = cdate + timedelta(days=14)
+        send_by = last
+        if last < ad.today():
+            notes.append(f"14 days from {cdate:%d.%m.%Y} ended {last:%d.%m.%Y}: the statutory withdrawal period "
+                         f"(if it applies) may be over, unless the withdrawal information was received later.")
+            send_by = None
+        else:
+            notes.append(f"Door-to-door/phone sales (Art. 40a ff. OR) and consumer credit (Art. 16 KKG): 14 days. "
+                         f"From {cdate:%d.%m.%Y} that is {ad.fmt_date(last, 'en', True)}; posting it on the last "
+                         f"day is enough (Art. 40e OR). The period starts only once the withdrawal information "
+                         f"was received.")
+    notes += ["Swiss law has no general withdrawal right for online purchases: only if the seller grants one "
+              "(check the AGB).",
+              "Send by registered mail (Einschreiben) for proof."]
+    return subject, "\n\n".join(paras), notes, send_by, True
+
+
+def tpl_generic(a, lang, sender):
+    return None, None, [], None, False
+
+
+TEMPLATES = {"kuendigung": tpl_kuendigung, "einsprache": tpl_einsprache, "widerruf": tpl_widerruf,
+             "generic": tpl_generic}
+
+
+def ensure_confirmation(body, lang):
+    """A Kündigung body from a file must ask for written confirmation."""
+    if re.search(r"bestätig|confirm", body, re.I):
+        return body, None
+    s = ("Bitte bestätigen Sie mir die Kündigung schriftlich und teilen Sie mir dabei das genaue Vertragsende mit."
+         if lang == "de" else
+         "Please confirm the termination in writing and let me know the exact end date of the contract.")
+    return body.rstrip() + "\n\n" + s, "added the written-confirmation sentence to the body"
+
+
+# ------------------------------------------------------------------------------------------ text
+
+def strip_md(s):
+    return s.replace("**", "")
+
+
+def compose(a, sender, subject, body, registered, letter_date, place):
+    """Return (dict of parts, full plain text)."""
+    lang = a.lang
+    to = [l.strip() for l in a.to.replace("\\n", "\n").split("\n") if l.strip()]
+    p = {
+        "sender": [sender["name"], sender["street"], sender["plz_city"]] + list(sender.get("extra") or []),
+        "to": to, "registered": T[lang]["registered"] if registered else None,
+        "dateline": f"{place}, {ad.fmt_date(letter_date, lang)}",
+        "subject": subject, "refs": a.ref or [],
+        "salutation": a.salutation or T[lang]["salutation"],
+        "body": body.strip(), "closing": a.closing or T[lang]["closing"],
+        "name": sender["name"], "encl": a.encl or [],
+    }
+    lines = p["sender"] + [""]
+    if p["registered"]:
+        lines.append(p["registered"].upper())
+    lines += to + ["", "", p["dateline"], "", "", p["subject"]] + p["refs"] + ["", p["salutation"], ""]
+    lines += [strip_md(p["body"]), "", p["closing"], "", "", "", p["name"]]
+    if p["encl"]:
+        lines += ["", T[lang]["encl"] if len(p["encl"]) > 1 else T[lang]["encl1"]]
+        lines += [f"- {e}" for e in p["encl"]]
+    return p, "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------------------------------ PDF
+
+def pick_fonts(text):
+    """Helvetica (standard 14, classic Swiss letter look) unless the text needs glyphs outside cp1252."""
+    try:
+        text.encode("cp1252")
+        return "Helvetica", "Helvetica-Bold"
+    except UnicodeEncodeError:
+        pass
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import reportlab
+    cands = [("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+             (os.path.join(os.path.dirname(reportlab.__file__), "fonts", "Vera.ttf"),
+              os.path.join(os.path.dirname(reportlab.__file__), "fonts", "VeraBd.ttf"))]
+    for reg, bold in cands:
+        if os.path.isfile(reg) and os.path.isfile(bold):
+            pdfmetrics.registerFont(TTFont("LetterSans", reg))
+            pdfmetrics.registerFont(TTFont("LetterSans-Bold", bold))
+            from reportlab.lib.fonts import addMapping
+            addMapping("LetterSans", 0, 0, "LetterSans")
+            addMapping("LetterSans", 1, 0, "LetterSans-Bold")
+            return "LetterSans", "LetterSans-Bold"
+    ad.warn("text has characters outside cp1252 and no Unicode font was found; some may not render")
+    return "Helvetica", "Helvetica-Bold"
+
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+NBSP_RULES = [(re.compile(r"\b(\d{1,2}\.) (?=[A-ZÄÖÜ][a-zäöü]+ \d{4})"), "\\1\u00a0"),  # 31. Dezember
+              (re.compile(r"\b(CHF|Fr\.|Art\.|Abs\.|Nr\.|No\.) (?=\d)"), "\\1\u00a0")]
+
+
+def nbsp(s):
+    """Keep '31. Dezember', 'CHF 120', 'Art. 14' on one line in the PDF."""
+    for rx, rep in NBSP_RULES:
+        s = rx.sub(rep, s)
+    return s
+
+
+def md_inline(s):
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc(nbsp(s)))
+
+
+def body_flowables(body, styles):
+    from reportlab.platypus import Paragraph
+    out = []
+    for block in re.split(r"\n\s*\n", body.strip()):
+        lines = [l.rstrip() for l in block.split("\n")]
+        if len(lines) == 1 and re.fullmatch(r"\*\*[^*]+\*\*", lines[0].strip()):
+            out.append(Paragraph(md_inline(lines[0].strip()), styles["heading"]))
+        elif all(re.match(r"\s*[-•–]\s+", l) for l in lines):
+            for i, l in enumerate(lines):
+                st = styles["bullet_last"] if i == len(lines) - 1 else styles["bullet"]
+                out.append(Paragraph(md_inline(re.sub(r"^\s*[-•–]\s+", "", l)), st, bulletText="–"))
+        else:
+            out.append(Paragraph("<br/>".join(md_inline(l) for l in lines), styles["body"]))
+    return out
+
+
+def fit_size(text, font, size, width_pt, minimum=7.5):
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    while size > minimum and stringWidth(text, font, size) > width_pt:
+        size -= 0.25
+    return size
+
+
+def render_pdf(p, out, a, fonts, sig, fs=11.0):
+    """Build the PDF at body size fs; returns the page count."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.colors import Color, black
+    from reportlab.platypus import (BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer, KeepTogether,
+                                    NextPageTemplate, Image)
+    mm = ad.MM
+    W, H = A4
+    F, FB = fonts
+    L = LAYOUT
+    win = L["window_left"] if a.window == "left" else L["window_right"]
+    lang = a.lang
+    ld = round(fs * 1.32, 2)
+
+    styles = {
+        "subject": ParagraphStyle("subject", fontName=FB, fontSize=fs, leading=ld),
+        "ref": ParagraphStyle("ref", fontName=F, fontSize=fs, leading=ld),
+        "body": ParagraphStyle("body", fontName=F, fontSize=fs, leading=ld, spaceAfter=fs * 0.9),
+        "heading": ParagraphStyle("heading", fontName=FB, fontSize=fs, leading=ld, spaceAfter=2, keepWithNext=1),
+        "bullet": ParagraphStyle("bullet", fontName=F, fontSize=fs, leading=ld, leftIndent=12, bulletIndent=2),
+        "bullet_last": ParagraphStyle("bullet_last", fontName=F, fontSize=fs, leading=ld, leftIndent=12,
+                                      bulletIndent=2, spaceAfter=fs * 0.9),
+        "small": ParagraphStyle("small", fontName=F, fontSize=10, leading=13),
+        "smallb": ParagraphStyle("smallb", fontName=FB, fontSize=10, leading=13, spaceBefore=6),
+    }
+
+    def top(y_mm):  # mm from top -> pt from bottom
+        return H - y_mm * mm
+
+    def draw_common(c):
+        if not a.no_marks:
+            c.setStrokeColor(Color(0.55, 0.55, 0.55))
+            c.setLineWidth(0.3)
+            for y in L["fold_marks"]:
+                c.line(4 * mm, top(y), 8 * mm, top(y))
+            c.line(4 * mm, top(L["punch_mark"]), 10 * mm, top(L["punch_mark"]))
+        if a.draft:
+            c.saveState()
+            c.setFillColor(Color(0.75, 0.75, 0.75, alpha=0.35))
+            c.setFont(FB, 96)
+            c.translate(W / 2, H / 2)
+            c.rotate(55)
+            c.drawCentredString(0, -30, T[lang]["draft"])
+            c.restoreState()
+
+    def draw_first(c, doc):
+        c.saveState()
+        draw_common(c)
+        # sender block: top-left (right window) or top-right (left window)
+        sx = L["window_right"]["x"] if a.window == "left" else L["margin_left"]
+        y = L["sender_top"] + 3.5
+        c.setFillColor(black)
+        for i, line in enumerate(p["sender"]):
+            c.setFont(FB if i == 0 else F, 10)
+            c.drawString(sx * mm, top(y), line)
+            y += 4.5
+        # address field
+        x0, y0, wmax = win["x"] * mm, win["y"], win["w"] * mm
+        if not a.no_return_line:
+            ret = f"{p['sender'][0]}, {p['sender'][1]}, {p['sender'][2]}"
+            rfs = fit_size(ret, F, 7, wmax, 5.5)
+            c.setFont(F, rfs)
+            c.drawString(x0, top(y0 + 3.5), ret)
+            c.setLineWidth(0.25)
+            c.setStrokeColor(black)
+            from reportlab.pdfbase.pdfmetrics import stringWidth
+            c.line(x0, top(y0 + 4.3), x0 + stringWidth(ret, F, rfs), top(y0 + 4.3))
+        if p["registered"]:
+            c.setFont(FB, 9.5)
+            c.drawString(x0, top(y0 + 9.5), p["registered"])
+        ya = y0 + 14.5
+        size = min(fit_size(l, F, 11, wmax) for l in p["to"])
+        for line in p["to"]:
+            c.setFont(F, size)
+            c.drawString(x0, top(ya), line)
+            ya += 4.6
+        if a.show_window:
+            c.setDash(2, 2)
+            c.setStrokeColor(Color(0.2, 0.4, 0.9))
+            c.setLineWidth(0.4)
+            c.rect(x0 - 2 * mm, top(y0 + win["h"]), wmax + 4 * mm, win["h"] * mm)
+            c.setDash()
+        # place, date
+        c.setFont(F, fs)
+        c.drawString(L["margin_left"] * mm, top(L["date_y"]), p["dateline"])
+        c.restoreState()
+
+    def draw_later(c, doc):
+        c.saveState()
+        draw_common(c)
+        c.setFont(F, 8.5)
+        c.setFillColor(Color(0.35, 0.35, 0.35))
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        right = f"{p['dateline'].split(', ', 1)[-1]} · {T[lang]['page']} {doc.page}"
+        room = fw - stringWidth(right, F, 8.5) - 8 * mm
+        head = f"{p['name']} · {strip_md(p['subject'])}"
+        while stringWidth(head, F, 8.5) > room and len(head) > 10:
+            head = head[:-2].rstrip() + "…"
+        c.drawString(L["margin_left"] * mm, top(15), head)
+        c.drawRightString(W - L["margin_right"] * mm, top(15), right)
+        c.restoreState()
+
+    fw = W - (L["margin_left"] + L["margin_right"]) * mm
+    f1 = Frame(L["margin_left"] * mm, L["margin_bottom"] * mm, fw, (297 - L["body_top"] - L["margin_bottom"]) * mm,
+               leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0, id="first")
+    f2 = Frame(L["margin_left"] * mm, L["margin_bottom"] * mm, fw, (297 - L["later_top"] - L["margin_bottom"]) * mm,
+               leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0, id="later")
+    doc = BaseDocTemplate(out, pagesize=A4, title=strip_md(p["subject"]), author=p["name"], subject=strip_md(p["subject"]),
+                          creator="letter (admin desk)", producer="letter (admin desk)")
+    doc.addPageTemplates([PageTemplate(id="first", frames=[f1], onPage=draw_first),
+                          PageTemplate(id="later", frames=[f2], onPage=draw_later)])
+
+    story = [NextPageTemplate("later"), Paragraph(md_inline(p["subject"]), styles["subject"])]
+    story += [Paragraph(md_inline(r), styles["ref"]) for r in p["refs"]]
+    story += [Spacer(1, ld), Paragraph(esc(p["salutation"]), styles["body"])]
+    story += body_flowables(p["body"], styles)
+    sign_block = [Spacer(1, 4), Paragraph(esc(p["closing"]), ParagraphStyle("c", parent=styles["body"], spaceAfter=0))]
+    if sig:
+        from PIL import Image as PILImage
+        iw, ih = PILImage.open(sig).size
+        w = 48 * mm
+        h = w * ih / iw
+        if h > 20 * mm:
+            h = 20 * mm
+            w = h * iw / ih
+        img = Image(sig, width=w, height=h)
+        img.hAlign = "LEFT"
+        sign_block += [Spacer(1, 2), img, Spacer(1, 2)]
+    else:
+        sign_block.append(Spacer(1, 18 * mm))
+    sign_block.append(Paragraph(esc(p["name"]), ParagraphStyle("n", parent=styles["body"], spaceAfter=0)))
+    story.append(KeepTogether(sign_block))
+    if p["encl"]:
+        story.append(Spacer(1, 8 * mm))
+        story.append(Paragraph(T[lang]["encl"] if len(p["encl"]) > 1 else T[lang]["encl1"], styles["smallb"]))
+        story += [Paragraph(md_inline(e), styles["small"], bulletText="–") for e in p["encl"]]
+    doc.build(story)
+    return doc.page
+
+
+# ------------------------------------------------------------------------------------------ commands
+
+def build_letter(a):
+    sender = ad.load_sender()
+    lang = a.lang
+    subject, body, notes, send_by_hint, registered = TEMPLATES[a.type](a, lang, sender)
+    added = None
+    if a.body_file or a.body is not None:
+        if a.body_file:
+            body = sys.stdin.read() if a.body_file == "-" else open(a.body_file, encoding="utf-8").read()
+        else:
+            body = a.body.replace("\\n", "\n")
+        if a.type == "kuendigung":
+            body, added = ensure_confirmation(body, lang)
+    if a.subject:
+        subject = a.subject
+    if not subject:
+        ad.die("--subject is required for --type generic", 2)
+    if not body or not body.strip():
+        ad.die("no body: pass --body-file F (or --body TEXT)", 2)
+    if a.registered is not None:
+        registered = a.registered
+    letter_date = ad.parse_date(a.date, "--date") if a.date else ad.today()
+    place = a.place or sender.get("city") or ad.assistant_profile.get("home.town")
+    p, text = compose(a, sender, subject, body, registered, letter_date, place)
+    if added:
+        notes.insert(0, added)
+    return sender, p, text, notes, send_by_hint, letter_date
+
+
+def check_to(to):
+    if len(to) < 2:
+        ad.die('--to needs at least name and "PLZ Ort" lines, e.g. --to "Salt Mobile SA\\nRue du Caudray 4\\n1020 Renens"', 2)
+    if len(to) > 6:
+        ad.warn(f"recipient has {len(to)} lines; more than 6 may not fit the envelope window")
+    if not any(re.search(r"\b\d{4,5}\b", l) for l in to[1:]):
+        ad.warn("recipient has no line with a postcode (PLZ Ort)")
+
+
+def cmd_new(a):
+    sender, p, text, notes, send_by_hint, letter_date = build_letter(a)
+    check_to(p["to"])
+    holes = sorted(set(PLACEHOLDER.findall(text)))
+    if a.preview:
+        sys.stdout.write(text)
+        print_notes(notes, holes, send_by_hint, a)
+        return
+    if holes and not a.draft:
+        ad.die("letter still has placeholders: " + "; ".join(holes) +
+               "\nfill them in (template facts or --body-file), or pass --draft for a watermarked draft", 3)
+    sig = None
+    if a.sign:
+        sig = ad.signature_path()
+        if not sig:
+            ad.warn(ad.NO_SIGNATURE_HINT + "; leaving space for a handwritten signature")
+        elif a.type in ("kuendigung", "einsprache", "widerruf"):
+            notes.append("A printed signature image is not a handwritten signature (Art. 14 OR): if written form "
+                         "is required, sign the printout by hand too.")
+    if a.out:
+        out = os.path.abspath(os.path.expanduser(a.out))
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+    else:
+        os.makedirs(LETTER_DIR, exist_ok=True)
+        out = os.path.join(LETTER_DIR, f"{letter_date.isoformat()}-{a.type}-{ad.slug(strip_md(p['subject']))}.pdf")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    fonts = pick_fonts(text)
+    # Prefer one page: step the body size down a little (11 -> 10 pt) before letting it run onto page 2.
+    import io
+    for fs in (11.0, 10.5, 10.0):
+        pages = render_pdf(p, io.BytesIO(), a, fonts, sig, fs)
+        if pages == 1:
+            break
+    else:
+        fs = 11.0
+    pages = render_pdf(p, out, a, fonts, sig, fs)
+    txt = out[:-4] + ".txt"
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"PDF: {out}  ({pages} page{'s' if pages > 1 else ''}, {fs:g} pt)")
+    print(f"TXT: {txt}")
+    if a.draft:
+        print("(draft: watermarked ENTWURF)")
+    print_notes(notes, holes, send_by_hint, a, header=False)
+    title = strip_md(p["subject"])
+    if a.file:
+        if a.draft:
+            ad.warn("not filing a draft in paperless")
+        else:
+            doc_type = "Kündigung" if a.type == "kuendigung" else None
+            line, fnotes = ad.paperless_file(out, f"{title} (Brief {letter_date:%d.%m.%Y})", letter_date, doc_type,
+                                             a.create_tag)
+            print(f"paperless: {line}")
+            for n in fnotes:
+                print(f"paperless: {n}")
+    if a.send_by:
+        sb = ad.parse_date(a.send_by, "--send-by")
+        how = {"kuendigung": " (send it Einschreiben / registered mail)",
+               "einsprache": " (Einschreiben recommended, for proof)",
+               "widerruf": " (Einschreiben recommended, for proof)"}.get(a.type, "")
+        short = title if len(title) <= 70 else title[:67].rstrip() + "…"
+        msg = f"📮 Post letter «{short}» by {sb:%a %d.%m.%Y}{how}. PDF: {out}"
+        at, outp = ad.send_reminder(sb, msg, f"letter:{ad.slug(title, 30)}")
+        print(f"reminder: {outp}")
+
+
+def print_notes(notes, holes, send_by_hint, a, header=True):
+    lines = []
+    if holes:
+        lines.append("placeholders to fill: " + "; ".join(holes))
+    lines += notes
+    if send_by_hint and not a.send_by:
+        lines.append(f"suggested: --send-by {send_by_hint.isoformat()}")
+    if not lines:
+        return
+    print("---" if header else "notes:")
+    for n in lines:
+        print(f"- {n}")
+
+
+def cmd_template(a):
+    sender = ad.load_sender()
+    subject, body, notes, send_by_hint, _ = TEMPLATES[a.type](a, a.lang, sender)
+    if body is None:
+        ad.die("generic letters have no template; write the body yourself", 2)
+    print(f"# subject: {subject}", file=sys.stderr)
+    print(body)
+    for n in notes:
+        print(f"# {n}", file=sys.stderr)
+    if send_by_hint:
+        print(f"# suggested: --send-by {send_by_hint.isoformat()}", file=sys.stderr)
+
+
+def cmd_signature(a):
+    if a.action == "status":
+        sig = ad.signature_path()
+        if sig:
+            from PIL import Image
+            w, h = Image.open(sig).size
+            print(f"signature image: {sig} ({w}x{h} px, mode {oct(os.stat(sig).st_mode & 0o777)})")
+        else:
+            print(ad.NO_SIGNATURE_HINT)
+            sys.exit(1)
+    else:
+        if not a.photo:
+            ad.die("usage: letter signature import PHOTO [--out PATH]", 2)
+        dst = a.out or ad.SIGNATURE
+        w, h = ad.clean_signature(a.photo, dst)
+        print(f"stored {dst} ({w}x{h} px, 0600). Check it: letter new ... --sign --draft")
+
+
+def add_template_args(p):
+    g = p.add_argument_group("template facts")
+    g.add_argument("--contract", help="kuendigung/widerruf: the contract, e.g. 'Mobile-Abo Salt'")
+    g.add_argument("--effective", help="kuendigung: end date YYYY-MM-DD, or 'next' (default)")
+    g.add_argument("--notice-months", type=int, help="kuendigung: notice period, to compute the arrival deadline")
+    g.add_argument("--decision", help="einsprache: e.g. 'Veranlagungsverfügung Staats- und Gemeindesteuern 2025'")
+    g.add_argument("--decision-date", help="einsprache: date of the decision")
+    g.add_argument("--received", help="einsprache: date the decision was received (30-day deadline)")
+    g.add_argument("--antrag", help="einsprache: the request (what should change)")
+    g.add_argument("--reasons-file", help="einsprache: file with the Begründung")
+    g.add_argument("--contract-date", help="widerruf: date concluded / withdrawal info received (14 days)")
+    g.add_argument("--basis", help="widerruf: legal basis, e.g. 'Art. 40a ff. OR'")
+    p.add_argument("--lang", choices=("de", "en"), default="de")
+    p.add_argument("--encl", action="append", help="enclosure (Beilage); repeat for several")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="letter", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    n = sp.add_parser("new", help="write a letter (PDF + .txt)")
+    n.add_argument("--type", choices=TYPES, default="generic")
+    n.add_argument("--to", required=True, help='recipient lines separated by \\n')
+    n.add_argument("--subject")
+    n.add_argument("--body-file", help="body text file ('-' = stdin)")
+    n.add_argument("--body", help="body text inline")
+    n.add_argument("--ref", action="append", help="reference line under the subject, e.g. 'Policen-Nr. 123'")
+    n.add_argument("--sign", action="store_true", help="place ~/.config/letter/signature.png if it exists")
+    n.add_argument("--out", help="output PDF path (the .txt goes next to it)")
+    n.add_argument("--window", choices=("right", "left"), default="right", help="envelope window side (default right)")
+    n.add_argument("--registered", dest="registered", action="store_true", default=None,
+                   help="print 'Einschreiben' above the address (default for kuendigung/einsprache/widerruf)")
+    n.add_argument("--no-registered", dest="registered", action="store_false")
+    n.add_argument("--salutation", help="default 'Sehr geehrte Damen und Herren'")
+    n.add_argument("--closing", help="default 'Freundliche Grüsse'")
+    n.add_argument("--date", help="letter date (default today)")
+    n.add_argument("--place", help="place for the date line (default the sender's city)")
+    n.add_argument("--draft", action="store_true", help="watermark ENTWURF; placeholders allowed")
+    n.add_argument("--preview", action="store_true", help="print the letter text only, write nothing")
+    n.add_argument("--show-window", action="store_true", help="outline the envelope window (for checking)")
+    n.add_argument("--no-return-line", action="store_true", help="omit the small sender line above the address")
+    n.add_argument("--no-marks", action="store_true", help="omit fold and punch marks")
+    n.add_argument("--file", action="store_true", help="upload the PDF to paperless")
+    n.add_argument("--create-tag", action="store_true", help="with --file: create tag Korrespondenz if missing")
+    n.add_argument("--send-by", help="YYYY-MM-DD: owner reminder 2 days before to post it")
+    add_template_args(n)
+    t = sp.add_parser("template", help="print a template body")
+    t.add_argument("type", choices=TYPES)
+    add_template_args(t)
+    s = sp.add_parser("signature", help="signature image: status | import PHOTO")
+    s.add_argument("action", choices=("status", "import"))
+    s.add_argument("photo", nargs="?")
+    s.add_argument("--out", help="import: destination (default ~/.config/letter/signature.png)")
+    a = ap.parse_args()
+    {"new": cmd_new, "template": cmd_template, "signature": cmd_signature}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

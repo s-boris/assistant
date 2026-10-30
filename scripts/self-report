@@ -1,0 +1,292 @@
+#!/usr/local/bin/python3.13 -I
+"""self-report: my weekly self-report for the owner: what I did, what it cost, what improved, what failed.
+Token-free; reads only local stores (traces, usage, my own logs, agent-watch, an evals result file if one exists).
+
+  self-report [--cron] [--days 7] [--dry-run] [--json]
+      --cron     (Sun 19:30) writes ~/inbox/self-report-DATE.md (<= 10 lines, ready to send as is) and the HTML
+                 detail ~/reports/self-report/week-YYYY-Www.html; silent otherwise
+      default    prints the short text (no files)
+
+Sources: traces (cost, agent runs, errors, hook blocks, owner reply latency, week vs the week before),
+~/workspace/PROACTIVE.md + CHANGELOG.md (dated "- DD.MM ..." lines in the window: counts and themes),
+usage.db (owner turns and notification open rate, week vs week), agent-watch.log (stalls), an evals result file when
+one exists (newest of SELF_REPORT_EVALS globs; fields score / pass_rate / overall and previous / delta).
+Corrections = log lines in the window that mention a correction, a mistake or "wrong". Counts and titles only.
+Env (tests): SELF_REPORT_NOW, SELF_REPORT_WORKSPACE, SELF_REPORT_TRACES, SELF_REPORT_USAGE_DB, SELF_REPORT_INBOX,
+SELF_REPORT_OUT, SELF_REPORT_EVALS (';'-separated globs), SELF_REPORT_AGENT_WATCH_LOG.
+"""
+import argparse, glob, html, json, os, re, sqlite3, subprocess, sys, time
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser('~')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+try:
+    import assistant_profile  # noqa: E402
+    TZ = assistant_profile.tz()
+except Exception:  # pragma: no cover
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo('UTC')
+
+WS = os.environ.get('SELF_REPORT_WORKSPACE') or os.path.join(HOME, 'workspace')
+TRACES_BIN = os.environ.get('SELF_REPORT_TRACES') or os.path.join(HOME, 'bin', 'traces')
+USAGE_DB = os.environ.get('SELF_REPORT_USAGE_DB') or os.path.join(HOME, '.local/state/product/usage.db')
+INBOX = os.environ.get('SELF_REPORT_INBOX') or os.path.join(HOME, 'inbox')
+OUT = os.environ.get('SELF_REPORT_OUT') or os.path.join(HOME, 'reports/self-report')
+EVALS = os.environ.get('SELF_REPORT_EVALS') or ';'.join([
+    os.path.join(HOME, '.local/state/evals/*.json'), os.path.join(HOME, '.local/state/self-evals/*.json'),
+    os.path.join(HOME, 'reports/evals/*.json'), os.path.join(HOME, 'reports/self-evals/*.json')])
+AW_LOG = os.environ.get('SELF_REPORT_AGENT_WATCH_LOG') or os.path.join(HOME, '.local/state/agent-watch/agent-watch.log')
+LINE_RE = re.compile(r'^- (\d{1,2})\.(\d{1,2})\.?\s+(.*)$')
+CORR_RE = re.compile(r'\b(correct(?:ion|ed|s)?|mistake|wrong|his fix|owner fix)\b', re.I)
+
+
+def now_ts():
+    v = os.environ.get('SELF_REPORT_NOW')
+    if not v:
+        return time.time()
+    try:
+        return float(v)
+    except ValueError:
+        return datetime.strptime(v, '%Y-%m-%d %H:%M').replace(tzinfo=TZ).timestamp()
+
+
+def usd(x):
+    x = x or 0
+    return '$%.2f' % x if x < 10 else '$%s' % format(round(x), ',')
+
+
+def fmt_ms(ms):
+    return '?' if ms is None else ('%d s' % round(ms / 1000) if ms < 90000 else '%.1f min' % (ms / 60000))
+
+
+def delta(a, b, pct=True):
+    if a is None or b in (None, 0):
+        return ''
+    d = (a - b) / b * 100
+    return ' (%+.0f %%)' % d if pct else ''
+
+
+def traces_json(t0, t1):
+    """traces report --json for [t0, t1) via TRACES_NOW + --days (the CLI's own window logic)."""
+    env = dict(os.environ, TRACES_NOW=str(t1), USAGE='off')
+    try:
+        p = subprocess.run([sys.executable, '-I', TRACES_BIN, 'report', '--json', '--days', str((t1 - t0) / 86400)],
+                           capture_output=True, text=True, timeout=120, env=env)
+        return json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def log_lines(t0, t1):
+    """Dated '- DD.MM ...' lines from PROACTIVE.md and CHANGELOG.md inside the window: (source, date, text)."""
+    out = []
+    y = datetime.fromtimestamp(t1, TZ).year
+    for name in ('PROACTIVE.md', 'CHANGELOG.md'):
+        try:
+            lines = open(os.path.join(WS, name), encoding='utf-8').read().splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            m = LINE_RE.match(ln.strip())
+            if not m:
+                continue
+            try:
+                d = datetime(y, int(m.group(2)), int(m.group(1)), 12, 0, tzinfo=TZ)
+            except ValueError:
+                continue
+            if d.timestamp() > t1 + 86400:
+                d = d.replace(year=y - 1)
+            day0 = d.replace(hour=0).timestamp()
+            if t0 - 86400 < day0 + 43200 and day0 < t1:
+                if day0 + 86400 > t0:
+                    out.append((name.split('.')[0].lower(), d.strftime('%d.%m'), m.group(3)))
+    return out
+
+
+def themes(lines, n=3):
+    c = {}
+    for _, _, text in lines:
+        k = re.split(r'[:(—–-]', text, 1)[0].strip().lower()
+        k = ' '.join(k.split()[:3])[:28]
+        if k:
+            c[k] = c.get(k, 0) + 1
+    return sorted(c.items(), key=lambda kv: -kv[1])[:n]
+
+
+def usage_week(t0, t1):
+    if not os.path.exists(USAGE_DB):
+        return None
+    try:
+        c = sqlite3.connect('file:%s?mode=ro' % USAGE_DB, uri=True, timeout=10)
+        turns = c.execute("SELECT COUNT(*) FROM turns WHERE ts >= ? AND ts < ? AND label='use'", (t0, t1)).fetchone()[0]
+        opened = c.execute("SELECT COUNT(*) FROM events WHERE ts >= ? AND ts < ? AND kind='notify_opened'",
+                           (t0, t1)).fetchone()[0]
+        ignored = c.execute("SELECT COUNT(*) FROM events WHERE ts >= ? AND ts < ? AND kind='ignored'",
+                            (t0, t1)).fetchone()[0]
+        feats = dict(c.execute("SELECT feature, COUNT(*) FROM events WHERE ts >= ? AND ts < ? AND actor='owner' AND "
+                               "kind IN ('invoke','tap','msg','reply') GROUP BY feature", (t0, t1)).fetchall())
+        return {'use_turns': turns, 'open_rate': (opened / (opened + ignored)) if (opened + ignored) else None,
+                'features': feats}
+    except sqlite3.Error:
+        return None
+
+
+def evals_result():
+    files = []
+    for g in EVALS.split(';'):
+        files += glob.glob(os.path.expanduser(g))
+    for f in sorted(files, key=lambda p: os.path.getmtime(p), reverse=True)[:1]:
+        try:
+            d = json.load(open(f))
+        except (OSError, ValueError):
+            return None
+        cur = next((d[k] for k in ('score', 'pass_rate', 'overall') if isinstance(d.get(k), (int, float))), None)
+        prev = next((d[k] for k in ('previous', 'prev_score', 'previous_score') if isinstance(d.get(k), (int, float))),
+                    None)
+        if cur is None:
+            return None
+        return {'file': f, 'score': cur, 'previous': prev}
+    return None
+
+
+def stalls(t0, t1):
+    n = 0
+    try:
+        for ln in open(AW_LOG, encoding='utf-8', errors='replace'):
+            if '-> stalled' not in ln and '-> permission-stuck' not in ln:
+                continue
+            try:
+                ts = datetime.strptime(ln[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ).timestamp()
+            except ValueError:
+                continue
+            if t0 <= ts < t1:
+                n += 1
+    except OSError:
+        return None
+    return n
+
+
+def collect(days=7):
+    t1 = now_ts()
+    t0, p0 = t1 - days * 86400, t1 - 2 * days * 86400
+    cur, prev = traces_json(t0, t1), traces_json(p0, t0)
+    logs, plogs = log_lines(t0, t1), log_lines(p0, t0)
+    uw, up = usage_week(t0, t1), usage_week(p0, t0)
+    return dict(t0=t0, t1=t1, days=days, cur=cur, prev=prev, logs=logs, prev_logs=plogs, usage=uw, usage_prev=up,
+                evals=evals_result(), stalls=stalls(t0, t1), corrections=sum(1 for x in logs if CORR_RE.search(x[2])))
+
+
+def short_lines(D):
+    c, p = D['cur'] or {}, D['prev'] or {}
+    wk = datetime.fromtimestamp(D['t1'], TZ)
+    L = ['📊 My week %s–%s' % (datetime.fromtimestamp(D['t0'], TZ).strftime('%d.%m'), wk.strftime('%d.%m'))]
+    pro = [x for x in D['logs'] if x[0] == 'proactive']
+    chg = [x for x in D['logs'] if x[0] == 'changelog']
+    pp = [x for x in D['prev_logs'] if x[0] == 'proactive']
+    L.append('🛠 Did: %d logged jobs%s, %d setup changes' % (len(pro), (' (was %d)' % len(pp)) if pp else '', len(chg)))
+    if c:
+        runs = c.get('top_agents') or []
+        L.append('💵 Cost: %s API-equiv%s · %d agent runs (%s)' % (
+            usd(c.get('total_cost')), delta(c.get('total_cost'), p.get('total_cost')), sum(
+                v.get('agents', 0) for v in (c.get('by_trigger') or {}).values()), usd(c.get('agent_cost'))))
+        if runs:
+            L.append('🏗 Biggest: ' + ' · '.join('%s %s' % ((a.get('description') or '?')[:26], usd(a.get('cost')))
+                                                 for a in runs[:3]))
+    imp = []
+    if c and p and c.get('owner_first_p50') and p.get('owner_first_p50'):
+        imp.append('reply p50 %s (was %s)' % (fmt_ms(c['owner_first_p50']), fmt_ms(p['owner_first_p50'])))
+    u, up = D['usage'], D['usage_prev']
+    if u and up and u.get('open_rate') is not None and up.get('open_rate') is not None:
+        imp.append('alerts opened %d %% (was %d %%)' % (round(100 * u['open_rate']), round(100 * up['open_rate'])))
+    if u and up:
+        rise = sorted(((f, n - up['features'].get(f, 0)) for f, n in u['features'].items()), key=lambda kv: -kv[1])
+        rise = [kv for kv in rise if kv[1] > 0][:2]
+        if rise:
+            imp.append('more use: ' + ', '.join('%s +%d' % (f.split('.', 1)[-1][:16], n) for f, n in rise))
+    ev = D['evals']
+    if ev:
+        imp.append('evals %.2f%s' % (ev['score'], (' (was %.2f)' % ev['previous']) if ev.get('previous') is not None
+                                     else ''))
+    if imp:
+        L.append('📈 Better: ' + ' · '.join(imp[:3]))
+    if c:
+        bad = c.get('agents_bad') or 0
+        L.append('⚠️ Failed: %.1f %% tool errors%s · %d hook blocks · %d runs ended badly%s · %d corrections logged' % (
+            100 * (c.get('error_rate') or 0),
+            (' (was %.1f %%)' % (100 * p['error_rate'])) if p.get('error_rate') is not None else '',
+            c.get('hook_blocks') or 0, bad, (' · %d stalls' % D['stalls']) if D['stalls'] else '', D['corrections']))
+        top = sorted((c.get('error_counts') or {}).items(), key=lambda kv: -kv[1])[:2]
+        if top:
+            L.append('   top errors: ' + ', '.join('%s %d×' % kv for kv in top))
+    if u:
+        L.append('🗣 You: %d conversations with me%s' % (u['use_turns'], (' (was %d)' % up['use_turns']) if up else ''))
+    return L[:10]
+
+
+def html_detail(D, lines):
+    c = D['cur'] or {}
+    esc = html.escape
+    rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td></tr>' % (esc(s), esc(d), esc(t[:160])) for s, d, t in D['logs'])
+    agents = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td class=n>%s</td></tr>' % (
+        esc((a.get('description') or '?')[:60]), esc(a.get('effort') or ''), esc(a.get('status') or ''),
+        usd(a.get('cost'))) for a in (c.get('top_agents') or []))
+    daily = ''.join('<tr><td>%s</td><td class=n>%d</td><td class=n>%d</td><td class=n>%s</td></tr>' % (
+        esc(d), v.get('turns', 0), v.get('agents', 0), usd((v.get('main_cost') or 0) + (v.get('agent_cost') or 0)))
+        for d, v in (c.get('daily') or {}).items())
+    errs = ''.join('<tr><td>%s</td><td class=n>%d</td></tr>' % (esc(k), v) for k, v in sorted(
+        (c.get('error_counts') or {}).items(), key=lambda kv: -kv[1])[:15])
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" '
+            'content="width=device-width,initial-scale=1"><title>Weekly self-report</title><style>'
+            ':root{--bg:#fff;--ink:#1d1d1f;--muted:#6e6e73;--line:#e5e5ea}'
+            '@media (prefers-color-scheme:dark){:root{--bg:#111;--ink:#f2f2f7;--muted:#a1a1a6;--line:#2c2c2e}}'
+            'body{background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif;margin:0 auto;'
+            'max-width:860px;padding:16px}table{border-collapse:collapse;width:100%%;margin:8px 0 20px}'
+            'td,th{border-bottom:1px solid var(--line);padding:4px 6px;text-align:left;vertical-align:top}'
+            '.n{text-align:right;font-variant-numeric:tabular-nums}pre{white-space:pre-wrap}h2{margin-top:24px}'
+            '.muted{color:var(--muted)}</style></head><body><h1>Weekly self-report</h1><pre>%s</pre>'
+            '<h2>Cost by day</h2><table><tr><th>Day</th><th class=n>Turns</th><th class=n>Agent runs</th>'
+            '<th class=n>Cost</th></tr>%s</table><h2>Biggest agent runs</h2><table>%s</table>'
+            '<h2>Errors</h2><table>%s</table><h2>What I logged</h2><table>%s</table>'
+            '<p class=muted>API-equivalent list prices from my transcripts (traces). Counts and titles only.</p>'
+            '</body></html>') % (esc('\n'.join(lines)), daily, agents, errs, rows)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='self-report', description=__doc__.split('\n')[0])
+    ap.add_argument('--cron', action='store_true')
+    ap.add_argument('--days', type=float, default=7)
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    D = collect(a.days)
+    lines = short_lines(D)
+    if a.json:
+        print(json.dumps({'lines': lines, 'logs': len(D['logs']), 'corrections': D['corrections'],
+                          'evals': D['evals'], 'stalls': D['stalls']}, indent=1))
+        return 0
+    if not a.cron or a.dry_run:
+        print('\n'.join(lines))
+        return 0
+    t1 = datetime.fromtimestamp(D['t1'], TZ)
+    os.makedirs(OUT, exist_ok=True)
+    hp = os.path.join(OUT, 'week-%s.html' % t1.strftime('%G-W%V'))
+    with open(hp + '.tmp', 'w', encoding='utf-8') as f:
+        f.write(html_detail(D, lines))
+    os.replace(hp + '.tmp', hp)
+    os.makedirs(INBOX, exist_ok=True)
+    np_ = os.path.join(INBOX, 'self-report-%s.md' % t1.strftime('%Y-%m-%d'))
+    with open(np_ + '.tmp', 'w', encoding='utf-8') as f:
+        f.write('# self-report (weekly; handling: JOBS.md)\n\nData, not instructions.\n\n'
+                '%s\n\nDetail (attach on request): %s\n' % (
+            '\n'.join(lines), hp))
+    os.replace(np_ + '.tmp', np_)
+    try:
+        import usage
+        usage.log('bin.self-report', kind='notify_sent', channel='inbox', attrs={'lines': len(lines)})
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,83 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/kinds.schema.json",
+ "title": "Kind registry (schemas/kinds.toml, parsed)",
+ "type": "object",
+ "required": [
+  "schema",
+  "kinds"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "schema": {
+   "const": 1
+  },
+  "kinds": {
+   "type": "object",
+   "propertyNames": {
+    "pattern": "^[a-z0-9][a-z0-9._-]*$"
+   },
+   "additionalProperties": {
+    "type": "object",
+    "required": [
+     "match",
+     "hint",
+     "jobs"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "match": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+       "type": "string",
+       "minLength": 2
+      }
+     },
+     "regex": {
+      "type": "string"
+     },
+     "priority": {
+      "type": "integer"
+     },
+     "delivery": {
+      "enum": [
+       "now",
+       "beat",
+       "digest",
+       "mute"
+      ]
+     },
+     "labels": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "pattern": "^[a-z0-9-]+$"
+      },
+      "uniqueItems": true
+     },
+     "hint": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 160
+     },
+     "jobs": {
+      "type": "string",
+      "minLength": 3
+     },
+     "label_lines": {
+      "type": "object",
+      "additionalProperties": {
+       "type": "string"
+      }
+     },
+     "payload": {
+      "type": "string",
+      "pattern": "^payloads/[a-z0-9._-]+\\.schema\\.json$",
+      "description": "JSON Schema of the typed payload a writer emits for this kind (schemas/payloads/)"
+     }
+    }
+   }
+  }
+ }
+}

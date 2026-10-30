@@ -1,0 +1,236 @@
+#!/usr/local/bin/python3.13 -I
+"""voice-hub: the brain's way to the voice relay, which runs in claude-hub-voice. Stdlib + core.
+
+Every brain-side caller of the relay goes through `voice-relay call|reply|status`: voice-reply (the session's 🗣️
+answers), talk-button, drive-update, drive-brief, lastcall, battery-guard, remind --call, push's call step,
+voicecheck and this container's voice.* tools. The voice-relay CLI hands those three subcommands to this script,
+which runs the hub gateway's voice.call / voice.reply / voice.status (hubgw ADAPTER_RUN: the relay's own claim queue
+in claude-hub-voice) and answers like the relay's own CLI: the same arguments, the relay's JSON on stdout, the same
+exit codes. `voice-relay calls|stats` (the relay's call log, which stays in claude-hub-voice) read voice.calls through
+`voice-hub calls` and print it themselves.
+
+  voice-hub call [--reason TEXT] [--say WORDS]   ring him. Exit 0 answered · 3 busy/declined/no answer · 4 in a call
+                                                 or rate-limited · 5 unavailable/failed · 6 nothing to decide
+                                                 (--reason decisions) · 2 relay down
+  voice-hub reply [--more] ID TEXT..             answer a hand-off. Exit 0 spoken · 3 not delivered (send it on
+                                                 Telegram) · 2 relay down
+  voice-hub status                               the relay's state (live, tg_calls, minutes, ...). Exit 0 up · 2 down
+  voice-hub calls [--last N] [--out] [--days D]  the call log as JSON (voice.calls detailed: calls = digests, newest
+                                                 last, metadata only; outgoing = answered / not answered of the
+                                                 listed outgoing calls; stats = quality numbers over D days; live).
+                                                 --out = only the calls that rang him. Exit 0 · 2 down
+
+Relay down (exit 2): the hub gateway unreachable or timed out; the relay in claude-hub-voice not polling (held,
+stopped, starting); or a gateway without the voice adapter queue (a release without voice: it would send the call
+back to this container's executor and round again), checked on /gw/health before every call.
+The call: POST {gateway}/mcp (MCP tools/call, stateless JSON) with the brain's hub token and a `_caller` stamp for
+principal reflex (a script the brain wrote: reads, home changes, messages to him; policy.cedar), signed like the
+hub-stamp hook (HMAC with the token over the tool's MCP name, valid 5 min). The token is read at use, never printed.
+Texts are capped as the relay caps them (reason, say: 300 chars); a reply over 600 chars (voice.reply's limit) is
+not sent: exit 3, send it on Telegram.
+Env: HUB_GW_URL (default: HUB_URL's host on port 8701, else http://claude-hub:8701; ASSISTANT_TEST=1 needs one) ·
+HUB_TOKEN_FILE (default ~/.secrets/hub-token).
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _r in (os.environ.get("ASSISTANT_LIB", ""), os.path.join(_here, "lib"), os.path.join(_here, "..")):
+    if _r and os.path.isfile(os.path.join(_r, "core", "__init__.py")):
+        sys.path.insert(0, os.path.abspath(_r))
+        break
+
+import argparse  # noqa: E402
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
+import json  # noqa: E402
+import time  # noqa: E402
+import urllib.parse  # noqa: E402
+
+from core import http as corehttp  # noqa: E402
+from core import paths  # noqa: E402
+
+GW_PORT = 8701
+STAMP_VERSION = "hub-stamp/1"  # tools.policy.STAMP_VERSION
+CALL_EXIT = {"answered": 0, "busy": 3, "declined": 3, "no_answer": 3, "in_call": 4, "rate_limited": 4, "nothing": 6}
+# the gateway's coarse statuses (hubmode.Executor), for an executor that sends no relay answer along
+COARSE = {"not_answered": "no_answer", "busy_or_limited": "in_call", "nothing_to_decide": "nothing"}
+DOWN = ("unavailable", "timeout")
+TEXT_MAX, REASON_MAX, REPLY_MAX = 300, 300, 600
+NO_QUEUE = (
+    "the hub gateway has no voice adapter queue (a release without voice): refused, the call would come back here; "
+    "deploy a hub release with the voice tree"
+)
+TIMEOUT = {"voice_call": 125.0, "voice_reply": 30.0, "voice_status": 15.0, "voice_calls": 35.0}  # gateway: tool timeout + 20 s + grace
+
+
+class Down(Exception):
+    """The relay can't be reached through the hub: exit 2."""
+
+
+def gw_url() -> str:
+    u = os.environ.get("HUB_GW_URL", "").rstrip("/")
+    if u:
+        return u
+    hub = os.environ.get("HUB_URL", "")
+    if hub:
+        p = urllib.parse.urlsplit(hub)
+        return f"{p.scheme}://{p.hostname}:{GW_PORT}"
+    if paths.test_mode():
+        raise Down("ASSISTANT_TEST=1: set HUB_GW_URL (tests never reach the real hub)")
+    return f"http://claude-hub:{GW_PORT}"
+
+
+def _token() -> bytes:
+    p = os.environ.get("HUB_TOKEN_FILE") or str(paths.home() / ".secrets" / "hub-token")
+    try:
+        with open(p, "rb") as f:
+            return f.read(4096).strip()
+    except OSError:
+        return b""
+
+
+def stamp(key: bytes, tool: str, now: float | None = None) -> dict:
+    """The `_caller` stamp for principal reflex (tools.policy.verify_stamp checks it)."""
+    p, a, t, s, ts = "reflex", "", "voice-hub", "", int(now if now is not None else time.time())
+    mac = hmac.new(key, "|".join((STAMP_VERSION, p, a, t, s, str(ts), tool)).encode(), hashlib.sha256)
+    return {"p": p, "a": a, "t": t, "s": s, "ts": ts, "m": mac.hexdigest()[:32]}
+
+
+def tool(name: str, args: dict) -> tuple[bool, dict, str]:
+    """One voice.* tool on the hub gateway -> (ok, structured data, text); Down when the relay can't be reached."""
+    gw = gw_url()
+    st, h = corehttp.call_json("GET", gw + "/gw/health", timeout=3.0)
+    if st != 200 or not isinstance(h, dict):
+        raise Down(f"hub gateway {'unreachable' if st == 0 else f'http {st}'}")
+    if "voice" not in (h.get("adapters") or {}):
+        raise Down(NO_QUEUE)
+    key = _token()
+    if not key:
+        raise Down("no hub token")
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": dict(args, _caller=stamp(key, name))}}  # fmt: skip
+    st, d = corehttp.call_json("POST", gw + "/mcp", body, token=key.decode("utf-8", "replace"),
+                               headers={"Accept": "application/json, text/event-stream"},
+                               timeout=TIMEOUT.get(name, 30.0))  # fmt: skip
+    r = d.get("result") if isinstance(d, dict) else None
+    if st != 200 or not isinstance(r, dict):
+        raise Down(f"hub gateway {'unreachable or timed out' if st == 0 else f'http {st}'}")
+    text = "".join(str(c.get("text") or "") for c in r.get("content") or [] if isinstance(c, dict))
+    data = r.get("structuredContent")
+    return not r.get("isError"), data if isinstance(data, dict) else {}, text
+
+
+def _code(text: str) -> str:
+    """The error code of a gateway error text ("code: message (hint: …)")."""
+    return text.split(":", 1)[0].strip() if ":" in text else ""
+
+
+def _err(why: str) -> None:
+    print(f"voice-relay not reachable: {why}", file=sys.stderr)
+
+
+def cmd_call(a: argparse.Namespace) -> int:
+    reason, say = a.reason[:REASON_MAX], a.say[:TEXT_MAX]
+    if not reason.strip():
+        print(json.dumps({"status": "failed", "detail": "voice-hub: --reason is needed (voice.call)"}))
+        return 5
+    try:
+        ok, data, text = tool("voice_call", {"reason": reason, **({"say": say} if say.strip() else {})})
+    except Down as e:
+        _err(str(e))
+        return 2
+    if not ok:
+        code = _code(text)
+        if code in DOWN:
+            _err(text[:200])
+            return 2
+        res = {"status": "rate_limited" if code == "rate_limited" else "failed", "detail": text[:200]}
+        print(json.dumps(res))
+        return CALL_EXIT.get(res["status"], 5)
+    res = data.get("result") if isinstance(data.get("result"), dict) else None
+    if res is None or not isinstance(res.get("status"), str):
+        st = str(data.get("status") or "failed")
+        res = {"status": COARSE.get(st, st)}
+    print(json.dumps(res))
+    return CALL_EXIT.get(res["status"], 5)
+
+
+def cmd_reply(a: argparse.Namespace) -> int:
+    text = " ".join(a.text)
+    if len(text) > REPLY_MAX:
+        print(f"not delivered: over {REPLY_MAX} characters for the call; send the answer on Telegram", file=sys.stderr)
+        return 3
+    try:
+        ok, data, msg = tool("voice_reply", {"id": a.id, "text": text, **({"more": True} if a.more else {})})
+    except Down as e:
+        _err(str(e))
+        return 2
+    if not ok and _code(msg) in DOWN:
+        _err(msg[:200])
+        return 2
+    if ok:
+        print(json.dumps(data))
+        if data.get("delivered") is True:
+            return 0
+    else:
+        print(f"voice-hub: {msg[:200]}", file=sys.stderr)
+    print("not delivered: send the answer on Telegram", file=sys.stderr)
+    return 3
+
+
+def cmd_status(a: argparse.Namespace) -> int:  # noqa: ARG001 (one signature for every command)
+    try:
+        ok, data, text = tool("voice_status", {"format": "detailed"})
+    except Down as e:
+        _err(str(e))
+        return 2
+    if not ok or data.get("up") is not True:
+        _err(text[:200] if not ok else "the relay is not up")
+        return 2
+    res = data.get("result") if isinstance(data.get("result"), dict) else {}
+    out = {**res, "live": data.get("live"), "tg_calls": data.get("tg_calls"), "via": "hub"}
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_calls(a: argparse.Namespace) -> int:
+    args = {"last": max(0, min(50, a.last)), "days": a.days, "format": "detailed"}
+    try:
+        ok, data, text = tool("voice_calls", {**args, **({"outgoing": True} if a.out else {})})
+    except Down as e:
+        _err(str(e))
+        return 2
+    if not ok or not isinstance(data.get("calls"), list):
+        _err(text[:200] if not ok else "no call log in the answer")
+        return 2
+    print(json.dumps({**data, "via": "hub"}))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="voice-relay", description="voice-hub: the relay in claude-hub-voice")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    o = sub.add_parser("call")
+    o.add_argument("--reason", default="")
+    o.add_argument("--say", default="")
+    r = sub.add_parser("reply")
+    r.add_argument("--more", action="store_true")
+    r.add_argument("id")
+    r.add_argument("text", nargs="+")
+    sub.add_parser("status")
+    c = sub.add_parser("calls")
+    c.add_argument("--last", type=int, default=5)
+    c.add_argument("--out", action="store_true")
+    c.add_argument("--days", type=float, default=7)
+    a = ap.parse_args(argv)
+    try:
+        return {"call": cmd_call, "reply": cmd_reply, "status": cmd_status, "calls": cmd_calls}[a.cmd](a)
+    except Exception as e:  # never a traceback for a caller that only reads the exit code
+        _err(f"voice-hub: {type(e).__name__}")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

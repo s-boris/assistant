@@ -1,0 +1,1105 @@
+#!/usr/bin/env python3
+"""security-watch: problems-only security watch over the owner's public surface, his server's auth signals and
+this box. Read-only everywhere; scans nothing but his own public IP (it must equal both this box's egress IP and
+the A record of his profile domain, else the scan is refused).
+
+Checks (a --cron run does each when due; --only NAME,... forces those):
+  ip         egress IP vs the domain's A/AAAA records (mismatch seen twice = finding; new AAAA = finding)
+  internetdb Shodan InternetDB for his IP (passive outside view: ports, tags, CVEs; CVEs cross-checked with the
+             CISA KEV catalogue that container-watch caches); daily
+  ports      nmap connect scan of his public IP (top ports + config extra_ports, rate-limited; hairpin view from
+             the LAN), then each open port is checked from outside via check-host.net (3 nodes, status only);
+             open from outside and not in config public_allow = finding; weekly
+  tls        certificate of every vhost name in the nginx mirror (+ the apex): days left (< tls_warn_days /
+             tls_crit_days) and chain/hostname validity; daily
+  ct         certificate-transparency inventory (crt.sh, Cert Spotter fallback): a name or issuing CA not in the
+             baseline = finding; daily
+  auth       config auth_probes (vhost -> paths) fetched without credentials: 2xx where a login is expected is
+             re-checked from outside (check-host.net); plus unread Unraid notifications about logins/auth from
+             unraid-health's last collect (no extra SSH call); plus config mtls_probes (the app's internet path,
+             device certificate required): a handshake without a client cert must get no HTTP answer, the server
+             cert must chain to the probe's ca_file with >= 30 days left, a wrong/missing SNI must get no
+             certificate, check-host.net confirms the port from outside; unreachable is info until first seen up;
+             daily
+  box        this container: ~/.secrets modes (lstat only, never opened), non-loopback listeners vs baseline,
+             risk-check + vault-guard hooks present/executable/wired with onFailure block, installed crontab ==
+             ~/crontab and required jobs present: in the installed crontab, or (registry core/schedules.toml
+             runs_on = hub) on a live, active hub schedule (`tool call workflow.schedules`, read only when one is
+             missing from cron; hub or registry unreadable = flagged as missing); daily
+KEV for container images lives in container-watch (its weekly alert); this tool only counts its KEV hits.
+
+Usage
+  security-watch run [--cron] [--only CHECKS] [--dry-run] [--json]   one ~/inbox note only for NEW findings
+  security-watch status [--json]          open, acked and resolved findings + last run per check
+  security-watch posture [--json]         the one-line weekly posture (also written to posture.txt each run)
+  security-watch ack KEY [--label TEXT] [--until YYYY-MM-DD|never] | ack list | ack rm KEY
+  security-watch baseline [ct|listen|auth|all]   accept the current values as known
+Files: ~/.local/state/security-watch/ (state.json, last.json, posture.txt, runs.log); config
+~/.config/security-watch/config.json (private: public_allow, extra_ports, auth_probes, thresholds).
+Exit: 0 ok (findings are not failures), 1 crash, 2 usage. Tests: ~/opt/security-watch-tests/run.sh.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import botlib  # noqa: E402
+import assistant_profile  # noqa: E402
+try:
+    import usage  # noqa: E402
+except Exception:                                     # analytics must never break the watch
+    usage = None
+
+HOME = Path(os.environ.get("HOME") or Path.home())
+STATE_DIR = HOME / ".local/state/security-watch"
+CONFIG = HOME / ".config/security-watch/config.json"
+INBOX = HOME / "inbox"
+CW_LAST = HOME / ".local/state/container-watch/last.json"
+CW_CACHE = HOME / ".cache/container-watch"
+UH_COLLECT = HOME / ".local/state/unraid-health/last-collect.txt"
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+NMAP = os.environ.get("SECURITY_WATCH_NMAP", "nmap")
+CRONTAB_CMD = os.environ.get("SECURITY_WATCH_CRONTAB", "crontab")
+TOOL_CMD = os.environ.get("SECURITY_WATCH_TOOL") or str(HOME / "bin/tool")   # the hub's schedules (read-only call)
+SCHEDULES = os.environ.get("SECURITY_WATCH_SCHEDULES") or None   # None = core.schedules' default registry
+PROC_NET = Path(os.environ.get("SECURITY_WATCH_PROC_NET", "/proc/net"))
+UA = "security-watch/1.0 (owner's own hosts; read-only)"
+SEV_NAME = {1: "LOW", 2: "MEDIUM", 3: "HIGH"}
+FEATURE = "skill.security-watch"
+
+DEFAULTS = dict(
+    public_allow=[80, 443],              # ports meant to be open to the internet
+    top_ports=1000, max_rate=100,
+    extra_ports=[3000, 5055, 6080, 6767, 7878, 8080, 8096, 8123, 8191, 8443, 8920, 8989, 9000, 9091, 9696,
+                 32400, 51413],
+    outside_max_ports=10,
+    nginx_dir="~/opt/nginx-mirror/etc-nginx/sites-enabled",
+    hosts=[],                            # extra names for the TLS check (default: nginx server_names + apex)
+    tls_warn_days=21, tls_crit_days=7,
+    auth_probes={},                      # {"sub": ["/api/path", ...]}: expected to need a login
+    mtls_probes=[],                      # [{"name": host, "port": 8443, "ca_file": path}]: device cert required
+    listen_allow=[],                     # non-loopback ports this container may listen on (baseline adds more)
+    cron_required=["brain-watch", "agent-watch", "brain auto", "security-watch"],
+    hooks=["risk-check.sh", "vault-guard.sh"],
+    intervals_h=dict(ip=0, internetdb=20, tls=20, ct=20, auth=20, box=0, ports=160),
+)
+ORDER = ["ip", "internetdb", "ports", "tls", "ct", "auth", "box"]
+BAD_TAGS = {"compromised", "malware", "c2", "doublepulsar", "botnet"}
+EOL_TAGS = {"eol-os", "eol-product"}
+AUTH_WORDS = re.compile(r"(?i)\blog ?in\b|login|password|unauthori[sz]ed|authenticat|brute|intrusion|invalid user|"
+                        r"\bssh\b|banned|blocked ip")
+
+
+# ----------------------------------------------------------------------------- small helpers
+def now():
+    return time.time()
+
+
+def iso(t=None):
+    return dt.datetime.fromtimestamp(t if t is not None else now(), dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def short(s, n=140):
+    s = re.sub(r"\s+", " ", str(s or "")).strip()
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    user = botlib.load_json(CONFIG, {}) or {}
+    for k, v in user.items():
+        if k == "intervals_h" and isinstance(v, dict):
+            cfg[k].update(v)
+        elif not k.startswith("_"):
+            cfg[k] = v
+    return cfg
+
+
+def http(url, timeout=20, accept=None, method="GET", follow=True):
+    """(status, headers, body bytes); never raises for HTTP errors (status 0 = network error)."""
+    h = {"User-Agent": UA}
+    if accept:
+        h["Accept"] = accept
+    req = urllib.request.Request(url, headers=h, method=method)
+    opener = urllib.request.build_opener(*([] if follow else [NoRedirect()]))
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            return r.status, dict(r.headers), r.read(4_000_000)
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers or {}), b""
+    except Exception:
+        return 0, {}, b""
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+def get_json(url, timeout=25):
+    st, _, body = http(url, timeout=timeout, accept="application/json")
+    if st != 200:
+        raise RuntimeError(f"{urllib.parse.urlparse(url).netloc}: HTTP {st or 'unreachable'}")
+    return json.loads(body or b"null")
+
+
+def resolve(name, family):
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(name, 443, family, socket.SOCK_STREAM)})
+    except socket.gaierror:
+        return []
+
+
+def egress_ip():
+    for url in ("https://api.ipify.org", "https://ipv4.icanhazip.com", "https://ifconfig.me/ip"):
+        st, _, body = http(url, timeout=10)
+        ip = body.decode(errors="replace").strip() if st == 200 else ""
+        if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+            return ip
+    return None
+
+
+def kev_catalogue():
+    """CISA KEV ids from container-watch's cache (no extra download); empty set when it has none yet."""
+    p = CW_CACHE / (hashlib.sha1(KEV_URL.encode()).hexdigest()[:20] + ".json")
+    d = botlib.load_json(p, {}) or {}
+    return set((d.get("data") or {}).keys())
+
+
+# ----------------------------------------------------------------------------- outside vantage (check-host.net)
+def _ch_submit(kind, host, nodes=3):
+    q = urllib.parse.urlencode({"host": host, "max_nodes": nodes})
+    j = get_json(f"https://check-host.net/check-{kind}?{q}")
+    return j.get("request_id")
+
+
+def _ch_results(ids, polls=3, wait=8):
+    """{key: result dict} for submitted check-host.net requests; one sleep per poll round for all of them."""
+    res, pending = {}, dict(ids)
+    for _ in range(polls):
+        if not pending:
+            break
+        time.sleep(wait)
+        for k, rid in list(pending.items()):
+            try:
+                r = get_json(f"https://check-host.net/check-result/{rid}") or {}
+            except Exception:
+                continue
+            res[k] = r
+            if r and all(v is not None for v in r.values()):
+                pending.pop(k)
+    return res
+
+
+def _ch_result(rid):
+    return _ch_results({0: rid}).get(0) or {}
+
+
+def outside_tcp(ip, ports):
+    """{port: 'open' | 'closed' | 'unknown'} from check-host.net nodes (open = any node connected)."""
+    out, ids = {}, {}
+    for p in ports:
+        try:
+            ids[p] = _ch_submit("tcp", f"{ip}:{p}")
+        except Exception:
+            out[p] = "unknown"
+    res = _ch_results(ids)
+    for p in ids:
+        vals = [v[0] for v in (res.get(p) or {}).values() if isinstance(v, list) and v and isinstance(v[0], dict)]
+        if any("address" in v and "error" not in v for v in vals):
+            out[p] = "open"
+        elif vals:
+            out[p] = "closed"
+        else:
+            out[p] = "unknown"
+    return out
+
+
+def outside_http(url):
+    """HTTP status codes seen by check-host.net nodes (ints), [] when unknown."""
+    try:
+        res = _ch_result(_ch_submit("http", url))
+    except Exception:
+        return []
+    codes = []
+    for v in res.values():
+        if isinstance(v, list) and v and isinstance(v[0], list) and len(v[0]) > 3:
+            try:
+                codes.append(int(v[0][3]))
+            except (TypeError, ValueError):
+                pass
+    return codes
+
+
+# ----------------------------------------------------------------------------- checks
+class Ctx:
+    def __init__(self, cfg, state, domain):
+        self.cfg, self.state, self.domain = cfg, state, domain
+        self.findings, self.metrics, self.errors, self.info = [], {}, {}, []
+        self._ip = None
+
+    def find(self, check, key, sev, title, detail="", confirm=1):
+        self.findings.append(dict(check=check, key=key, sev=sev, title=short(title, 120),
+                                  detail=short(detail, 220), confirm=confirm))
+
+    @property
+    def ip(self):
+        """His public IP, only when the egress IP and the domain's single A record agree (scan guard)."""
+        if self._ip is None:
+            eg = egress_ip()
+            a = resolve(self.domain, socket.AF_INET) if self.domain else []
+            self._ip = eg if (eg and a == [eg]) else ""
+            self.metrics.setdefault("ip", {}).update(egress_ok=bool(eg), a_records=len(a), match=bool(self._ip))
+        return self._ip
+
+
+def check_ip(c):
+    ip = c.ip
+    m = c.metrics["ip"]
+    if not m["egress_ok"]:
+        raise RuntimeError("egress IP unknown (all echo services failed)")
+    if not ip:
+        c.find("ip", "ip:dns-mismatch", 3, "The domain's A record does not point to your own connection",
+               f"{m['a_records']} A record(s), none equal to this box's egress IP (DNS hijack, a stale DDNS "
+               "update or an IP change)", confirm=2)
+    aaaa = resolve(c.domain, socket.AF_INET6)
+    m["aaaa"] = len(aaaa)
+    if aaaa and not c.state.get("baseline", {}).get("aaaa"):
+        c.find("ip", "ip:aaaa-new", 2, "The domain now has an IPv6 (AAAA) record",
+               "IPv6 bypasses the IPv4 port forwards: check the router's IPv6 firewall")
+    h = hashlib.sha256((ip or "").encode()).hexdigest()[:10] if ip else None
+    prev = c.state.get("ip_hash")
+    m["changed"] = bool(h and prev and h != prev)
+    if h:
+        c.state["ip_hash"] = h
+
+
+def check_internetdb(c):
+    ip = c.ip
+    if not ip:
+        raise RuntimeError("no verified public IP (see ip check)")
+    st, _, body = http(f"https://internetdb.shodan.io/{ip}", timeout=20, accept="application/json")
+    if st == 404:
+        d = {}
+    elif st == 200:
+        d = json.loads(body or b"{}")
+    else:
+        raise RuntimeError(f"internetdb.shodan.io: HTTP {st or 'unreachable'}")
+    ports, vulns, tags = sorted(d.get("ports") or []), sorted(d.get("vulns") or []), set(d.get("tags") or [])
+    allow = set(c.cfg["public_allow"])
+    kev = kev_catalogue()
+    kev_hits = sorted(v for v in vulns if v.upper() in kev)
+    c.metrics["internetdb"] = dict(ports=ports, vulns=len(vulns), kev=len(kev_hits), tags=sorted(tags),
+                                   kev_catalogue=len(kev))
+    extra = [p for p in ports if p not in allow]
+    if extra:
+        seen = outside_tcp(ip, extra[: c.cfg["outside_max_ports"]])
+        for p in extra:
+            if seen.get(p) == "closed":
+                c.info.append(f"Shodan still lists port {p}, but it is closed from outside now (stale scan)")
+            else:
+                c.find("internetdb", f"idb-port:{p}", 3, f"Port {p} is open to the internet (Shodan's outside view)",
+                       f"not in public_allow; check-host.net: {seen.get(p, 'not checked')}; find the port forward "
+                       "on the router or close it")
+    for v in kev_hits:
+        c.find("internetdb", f"idb-kev:{v}", 3, f"Shodan maps {v} (CISA KEV: exploited in the wild) to your public IP",
+               "banner-based guess: confirm the version behind the port and patch it")
+    for t in sorted(tags & BAD_TAGS):
+        c.find("internetdb", f"idb-tag:{t}", 3, f"Shodan tags your public IP '{t}'",
+               "seen in Shodan's scans of your IP: check the exposed services and the router at once")
+    for t in sorted(tags & EOL_TAGS):
+        c.find("internetdb", f"idb-tag:{t}", 2, f"Shodan tags your public IP '{t}' (end-of-life software)",
+               "an exposed service runs software without security updates")
+
+
+def nmap_scan(ip, args):
+    cmd = [NMAP, "-sT", "-Pn", "-n", "--open", "--max-retries", "1", "-T3", "-oX", "-"] + args + [ip]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if p.returncode != 0:
+        raise RuntimeError(f"nmap exit {p.returncode}: {short(p.stderr, 120)}")
+    out = {}
+    for port in ET.fromstring(p.stdout).iter("port"):
+        s = port.find("state")
+        if s is not None and s.get("state") == "open":
+            sv = port.find("service")
+            out[int(port.get("portid"))] = sv.get("name") if sv is not None else ""
+    return out
+
+
+def check_ports(c):
+    ip = c.ip
+    if not ip:
+        raise RuntimeError("no verified public IP: refusing to scan (see ip check)")
+    rate = str(int(c.cfg["max_rate"]))
+    found = nmap_scan(ip, ["--top-ports", str(int(c.cfg["top_ports"])), "--max-rate", rate])
+    extra = [int(p) for p in c.cfg.get("extra_ports") or []]
+    if extra:
+        found.update(nmap_scan(ip, ["-p", ",".join(map(str, sorted(set(extra)))), "--max-rate", rate]))
+    allow = set(c.cfg["public_allow"])
+    probe = sorted(found)[: c.cfg["outside_max_ports"]]
+    seen = outside_tcp(ip, probe) if probe else {}
+    outside_open = sorted(p for p, v in seen.items() if v == "open")
+    lan_only = sorted(p for p, v in seen.items() if v == "closed")
+    c.metrics["ports"] = dict(hairpin=sorted(found), outside_open=outside_open, lan_only=lan_only,
+                              unknown=sorted(p for p, v in seen.items() if v == "unknown"),
+                              unchecked=sorted(set(found) - set(probe)))
+    for p in outside_open:
+        if p not in allow:
+            c.find("ports", f"port:{p}", 3, f"Port {p} ({found[p] or 'unknown service'}) is open to the internet",
+                   "not in public_allow; confirmed by check-host.net nodes; find the port forward or close it")
+    for p in sorted(set(found) - set(probe)):
+        if p not in allow:
+            c.find("ports", f"port-unchecked:{p}", 1, f"Port {p} answers on your public IP but was not checked "
+                   "from outside", f"more than {c.cfg['outside_max_ports']} open ports; raise outside_max_ports")
+    prev = set(c.state.get("ports_hairpin") or [])
+    if prev:
+        new_lan = sorted(set(lan_only) - prev)
+        if new_lan:
+            c.info.append("new router-side ports (filtered from outside): " + ",".join(map(str, new_lan)))
+    c.state["ports_hairpin"] = sorted(found)
+
+
+def nginx_names(c):
+    names = set()
+    d = Path(os.path.expanduser(c.cfg["nginx_dir"]))
+    dom = c.domain.lower()
+    for f in sorted(d.glob("*")) if d.is_dir() else []:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"(?m)^\s*server_name\s+([^;]+);", text):
+            for n in m.group(1).split():
+                n = n.lower().strip()
+                if n == dom or n.endswith("." + dom):
+                    names.add(n)
+    names.update(h.lower() for h in c.cfg.get("hosts") or [])
+    names.add(dom)
+    return sorted(n for n in names if "*" not in n)
+
+
+def tls_probe(ip, name, timeout=10):
+    """dict(days, fp, issuer, error) for the certificate nginx serves for SNI name (connects to his IP)."""
+    def der_info(der):
+        p = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout", "-enddate", "-issuer"],
+                           input=der, capture_output=True, timeout=20)
+        out = p.stdout.decode(errors="replace")
+        end = re.search(r"notAfter=(.+)", out)
+        iss = re.search(r"issuer=.*?O\s*=\s*([^,/\n]+)", out)
+        t = dt.datetime.strptime(end.group(1).strip(), "%b %d %H:%M:%S %Y %Z").replace(tzinfo=dt.timezone.utc)
+        return t.timestamp(), (iss.group(1).strip() if iss else "")
+    err = None
+    raw = socket.create_connection((ip, 443), timeout=timeout)
+    try:
+        try:
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(raw, server_hostname=name) as s:
+                der = s.getpeercert(binary_form=True)
+        except ssl.SSLCertVerificationError as e:
+            err = short(e.verify_message or str(e), 80)
+            raw2 = socket.create_connection((ip, 443), timeout=timeout)
+            ctx = ssl.create_default_context()
+            ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+            with ctx.wrap_socket(raw2, server_hostname=name) as s:
+                der = s.getpeercert(binary_form=True)
+    finally:
+        raw.close()
+    exp, issuer = der_info(der)
+    return dict(days=round((exp - now()) / 86400, 1), fp=hashlib.sha256(der).hexdigest()[:16], issuer=issuer,
+                error=err)
+
+
+def check_tls(c):
+    ip = c.ip
+    if not ip:
+        raise RuntimeError("no verified public IP (see ip check)")
+    res, failed = {}, []
+    for n in nginx_names(c):
+        try:
+            res[n] = tls_probe(ip, n)
+        except Exception as e:
+            failed.append(n)
+            c.info.append(f"TLS {n}: {type(e).__name__}")
+    if not res:
+        raise RuntimeError("no TLS handshake succeeded")
+    certs = {}
+    for n, r in res.items():
+        certs.setdefault(r["fp"], dict(r, names=[]))["names"].append(n)
+    c.metrics["tls"] = dict(names=len(res), certs=len(certs), failed=len(failed),
+                            min_days=min(r["days"] for r in res.values()))
+    for fp, r in certs.items():
+        label = r["names"][0] + (f" (+{len(r['names']) - 1})" if len(r["names"]) > 1 else "")
+        if r["days"] < c.cfg["tls_crit_days"]:
+            c.find("tls", f"tls-exp:{fp}", 3, f"TLS certificate for {label} expires in {r['days']:.0f} days",
+                   "renewal is failing: check certbot on the web VM")
+        elif r["days"] < c.cfg["tls_warn_days"]:
+            c.find("tls", f"tls-exp:{fp}", 2, f"TLS certificate for {label} expires in {r['days']:.0f} days",
+                   "Let's Encrypt renews at 30 days left, so renewal looks stuck")
+    for n, r in res.items():
+        if r["error"]:
+            c.find("tls", f"tls-invalid:{n}", 3, f"TLS certificate for {n} does not validate", r["error"])
+
+
+def ct_entries(domain):
+    """[(name, issuer)] from crt.sh, Cert Spotter as fallback; raises when both fail."""
+    errs = []
+    try:
+        j = get_json(f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json&exclude=expired", timeout=45)
+        out = []
+        for e in j or []:
+            iss = re.search(r"O=([^,]+)", e.get("issuer_name") or "")
+            for n in str(e.get("name_value") or "").split("\n"):
+                out.append((n.strip().lower(), iss.group(1).strip().strip('"') if iss else "?"))
+        return out, "crt.sh"
+    except Exception as e:
+        errs.append(short(e, 60))
+    try:
+        q = urllib.parse.urlencode({"domain": domain, "include_subdomains": "true", "expand": "dns_names"})
+        j = get_json(f"https://api.certspotter.com/v1/issuances?{q}&expand=issuer", timeout=45)
+        out = []
+        for e in j or []:
+            i = e.get("issuer") or {}
+            m = re.search(r"O=([^,]+)", i.get("name") or "")
+            iss = m.group(1).strip().strip('"') if m else (i.get("friendly_name") or "?")
+            for n in e.get("dns_names") or []:
+                out.append((n.strip().lower(), iss))
+        return out, "certspotter"
+    except Exception as e:
+        errs.append(short(e, 60))
+    raise RuntimeError("CT sources failed: " + "; ".join(errs))
+
+
+def issuer_org(i):
+    return re.sub(r"[^a-z0-9]+", " ", (i or "").lower()).strip()
+
+
+def check_ct(c):
+    entries, src = ct_entries(c.domain)
+    names = sorted({n for n, _ in entries if n})
+    issuers = sorted({issuer_org(i) for _, i in entries if i and i != "?"})
+    base = c.state.setdefault("baseline", {})
+    c.metrics["ct"] = dict(source=src, names=len(names), issuers=len(issuers))
+    if "ct_names" not in base:
+        base["ct_names"], base["ct_issuers"] = names, issuers
+        c.info.append(f"CT baseline set: {len(names)} names, {len(issuers)} issuers")
+        return
+    for n in sorted(set(names) - set(base["ct_names"])):
+        iss = sorted({i for nn, i in entries if nn == n})
+        c.find("ct", f"ct-name:{n}", 2, f"New certificate name in CT logs: {n}",
+               f"issued by {', '.join(iss)[:60]}; if you didn't set it up, someone holds a cert for your domain "
+               "(accept with `security-watch baseline ct`)")
+    for i in sorted(set(issuers) - set(base["ct_issuers"])):
+        c.find("ct", f"ct-issuer:{i}", 2, f"A new CA issued a certificate for your domain: {i}",
+               "your certs normally come from the baseline CA; check whether you switched CA")
+    c.metrics["ct"]["new"] = len(set(names) - set(base["ct_names"]))
+
+
+def unraid_auth_notifications():
+    """[(subject, importance)] of unread Unraid notifications about logins/auth from unraid-health's collect."""
+    try:
+        text = UH_COLLECT.read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"(?ms)^=====UH notify_unread\n(.*?)(?=^=====UH |\Z)", text)
+    if not m:
+        return []
+    out, cur = [], {}
+    for line in m.group(1).splitlines() + ["@file=END"]:
+        if line.startswith("@file="):
+            if cur and AUTH_WORDS.search(cur.get("subject", "") + " " + cur.get("event", "") + " "
+                                         + cur.get("description", "")):
+                out.append((cur.get("subject") or cur.get("event") or "?", cur.get("importance", "")))
+            cur = {}
+        else:
+            k, _, v = line.partition("=")
+            if k in ("subject", "event", "description", "importance"):
+                cur[k] = v.strip().strip('"')
+    return out
+
+
+def mtls_probe(ip, name, port, ca_file, timeout=10):
+    """An mTLS-only endpoint (nginx SNI passthrough -> phonegw, CERT_REQUIRED), probed WITHOUT a client certificate.
+    dict(reachable, cert_ok, days, nocert_answered, wrong_sni_answered, error). nocert_answered: HTTP bytes came back
+    although no device cert was sent (must never happen); wrong_sni_answered: a certificate for a wrong or no SNI."""
+    r = dict(reachable=False, cert_ok=False, days=None, nocert_answered=False, wrong_sni_answered=False, error=None)
+    try:
+        raw = socket.create_connection((ip, port), timeout=timeout)
+    except OSError as e:
+        r["error"] = type(e).__name__
+        return r
+    r["reachable"] = True
+    try:
+        ctx = ssl.create_default_context(cafile=ca_file)
+        with ctx.wrap_socket(raw, server_hostname=name) as s:
+            cert = s.getpeercert()
+            r["cert_ok"] = True
+            r["days"] = round((ssl.cert_time_to_seconds(cert["notAfter"]) - now()) / 86400, 1)
+            try:
+                s.sendall(b"GET /v1/health HTTP/1.1\r\nHost: " + name.encode() + b"\r\nConnection: close\r\n\r\n")
+                r["nocert_answered"] = bool(s.recv(64))
+            except (ssl.SSLError, OSError):
+                pass                                      # TLS alert "certificate required" / reset: as designed
+    except ssl.SSLCertVerificationError as e:
+        r["error"] = "verify: " + short(e.verify_message or str(e), 60)
+    except (ssl.SSLError, OSError) as e:
+        r["error"] = "handshake: " + type(e).__name__
+    finally:
+        raw.close()
+    for sni in ("wrong-sni.invalid", None):
+        try:
+            raw = socket.create_connection((ip, port), timeout=timeout)
+        except OSError:
+            continue
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+            with ctx.wrap_socket(raw, server_hostname=sni) as s:
+                if s.getpeercert(binary_form=True):
+                    r["wrong_sni_answered"] = True
+        except (ssl.SSLError, OSError):
+            pass                                          # closed before any certificate: as designed
+        finally:
+            raw.close()
+    return r
+
+
+def check_mtls(c):
+    probes = c.cfg.get("mtls_probes") or []
+    if not probes:
+        return
+    ip = c.ip
+    if not ip:
+        c.info.append("mtls probes skipped: no verified public IP")
+        return
+    live = c.state.setdefault("mtls_live", {})
+    out = []
+    for p in probes:
+        name, port = p["name"], int(p.get("port") or 443)
+        key = f"{name}:{port}"
+        r = mtls_probe(ip, name, port, os.path.expanduser(p.get("ca_file") or ""))
+        if not r["cert_ok"] and not r["nocert_answered"] and not r["wrong_sni_answered"]:
+            if live.get(key):
+                c.find("auth", f"mtls-down:{key}", 1, f"{key} (the app's internet path) does not answer",
+                       f"{r['error'] or 'no handshake'}; the app falls back to LAN/WireGuard; `phone status`")
+                out.append(dict(name=key, state="down", error=r["error"]))
+            else:
+                c.info.append(f"mtls {key}: pending, not live yet ({r['error'] or 'no handshake'})")
+                out.append(dict(name=key, state="pending", error=r["error"]))
+            continue
+        live[key] = True
+        if r["nocert_answered"]:
+            c.find("auth", f"mtls-open:{key}", 3, f"{key} answers without a device certificate",
+                   "the app gateway must require the certificate in the handshake: `hub phone stop` now "
+                   "(the gateway runs in claude-hub-phone)")
+        if r["wrong_sni_answered"]:
+            c.find("auth", f"mtls-sni:{key}", 2, f"port {port} hands out a certificate for a wrong or missing name",
+                   "the nginx stream map must close anything but the app name (streams-enabled on the web VM)")
+        if not r["cert_ok"]:
+            c.find("auth", f"mtls-cert:{key}", 2, f"{key} certificate does not chain to the expected CA", r["error"] or "")
+        elif r["days"] is not None and r["days"] < 30:
+            c.find("auth", f"mtls-exp:{key}", 3 if r["days"] < 7 else 2,
+                   f"{key} certificate expires in {r['days']:.0f} days", "the gateway renews it under 30 days: check it")
+        seen = outside_tcp(ip, [port]).get(port, "unknown")
+        if seen == "closed":
+            c.info.append(f"mtls {key}: answers here but not from outside (router forward?)")
+        out.append(dict(name=key, state="ok", days=r["days"], outside=seen))
+    c.metrics.setdefault("auth", {})["mtls"] = out
+
+
+def check_auth(c):
+    probes = c.cfg.get("auth_probes") or {}
+    base = c.state.setdefault("baseline", {}).setdefault("auth", {})
+    gated = opened = 0
+    for sub, paths in sorted(probes.items()):
+        host = c.domain if sub in ("", "@") else f"{sub}.{c.domain}"
+        for path in paths:
+            url = f"https://{host}{path}"
+            st, _, _ = http(url, timeout=15, follow=False)
+            if st == 0:
+                c.info.append(f"auth probe {host}{path}: unreachable")
+                continue
+            if 200 <= st < 300:
+                opened += 1
+                codes = outside_http(url)
+                if any(200 <= x < 300 for x in codes):
+                    c.find("auth", f"auth-open:{host}{path}", 3,
+                           f"{host}{path} answers without a login from the internet",
+                           f"HTTP {st} here, outside nodes: {sorted(set(codes))}; turn the app's authentication back on")
+                elif base.get(url) and not 200 <= base[url] < 300:
+                    c.find("auth", f"auth-lan:{host}{path}", 2,
+                           f"{host}{path} stopped asking for a login from the LAN",
+                           f"was HTTP {base[url]}, now {st}; outside: {sorted(set(codes)) or 'unknown'}")
+            else:
+                gated += 1
+                base[url] = st
+    c.metrics["auth"] = dict(probes=sum(len(v) for v in probes.values()), gated=gated, open=opened)
+    notes = unraid_auth_notifications()
+    if notes is None:
+        c.info.append("unraid-health collect missing: no Unraid notification check")
+    else:
+        c.metrics["auth"]["unraid_notifications"] = len(notes)
+        for subj, imp in notes:
+            k = hashlib.sha1(subj.encode()).hexdigest()[:10]
+            c.find("auth", f"unraid-note:{k}", 3 if imp in ("alert", "warning") else 2,
+                   f"Unraid notification about logins: {short(subj, 90)}", "read it in the Unraid web UI")
+    check_mtls(c)
+
+
+def is_loopback(hexaddr):
+    """/proc/net/tcp{,6} address (little-endian hex): 127.0.0.0/8, ::1 or ::ffff:127.x."""
+    a = hexaddr.upper()
+    if len(a) == 8:
+        return a.endswith("7F")
+    return a == "00000000000000000000000001000000" or (a.startswith("0000000000000000FFFF0000") and a.endswith("7F"))
+
+
+def _ephemeral_low():
+    try:
+        return int(Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0])
+    except Exception:
+        return 32768
+
+
+EPHEMERAL_LOW = _ephemeral_low()
+
+
+def listeners():
+    out = set()
+    for fn, listen_state in (("tcp", "0A"), ("tcp6", "0A"), ("udp", "07"), ("udp6", "07")):
+        try:
+            lines = (PROC_NET / fn).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            f = ln.split()
+            if len(f) < 4 or f[3] != listen_state:
+                continue
+            addr, port = f[1].split(":")
+            port = int(port, 16)
+            if fn.startswith("udp") and (port == 0 or port >= EPHEMERAL_LOW):
+                continue                     # unconnected UDP client sockets on ephemeral ports are not services
+            if not is_loopback(addr):
+                out.add(f"{fn[:3]}/{port}")
+    return sorted(out, key=lambda s: (s[:3], int(s[4:])))
+
+
+def check_box(c):
+    issues = 0
+    sec = HOME / ".secrets"
+    try:
+        st = sec.lstat()
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            c.find("box", "secrets:dir", 3, "~/.secrets is not a plain directory")
+        elif st.st_mode & 0o077:
+            c.find("box", "secrets:dir-mode", 3, f"~/.secrets is readable by others (mode {stat.S_IMODE(st.st_mode):o})",
+                   "chmod 700 ~/.secrets")
+        uid = os.getuid()
+        for root, dirs, files in os.walk(sec, followlinks=False):
+            for n in dirs + files:
+                p = Path(root) / n
+                s = p.lstat()
+                rel = str(p.relative_to(sec))
+                if stat.S_ISLNK(s.st_mode):
+                    tgt = os.path.realpath(p)
+                    if not tgt.startswith(str(sec) + os.sep):
+                        c.find("box", f"secrets:link:{rel}", 2, f"~/.secrets/{rel} is a symlink out of ~/.secrets")
+                    continue
+                if s.st_mode & 0o077:
+                    issues += 1
+                    c.find("box", f"secrets:mode:{rel}", 3,
+                           f"~/.secrets/{rel} is readable by group/others (mode {stat.S_IMODE(s.st_mode):o})",
+                           "chmod go-rwx (contents never read)")
+                if s.st_uid != uid:
+                    c.find("box", f"secrets:owner:{rel}", 2, f"~/.secrets/{rel} is owned by uid {s.st_uid}")
+    except FileNotFoundError:
+        c.find("box", "secrets:missing", 2, "~/.secrets is missing")
+    # listeners
+    cur = listeners()
+    base = c.state.setdefault("baseline", {})
+    allow = {f"tcp/{p}" for p in c.cfg.get("listen_allow") or []}
+    if "listen" not in base:
+        base["listen"] = cur
+        c.info.append("listener baseline set: " + (", ".join(cur) or "none"))
+    new = sorted(set(cur) - set(base["listen"]) - allow)
+    for l in new:
+        c.find("box", f"listen:{l}", 1, f"New non-loopback listener in this container: {l}",
+               "only published ports are reachable from the LAN; accept with `security-watch baseline listen`")
+    # hooks
+    settings = botlib.load_json(HOME / ".claude/settings.json", {}) or {}
+    wired = {}
+    for m in (settings.get("hooks") or {}).get("PreToolUse") or []:
+        for h in m.get("hooks") or []:
+            for name in c.cfg["hooks"]:
+                if (h.get("command") or "").rstrip().endswith("/" + name):
+                    wired[name] = (h.get("onFailure") == "block", m.get("matcher") or "")
+    for name in c.cfg["hooks"]:
+        p = HOME / ".claude/hooks" / name
+        if not (p.is_file() and os.access(p, os.X_OK)):
+            c.find("box", f"hook:missing:{name}", 3, f"Hook {name} is missing or not executable",
+                   "every Bash call may be unguarded or blocked: `brain restore` it")
+        elif name not in wired:
+            c.find("box", f"hook:unwired:{name}", 3, f"Hook {name} is not wired in settings.json PreToolUse")
+        elif not wired[name][0]:
+            c.find("box", f"hook:failopen:{name}", 2, f"Hook {name} lost onFailure: block (fails open)")
+        elif "Bash" not in wired[name][1]:
+            c.find("box", f"hook:matcher:{name}", 2, f"Hook {name} no longer covers Bash")
+    # crontab
+    try:
+        p = subprocess.run([CRONTAB_CMD, "-l"], capture_output=True, text=True, timeout=20)
+        installed = p.stdout if p.returncode == 0 else ""
+    except Exception:
+        installed = ""
+    try:
+        want = (HOME / "crontab").read_text()
+    except OSError:
+        want = None
+    jobs = [l for l in installed.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    c.metrics["box"] = dict(listeners=len(cur), cron_jobs=len(jobs), hooks=len(wired))
+    if not jobs:
+        c.find("box", "cron:empty", 3, "The installed crontab is empty", "reinstall: crontab ~/crontab")
+        return
+    if want is not None and installed.strip() != want.strip():
+        c.find("box", "cron:drift", 2, "The installed crontab differs from ~/crontab",
+               "someone edited one side: diff them, then `crontab ~/crontab`", confirm=2)
+    missing = [job for job in c.cfg["cron_required"] if not any(job in l for l in jobs)]
+    on_hub = hub_live_required(missing) if missing else {}
+    for job in missing:
+        if on_hub and on_hub.get(job):
+            c.info.append(f"required job '{job}' runs on its live hub schedule ({on_hub[job]})")
+            continue
+        c.find("box", f"cron:missing:{job}", 2, f"Cron job '{job}' is missing from the installed crontab",
+               "and the schedule registry or the hub's schedules could not be read" if on_hub is None else
+               "and it has no live hub schedule (registry runs_on = hub + `tool call workflow.schedules`)")
+
+
+def hub_live_required(required):
+    """{required job: hub schedule name} for the required jobs (cron_required substrings) whose registry entry
+    (core/schedules.toml: the job named like it, else the one entry whose cron_line holds it) has runs_on = hub and
+    whose hub schedule is live and ACTIVE; {} for none. None = the registry or the hub could not be read, so the caller
+    flags every job missing from cron (fail safe). The hub is asked only when the registry says hub."""
+    try:
+        from core import schedules as reg
+        r = reg.load(SCHEDULES)
+    except Exception:
+        return None
+    want = {}
+    for job in required:
+        e = r.entry(job.replace(" ", "-"))
+        if e is None:
+            hits = [x for x in r.jobs.values() if job in x.cron_line]
+            e = hits[0] if len(hits) == 1 else None
+        if e is not None and e.runs_on == "hub":
+            want[job] = e.name
+    if not want:
+        return {}
+    try:
+        p = subprocess.run([TOOL_CMD, "call", "workflow.schedules", "{}", "--json"], capture_output=True, text=True,
+                           timeout=90)
+        res = json.loads(p.stdout or "{}") if p.returncode == 0 else {}
+        rows = (res.get("data") or {}).get("schedules") if res.get("ok") is True else None
+    except Exception:
+        rows = None
+    if not isinstance(rows, list):
+        return None
+    live = {x.get("job"): x.get("name") or f"job:{x.get('job')}" for x in rows if isinstance(x, dict)
+            and x.get("mode") == "live" and x.get("status") == "ACTIVE"}
+    return {job: live[name] for job, name in want.items() if name in live}
+
+
+CHECKS = dict(ip=check_ip, internetdb=check_internetdb, ports=check_ports, tls=check_tls, ct=check_ct,
+              auth=check_auth, box=check_box)
+
+
+# ----------------------------------------------------------------------------- run + bookkeeping
+def due(state, cfg, name):
+    last = (state.get("checks") or {}).get(name, {}).get("ok_at")
+    return not last or (now() - last) >= cfg["intervals_h"].get(name, 20) * 3600 - 600
+
+
+def acked(state, key):
+    a = (state.get("acks") or {}).get(key)
+    if not a:
+        return False
+    u = a.get("until") or "never"
+    return u == "never" or dt.date.today().isoformat() <= u
+
+
+def run(args):
+    cfg = load_config()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE_DIR / "lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        print("security-watch: another run is active", file=sys.stderr)
+        return 0
+    try:
+        return _run_locked(args, cfg)
+    finally:
+        lock.close()
+
+
+def _run_locked(args, cfg):
+    state = botlib.load_json(STATE_DIR / "state.json", {}) or {}
+    domain = (assistant_profile.get("network.domain", "") or "").strip().lower()
+    c = Ctx(cfg, state, domain)
+    only = [x.strip() for x in (args.only or "").split(",") if x.strip()]
+    bad = [x for x in only if x not in CHECKS]
+    if bad:
+        print(f"unknown check(s): {', '.join(bad)} (known: {', '.join(ORDER)})", file=sys.stderr)
+        return 2
+    todo = only or [n for n in ORDER if not args.cron or due(state, cfg, n)]
+    if not domain:
+        for n in ("ip", "internetdb", "ports", "tls", "ct", "auth"):
+            if n in todo:
+                todo.remove(n)
+                c.errors[n] = "no network.domain in the profile"
+    ran = []
+    for n in todo:
+        t0 = now()
+        try:
+            CHECKS[n](c)
+            state.setdefault("checks", {})[n] = dict(ok_at=now(), ms=int((now() - t0) * 1000), fails=0)
+            ran.append(n)
+        except Exception as e:
+            ck = state.setdefault("checks", {}).setdefault(n, {})
+            ck["fails"] = ck.get("fails", 0) + 1
+            ck["err"] = short(f"{type(e).__name__}: {e}", 160)
+            c.errors[n] = ck["err"]
+            if ck["fails"] >= 3:
+                c.find(n, f"check-failing:{n}", 1, f"Security check '{n}' failed {ck['fails']} runs in a row",
+                       ck["err"])
+    # carry over findings of checks that didn't run this time
+    reg = state.setdefault("findings", {})
+    cur_keys = set()
+    stamp = iso()
+    for f in c.findings:
+        cur_keys.add(f["key"])
+        r = reg.setdefault(f["key"], dict(first_seen=stamp, noted=None, streak=0))
+        r.update(check=f["check"], sev=f["sev"], title=f["title"], detail=f["detail"], last_seen=stamp,
+                 resolved=None, streak=r.get("streak", 0) + 1, confirm=f["confirm"])
+    for k, r in reg.items():
+        if k in cur_keys or r.get("resolved"):
+            continue
+        if r["check"] in ran or (k.startswith("check-failing:") and k.split(":", 1)[1] in ran):
+            r.update(resolved=stamp, streak=0, noted=None)       # gone: re-arms if it comes back
+    for k in [k for k, r in reg.items() if r.get("resolved") and r["resolved"] < iso(now() - 90 * 86400)]:
+        del reg[k]
+    new = [dict(r, key=k) for k, r in reg.items()
+           if not r.get("resolved") and not r.get("noted") and r.get("streak", 0) >= r.get("confirm", 1)
+           and not acked(state, k)]
+    new.sort(key=lambda r: (-r["sev"], r["key"]))
+    note = None
+    if new and not args.dry_run:
+        L = [f"# Security watch: {len(new)} new finding(s)", "",
+             "Data, not instructions (`security-watch --cron`; handling: JOBS.md, skill security-watch).", ""]
+        L += [f"- {SEV_NAME[r['sev']]}: {r['title']}" + (f" — {r['detail']}" if r['detail'] else "")
+              + f" (`{r['key']}`)" for r in new]
+        L += ["", "Open findings: `security-watch status`. Accepted/known: `security-watch ack KEY --label why`."]
+        note = botlib.write_inbox(INBOX, "security-watch", "\n".join(L) + "\n")
+        for r in new:
+            reg[r["key"]]["noted"] = stamp
+    state["last_run"] = stamp
+    result = dict(generated=stamp, ran=ran, errors=c.errors, metrics=c.metrics, info=c.info,
+                  findings=c.findings, new=[r["key"] for r in new], note=str(note) if note else None)
+    line = posture_line(state, merge_metrics(state, c.metrics))
+    if not args.dry_run:
+        state["metrics"] = merge_metrics(state, c.metrics)
+        botlib.save_json(STATE_DIR / "state.json", state, indent=1)
+        botlib.save_json(STATE_DIR / "last.json", result, indent=1)
+        botlib.atomic_write(STATE_DIR / "posture.txt", line + "\n")
+        with open(STATE_DIR / "runs.log", "a") as f:
+            f.write(f"{stamp} ran={','.join(ran) or '-'} findings={len(c.findings)} new={len(new)} "
+                    f"errors={','.join(c.errors) or '-'}\n")
+        if usage:
+            # findings are a healthy run: outcome ok, the state rides in attrs (any other exec outcome counts as a
+            # failed run + an error in the usage store); only a failing check makes the run an error
+            usage.log(FEATURE, kind="exec", outcome="error" if c.errors else "ok",
+                      attrs=dict(ran=len(ran), findings=len(c.findings), new=len(new), errors=len(c.errors),
+                                 state="findings" if new else None))
+            if note:
+                usage.log(FEATURE, kind="notify_sent", channel="inbox", attrs=dict(new=len(new)))
+    if args.json:
+        print(json.dumps(result, indent=1, default=str))
+    elif not args.cron:
+        print(line)
+        for r in new:
+            print(f"NEW {SEV_NAME[r['sev']]} {r['title']} ({r['key']})")
+        for n, e in c.errors.items():
+            print(f"error {n}: {e}")
+    return 0
+
+
+def merge_metrics(state, m):
+    old = dict(state.get("metrics") or {})
+    for k, v in m.items():
+        old[k] = dict(v, at=iso())
+    return old
+
+
+def open_findings(state):
+    return {k: r for k, r in (state.get("findings") or {}).items()
+            if not r.get("resolved") and r.get("streak", 0) >= r.get("confirm", 1) and not acked(state, k)}
+
+
+def posture_line(state, m):
+    def g(k, f, default="?"):
+        return (m.get(k) or {}).get(f, default)
+    parts = []
+    idb = m.get("internetdb") or {}
+    if idb:
+        parts.append("Shodan sees ports " + (",".join(map(str, idb.get("ports") or [])) or "none")
+                     + (f" (KEV {idb.get('kev')})" if idb.get("kev") else ""))
+    pt = m.get("ports") or {}
+    if pt:
+        parts.append(f"scan {pt.get('at', '')[:10]}: {len(pt.get('outside_open') or [])} open outside, "
+                     f"{len(pt.get('lan_only') or [])} router-only")
+    if m.get("tls"):
+        parts.append(f"TLS {g('tls', 'min_days'):.0f} d left" if isinstance(g('tls', 'min_days'), (int, float))
+                     else "TLS ?")
+    if m.get("ct"):
+        parts.append(f"CT {g('ct', 'names')} names")
+    if m.get("auth"):
+        parts.append(f"login gates {g('auth', 'gated')}/{g('auth', 'probes')}")
+    cw = botlib.load_json(CW_LAST, {}) or {}
+    kev = (cw.get("kev") or {})
+    if kev:
+        parts.append(f"container KEV {len(kev.get('affecting') or [])}")
+    if m.get("box"):
+        parts.append("box " + ("ok" if not any(k.split(':')[0] in ('secrets', 'hook', 'cron', 'listen')
+                                                 for k in open_findings(state)) else "issues"))
+    op = open_findings(state)
+    worst = max((r["sev"] for r in op.values()), default=0)
+    parts.append(f"open findings {len(op)}" + (f" (worst {SEV_NAME[worst]})" if worst else ""))
+    return "🛡 Security: " + " · ".join(parts)
+
+
+def cmd_status(args):
+    state = botlib.load_json(STATE_DIR / "state.json", {}) or {}
+    if args.json:
+        print(json.dumps(dict(open=open_findings(state), acks=state.get("acks") or {},
+                              checks=state.get("checks") or {}, metrics=state.get("metrics") or {}), indent=1))
+        return 0
+    print(posture_line(state, state.get("metrics") or {}))
+    print(f"last run: {state.get('last_run', 'never')}")
+    for n in ORDER:
+        ck = (state.get("checks") or {}).get(n)
+        if ck:
+            ok = iso(ck["ok_at"])[:16] if ck.get("ok_at") else "never"
+            print(f"  {n:<10} ok {ok}" + (f"  fails {ck['fails']}: {ck.get('err', '')}" if ck.get("fails") else ""))
+    op = open_findings(state)
+    print(f"open findings: {len(op)}")
+    for k, r in sorted(op.items(), key=lambda kv: (-kv[1]["sev"], kv[0])):
+        print(f"  {SEV_NAME[r['sev']]:<6} {r['title']} ({k}; since {r['first_seen'][:10]})")
+    for k, a in sorted((state.get("acks") or {}).items()):
+        print(f"  acked  {k}: {a.get('label', '')} (until {a.get('until', 'never')})")
+    return 0
+
+
+def cmd_posture(args):
+    state = botlib.load_json(STATE_DIR / "state.json", {}) or {}
+    line = posture_line(state, state.get("metrics") or {})
+    print(json.dumps(dict(line=line, open=len(open_findings(state)), last_run=state.get("last_run")))
+          if args.json else line)
+    return 0
+
+
+def cmd_ack(args):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state = botlib.load_json(STATE_DIR / "state.json", {}) or {}
+    acks = state.setdefault("acks", {})
+    if args.key in (None, "list"):
+        for k, a in sorted(acks.items()):
+            print(f"{k}: {a.get('label', '')} (until {a.get('until', 'never')})")
+        return 0
+    if args.key == "rm":
+        if not args.rest or args.rest[0] not in acks:
+            print("ack rm KEY: no such ack", file=sys.stderr)
+            return 2
+        acks.pop(args.rest[0])
+    else:
+        if args.until != "never" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.until or ""):
+            print("--until YYYY-MM-DD or never", file=sys.stderr)
+            return 2
+        acks[args.key] = dict(label=short(args.label or "", 80), until=args.until, at=iso())
+    botlib.save_json(STATE_DIR / "state.json", state, indent=1)
+    print("ok")
+    return 0
+
+
+def cmd_baseline(args):
+    state = botlib.load_json(STATE_DIR / "state.json", {}) or {}
+    base = state.setdefault("baseline", {})
+    what = args.what
+    if what in ("ct", "all"):
+        base.pop("ct_names", None)
+        base.pop("ct_issuers", None)
+    if what in ("listen", "all"):
+        base["listen"] = listeners()
+    if what in ("auth", "all"):
+        base["auth"] = {}
+    for k, r in (state.get("findings") or {}).items():
+        if (what == "all" or k.startswith({"ct": "ct-", "listen": "listen:", "auth": "auth-"}.get(what, "~"))) \
+                and not r.get("resolved"):
+            r.update(resolved=iso(), streak=0, noted=None)
+    botlib.save_json(STATE_DIR / "state.json", state, indent=1)
+    print(f"baseline {what}: reset" + (" (CT re-learns on the next ct run)" if what in ("ct", "all") else ""))
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="security-watch", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    r = sub.add_parser("run")
+    r.add_argument("--cron", action="store_true", help="only the checks that are due; quiet")
+    r.add_argument("--only", help="comma list of checks: " + ",".join(ORDER))
+    r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--json", action="store_true")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    s2 = sub.add_parser("posture")
+    s2.add_argument("--json", action="store_true")
+    a = sub.add_parser("ack")
+    a.add_argument("key", nargs="?")
+    a.add_argument("rest", nargs="*")
+    a.add_argument("--label")
+    a.add_argument("--until", default="never")
+    b = sub.add_parser("baseline")
+    b.add_argument("what", nargs="?", default="all", choices=["ct", "listen", "auth", "all"])
+    args = p.parse_args(argv)
+    if args.cmd == "run":
+        return run(args)
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "posture":
+        return cmd_posture(args)
+    if args.cmd == "ack":
+        return cmd_ack(args)
+    if args.cmd == "baseline":
+        return cmd_baseline(args)
+    p.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(1)

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.answer.json",
+  "title": "the app's answer to an ask (coarse only: no coordinates, no text)",
+  "type": "object",
+  "properties": {
+    "q_id": {
+      "type": "string",
+      "pattern": "^q_[A-Za-z0-9]{1,40}$"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "result": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "fresh": {
+          "type": "boolean"
+        },
+        "inside": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "band": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z][a-z0-9_:.-]{0,15}$"
+        },
+        "zone": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,23}(:[a-z0-9_-]{1,32})?$"
+        },
+        "fix_age_min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "error": {
+          "enum": [
+            "unsupported",
+            "no_permission",
+            "paused",
+            "no_fix",
+            "timeout",
+            "unknown_place"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "q_id",
+    "ok"
+  ]
+}

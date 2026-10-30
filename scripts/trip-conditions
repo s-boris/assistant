@@ -1,0 +1,998 @@
+#!/usr/bin/env -S python3 -I
+"""trip-conditions TRIP [--date YYYY-MM-DD] [--days N] [--json] [--full] [--no-advisory] [--refresh] | --list
+Phone-sized conditions brief for one trip from the private config, one block per place (island) leg:
+weather, wind, waves/swell, sea temperature, UV, sun times, model tides (or official ones from an optional
+marine bulletin PDF, shown as an "official" line next to the model values), a dive estimate (long-range go/no and
+water visibility: heuristics from wind, waves and the last 48 h of rain, always labelled as an estimate), a reef
+heat-stress line (NOAA Coral Reef Watch virtual station), travel-advice changes (GOV.UK content API; other
+advisories as links only) and season context (config text per month, a wind-regime signal from the forecast,
+and typical values for the same dates in past years for days the forecast doesn't reach yet).
+  --date D       first day (default: today in the trip's zone); a day before the first leg = preview of every leg
+  --days N       days from --date (default 1, max 60); up to 2 days print full blocks, more print one line per
+                 day (--full: full blocks anyway); days past the 16-day forecast get the climate block per leg
+  --json         structured output instead of the brief
+  --no-advisory  skip the travel-advice and reef lookups
+  --refresh      ignore cached responses (fresh ones are still cached)
+  --list         the trip keys in the config
+Config (private) ~/.config/trip-conditions/trips.json:
+  {"trips": {"<key>": {"name", "tz" (IANA), "emoji",
+    "legs": [{"name", "spot", "from", "to" (YYYY-MM-DD inclusive; on an overlap day the later leg wins),
+              "lat", "lon", "sea_lat", "sea_lon" (a point just offshore: on-land points get no sea data),
+              "coast_faces_deg" (onshore/sheltered note), "dive_label", "crossing" (label: sea-state line on
+              the leg's first day)}],
+    "dive": {DIVE_DEFAULTS keys}, "reef": {"crw_station": "<CRW virtual station file name>"},
+    "advisory": {"govuk": "<country slug>", "links": [{"label", "url"}]},
+    "bulletin": {"format": "sma-marine", "label", "area" (1), "page_url" (template: {d} {dd} {th} {mm} {month}
+                 {Month} {yyyy}), "pdf_regex" (finds the PDF link on that page; or "pdf_url" as a template)},
+                 a leg with "bulletin": false skips it; today's bulletin only, needs pdftotext (poppler-utils),
+    "season": {"months": {"<1-12>": "text"}, "climate_years": 5,
+               "wind_regimes": [{"name", "from_deg", "to_deg", "min_days", "note"}]},
+    "notes": ["static line shown at the end", ...]}}}
+Sources (keyless, read-only): Open-Meteo forecast (16 d) + marine (8 d) + archive, NOAA CRW station text, GOV.UK
+content API, the optional bulletin PDF. Every request: 25 s timeout and a User-Agent; cache ~/.cache/trip-conditions
+(forecast, marine and advice 3 h, bulletin 4 h, reef 6 h, climate 30 d); a stale copy up to 7 d old stands in when
+a fetch fails. A missing or changed bulletin gives one "bulletin unavailable" note.
+State ~/.local/state/trip-conditions/advisory-<slug>.json remembers the GOV.UK version seen (for "changed").
+Exit: 0 ok; 1 usage or config error; 2 a source failed (the brief is still printed, with a note per source).
+Env (tests): TRIP_CONDITIONS_CONFIG, TRIP_CONDITIONS_CACHE, TRIP_CONDITIONS_STATE, TRIP_CONDITIONS_NOW (ISO time
+in the trip zone, or epoch), TRIP_CONDITIONS_FIXTURES (dir with forecast.json marine.json archive.json crw.txt
+govuk.json bulletin_page.html bulletin.txt (the PDF's text): read instead of the network), TRIP_CONDITIONS_URL_LOG (fixture mode: append each URL).
+Tests: ~/opt/assistant/tests/legacy/trip-conditions/run.sh
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "bin", "lib"), os.path.expanduser("~/bin/lib"),
+             os.path.join(_here, "lib")):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, "lib", "core")) and os.path.isdir(os.path.join(_here, "..", "core")):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import http as web  # noqa: E402
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("TRIP_CONDITIONS_CONFIG") or os.path.join(HOME, ".config/trip-conditions/trips.json")
+CACHE = os.environ.get("TRIP_CONDITIONS_CACHE") or os.path.join(HOME, ".cache/trip-conditions")
+STATE = os.environ.get("TRIP_CONDITIONS_STATE") or os.path.join(HOME, ".local/state/trip-conditions")
+FIXTURES = os.environ.get("TRIP_CONDITIONS_FIXTURES")
+UA = "trip-conditions/1.0 (personal travel brief; low volume, cached)"
+TIMEOUT = 25
+STALE_MAX = 7 * 86400
+TTL = {"forecast": 3 * 3600, "marine": 3 * 3600, "govuk": 3 * 3600, "crw": 6 * 3600, "archive": 30 * 86400,
+       "bulletin_page": 4 * 3600, "bulletin_pdf": 4 * 3600}
+FIXTURE_FILES = {"crw": "crw.txt", "bulletin_page": "bulletin_page.html", "bulletin_pdf": "bulletin.txt"}
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+CRW_URL = "https://coralreefwatch.noaa.gov/product/vs/data/{}.txt"
+GOVUK_URL = "https://www.gov.uk/api/content/foreign-travel-advice/{}"
+FORECAST_DAYS, MARINE_DAYS = 16, 8
+DAILY = ("weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,"
+         "wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,uv_index_max,sunrise,sunset")
+MARINE_DAILY = ("wave_height_max,wave_direction_dominant,wave_period_max,swell_wave_height_max,"
+                "swell_wave_direction_dominant,swell_wave_period_max,wind_wave_height_max")
+DIVE_DEFAULTS = {"go_wind_kn": 12, "go_wave_m": 1.2, "marginal_wave_m": 1.8, "marginal_wind_kn": 20,
+                 "good_rain_mm": 5, "reduced_rain_mm": 20, "crossing_rough_wave_m": 2.0,
+                 "crossing_rough_wind_kn": 25, "crossing_moderate_wave_m": 1.5}
+BAA = ["no heat stress", "bleaching watch", "bleaching warning", "alert level 1 (bleaching likely)",
+       "alert level 2 (severe bleaching likely)", "alert level 3", "alert level 4", "alert level 5"]
+COMPASS = "N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW".split()
+DOW = "Mon Tue Wed Thu Fri Sat Sun".split()
+MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+MONTH_NAMES = ("January February March April May June July August September October November December").split()
+DIRS = {"north": "N", "south": "S", "east": "E", "west": "W", "northeast": "NE", "northwest": "NW",
+        "southeast": "SE", "southwest": "SW", "variable": "var"}
+WMO = [((0,), "☀️", "Clear"), ((1,), "🌤", "Mostly clear"), ((2,), "⛅", "Partly cloudy"), ((3,), "☁️", "Cloudy"),
+       ((45, 48), "🌫", "Fog"), ((51, 53, 55, 56, 57), "🌦", "Drizzle"), ((61, 66), "🌧", "Light rain"),
+       ((63,), "🌧", "Rain"), ((65, 67), "🌧", "Heavy rain"), ((71, 73, 75, 77, 85, 86), "🌨", "Snow"),
+       ((80,), "🌦", "Showers"), ((81,), "🌧", "Heavy showers"), ((82,), "🌧", "Violent showers"),
+       ((95,), "⛈", "Thunderstorms"), ((96, 99), "⛈", "Thunderstorms, hail")]
+
+
+class SourceError(Exception):
+    pass
+
+
+class UsageError(Exception):
+    pass
+
+
+# ---------- fetching ----------
+def fetch(url, kind, refresh=False, binary=False):
+    """Return (body, note); body is bytes when binary. Fixture mode reads a file; else a fresh cache entry, else the
+    network (stale fallback)."""
+    mode, enc = ("rb", None) if binary else ("r", "utf-8")
+    if FIXTURES:
+        log = os.environ.get("TRIP_CONDITIONS_URL_LOG")
+        if log:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(url + "\n")
+        try:
+            with open(os.path.join(FIXTURES, FIXTURE_FILES.get(kind, kind + ".json")), mode, encoding=enc) as f:
+                return f.read(), None
+        except OSError:
+            raise SourceError("no response (fixture missing)")
+    path = os.path.join(CACHE, hashlib.sha1(url.encode()).hexdigest()[:20] + ".body")
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        age = None
+    if age is not None and age < TTL[kind] and not refresh:
+        with open(path, mode, encoding=enc) as f:
+            return f.read(), None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json, text/plain, */*"})
+        with web.open(req, timeout=TIMEOUT) as r:
+            body = r.read(8_000_000)
+        body = body if binary else body.decode("utf-8", "replace")
+    except Exception as e:  # network, HTTP or timeout: fall back to a stale copy
+        err = getattr(e, "code", None) or type(e).__name__
+        if age is not None and age < STALE_MAX:
+            with open(path, mode, encoding=enc) as f:
+                return f.read(), f"stale copy, {int(age // 3600)} h old (fetch failed: {err})"
+        raise SourceError(f"fetch failed: {err}")
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "wb" if binary else "w", encoding=enc) as f:
+        f.write(body)
+    os.replace(tmp, path)
+    return body, None
+
+
+def record(src, name, ok, note=None):
+    cur = src.get(name)
+    if cur is None or (cur["ok"] and not ok) or (ok and cur["ok"] and note and not cur["note"]):
+        src[name] = {"ok": ok, "note": note}
+
+
+def source_json(src, name, url, kind, refresh):
+    try:
+        body, note = fetch(url, kind, refresh)
+        data = json.loads(body)
+    except SourceError as e:
+        record(src, name, False, str(e))
+        return None
+    except ValueError:
+        record(src, name, False, "unreadable response")
+        return None
+    if isinstance(data, dict) and data.get("error"):
+        record(src, name, False, str(data.get("reason") or "API error")[:120])
+        return None
+    record(src, name, True, note)
+    return data
+
+
+def om_url(base, legs, lat_key, lon_key, params):
+    q = {"latitude": ",".join(f"{float(l.get(lat_key, l['lat'])):.3f}" for l in legs),
+         "longitude": ",".join(f"{float(l.get(lon_key, l['lon'])):.3f}" for l in legs)}
+    q.update(params)
+    return base + "?" + urllib.parse.urlencode(q, safe=",")
+
+
+def per_location(data, n):
+    """Open-Meteo returns a list for several points, a dict for one; None when the shape is off."""
+    locs = data if isinstance(data, list) else [data]
+    return locs if len(locs) == n and all(isinstance(x, dict) for x in locs) else None
+
+
+def by_date(block):
+    t = (block or {}).get("time") or []
+    return {d: {k: (v[i] if isinstance(v, list) and i < len(v) else None) for k, v in block.items() if k != "time"}
+            for i, d in enumerate(t)}
+
+
+def hourly_summary(h):
+    """Per date: mean sea-surface temperature and model tide extremes (local maxima/minima of the sea level)."""
+    times, sst, lvl = (h or {}).get("time") or [], (h or {}).get("sea_surface_temperature") or [], \
+        (h or {}).get("sea_level_height_msl") or []
+    out = {}
+    for i, t in enumerate(times):
+        d = out.setdefault(t[:10], {"sst": [], "high": [], "low": []})
+        if i < len(sst) and sst[i] is not None:
+            d["sst"].append(sst[i])
+        if 0 < i < len(lvl) - 1 and None not in (lvl[i - 1], lvl[i], lvl[i + 1]):
+            if lvl[i] > lvl[i - 1] and lvl[i] >= lvl[i + 1]:
+                d["high"].append(t[11:16])
+            elif lvl[i] < lvl[i - 1] and lvl[i] <= lvl[i + 1]:
+                d["low"].append(t[11:16])
+    return {k: {"sea_temp": round(sum(v["sst"]) / len(v["sst"]), 1) if v["sst"] else None,
+                "high": v["high"], "low": v["low"]} for k, v in out.items()}
+
+
+# ---------- helpers ----------
+def compass(deg):
+    return None if deg is None else COMPASS[int((float(deg) % 360) / 22.5 + 0.5) % 16]
+
+
+def wmo(code):
+    if code is None:
+        return "❔", "No data"
+    for codes, emoji, text in WMO:
+        if int(code) in codes:
+            return emoji, text
+    return "🌡", f"Code {code}"
+
+
+def num(v, nd=0):
+    if v is None:
+        return "?"
+    return f"{float(v):.{nd}f}"
+
+
+def mm(v):
+    if v is None:
+        return "?"
+    return "0" if v < 0.05 else (f"{v:.1f}" if v < 10 else f"{v:.0f}")
+
+
+def ddmm(d):
+    return f"{d.day:02d}.{d.month:02d}"
+
+
+def dlabel(d):
+    return f"{DOW[d.weekday()]} {ddmm(d)}"
+
+
+def parse_date(s, what):
+    try:
+        return dt.date.fromisoformat(s)
+    except (TypeError, ValueError):
+        raise UsageError(f"{what}: not a YYYY-MM-DD date: {s!r}")
+
+
+def shift_year(d, k):
+    try:
+        return d.replace(year=d.year + k)
+    except ValueError:  # 29 Feb
+        return d.replace(year=d.year + k, day=28)
+
+
+def now_in(tz):
+    v = os.environ.get("TRIP_CONDITIONS_NOW")
+    if not v:
+        return dt.datetime.now(tz)
+    if v.isdigit():
+        return dt.datetime.fromtimestamp(int(v), tz)
+    t = dt.datetime.fromisoformat(v)
+    return t.replace(tzinfo=tz) if t.tzinfo is None else t.astimezone(tz)
+
+
+def leg_title(leg):
+    return " · ".join(x for x in (leg["name"], leg.get("spot")) if x)
+
+
+# ---------- config ----------
+def load_config():
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        raise UsageError(f"no config at {CONFIG} (see --help for the format)")
+    except ValueError as e:
+        raise UsageError(f"config is not valid JSON: {e}")
+    trips = cfg.get("trips") if isinstance(cfg, dict) else None
+    if not isinstance(trips, dict) or not trips:
+        raise UsageError("config has no \"trips\" object")
+    return trips
+
+
+def check_trip(key, trip):
+    if not isinstance(trip, dict):
+        raise UsageError(f"trip {key}: not an object")
+    try:
+        trip["_tz"] = ZoneInfo(trip.get("tz") or "UTC")
+    except Exception:
+        raise UsageError(f"trip {key}: unknown time zone {trip.get('tz')!r}")
+    legs = trip.get("legs")
+    if not isinstance(legs, list) or not legs:
+        raise UsageError(f"trip {key}: no legs")
+    for i, leg in enumerate(legs):
+        for k in ("name", "from", "to", "lat", "lon"):
+            if leg.get(k) in (None, ""):
+                raise UsageError(f"trip {key}: leg {i + 1} lacks {k!r}")
+        leg["_from"], leg["_to"] = parse_date(leg["from"], f"leg {leg['name']} from"), parse_date(leg["to"], f"leg {leg['name']} to")
+        if leg["_to"] < leg["_from"]:
+            raise UsageError(f"trip {key}: leg {leg['name']} ends before it starts")
+    trip["_dive"] = {**DIVE_DEFAULTS, **(trip.get("dive") or {})}
+    return trip
+
+
+def legs_for(trip, d):
+    """(legs, mode): the leg on day d (overlap: the later start wins), every leg before the trip, none after."""
+    legs = trip["legs"]
+    cover = [l for l in legs if l["_from"] <= d <= l["_to"]]
+    if cover:
+        return [max(cover, key=lambda l: l["_from"])], "trip"
+    if d < min(l["_from"] for l in legs):
+        return legs, "preview"
+    return [], "none"
+
+
+# ---------- assessments ----------
+def dive_estimate(rec, t):
+    wind = (rec.get("wind") or {}).get("kn")
+    wave = (rec.get("sea") or {}).get("wave_m")
+    rain = rec.get("rain_48h_mm")
+    long_range = None
+    if wind is not None and wave is not None:
+        if wind < t["go_wind_kn"] and wave < t["go_wave_m"]:
+            long_range = "go"
+        elif wave <= t["marginal_wave_m"] and wind < t["marginal_wind_kn"]:
+            long_range = "marginal"
+        else:
+            long_range = "no"
+    vis, why = None, []
+    if wave is not None and rain is not None:
+        if rain > t["reduced_rain_mm"]:
+            why.append("runoff")
+        if wave > t["marginal_wave_m"]:
+            why.append("rough sea")
+        vis = "reduced" if why else ("good" if rain < t["good_rain_mm"] and wave < t["go_wave_m"] else "fair")
+    return {"long_range": long_range, "visibility": vis, "why": why, "estimate": True}
+
+
+def exposure(leg, deg):
+    face = leg.get("coast_faces_deg")
+    if face is None or deg is None:
+        return None
+    diff = abs((float(deg) - float(face) + 180) % 360 - 180)
+    return "onshore" if diff <= 60 else ("sheltered" if diff >= 120 else "cross-shore")
+
+
+def crossing_state(rec, t):
+    wave = (rec.get("sea") or {}).get("wave_m")
+    wind = (rec.get("wind") or {}).get("kn")
+    if wave is None:
+        return None
+    if wave >= t["crossing_rough_wave_m"] or (wind or 0) >= t["crossing_rough_wind_kn"]:
+        return "likely rough: delays or cancellations possible"
+    if wave >= t["crossing_moderate_wave_m"]:
+        return "moderate, choppy"
+    return "calm enough"
+
+
+def day_record(leg, d, fc, mar, hs, t):
+    ds = d.isoformat()
+    f, m, h = (fc or {}).get(ds), (mar or {}).get(ds), (hs or {}).get(ds)
+    rec = {"date": ds, "leg": leg["name"], "spot": leg.get("spot")}
+    if f and f.get("temperature_2m_max") is not None:
+        emoji, text = wmo(f.get("weather_code"))
+        rec["weather"] = {"code": f.get("weather_code"), "emoji": emoji, "text": text,
+                          "tmin_c": f.get("temperature_2m_min"), "tmax_c": f.get("temperature_2m_max"),
+                          "rain_mm": f.get("precipitation_sum"), "rain_prob_pct": f.get("precipitation_probability_max")}
+        rec["wind"] = {"kn": f.get("wind_speed_10m_max"), "gust_kn": f.get("wind_gusts_10m_max"),
+                       "dir_deg": f.get("wind_direction_10m_dominant"), "dir": compass(f.get("wind_direction_10m_dominant"))}
+        rec["exposure"] = exposure(leg, f.get("wind_direction_10m_dominant"))
+        rec["uv"] = f.get("uv_index_max")
+        rec["sun"] = {"rise": (f.get("sunrise") or "")[11:16] or None, "set": (f.get("sunset") or "")[11:16] or None}
+        prev = [((fc or {}).get((d - dt.timedelta(days=k)).isoformat()) or {}).get("precipitation_sum") for k in (1, 2)]
+        rec["rain_48h_mm"] = round(sum(prev), 1) if None not in prev else None
+    if m and m.get("wave_height_max") is not None:
+        rec["sea"] = {"wave_m": m.get("wave_height_max"), "wave_dir": compass(m.get("wave_direction_dominant")),
+                      "wave_period_s": m.get("wave_period_max"), "swell_m": m.get("swell_wave_height_max"),
+                      "swell_dir": compass(m.get("swell_wave_direction_dominant")),
+                      "swell_period_s": m.get("swell_wave_period_max"), "wind_wave_m": m.get("wind_wave_height_max")}
+    if h:
+        if h["sea_temp"] is not None:
+            rec.setdefault("sea", {})["temp_c"] = h["sea_temp"]
+        if h["high"] or h["low"]:
+            rec["tides"] = {"high": h["high"], "low": h["low"], "source": "model, approximate"}
+    rec["dive"] = dive_estimate(rec, t)
+    if leg.get("crossing"):
+        rec["crossing"] = crossing_state(rec, t)
+    return rec
+
+
+def next_window(recs, d):
+    for r in recs:
+        if r["date"] > d.isoformat() and r["dive"]["long_range"] == "go":
+            return dlabel(dt.date.fromisoformat(r["date"]))
+    return None
+
+
+def wind_regimes(trip, fc0, today):
+    out = []
+    days = sorted(k for k in (fc0 or {}) if k >= today.isoformat())
+    for rg in (trip.get("season") or {}).get("wind_regimes") or []:
+        lo, hi, need = float(rg.get("from_deg", 0)), float(rg.get("to_deg", 360)), int(rg.get("min_days", 2))
+        run, start = 0, None
+        for k in days:
+            deg = fc0[k].get("wind_direction_10m_dominant")
+            inside = deg is not None and ((lo <= deg <= hi) if lo <= hi else (deg >= lo or deg <= hi))
+            run = run + 1 if inside else 0
+            if run == 1:
+                cand = k
+            if run >= need:
+                start = cand
+                break
+        out.append({"name": rg.get("name", "wind regime"), "signal_from": start, "sector": [lo, hi],
+                    "min_days": need, "note": rg.get("note")})
+    return out
+
+
+def climate_stats(rows):
+    tmax = [r["temperature_2m_max"] for r in rows if r.get("temperature_2m_max") is not None]
+    tmin = [r["temperature_2m_min"] for r in rows if r.get("temperature_2m_min") is not None]
+    rain = [r["precipitation_sum"] for r in rows if r.get("precipitation_sum") is not None]
+    wind = [r["wind_speed_10m_max"] for r in rows if r.get("wind_speed_10m_max") is not None]
+    if not tmax or not rain:
+        return None
+    avg = lambda xs: round(sum(xs) / len(xs), 1) if xs else None  # noqa: E731
+    return {"tmin_c": avg(tmin), "tmax_c": avg(tmax), "rain_mm_day": avg(rain),
+            "wet_days_pct": round(100 * sum(1 for x in rain if x >= 1) / len(rain)), "wind_kn": avg(wind),
+            "samples": len(rain)}
+
+
+def reef(src, trip, refresh):
+    station = (trip.get("reef") or {}).get("crw_station")
+    if not station:
+        return None
+    try:
+        body, note = fetch(CRW_URL.format(urllib.parse.quote(station)), "crw", refresh)
+    except SourceError as e:
+        record(src, "reef", False, str(e))
+        return None
+    last = None
+    for line in body.splitlines():
+        p = line.split()
+        if len(p) >= 10 and p[0].isdigit() and len(p[0]) == 4:
+            last = p
+    if not last:
+        record(src, "reef", False, "no data rows")
+        return None
+    record(src, "reef", True, note)
+    try:
+        baa = int(float(last[9]))
+        return {"date": f"{last[0]}-{last[1]}-{last[2]}", "sst_c": float(last[5]), "anomaly_c": float(last[6]),
+                "dhw": float(last[8]), "alert": baa, "alert_text": BAA[baa] if 0 <= baa < len(BAA) else f"level {baa}",
+                "source": "NOAA Coral Reef Watch"}
+    except (ValueError, IndexError):
+        record(src, "reef", False, "unreadable data row")
+        return None
+
+
+# ---------- official marine bulletin (optional) ----------
+def ordinal(n):
+    return "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def pdf_text(data):
+    """pdftotext -layout of a PDF; anything else (a fixture) is taken as the text already."""
+    if not data.startswith(b"%PDF"):
+        return data.decode("utf-8", "replace")
+    if not shutil.which("pdftotext"):
+        raise SourceError("pdftotext missing")
+    try:
+        p = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", "-", "-"], input=data, capture_output=True,
+                           timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SourceError(f"pdftotext failed: {type(e).__name__}")
+    if p.returncode:
+        raise SourceError("pdftotext failed")
+    return p.stdout.decode("utf-8", "replace")
+
+
+def short_dir(s):
+    """'East to South-east' -> 'E–SE'; unknown words: the text as is."""
+    s = s.strip(" ,")
+    out = []
+    for part in re.split(r"\s+to\s+|/", s, flags=re.I):
+        k = re.sub(r"[\s-]", "", part.lower())
+        if k not in DIRS:
+            return s
+        out.append(DIRS[k])
+    return "–".join(out)
+
+
+def row_block(lines, label):
+    """Text of the table row starting with label (case-insensitive) plus its indented continuation lines."""
+    for i, l in enumerate(lines):
+        if re.match(label, l, re.I):
+            j = i + 1
+            while j < len(lines) and lines[j][:1] == " " and lines[j].strip():
+                j += 1
+            return lines[i], lines[i + 1:j]
+    return None, []
+
+
+def kn(kmh):
+    return round(kmh / 1.852)
+
+
+def parse_sma(text, area=1):
+    """SMA 24 h marine forecast (pdftotext -layout): sea state, max wave height, wind and tides for one area."""
+    k = max(1, int(area)) - 1
+    m = re.search(r"Issued at\s*(\d{2})(\d{2})\s*LT\s+on\s+\w+\s+(\d{1,2}\s+\w{3}\s+\d{4})", text)
+    if not m or not re.search(r"MARINE\s+FORECAST", text, re.I):
+        raise SourceError("format not recognised")
+    try:
+        day = dt.datetime.strptime(m.group(3), "%d %b %Y").date()
+    except ValueError:
+        raise SourceError("format not recognised (issue date)")
+    out = {"date": day.isoformat(), "issued": f"{m.group(1)}:{m.group(2)}", "area": k + 1}
+    lines = text.splitlines()
+    first, _ = row_block(lines, r"\s*STATE OF THE SEA")
+    if first:
+        vals = re.split(r"\s{2,}", re.sub(r"(?i)^\s*STATE OF THE SEA", "", first).strip())
+        if len(vals) > k and vals[k]:
+            out["sea_state"] = vals[k]
+    first, _ = row_block(lines, r"\s*MAXIMUM")
+    if first:
+        r = re.findall(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*m\b", first)
+        if len(r) > k:
+            out["wave_m"] = [float(r[k][0]), float(r[k][1])]
+    first, cont = row_block(lines, r"\s*WIND\b")
+    if first:
+        rest = re.sub(r"(?i)^\s*WIND", "", first)
+        r = re.findall(r"(\d+)\s*-\s*(\d+)", rest)
+        if len(r) > k:
+            lo, hi = int(r[k][0]), int(r[k][1])
+            dirs = re.split(r"\d+\s*-\s*\d+\s*(?:Km/hr)?,?", rest, flags=re.I)
+            d = re.sub(r"(?i)^\s*,?\s*max\s*\d*\s*(?:km/hr)?\s*,?", "", dirs[k]) if len(dirs) > k else ""
+            w = {"dir": short_dir(d) if d.strip(" ,") else None, "kmh": [lo, hi], "kn": [kn(lo), kn(hi)]}
+            mx = re.findall(r"(?<![\d-])(\d+)\s*Km/hr", " ".join(cont), re.I)
+            if len(mx) > k:
+                w["max_kmh"], w["max_kn"] = int(mx[k]), kn(int(mx[k]))
+            out["wind"] = w
+    tides = {}
+    for kind in ("high", "low"):
+        l = next((x for x in lines if re.match(rf"\s*{kind} tide\s*:", x, re.I)), None)
+        if l:
+            ts = re.findall(r"(\d{1,2})\s*h\s*(\d{2})(?:\s*(\d+(?:\.\d+)?)\s*m)?", l.split(":", 1)[1])
+            tides[kind] = [f"{int(h):02d}:{mi}" for h, mi, _ in ts]
+            tides[kind + "_m"] = [float(x) if x else None for _, _, x in ts]
+    if tides.get("high") or tides.get("low"):
+        out["tides"] = {"high": tides.get("high") or [], "low": tides.get("low") or [],
+                        "high_m": tides.get("high_m") or [], "low_m": tides.get("low_m") or []}
+    if not any(x in out for x in ("sea_state", "wave_m", "wind", "tides")):
+        raise SourceError("format not recognised (no area values)")
+    return out
+
+
+PARSERS = {"sma-marine": parse_sma}
+
+
+def bulletin(src, trip, refresh, today):
+    """Today's official bulletin for the trip, or None (no config; a fetch/parse failure records one note)."""
+    cfg = trip.get("bulletin")
+    if not isinstance(cfg, dict):
+        return None
+    name = cfg.get("label") or "bulletin"
+    v = {"d": today.day, "dd": f"{today.day:02d}", "th": ordinal(today.day), "mm": f"{today.month:02d}",
+         "month": MONTH_NAMES[today.month - 1].lower(), "Month": MONTH_NAMES[today.month - 1], "yyyy": today.year}
+    try:
+        parser = PARSERS.get(cfg.get("format") or "sma-marine")
+        if not parser:
+            raise SourceError(f"unknown format {cfg.get('format')!r}")
+        notes = []
+        if cfg.get("pdf_url"):
+            pdf = cfg["pdf_url"].format(**v)
+        elif cfg.get("page_url"):
+            page = cfg["page_url"].format(**v)
+            html, n = fetch(page, "bulletin_page", refresh)
+            notes.append(n)
+            m = re.search(cfg.get("pdf_regex") or r'href="([^"]+\.pdf)"', html, re.I)
+            if not m:
+                raise SourceError("no PDF link on the page")
+            pdf = urllib.parse.urljoin(page, m.group(1))
+        else:
+            raise SourceError("no page_url or pdf_url in the config")
+        data, n = fetch(pdf, "bulletin_pdf", refresh, binary=True)
+        notes.append(n)
+        res = parser(pdf_text(data), cfg.get("area") or 1)
+        if res["date"] != today.isoformat():
+            raise SourceError(f"latest is from {ddmm(dt.date.fromisoformat(res['date']))}")
+    except SourceError as e:
+        record(src, name, False, f"bulletin unavailable ({e})")
+        return None
+    except Exception as e:  # an unexpected layout must never break the brief
+        record(src, name, False, f"bulletin unavailable ({type(e).__name__})")
+        return None
+    record(src, name, True, next((n for n in notes if n), None))
+    res["label"] = name
+    return res
+
+
+def apply_bulletin(day, legs_by_name, b):
+    if not b or day["date"] != b["date"]:
+        return
+    for rec in day["legs"]:
+        if legs_by_name[rec["leg"]].get("bulletin") is False:
+            continue
+        rec["official"] = {k: v for k, v in b.items() if k != "tides"}
+        if b.get("tides"):
+            if rec.get("tides"):
+                rec["tides_model"] = rec["tides"]
+            rec["tides"] = {"high": b["tides"]["high"], "low": b["tides"]["low"], "source": f"{b['label']} bulletin"}
+
+
+def fmt_official(o):
+    bits = [o["sea_state"]] if o.get("sea_state") else []
+    if o.get("wave_m"):
+        bits.append(f"waves {num(o['wave_m'][0], 1)}–{num(o['wave_m'][1], 1)} m")
+    w = o.get("wind")
+    if w:
+        s = f"wind {w['dir'] + ' ' if w.get('dir') else ''}{w['kn'][0]}–{w['kn'][1]} kn"
+        if w.get("max_kn"):
+            s += f", max {w['max_kn']}"
+        bits.append(s)
+    return f"🏛 Official ({o['label']}, area {o['area']}): " + " · ".join(bits)
+
+
+def advisory(src, trip, refresh, today):
+    adv = trip.get("advisory") or {}
+    out = {"links": [l for l in adv.get("links") or [] if isinstance(l, dict) and l.get("url")]}
+    slug = adv.get("govuk")
+    if not slug:
+        return out
+    g = source_json(src, "advice", GOVUK_URL.format(urllib.parse.quote(slug)), "govuk", refresh)
+    if not isinstance(g, dict):
+        return out
+    det = g.get("details") or {}
+    ver = g.get("public_updated_at") or det.get("reviewed_at")
+    path = os.path.join(STATE, f"advisory-{slug}.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    if not st.get("version"):
+        status, st = "first check", {"version": ver, "seen_since": today.isoformat()}
+    elif st["version"] != ver:
+        status = f"changed since the last check ({ddmm(dt.date.fromisoformat(st['seen_since']))})"
+        st = {"version": ver, "seen_since": today.isoformat(), "previous": st["version"], "changed_on": today.isoformat()}
+    elif st.get("changed_on") == today.isoformat():
+        status = "changed today"
+    else:
+        status = f"no change since {ddmm(dt.date.fromisoformat(st['seen_since']))}"
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    alerts = [str(a).replace("_", " ") for a in det.get("alert_status") or []]
+    out["govuk"] = {"updated": (ver or "")[:10] or None, "change": (det.get("change_description") or "").strip() or None,
+                    "status": status, "alerts": alerts}
+    return out
+
+
+# ---------- formatting ----------
+def fmt_full(rec, leg, title, nxt=None, crossing=False, window=None):
+    out = [f"**{title}**"]
+    w, wd, sea, dv = rec.get("weather"), rec.get("wind"), rec.get("sea") or {}, rec["dive"]
+    if not w:
+        return out + ["no forecast data for this day"]
+    prob = f" ({num(w['rain_prob_pct'])} %)" if w.get("rain_prob_pct") is not None else ""
+    out.append(f"{w['emoji']} {w['text']}, {mm(w['rain_mm'])} mm{prob} · {num(w['tmin_c'])}–{num(w['tmax_c'])} °C")
+    s = f"💨 {wd['dir'] or '?'} {num(wd['kn'])} kn, gusts {num(wd['gust_kn'])}"
+    spot = leg.get("spot") or leg["name"]
+    if rec.get("exposure") == "onshore":
+        s += f" · onshore at {spot}"
+    elif rec.get("exposure") == "sheltered":
+        s += f" · {spot} sheltered"
+    if nxt and nxt.get("wind"):
+        s += f" → next day {nxt['wind']['dir'] or '?'} {num(nxt['wind']['kn'])} kn"
+    out.append(s)
+    if sea.get("wave_m") is not None:
+        s = f"🌊 Waves {num(sea['wave_m'], 1)} m"
+        if sea.get("swell_m") is not None:
+            s += f", swell {num(sea['swell_m'], 1)} m {sea.get('swell_dir') or ''}".rstrip()
+            if sea.get("swell_period_s"):
+                s += f" {num(sea['swell_period_s'])} s"
+        if sea.get("temp_c") is not None:
+            s += f" · sea {num(sea['temp_c'])} °C"
+        out.append(s)
+    else:
+        out.append("🌊 sea forecast not out yet (8-day range)")
+    if rec.get("official"):
+        out.append(fmt_official(rec["official"]))
+    parts = []
+    if dv["long_range"]:
+        parts.append(f"{leg.get('dive_label') or 'Long-range dives'}: {dv['long_range']}")
+    if dv["visibility"]:
+        parts.append(f"visibility {dv['visibility']}" + (f" ({', '.join(dv['why'])})" if dv["why"] else ""))
+    if parts:
+        out.append("🤿 " + " · ".join(parts) + " · estimate")
+    if crossing and rec.get("crossing"):
+        out.append(f"⛴ {leg['crossing']}: {rec['crossing']}")
+    sun = [f"UV {num(rec.get('uv'))}"]
+    if rec.get("sun", {}).get("rise"):
+        sun.append(f"{rec['sun']['rise']}–{rec['sun']['set']}")
+    td = rec.get("tides")
+    if td:
+        bits = [f"high {'/'.join(td['high'][:2])}" if td["high"] else "", f"low {'/'.join(td['low'][:2])}" if td["low"] else ""]
+        sun.append(("tide ~" if td["source"].startswith("model") else "tide ") + ", ".join(b for b in bits if b))
+    out.append("☀️ " + " · ".join(sun))
+    if window:
+        out.append(f"→ next long-range window: {window}")
+    return out
+
+
+def fmt_line(rec, leg, first_day):
+    d = dt.date.fromisoformat(rec["date"])
+    w, wd, sea, dv = rec.get("weather"), rec.get("wind"), rec.get("sea") or {}, rec["dive"]
+    if not w:
+        return f"{dlabel(d)} no forecast data"
+    s = f"{dlabel(d)} {w['emoji']} {num(w['tmin_c'])}–{num(w['tmax_c'])}° {mm(w['rain_mm'])} mm · {wd['dir'] or '?'} {num(wd['kn'])} kn"
+    s += f" · 🌊 {num(sea['wave_m'], 1)} m" if sea.get("wave_m") is not None else " · 🌊 –"
+    if (rec.get("official") or {}).get("sea_state"):
+        s += f" (🏛 {rec['official']['sea_state']})"
+    if dv["long_range"]:
+        s += f" · 🤿 {dv['long_range']}" + (f", vis {dv['visibility']}" if dv["visibility"] else "")
+    if first_day and rec.get("crossing") and rec["crossing"] != "calm enough":
+        s += f" · ⛴ {rec['crossing'].split(':')[0]}"
+    return s
+
+
+def leg_summary(recs):
+    sea = [r["sea"]["temp_c"] for r in recs if (r.get("sea") or {}).get("temp_c") is not None]
+    uv = [r["uv"] for r in recs if r.get("uv") is not None]
+    sun = next((r["sun"] for r in recs if (r.get("sun") or {}).get("rise")), None)
+    bits = []
+    if sea:
+        bits.append(f"sea {num(sum(sea) / len(sea))} °C")
+    if uv:
+        bits.append(f"UV up to {num(max(uv))}")
+    if sun:
+        bits.append(f"sun {sun['rise']}–{sun['set']}")
+    return " · ".join(bits)
+
+
+def render(res, trip, full):
+    L = []
+    d0, d1, nd = dt.date.fromisoformat(res["date"]), dt.date.fromisoformat(res["date_end"]), res["ndays"]
+    span = dlabel(d0) + (f"–{dlabel(d1)}" if nd > 1 else "")
+    L.append(f"**{trip.get('emoji') or '🧭'} {trip.get('name') or res['trip']} conditions · {span}**")
+    if res["preview_days"]:
+        L.append(f"Preview: the trip starts in {res['preview_days']} days; every leg shown")
+    compact = nd > 2 and not full
+    travel = [f"{dlabel(dt.date.fromisoformat(day['date']))}: no leg (travel day)" for day in res["days"]
+              if day["mode"] == "none" and day["date"] <= res["forecast_until"]]
+    recs_by_leg = res["_recs_by_leg"]
+    if compact:
+        groups = {}
+        for day in res["days"]:
+            for rec in day["legs"]:
+                groups.setdefault(rec["leg"], []).append(rec)
+        for name, recs in groups.items():
+            leg = res["_legs"][name]
+            L += ["", f"**{leg_title(leg)}**"]
+            summ = leg_summary(recs)
+            if summ:
+                L.append(summ)
+            for rec in recs:
+                L.append(fmt_line(rec, leg, dt.date.fromisoformat(rec["date"]) == leg["_from"]))
+        L += travel
+        if groups:
+            L.append("🤿 = long-range dives, visibility: estimates from wind, waves and rain")
+    else:
+        for day in res["days"]:
+            d = dt.date.fromisoformat(day["date"])
+            for rec in day["legs"]:
+                leg = res["_legs"][rec["leg"]]
+                title = leg_title(leg) if nd == 1 else f"{dlabel(d)} · {leg_title(leg)}"
+                series = recs_by_leg.get(rec["leg"], [])
+                nxt = next((r for r in series if r["date"] == (d + dt.timedelta(days=1)).isoformat()), None) \
+                    if nd == 1 else None
+                win = next_window(series, d) if rec["dive"]["long_range"] in ("no", "marginal") else None
+                show_x = day["mode"] == "preview" or d == leg["_from"]
+                L += [""] + fmt_full(rec, leg, title, nxt, show_x, win)
+        L += travel
+    yrs = res.get("climate_years")
+    for b in res["beyond"]:
+        leg = res["_legs"][b["leg"]]
+        L += ["", f"**{leg_title(leg)}** · {ddmm(dt.date.fromisoformat(b['from']))}–{ddmm(dt.date.fromisoformat(b['to']))}, beyond the forecast"]
+        c = b.get("climate")
+        if c:
+            L.append(f"📊 Typical for these dates ({yrs}): {num(c['tmin_c'])}–{num(c['tmax_c'])} °C · rain "
+                     f"{mm(c['rain_mm_day'])} mm/day, {c['wet_days_pct']} % wet days · wind {num(c['wind_kn'])} kn")
+        else:
+            L.append("📊 no climate data")
+    tail = []
+    for s in res["season"]["months"]:
+        tail.append(f"🗓 Season ({s['month']}): {s['text']}")
+    for rg in res["season"]["wind_regimes"]:
+        if rg["signal_from"]:
+            t = f"🧭 {rg['name']}: signal from {dlabel(dt.date.fromisoformat(rg['signal_from']))} (wind {rg['sector'][0]:.0f}–{rg['sector'][1]:.0f}° for {rg['min_days']}+ days)"
+            if rg.get("note"):
+                t += f"; {rg['note']}"
+        else:
+            t = f"🧭 {rg['name']}: not set in (no {rg['min_days']}+ days of {rg['sector'][0]:.0f}–{rg['sector'][1]:.0f}° wind in the forecast)"
+        tail.append(t)
+    r = res.get("reef")
+    if r:
+        tail.append(f"🪸 Reef ({ddmm(dt.date.fromisoformat(r['date']))}, NOAA CRW): {r['alert_text']} · SST {r['sst_c']:.1f} °C "
+                    f"({r['anomaly_c']:+.1f}) · DHW {r['dhw']:.1f}")
+    adv = res.get("advisory") or {}
+    g = adv.get("govuk")
+    if g:
+        ch = g["change"] or ""
+        ch = (ch[:77] + "…") if len(ch) > 78 else ch
+        upd = dt.date.fromisoformat(g["updated"]).strftime("%d.%m.%Y") if g["updated"] else "?"
+        tail.append(f"🛂 GOV.UK advice (last update {upd}): {g['status']}" + (f" · “{ch}”" if ch else ""))
+        if g["alerts"]:
+            tail.append("⚠️ GOV.UK alert: " + "; ".join(g["alerts"]))
+    for link in adv.get("links") or []:
+        tail.append(f"🔗 {link.get('label') or 'Advice'}: {link['url']}")
+    for n in trip.get("notes") or []:
+        tail.append(f"📝 {n}")
+    for name, s in res["sources"].items():
+        if not s["ok"]:
+            tail.append(f"⚠️ {name}: {s['note']}")
+        elif s["note"]:
+            tail.append(f"ℹ️ {name}: {s['note']}")
+    if tail:
+        L += [""] + tail
+    return "\n".join(L)
+
+
+# ---------- main ----------
+def build(key, trip, start, ndays, refresh, with_advisory):
+    tz = trip["_tz"]
+    today = now_in(tz).date()
+    if start < today:
+        raise UsageError(f"--date {start} is in the past (today in {trip.get('tz')}: {today})")
+    legs = trip["legs"]
+    t = trip["_dive"]
+    horizon = today + dt.timedelta(days=FORECAST_DAYS - 1)
+    dates = [start + dt.timedelta(days=i) for i in range(ndays)]
+    plan = [(d, *legs_for(trip, d)) for d in dates]
+    src = {}
+    fc_locs = mar_locs = None
+    if any(d <= horizon and lg for d, lg, _ in plan):
+        tzq = trip.get("tz") or "UTC"
+        data = source_json(src, "forecast", om_url(FORECAST_URL, legs, "lat", "lon", {
+            "daily": DAILY, "wind_speed_unit": "kn", "timezone": tzq, "forecast_days": FORECAST_DAYS,
+            "past_days": 2}), "forecast", refresh)
+        if data is not None:
+            fc_locs = per_location(data, len(legs))
+            if fc_locs is None:
+                record(src, "forecast", False, "unexpected response shape")
+        if any(d <= today + dt.timedelta(days=MARINE_DAYS - 1) and lg for d, lg, _ in plan):
+            data = source_json(src, "marine", om_url(MARINE_URL, legs, "sea_lat", "sea_lon", {
+                "daily": MARINE_DAILY, "hourly": "sea_surface_temperature,sea_level_height_msl",
+                "timezone": tzq, "forecast_days": MARINE_DAYS}), "marine", refresh)
+            if data is not None:
+                mar_locs = per_location(data, len(legs))
+                if mar_locs is None:
+                    record(src, "marine", False, "unexpected response shape")
+    fc = [by_date(x.get("daily")) for x in fc_locs] if fc_locs else [{} for _ in legs]
+    mar = [by_date(x.get("daily")) for x in mar_locs] if mar_locs else [{} for _ in legs]
+    hs = [hourly_summary(x.get("hourly")) for x in mar_locs] if mar_locs else [{} for _ in legs]
+    idx = {l["name"]: i for i, l in enumerate(legs)}
+    if fc_locs:  # the last forecast day often comes back empty: the horizon is the last day with data everywhere
+        last = [max((k for k, v in f.items() if v.get("temperature_2m_max") is not None), default=None) for f in fc]
+        if None not in last:
+            horizon = min(horizon, dt.date.fromisoformat(min(last)))
+    # every forecast day per leg (for "next day" and the next long-range window), not just the shown ones
+    recs_by_leg = {}
+    for leg in legs:
+        i = idx[leg["name"]]
+        recs_by_leg[leg["name"]] = [day_record(leg, today + dt.timedelta(days=k), fc[i], mar[i], hs[i], t)
+                                    for k in range(FORECAST_DAYS)]
+    res = {"trip": key, "generated": now_in(tz).isoformat(timespec="minutes"), "date": start.isoformat(),
+           "date_end": dates[-1].isoformat(), "ndays": ndays,
+           "forecast_until": horizon.isoformat(), "days": [], "beyond": [], "sources": src,
+           "_legs": {l["name"]: l for l in legs}, "_recs_by_leg": recs_by_leg}
+    first = min(l["_from"] for l in legs)
+    res["preview_days"] = (first - start).days if start < first else 0
+    beyond = {}
+    for d, lg, mode in plan:
+        if d > horizon:
+            for leg in lg:
+                beyond.setdefault(leg["name"], []).append(d)
+            continue
+        day = {"date": d.isoformat(), "mode": mode, "legs": []}
+        for leg in lg:
+            i = idx[leg["name"]]
+            day["legs"].append(day_record(leg, d, fc[i], mar[i], hs[i], t))
+        res["days"].append(day)
+    if not res["days"]:
+        res["days"].append({"date": start.isoformat(), "mode": "beyond", "legs": []})
+    if any(day["date"] == today.isoformat() and day["legs"] for day in res["days"]):
+        b = bulletin(src, trip, refresh, today)
+        if b:
+            res["bulletin"] = b
+            for day in res["days"]:
+                apply_bulletin(day, res["_legs"], b)
+    if beyond:
+        n = max(1, min(int((trip.get("season") or {}).get("climate_years", 5)), 10))
+        all_days = sorted({d for v in beyond.values() for d in v})
+        rows = [[] for _ in legs]
+        tzq = trip.get("tz") or "UTC"
+        for k in range(1, n + 1):
+            url = om_url(ARCHIVE_URL, legs, "lat", "lon", {
+                "start_date": shift_year(all_days[0], -k).isoformat(), "end_date": shift_year(all_days[-1], -k).isoformat(),
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
+                "wind_speed_unit": "kn", "timezone": tzq})
+            data = source_json(src, "climate", url, "archive", refresh)
+            locs = per_location(data, len(legs)) if data is not None else None
+            for i, loc in enumerate(locs or []):
+                for ds, r in by_date(loc.get("daily")).items():
+                    rows[i].append((ds[5:], r))
+        y0 = all_days[0].year
+        res["climate_years"] = f"{y0 - n}–{y0 - 1}"
+        for name, ds in beyond.items():
+            md = {d.isoformat()[5:] for d in ds}
+            res["beyond"].append({"leg": name, "from": ds[0].isoformat(), "to": ds[-1].isoformat(),
+                                  "climate": climate_stats([r for m, r in rows[idx[name]] if m in md])})
+    months = []
+    for d in dates:
+        txt = ((trip.get("season") or {}).get("months") or {}).get(str(d.month))
+        name = MONTHS[d.month - 1]
+        if not txt or any(name in m["month"] for m in months):
+            continue
+        same = next((m for m in months if m["text"] == txt), None)
+        if same:
+            same["month"] += f", {name}"
+        else:
+            months.append({"month": name, "text": txt})
+    res["season"] = {"months": months, "wind_regimes": wind_regimes(trip, fc[0], today)}
+    if with_advisory:
+        res["reef"] = reef(src, trip, refresh)
+        res["advisory"] = advisory(src, trip, refresh, today)
+    return res
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("trip", nargs="?")
+    ap.add_argument("--date")
+    ap.add_argument("--days", type=int, default=1)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--no-advisory", action="store_true")
+    ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    try:
+        a, extra = ap.parse_known_args(argv)
+    except SystemExit:
+        return 1
+    if a.help:
+        print(__doc__.strip())
+        return 0
+    try:
+        if extra:
+            raise UsageError(f"unknown argument(s): {' '.join(extra)}")
+        trips = load_config()
+        if a.list:
+            for k, v in trips.items():
+                print(f"{k}\t{(v or {}).get('name', '')}")
+            return 0
+        if not a.trip:
+            raise UsageError("which trip? (--list shows them)")
+        if a.trip not in trips:
+            raise UsageError(f"no trip {a.trip!r} in the config (have: {', '.join(trips)})")
+        if not 1 <= a.days <= 60:
+            raise UsageError("--days must be 1-60")
+        trip = check_trip(a.trip, trips[a.trip])
+        start = parse_date(a.date, "--date") if a.date else now_in(trip["_tz"]).date()
+        res = build(a.trip, trip, start, a.days, a.refresh, not a.no_advisory)
+    except UsageError as e:
+        print(f"trip-conditions: {e}", file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps({k: v for k, v in res.items() if not k.startswith("_")}, ensure_ascii=False, indent=1))
+    else:
+        print(render(res, trip, a.full))
+    return 2 if any(not s["ok"] for s in res["sources"].values()) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""home-ctx: Home autopilot 2's phone-context feed for Home Assistant, plus its read-only replay.
+
+  home-ctx show [--json]                      the context HA would get now (phone app via phonegw + sleep-in guard)
+  home-ctx feed [--apply] [--reason R] [--json]
+                                              build it; write input_text.phone_context only with --apply AND
+                                              ~/.config/home-ctx/config.json {"write": true} (else a dry run that keeps
+                                              only the local state: screen-off tracking, last value)
+  home-ctx pull [--days 7]                    read-only: `ha history` / `ha logbook` / `vault events` into the private
+                                              replay dir (~/.local/state/home-autopilot2/hist; entity list from
+                                              ~/.config/home-ctx/entities.json)
+  home-ctx sim [--days 7] [--end ISO] [--json] replay the scene rules over that history (no HA writes)
+
+Callers: phonegw's `home_ctx` routine (off by default) on home-fence / screen / dnd / charging changes; a */5 cron
+heartbeat once live (not installed). Exit: 0 ok · 1 error · 2 usage · 3 --apply while writes are disabled.
+Library: ~/bin/lib/homectx.py (feed), ~/bin/lib/homectx_sim.py (replay). Tests: ~/opt/home-ctx-tests/run.sh.
+"""
+import json
+import os
+import subprocess
+import sys
+
+from datetime import datetime, timedelta
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import homectx  # noqa: E402
+import homectx_sim  # noqa: E402
+
+try:
+    from lib.usage import log as usage_log  # noqa: E402
+except Exception:  # pragma: no cover
+    try:
+        from usage import log as usage_log
+    except Exception:
+        usage_log = None
+
+
+def _usage(kind, outcome, attrs=None):
+    if usage_log:
+        try:
+            usage_log("home.autopilot2", kind=kind, channel="cli", outcome=outcome, attrs=attrs)
+        except Exception:
+            pass
+
+
+def _flag(args, name):
+    if name in args:
+        args.remove(name)
+        return True
+    return False
+
+
+def _opt(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        if i + 1 >= len(args):
+            raise SystemExit(2)
+        v = args[i + 1]
+        del args[i:i + 2]
+        return v
+    return default
+
+
+def cmd_feed(args, apply):
+    as_json = _flag(args, "--json")
+    reason = _opt(args, "--reason", "manual")
+    if apply and not homectx.write_enabled():
+        print("home-ctx: writes disabled (~/.config/home-ctx/config.json write=false); dry run instead",
+              file=sys.stderr)
+        res = homectx.feed(apply=False, reason=reason)
+        rc = 3
+    else:
+        res = homectx.feed(apply=apply, reason=reason)
+        rc = 0 if (not apply or not res["write"] or res["applied"]) else 1
+    if as_json:
+        print(json.dumps(res, sort_keys=True))
+    else:
+        print(res["value"])
+        tail = "" if (res["applied"] or not res["write"]) else " - dry run, would run: " + res["would_run"]
+        print("write: %s (%s)%s" % ("yes" if res["write"] else "no", res["why"], tail))
+    return rc
+
+
+def cmd_show(args):
+    st = homectx.load_json(os.path.join(homectx.STATE_DIR, "state.json"), {}) or {}
+    ctx, _ = homectx.build(homectx.phone_now(), homectx.sleepin_active(), st.get("local"))
+    print(json.dumps(ctx, sort_keys=True) if "--json" in args else homectx.encode(ctx))
+    return 0
+
+
+def _run_json(argv, timeout=120):
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError("%s: exit %s" % (" ".join(argv[:3]), p.returncode))
+    return json.loads(p.stdout)
+
+
+def cmd_pull(args):
+    days = int(_opt(args, "--days", "7"))
+    E = homectx_sim.entities()
+    if not E:
+        print("home-ctx: no entity list (~/.config/home-ctx/entities.json)", file=sys.stderr)
+        return 1
+    since = (datetime.now().astimezone() - timedelta(days=days, hours=1)).isoformat(timespec="seconds")
+    out = homectx_sim.HIST
+    os.makedirs(out, mode=0o700, exist_ok=True)
+    ents = list(E.get("lr_lights", [])) + list(E.get("other_lights", [])) + list(E.get("tvs", [])) + \
+        list(E.get("speakers", [])) + [E.get(k) for k in ("battery", "next_alarm", "lux", "presence", "movie",
+                                                           "workday")] + list(E.get("pull_extra", []))
+    ok, bad = 0, []
+    for e in [x for x in ents if x]:
+        try:
+            d = _run_json(["ha", "history", e, "--since", since, "--limit", "5000", "--json"])
+            homectx.save_json(os.path.join(out, e + ".json"), d)
+            ok += 1
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+            bad.append(e)
+    for a in E.get("logbook", []):
+        try:
+            d = _run_json(["ha", "logbook", a, "--since", since, "--limit", "1000", "--json"])
+            homectx.save_json(os.path.join(out, "lb_" + a.split(".", 1)[1] + ".json"), d)
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+            bad.append(a)
+    evs, cur = [], "0"
+    for _ in range(40):
+        try:
+            d = _run_json(["vault", "events", "--source", "homeassistant", "--since", str(cur), "--max", "500",
+                           "--json"])
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+            bad.append("vault events")
+            break
+        evs += d.get("events") or []
+        cur = d.get("next_cursor")
+        if not d.get("more"):
+            break
+    homectx.save_json(os.path.join(out, "vault_ha_events.json"), evs)
+    print("pulled %d histories, %d vault events%s" % (ok, len(evs), (" · failed: " + ", ".join(bad)) if bad else ""))
+    return 0 if not bad else 1
+
+
+def _fmt_sim(o):
+    L = ["Home autopilot 2 replay %s -> %s (location known from %s)" % (o["window"][0], o["window"][1],
+                                                                         o["location_known_from"])]
+    a = o["arrival"]
+    L.append("arrival: %d arrivals · dark %d · v1 fired %d · v2 fires %d" % (
+        len(a), sum(r["dark"] for r in a), sum(1 for r in a if r["v1"]), sum(1 for r in a if r["v2"])))
+    L += ["  %s %-12s v1=%-11s v2=%-12s %s" % (r["at"], r["source"][:12], r["v1"], r["v2"], r["why"]) for r in a
+          if r["dark"]]
+    b = o["bedtime"]
+    L.append("bedtime: %d nights · fires %d · with something on %d" % (
+        len(b), sum(1 for r in b if r["fire"]), sum(1 for r in b if r.get("lights_on") or r.get("tv_on_idle"))))
+    L += ["  %s fire %s on=%s earlier_by=%s still_up_risk=%s asleep=%s" % (
+        r["night"], r["fire"], ",".join(r.get("lights_on") or []) or "-", r.get("earlier_by_min"),
+        r.get("still_up_risk"), r.get("asleep_detected")) for r in b if r["fire"]]
+    w = o["wakeup"]
+    L.append("wakeup: %d mornings · fade-ins %d" % (len(w), sum(1 for r in w if r["fire"])))
+    L += ["  %s alarm %s -> %s (%s)" % (r["morning"], r["alarm"], r["fire"], r["why"]) for r in w]
+    lv = o["leaving"]
+    L.append("leaving: %d departures · v2 auto-off %d · v1 prompts %d" % (
+        len(lv), sum(1 for r in lv if r["v2"]), sum(1 for r in lv if r["v1_prompt"])))
+    L += ["  %s away %s min, fires +%s: %s %s" % (r["at"], r["away_min"], r["fire_after_min"], r["v2"] or "-",
+                                                  r["why"]) for r in lv]
+    L.append("still on: %s" % json.dumps(o["still_on"], sort_keys=True))
+    return "\n".join(L)
+
+
+def cmd_sim(args):
+    as_json = _flag(args, "--json")
+    days = int(_opt(args, "--days", "7"))
+    end_s = _opt(args, "--end")
+    end = datetime.fromisoformat(end_s).timestamp() if end_s else None
+    end = end or datetime.now().astimezone().replace(minute=0, second=0, microsecond=0).timestamp()
+    if not os.path.isdir(homectx_sim.HIST):
+        print("home-ctx: no replay data; run `home-ctx pull` first", file=sys.stderr)
+        return 1
+    o = homectx_sim.run(start=end - days * 86400, end=end)
+    print(json.dumps(o, sort_keys=True) if as_json else _fmt_sim(o))
+    return 0
+
+
+def main(argv):
+    args = list(argv)
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    cmd = args.pop(0)
+    try:
+        if cmd == "feed":
+            rc = cmd_feed(args, _flag(args, "--apply"))
+        elif cmd == "show":
+            rc = cmd_show(args)
+        elif cmd == "pull":
+            rc = cmd_pull(args)
+        elif cmd == "sim":
+            rc = cmd_sim(args)
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    except SystemExit as e:
+        return int(e.code or 2)
+    # a healthy run is outcome ok (the usage store counts any other exec outcome as a failed run + an error);
+    # the subcommand rides in attrs
+    _usage("exec", "ok" if rc == 0 else "rc%s" % rc, {"cmd": cmd})
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

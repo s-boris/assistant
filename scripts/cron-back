@@ -1,0 +1,362 @@
+#!/usr/local/bin/python3.13 -I
+# managed: ~/opt/assistant — edit there, deploy with assistant land
+"""cron-back: move the plain periodic jobs from hub schedules back to ~/crontab, and back again.
+
+The moved jobs are the registry entries with target "cron-back 29.10" (core/schedules.toml; their cron_line is the
+line cron runs: cron-fail + flock + timeout around the argv the hub ran). The hub keeps the real workflows
+(reminders, event windows, web-task approvals). Each step is idempotent; rerun after any failure.
+
+  cron-back status [--json]          per job: hub schedule (live/absent), cron line (yes/no), last cron run
+  cron-back apply [--only a,b] [--dry-run]     8 jobs at a time: their hub schedules absent, then their
+                                     cron_lines in one ~/crontab write (never both at once); then `assistant cron
+                                     check` must be clean
+  cron-back verify [--json]          every moved job that runs at least hourly has a cron run (cron-fail's run log)
+                                     since its cut-over and within its period; daily/weekly ones show their next tick
+  cron-back rollback [--only a,b] [--dry-run]  the reverse: `assistant cron rm`, then the hub schedule live again
+                                     (jobs whose registry entry is a shell line stay in cron); the registry still
+                                     says cron until the cron-back commit is reverted (`assistant cron check` names
+                                     the lines meanwhile)
+
+Exit: 0 done/clean · 1 a step failed (the job is left as it was before that step) · 2 usage · 3 check not clean.
+State: ~/.local/state/cron-back/applied.json (cut-over time per job). Tests: tests/ops/test_cron_back.py.
+Env (tests): CRON_BACK_TOOL, CRON_BACK_ASSISTANT, CRON_BACK_CRONTAB, CRON_BACK_STATE, ASSISTANT_SCHEDULES.
+"""
+
+import argparse
+import json
+import os
+import pwd
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True
+_here = os.path.dirname(os.path.realpath(__file__))
+try:
+    _home = pwd.getpwuid(os.getuid()).pw_dir
+except KeyError:  # a uid with no passwd entry (the CI runner under a clean env): HOME
+    _home = os.environ.get("HOME") or os.path.expanduser("~")
+for _lib in (os.path.join(_home, "bin", "lib"), os.path.expanduser("~/bin/lib"), os.path.join(_here, "lib")):
+    sys.path.insert(0, _lib)
+if not os.path.isdir(os.path.join(_here, "lib", "core")) and os.path.isdir(os.path.join(_here, "..", "core")):
+    sys.path.insert(0, os.path.dirname(_here))
+from core import cronruns, schedules  # noqa: E402
+
+HOME = os.path.expanduser("~")
+TOOL = os.environ.get("CRON_BACK_TOOL") or os.path.join(HOME, "bin", "tool")
+ASSISTANT = os.environ.get("CRON_BACK_ASSISTANT") or os.path.join(HOME, "bin", "assistant")
+CRONTAB = os.environ.get("CRON_BACK_CRONTAB") or os.path.join(HOME, "crontab")
+CRONTAB_BIN = os.environ.get("CRON_BACK_CRONTAB_BIN") or "crontab"
+STATE = os.environ.get("CRON_BACK_STATE") or os.path.join(HOME, ".local", "state", "cron-back")
+WHY = "cron-back: plain periodic job back to cron"
+
+
+def moved(only=None):
+    reg = schedules.load()
+    es = [e for e in reg.jobs.values() if e.target == schedules.CRON_BACK]
+    if only:
+        unknown = set(only) - {e.name for e in es}
+        if unknown:
+            raise SystemExit(f"cron-back: not a moved job: {', '.join(sorted(unknown))}")
+        es = [e for e in es if e.name in only]
+    return es
+
+
+def sh(argv, timeout=120):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timed out after {timeout} s"
+    except OSError as e:
+        return 127, "", str(e)
+    return r.returncode, r.stdout, r.stderr
+
+
+def hub_schedules():
+    rc, out, err = sh([TOOL, "call", "workflow.schedules", "{}", "--json"], timeout=90)
+    if rc != 0:
+        raise SystemExit(f"cron-back: hub schedules unreadable (tool exit {rc}): {err.strip()[:200]}")
+    rows = (json.loads(out).get("data") or {}).get("schedules") or []
+    return {r.get("job") or r["name"].split(":", 1)[1]: r for r in rows}
+
+
+def cron_tags():
+    try:
+        text = open(os.path.realpath(CRONTAB), encoding="utf-8").read()
+    except OSError:
+        text = ""
+    return {t for _, _, _, t in schedules.active_lines(text) if t}
+
+
+PACE = float(os.environ.get("CRON_BACK_PACE") or 2.2)  # workflow.schedule is rate-limited to 30/min
+
+
+def schedule(job, state):
+    time.sleep(PACE)
+    body = json.dumps({"job": job, "state": state, "why": WHY})
+    rc, out, err = sh([TOOL, "call", "workflow.schedule", body], timeout=90)
+    return rc == 0, (err or out).strip()[:200]
+
+
+def load_state():
+    try:
+        return json.load(open(os.path.join(STATE, "applied.json")))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = os.path.join(STATE, "applied.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1, sort_keys=True)
+    os.replace(tmp, os.path.join(STATE, "applied.json"))
+
+
+def minute_edge():
+    """Do a hub->cron swap away from a minute boundary, so an every-minute job keeps its tick."""
+    s = time.localtime().tm_sec
+    if s >= 45:
+        time.sleep(62 - s)
+
+
+def crontab_edit(add=(), rm=()):
+    """Add (name, line) pairs / remove tagged lines in ~/crontab in ONE write, then install it (`crontab FILE`); on a
+    failed install the old file is put back. Its own flock (not the deploy queue: `assistant cron add` waits behind
+    every land there). Lines get `  # assistant:<name>`; a name already in the file is skipped."""
+    import re
+
+    from core import locks
+
+    os.makedirs(STATE, exist_ok=True)
+    with locks.hold(os.path.join(STATE, "crontab.lock"), wait=120) as fd:
+        if fd is None:
+            raise RuntimeError("crontab lock busy for 120 s")
+        ct = os.path.realpath(CRONTAB)
+        old = open(ct, encoding="utf-8").read() if os.path.exists(ct) else ""
+        lines = old.splitlines()
+        rm = set(rm)
+        new = [ln for ln in lines if not ((m := schedules.TAG_RE.search(ln)) and m.group(1) in rm)]
+        have = {m.group(1) for ln in new if (m := schedules.TAG_RE.search(ln))}  # rm + add = replace in place
+        for name, line in add:
+            if name in have:
+                continue
+            f = line.split()
+            if len(f) < 6 or not all(re.fullmatch(r"[0-9A-Za-z*/,\-]+", x) for x in f[:5]) or "\n" in line:
+                raise ValueError(f"{name}: not a cron line")
+            new.append(f"{line.rstrip()}  # assistant:{name}")
+        if new == lines:
+            return
+        mode = os.stat(ct).st_mode & 0o777 if os.path.exists(ct) else 0o644
+        tmp = ct + ".cron-back.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(new) + "\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, ct)
+        rc = sh([CRONTAB_BIN, ct])[0]
+        if rc != 0:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(old)
+            os.chmod(tmp, mode)
+            os.replace(tmp, ct)
+            sh([CRONTAB_BIN, ct])
+            raise RuntimeError(f"crontab install failed (exit {rc}); old file restored")
+
+
+def batches(es, n=8):
+    for i in range(0, len(es), n):
+        yield es[i : i + n]
+
+
+def apply(es, dry):
+    hub, tags, st = hub_schedules(), cron_tags(), load_state()
+    todo = [e for e in es if e.name in hub or e.line not in tags]
+    bad = 0
+    text = open(os.path.realpath(CRONTAB), encoding="utf-8").read() if os.path.exists(CRONTAB) else ""
+    body = {t: b.rstrip() for _, _, b, t in schedules.active_lines(text) if t}
+    stale = [e for e in es if e.name not in hub and e.line in body and body[e.line] != e.cron_line.rstrip()]
+    if stale and not dry:  # the registry's line changed: replace it in one write (same tag, never two lines)
+        crontab_edit(rm=[e.line for e in stale], add=[(e.line, e.cron_line) for e in stale])
+        print(f"{len(stale)} cron line(s) refreshed from the registry: {', '.join(e.name for e in stale[:6])}...")
+    elif stale:
+        print(f"would refresh {len(stale)} cron line(s) from the registry")
+    if dry:
+        for e in todo:
+            print(
+                f"{e.name}: would {'remove the hub schedule, ' if e.name in hub else ''}"
+                f"{'add the cron line' if e.line not in tags else '(cron line there)'}"
+            )
+        return 0
+    for group in batches(todo):
+        minute_edge()
+        off = []  # hub schedule gone (or never there): these get their cron line in this batch's one write
+        for e in group:
+            if e.name in hub:
+                ok, msg = schedule(e.name, "absent")
+                if not ok:
+                    print(f"{e.name}: hub schedule not removed ({msg}); left on the hub", file=sys.stderr)
+                    bad += 1
+                    continue
+            off.append(e)
+        try:
+            crontab_edit(add=[(e.line, e.cron_line) for e in off if e.line not in tags])
+        except (OSError, ValueError, RuntimeError) as ex:
+            for e in off:  # never leave a job with no runner
+                if e.name in hub:
+                    ok, msg = schedule(e.name, "live")
+                    print(
+                        f"{e.name}: cron line not written ({ex}); hub schedule "
+                        f"{'restored' if ok else 'NOT restored: ' + msg}",
+                        file=sys.stderr,
+                    )
+            bad += len(off)
+            continue
+        now = int(time.time())
+        for e in off:
+            st[e.name] = st.get(e.name) or now
+            print(f"{e.name}: on cron")
+        save_state(st)
+    if not os.environ.get("CRON_BACK_NO_COMMIT"):
+        sh(["brain-commit", f"cron-back apply: {len(todo) - bad} job(s) on cron"], timeout=120)
+    rc, out, err = sh([ASSISTANT, "cron", "check"], timeout=1800)
+    print((out or err).strip().splitlines()[-1] if (out or err).strip() else f"cron check exit {rc}")
+    return 1 if bad else (3 if rc != 0 else 0)
+
+
+def rollback(es, dry):
+    hub, tags, st = hub_schedules(), cron_tags(), load_state()
+    bad = 0
+    todo = []
+    for e in es:
+        if e.movable():
+            print(f"{e.name}: stays in cron ({e.movable()})")
+        elif e.name not in hub or e.line in tags:
+            todo.append(e)
+    if dry:
+        for e in todo:
+            print(
+                f"{e.name}: would {'remove the cron line, ' if e.line in tags else ''}"
+                f"{'put the hub schedule live' if e.name not in hub else '(hub schedule there)'}"
+            )
+        return 0
+    for group in batches(todo):
+        minute_edge()
+        try:
+            crontab_edit(rm=[e.line for e in group if e.line in tags])
+        except (OSError, ValueError, RuntimeError) as ex:
+            print(f"{', '.join(e.name for e in group)}: cron lines not removed ({ex}); left on cron", file=sys.stderr)
+            bad += len(group)
+            continue
+        for e in group:
+            if e.name not in hub:
+                ok, msg = schedule(e.name, "live")
+                if not ok:
+                    try:
+                        crontab_edit(add=[(e.line, e.cron_line)])
+                        back = "restored"
+                    except (OSError, ValueError, RuntimeError):
+                        back = "NOT restored"
+                    print(f"{e.name}: hub schedule failed ({msg}); cron line {back}", file=sys.stderr)
+                    bad += 1
+                    continue
+            st.pop(e.name, None)
+            print(f"{e.name}: on the hub")
+        save_state(st)
+    print(
+        "registry: still runs_on cron for these jobs; revert the cron-back commit and land it "
+        "(`assistant cron check` names the lines until then)"
+    )
+    return 1 if bad else 0
+
+
+def period_s(cron):
+    """The longest gap between two ticks for a minute/hourly cron (None = daily or slower)."""
+    c = schedules.cadence(cron)
+    if c == "minute":
+        m = sorted(schedules._values(cron.split()[0], 0, 59) or [])
+        hours = schedules._values(cron.split()[1], 0, 23) or set()
+        if len(hours) < 24:
+            return None  # minute-level but only some hours: judged like a daily job
+        gaps = [b - a for a, b in zip(m, m[1:], strict=False)] + [m[0] + 60 - m[-1]]
+        return max(gaps) * 60
+    if c == "hourly" and len(schedules._values(cron.split()[1], 0, 23) or ()) == 24:
+        return 3600
+    return None
+
+
+def verify(es, as_json):
+    st, now = load_state(), time.time()
+    rows = cronruns.runs(now - 2 * 86400, now)
+    last = {}
+    for r in rows:
+        last.setdefault(r["job"], []).append(r)
+    res, bad = [], 0
+    for e in es:
+        t0 = st.get(e.name)
+        p = period_s(e.cron)
+        mine = [r for r in last.get(e.name, []) if t0 and r["ts"] >= t0 - 5]
+        logged = "cron-fail" in e.cron_line.split(None, 5)[5]
+        if not t0:
+            v = "not cut over"
+        elif not logged:
+            v = "no run log (own failure note)"
+        elif mine:
+            v = "ran ok" if mine[-1]["ok"] else f"ran, rc {mine[-1]['rc']}"
+        elif p is None:
+            v = "not due yet (daily/weekly)"
+        elif now - t0 > p + 120:
+            v = "MISSING"
+            bad += 1
+        else:
+            v = f"waiting (period {p // 60} min)"
+        res.append({"job": e.name, "cron": e.cron, "cut_over": t0, "runs": len(mine), "verdict": v})
+    if as_json:
+        print(json.dumps(res, indent=1))
+    else:
+        for r in res:
+            print(f"{r['job']:28} {r['cron']:18} {r['runs']:3} run(s)  {r['verdict']}")
+        print(f"{len(res)} jobs, {bad} missing a run within their period")
+    return 1 if bad else 0
+
+
+def status(es, as_json):
+    hub, tags = hub_schedules(), cron_tags()
+    res = [{"job": e.name, "hub": e.name in hub, "cron": e.line in tags} for e in es]
+    both = [r["job"] for r in res if r["hub"] and r["cron"]]
+    none = [r["job"] for r in res if not r["hub"] and not r["cron"]]
+    if as_json:
+        print(json.dumps({"jobs": res, "both": both, "none": none}, indent=1))
+    else:
+        print(
+            f"{sum(r['cron'] and not r['hub'] for r in res)} on cron, {sum(r['hub'] and not r['cron'] for r in res)} "
+            f"on the hub, {len(both)} on both, {len(none)} on neither (of {len(res)})"
+        )
+        for j in both:
+            print(f"  BOTH: {j}")
+        for j in none:
+            print(f"  NONE: {j}")
+    return 1 if both or none else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="cron-back", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for n in ("apply", "rollback"):
+        p = sub.add_parser(n)
+        p.add_argument("--only", default="")
+        p.add_argument("--dry-run", action="store_true")
+    for n in ("status", "verify"):
+        sub.add_parser(n).add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    es = moved([x for x in getattr(a, "only", "").split(",") if x])
+    if a.cmd == "apply":
+        return apply(es, a.dry_run)
+    if a.cmd == "rollback":
+        return rollback(es, a.dry_run)
+    if a.cmd == "verify":
+        return verify(es, a.json)
+    return status(es, a.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

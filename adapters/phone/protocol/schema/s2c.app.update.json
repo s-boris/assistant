@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.app.update.json",
+  "title": "a newer APK is ready: GET path over mTLS, check size + sha256, he taps Install (also GET /v1/app/latest)",
+  "type": "object",
+  "properties": {
+    "code": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z._+-]{1,32}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "size": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "path": {
+      "type": "string",
+      "pattern": "^/v1/app/apk/[0-9]{1,9}$"
+    },
+    "notes": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "string",
+        "maxLength": 80
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "code",
+    "name",
+    "sha256",
+    "size",
+    "path"
+  ]
+}

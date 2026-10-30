@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""tts: text to a Telegram voice note, made locally (Piper TTS on the CPU; no text leaves the box).
+
+  tts TEXT|- [--lang en|de] [--out FILE.ogg] [--max-seconds 60] [--voice NAME] [--json]
+  tts --print-text TEXT|- [--lang en|de]     the text as it will be spoken (no audio)
+  tts --check | --setup
+  tts --server start|stop|status [--idle MIN] [--no-wait]   warm Piper process (below)
+
+Writes OGG/Opus, mono, 48 kHz (Telegram's voice-note format; send it with tg-voice) and prints its path;
+--json prints {file, seconds, bytes, lang, voice, truncated, warm}. Without --out the file goes to ~/.cache/tts/
+(files there older than a day are pruned on each run). TEXT "-" or no TEXT reads stdin.
+Spoken text: emoji, Markdown/HTML markup, URLs and code blocks are dropped; times (en: 2:30 p m, de: 14 Uhr 30),
+dates (DD.MM[.YYYY], ISO), CHF/EUR/$ amounts, percent, degrees, ranges and common units are written out.
+Over --max-seconds it keeps the whole sentences that fit and ends with "The rest is in the text." /
+"Der Rest steht im Text." (one sentence longer than the cap is cut with a short fade).
+Voices (rhasspy/piper-voices v1.0.0, ~/opt/piper-voices): en = en_US-lessac-medium, de = de_DE-thorsten-medium;
+--voice NAME picks another installed model (NAME.onnx there).
+--check: venv imports piper, both voices present, ffmpeg has libopus (exit 0/1; fast, used at boot).
+--setup: idempotent repair: rebuilds the venv from the repo's ops/requirements/piper.txt when piper no longer imports
+(needs python3-venv) and refetches missing or corrupt voices (md5-checked). Only --setup uses the network
+(every Piper process runs with onnxruntime's telemetry off: ORT_DISABLE_TELEMETRY=1).
+Exit: 0 ok, 1 failed, 2 bad arguments or nothing to say.
+--server start|stop|status [--idle MIN] [--no-wait]: a warm Piper process keeps both voices loaded (model load is
+~0.9 s of the ~1.2 s a cold call takes; warm ~0.25 s). Unix socket piper.sock (0600) in the cache folder, single
+instance (piper.lock), exits after --idle minutes without a request (default 30, TTS_SERVER_IDLE_MIN); log
+piper-server.log. Every call uses it when it answers and falls back to a cold Piper process otherwise (TTS_SERVER=0
+= always cold). `voice-say` starts it. status: exit 0 = warm.
+Env: TTS_THREADS (CPU threads, default 8); tests: TTS_VENV, TTS_VOICES, TTS_CACHE. Tests: ~/opt/tts-tests/run.sh.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.request
+
+HOME = os.path.expanduser('~')
+VENV = os.environ.get('TTS_VENV', f'{HOME}/opt/piper-venv')
+VOICES_DIR = os.environ.get('TTS_VOICES', f'{HOME}/opt/piper-voices')
+CACHE = os.environ.get('TTS_CACHE', f'{HOME}/.cache/tts')
+REQS = os.path.join(os.environ.get('ASSISTANT_REPO') or f'{HOME}/opt/assistant', 'ops', 'requirements', 'piper.txt')
+HF = 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/'
+# lang: (model, path in the voices repo, onnx size, onnx md5, json md5)
+VOICES = {
+    'en': ('en_US-lessac-medium', 'en/en_US/lessac/medium/', 63201294,
+           '2fc642b535197b6305c7c8f92dc8b24f', 'c1f2b7bddefe113f3255ff9ef234cfd3'),
+    'de': ('de_DE-thorsten-medium', 'de/de_DE/thorsten/medium/', 63201294,
+           'a129b00fb3078df43c96bab6c94535c0', '843a7bd7272724f750534dd5a26d1aad'),
+}
+
+W = {
+    'en': dict(rest='The rest is in the text.', code='Code in the text.', link='link', to='to', arrow='to',
+               and_='and', or_='or', percent='percent', deg='degrees', about='about', atmost='at most',
+               atleast='at least', under='under', over='over', times='times', number='number',
+               plusminus='plus or minus'),
+    'de': dict(rest='Der Rest steht im Text.', code='Code steht im Text.', link='Link', to='bis', arrow='nach',
+               and_='und', or_='oder', percent='Prozent', deg='Grad', about='etwa', atmost='höchstens',
+               atleast='mindestens', under='unter', over='über', times='mal', number='Nummer',
+               plusminus='plus minus'),
+}
+CUR = {'en': {'chf': ('franc', 'francs'), 'eur': ('euro', 'euros'), 'usd': ('dollar', 'dollars')},
+       'de': {'chf': ('Franken', 'Franken'), 'eur': ('Euro', 'Euro'), 'usd': ('Dollar', 'Dollar')}}
+UNITS = {  # unit after a number: (en singular, en plural, de singular, de plural)
+    'km/h': ('kilometre per hour', 'kilometres per hour', 'Kilometer pro Stunde', 'Kilometer pro Stunde'),
+    'km': ('kilometre', 'kilometres', 'Kilometer', 'Kilometer'),
+    'min': ('minute', 'minutes', 'Minute', 'Minuten'),
+    'h': ('hour', 'hours', 'Stunde', 'Stunden'),
+    's': ('second', 'seconds', 'Sekunde', 'Sekunden'),
+    'sec': ('second', 'seconds', 'Sekunde', 'Sekunden'),
+    'ms': ('millisecond', 'milliseconds', 'Millisekunde', 'Millisekunden'),
+    'kg': ('kilo', 'kilos', 'Kilo', 'Kilo'),
+    'MB': ('megabyte', 'megabytes', 'Megabyte', 'Megabyte'),
+    'GB': ('gigabyte', 'gigabytes', 'Gigabyte', 'Gigabyte'),
+    'TB': ('terabyte', 'terabytes', 'Terabyte', 'Terabyte'),
+    'Mbit/s': ('megabit', 'megabit', 'Megabit', 'Megabit'),
+    'Mbit': ('megabit', 'megabit', 'Megabit', 'Megabit'),
+    'Mbps': ('megabit', 'megabit', 'Megabit', 'Megabit'),
+    'Gbit/s': ('gigabit', 'gigabit', 'Gigabit', 'Gigabit'),
+    'Gbit': ('gigabit', 'gigabit', 'Gigabit', 'Gigabit'),
+}
+ABBR = {
+    'en': [(r'\be\.g\.', 'for example'), (r'\bi\.e\.', 'that is'), (r'\bapprox\.', 'about'),
+           (r'\bvs\.?(?=\s)', 'versus'), (r'\betc\.', 'and so on')],
+    'de': [(r'\bz\.\s?B\.', 'zum Beispiel'), (r'\bca\.', 'circa'), (r'\binkl\.', 'inklusive'),
+           (r'\bbzw\.', 'beziehungsweise'), (r'\busw\.', 'und so weiter'), (r'\bd\.\s?h\.', 'das heisst'),
+           (r'\bevtl\.', 'eventuell'), (r'\bvs\.?(?=\s)', 'gegen')],
+}
+MONTHS = {'en': ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+                 'October', 'November', 'December'],
+          'de': ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September',
+                 'Oktober', 'November', 'Dezember']}
+# Words before a bare DD.MM that make it a date rather than a decimal or version number.
+DATE_CTX = re.compile(
+    r'(?:^|[(\[,;:]|\b(?:on|from|until|till|by|due|since|before|after|'
+    r'mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+    r'am|ab|bis|vom|zum|seit|vor|nach|und|per|mo|di|mi|do|fr|sa|so|montag|dienstag|mittwoch|'
+    r'donnerstag|freitag|samstag|sonntag)\.?)\s*$', re.I)
+VERSION_BEFORE = re.compile(r'\b(?:v|version|release|update[ds]?|upgrade[ds]?|to|ubuntu|node|python|'
+                            r'android|ios|kernel|firmware|auf|von)\s*$', re.I)
+CURRENCY_BEFORE = re.compile(r'(?:CHF|SFr\.?|Fr\.|EUR|€|\$|USD)\s?$')
+ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve',
+        'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen']
+TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty']
+
+
+def en_num(n):
+    if n < 20:
+        return ONES[n]
+    t, o = divmod(n, 10)
+    return TENS[t] + ('-' + ONES[o] if o else '')
+
+
+def en_ordinal(n):
+    suf = 'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+    return f'{n}{suf}'
+
+
+def say_time(h, m, lang):
+    if lang == 'de':
+        if h == 0 and m == 0:
+            return 'Mitternacht'
+        return f'{h} Uhr' + (f' {m}' if m else '')
+    if h == 0 and m == 0:
+        return 'midnight'
+    if h == 12 and m == 0:
+        return 'noon'
+    h12 = h % 12 or 12
+    mins = '' if m == 0 else (' oh ' + ONES[m] if m < 10 else ' ' + en_num(m))
+    return f'{ONES[h12]}{mins} ' + ('a m' if h < 12 else 'p m')
+
+
+def say_date(d, mo, y, lang):
+    if not (1 <= d <= 31 and 1 <= mo <= 12):
+        return None
+    if lang == 'de':
+        return f'{d}. {MONTHS["de"][mo - 1]}' + (f' {y}' if y else '')
+    return f'{MONTHS["en"][mo - 1]} {en_ordinal(d)}' + (f', {y}' if y else '')
+
+
+def amount(num, cents, unit, lang):
+    whole = int(num) if num.isdigit() else num
+    word = CUR[lang][unit][0 if whole == 1 and not cents else 1]
+    return f'{num} {word}' + (f' {cents}' if cents and cents not in ('00', '-', '–') else '')
+
+
+def is_emoji_char(ch):
+    o = ord(ch)
+    if o in (0x200D, 0xFE0E, 0xFE0F, 0x20E3) or 0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF:
+        return True
+    return unicodedata.category(ch) in ('So', 'Sk', 'Cs', 'Co', 'Cn', 'Me')
+
+
+def normalize(text, lang):
+    """The text as it should be spoken: no markup or emoji, numbers in readable form."""
+    w = W[lang]
+    t = unicodedata.normalize('NFC', text.replace('\r', ''))
+    # Blocks: fenced code, HTML tags, Markdown links and bare URLs.
+    t = re.sub(r'```.*?(?:```|$)', '\n' + w['code'] + '\n', t, flags=re.S)
+    t = re.sub(r'<pre>.*?</pre>', '\n' + w['code'] + '\n', t, flags=re.S | re.I)
+    t = re.sub(r'<br\s*/?>', '\n', t, flags=re.I)
+    t = re.sub(r'</?[A-Za-z][\w-]*(?:\s[^<>]*)?>', '', t)
+    t = re.sub(r'!?\[([^\]\n]*)\]\([^)\s]*\)', r'\1', t)
+    t = re.sub(r'(?:https?://|www\.)\S+', w['link'], t)
+    t = re.sub(r'\|\|(.+?)\|\|', r'\1', t)
+    # Abbreviations, thousands separators (1'000, thin spaces), ISO dates and date ranges.
+    for pat, rep in ABBR[lang]:
+        t = re.sub(pat, rep, t, flags=re.I)
+    t = re.sub(r"(?<=\d)['’  ](?=\d{3}\b)", '', t)
+
+    def iso(m):
+        s = say_date(int(m[3]), int(m[2]), int(m[1]), lang)
+        return s or m[0]
+    t = re.sub(r'\b(\d{4})-(\d{2})-(\d{2})\b', iso, t)
+
+    def drange(m):
+        a, b = say_date(int(m[1]), int(m[2]), None, lang), say_date(int(m[3]), int(m[4]), None, lang)
+        return f'{a} {w["to"]} {b}' if a and b else m[0]
+    t = re.sub(r'(?<![\d.])(\d{1,2})\.(\d{1,2})\.?(?:\s?[–—-]\s?|\s+(?:to|until|till|bis)\s+)(\d{1,2})\.(\d{1,2})\.?(?![\d])', drange, t)
+
+    # Currency before the number range rule (CHF 20.– must not become a range).
+    def cur_pre(m):
+        unit = {'c': 'chf', 's': 'chf', 'f': 'chf', 'e': 'eur', '€': 'eur', '$': 'usd', 'u': 'usd'}[m[1][0].lower()]
+        return amount(m[2], m[3], unit, lang)
+    t = re.sub(r'(CHF|SFr\.?|Fr\.(?!\s?\d{1,2}\.\d{1,2}\.)|EUR|€|\$|USD)\s?(\d+)(?:[.,](\d{2}|[–-])(?!\d))?', cur_pre, t)
+
+    def cur_post(m):
+        unit = {'c': 'chf', 'f': 'chf', 'e': 'eur', '€': 'eur', 'u': 'usd'}[m[3][0].lower()]
+        return amount(m[1], m[2], unit, lang)
+    t = re.sub(r'(?<![\d.,])(\d+)(?:[.,](\d{2}|[–-]))?\s?(CHF|Fr\.|Franken|EUR|€|USD)(?![\w])', cur_post, t)
+
+    # Explicit dates: 24.10. / 24.10.2026 (a consumed sentence dot is put back before a capital or line end).
+    def ddate(m):
+        y = m[3]
+        s = say_date(int(m[1]), int(m[2]), y, lang)
+        if not s or (y is None and VERSION_BEFORE.search(d_ref[0][max(0, m.start() - 14):m.start()])):
+            return m[0]
+        return s + ('.' if (y is None and m[4] is not None) else '')
+    d_ref = [t]
+    t = re.sub(r'(?<![\d.])(\d{1,2})\.(\d{1,2})\.(\d{4})?(?!\d)(?=(\s+[A-ZÄÖÜ]|\s*$)?)', ddate, t, flags=re.M)
+
+    # Bare DD.MM only with date context before it (on 24.10, bis 6.12, line start), never after a currency.
+    def bare(m):
+        before = t_ref[0][max(0, m.start() - 14):m.start()]
+        if CURRENCY_BEFORE.search(before) or VERSION_BEFORE.search(before):
+            return m[0]
+        if not DATE_CTX.search(before) and int(m[1]) < 10:  # 4.10 without context: likely a version
+            return m[0]
+        return say_date(int(m[1]), int(m[2]), None, lang) or m[0]
+    t_ref = [t]
+    t = re.sub(r'(?<![\d.:\'’])(\d{1,2})\.(\d{2})(?![\d.]|\s?(?:%|°|[KMGT]B\b|GHz|kg|km|Mbit|Gbit))', bare, t)
+
+    # Ranges, times, comparisons, percent, degrees, units.
+    t = re.sub(r'(?<=\d)\s?[–—]\s?(?=\d)', f' {w["to"]} ', t)
+    t = re.sub(r'(?<![\d-])(\d{1,3})-(\d{1,3})(?![\d-])', rf'\1 {w["to"]} \2', t)
+    t = re.sub(r'(?<![\d:.])([01]?\d|2[0-3]):([0-5]\d)(?![\d:])', lambda m: say_time(int(m[1]), int(m[2]), lang), t)
+    t = re.sub(r'(?:~|≈|\bca\b)\s?(?=\d)', w['about'] + ' ', t)
+    t = re.sub(r'≤\s?', w['atmost'] + ' ', t)
+    t = re.sub(r'≥\s?', w['atleast'] + ' ', t)
+    t = re.sub(r'±\s?', w['plusminus'] + ' ', t)
+    t = re.sub(r'(?<![<\w])<\s?(?=\d)', w['under'] + ' ', t)
+    t = re.sub(r'(?<![>\w])>\s?(?=\d)', w['over'] + ' ', t)
+    t = re.sub(r'(\d)\s?%', rf'\1 {w["percent"]}', t)
+    t = re.sub(r'(\d)\s?°\s?[CF]?\b', rf'\1 {w["deg"]}', t)
+    t = re.sub(r'(\d)\s?[x×](?=\s|$|[.,;])', rf'\1 {w["times"]}', t)
+    t = re.sub(r'#(\d+)', rf'{w["number"]} \1', t)
+    units = '|'.join(re.escape(u) for u in sorted(UNITS, key=len, reverse=True))
+
+    def unit(m):
+        en_s, en_p, de_s, de_p = UNITS[m[2]]
+        one = m[1] in ('1', '1.0')
+        word = (en_s if one else en_p) if lang == 'en' else (de_s if one else de_p)
+        return f'{m[1]} {word}'
+    t = re.sub(rf'(\d+(?:[.,]\d+)?)\s?({units})(?![\w/])', unit, t)
+    # Symbols and markup left over.
+    t = re.sub(r'\s*[→⇒➜➡⟶]\s*', f' {w["arrow"]} ', t)
+    t = re.sub(r'\s*&\s*', f' {w["and_"]} ', t)
+    t = re.sub(r'(?<=[A-Za-zÄÖÜäöüß])/(?=[A-Za-zÄÖÜäöüß])', f' {w["or_"]} ', t)
+    t = re.sub(r'\s+[–—]\s+|\s*—\s*', ', ', t)
+    t = t.replace('…', '...')
+    t = ''.join(ch for ch in t if not is_emoji_char(ch))
+    t = re.sub(r'(\*\*|__|~~|`)', '', t)
+    t = re.sub(r'(?<!\w)[*_](\S(?:.*?\S)?)[*_](?!\w)', r'\1', t)
+    # Lines become sentences: headings, quotes, bullets and table rows lose their markers.
+    sentences = []
+    for line in t.split('\n'):
+        line = line.strip()
+        if re.fullmatch(r'\|?[\s:|-]*-[\s:|-]*\|?', line or 'x'):  # table separator row
+            continue
+        if line.startswith('|'):
+            line = ', '.join(c.strip() for c in line.strip('|').split('|') if c.strip())
+        line = re.sub(r'^(?:#{1,6}\s+|>+\s?|[-*+•▪◦]\s+|\d{1,2}[.)]\s+)+', '', line)
+        line = re.sub(r'[*_#|`>]', ' ', line) if re.search(r'[*#|`]', line) else line
+        line = re.sub(r'\s+', ' ', line).strip(' ,;')
+        if not re.search(r'\w', line):
+            continue
+        if not re.search(r'[.!?:;]$', line):
+            line += '.'
+        sentences.append(line)
+    t = ' '.join(sentences)
+    t = re.sub(r'\s+([.,!?;:])', r'\1', t)
+    t = re.sub(r'([.!?])[.,;:]+', r'\1', t)
+    t = re.sub(r',\s*([.!?])', r'\1', t)
+    t = re.sub(r'\(\s*\)', '', t)
+    return re.sub(r'\s{2,}', ' ', t).strip()
+
+
+SYNTH_CORE = r'''
+import json, os, sys, wave
+import numpy as np
+import onnxruntime as ort
+from piper import PiperVoice
+THREADS = [1]
+_session = ort.InferenceSession
+def _capped(path, sess_options=None, **kw):  # cap CPU threads (default: all cores)
+    so = sess_options or ort.SessionOptions()
+    so.intra_op_num_threads, so.inter_op_num_threads = THREADS[0], 1
+    return _session(path, sess_options=so, **kw)
+ort.InferenceSession = _capped
+def render(voice, a):
+    sr = voice.config.sample_rate
+    gap = np.zeros(int(sr * a["gap"]), dtype=np.int16)
+    budget = int(sr * a["max"])
+    def length(parts):
+        return sum(len(p) for p in parts) + len(gap) * max(0, len(parts) - 1)
+    parts, over = [], False
+    for c in voice.synthesize(a["text"]):
+        parts.append(c.audio_int16_array.reshape(-1))
+        if length(parts) > budget:
+            over = True
+            break
+    if over:
+        tail = np.concatenate([c.audio_int16_array.reshape(-1) for c in voice.synthesize(a["tail"])])
+        first = parts[0]
+        while parts and length(parts + [tail]) > budget:
+            parts.pop()
+        if not parts:
+            keep = max(0, budget - len(tail) - len(gap))
+            cut = first[:keep].astype(np.float32)
+            fade = min(len(cut), int(sr * 0.15))
+            if fade:
+                cut[-fade:] *= np.linspace(1, 0, fade)
+            parts = [cut.astype(np.int16)]
+        parts.append(tail)
+    out = []
+    for i, p in enumerate(parts):
+        if i:
+            out.append(gap)
+        out.append(p)
+    audio = np.concatenate(out) if out else np.zeros(0, np.int16)
+    with wave.open(a["wav"], "wb") as f:
+        f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr); f.writeframes(audio.tobytes())
+    return {"seconds": round(len(audio) / sr, 2), "truncated": over}
+'''
+
+SYNTH = SYNTH_CORE + r'''
+a = json.loads(sys.stdin.read())
+THREADS[0] = a["threads"]
+print(json.dumps(render(PiperVoice.load(a["model"]), a)))
+'''
+
+# Warm server: the same render() with the voices kept loaded (model load ~0.9 s of the ~1.2 s per call).
+# One JSON line in, one out, on a 0600 Unix socket; exits after cfg idle seconds without a request.
+SERVER = SYNTH_CORE + r'''
+import fcntl, socket
+cfg = json.loads(sys.argv[1])
+THREADS[0] = cfg["threads"]
+lockf = open(cfg["lock"], "a")
+try:
+    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)  # another server holds the lock
+voices = {}
+def voice(m):
+    if m not in voices:
+        voices[m] = PiperVoice.load(m)
+    return voices[m]
+for m in cfg["preload"]:
+    try:
+        voice(m)
+    except Exception as e:
+        print(f"preload {os.path.basename(m)}: {type(e).__name__}", file=sys.stderr)
+try:
+    os.unlink(cfg["sock"])
+except FileNotFoundError:
+    pass
+os.umask(0o077)
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(cfg["sock"])
+srv.listen(8)
+srv.settimeout(cfg["idle"])
+print(f"ready pid {os.getpid()} voices {len(voices)}", file=sys.stderr, flush=True)
+stop = False
+while not stop:
+    try:
+        conn, _ = srv.accept()
+    except socket.timeout:
+        break
+    with conn:
+        try:
+            conn.settimeout(10)
+            buf = b""
+            while not buf.endswith(b"\n") and len(buf) < 1 << 20:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            req = json.loads(buf)
+            op = req.get("op")
+            if op == "ping":
+                res = {"ok": True, "pid": os.getpid(), "voices": len(voices)}
+            elif op == "stop":
+                res, stop = {"ok": True}, True
+            else:
+                res = render(voice(req["model"]), req)
+        except Exception as e:
+            res = {"error": type(e).__name__ + ": " + str(e)[:200]}
+        try:
+            conn.sendall((json.dumps(res) + "\n").encode())
+        except OSError:
+            pass
+srv.close()
+try:
+    os.unlink(cfg["sock"])  # ours: the lock keeps other servers from binding
+except OSError:
+    pass
+'''
+
+
+def py():
+    return os.path.join(VENV, 'bin', 'python')
+
+
+def venv_env():
+    """The environment of every venv python that imports onnxruntime: its usage telemetry off. onnxruntime keeps a
+    device id and an event queue under ~/.cache/Microsoft and uploads them over HTTPS from any process that lives a
+    few seconds (the warm server, a slow synthesis) unless ORT_DISABLE_TELEMETRY is set; Piper runs offline."""
+    return dict(os.environ, ORT_DISABLE_TELEMETRY='1')
+
+
+def piper_ok():
+    try:
+        return subprocess.run([py(), '-I', '-c', 'import piper, onnxruntime'], capture_output=True,
+                              timeout=60, env=venv_env()).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def opus_ok():
+    try:
+        r = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True, timeout=30)
+        return 'libopus' in r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def check():
+    problems = []
+    if not piper_ok():
+        problems.append(f'piper does not import from {VENV}')
+    for lang, (name, _, size, _, _) in VOICES.items():
+        p = os.path.join(VOICES_DIR, name + '.onnx')
+        if not (os.path.isfile(p) and os.path.getsize(p) == size and os.path.isfile(p + '.json')):
+            problems.append(f'voice {name} ({lang}) missing or incomplete')
+    if not opus_ok():
+        problems.append('ffmpeg with libopus missing')
+    for p in problems:
+        print('tts: ' + p, file=sys.stderr)
+    if not problems:
+        print('tts: ok (piper, voices en+de, ffmpeg libopus)')
+    return 0 if not problems else 1
+
+
+def fetch(url, dest, digest):
+    tmp = dest + '.part'
+    with urllib.request.urlopen(url, timeout=60) as r, open(tmp, 'wb') as f:
+        while True:
+            b = r.read(1 << 20)
+            if not b:
+                break
+            f.write(b)
+    if md5(tmp) != digest:
+        os.unlink(tmp)
+        raise RuntimeError(f'md5 mismatch for {os.path.basename(dest)}')
+    os.replace(tmp, dest)
+
+
+def setup():
+    rc = 0
+    if not piper_ok():
+        print(f'tts: rebuilding {VENV}', file=sys.stderr)
+        r = subprocess.run([sys.executable, '-m', 'venv', '--clear', VENV])
+        if r.returncode == 0:
+            r = subprocess.run([py(), '-m', 'pip', 'install', '-q', '-r', REQS])
+        if r.returncode != 0 or not piper_ok():
+            print('tts: venv rebuild failed (python3-venv installed? network?)', file=sys.stderr)
+            rc = 1
+    os.makedirs(VOICES_DIR, exist_ok=True)
+    for name, path, size, onnx_md5, json_md5 in VOICES.values():
+        for ext, digest in (('.onnx', onnx_md5), ('.onnx.json', json_md5)):
+            dest = os.path.join(VOICES_DIR, name + ext)
+            if os.path.isfile(dest) and (ext == '.onnx' and os.path.getsize(dest) == size and md5(dest) == digest
+                                         or ext != '.onnx' and md5(dest) == digest):
+                continue
+            print(f'tts: fetching {name}{ext}', file=sys.stderr)
+            try:
+                fetch(HF + path + name + ext, dest, digest)
+            except Exception as e:  # noqa: BLE001 - report and go on with the next file
+                print(f'tts: {name}{ext}: {e}', file=sys.stderr)
+                rc = 1
+    return check() or rc
+
+
+def prune_cache():
+    try:
+        now = time.time()
+        for n in os.listdir(CACHE):
+            p = os.path.join(CACHE, n)
+            if n.startswith('tts-') and n.endswith('.ogg') and now - os.path.getmtime(p) > 86400:
+                os.unlink(p)
+    except OSError:
+        pass
+
+
+def sock_path():
+    return os.path.join(CACHE, 'piper.sock')
+
+
+def server_call(req, timeout=300):
+    """One JSON request to the warm server; None when it is not there or fails (the caller goes cold)."""
+    path = sock_path()
+    if os.environ.get('TTS_SERVER') == '0' or len(path) > 100 or not os.path.exists(path):
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect(path)
+            s.settimeout(timeout)
+            s.sendall((json.dumps(req) + '\n').encode())
+            buf = b''
+            while not buf.endswith(b'\n'):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        res = json.loads(buf)
+        return None if not isinstance(res, dict) or 'error' in res else res
+    except (OSError, ValueError):
+        return None
+
+
+def server(action, idle_min, wait):
+    if action == 'status':
+        r = server_call({'op': 'ping'}, timeout=5)
+        print(f"tts server: warm (pid {r['pid']}, {r['voices']} voices)" if r else 'tts server: cold (not running)')
+        return 0 if r else 1
+    if action == 'stop':
+        r = server_call({'op': 'stop'}, timeout=5)
+        print('tts server: stopped' if r else 'tts server: was not running')
+        return 0
+    if server_call({'op': 'ping'}, timeout=5):
+        return 0
+    if len(sock_path()) > 100:
+        print('tts: cache path too long for a socket', file=sys.stderr)
+        return 1
+    os.makedirs(CACHE, exist_ok=True)
+    cfg = {'sock': sock_path(), 'lock': os.path.join(CACHE, 'piper.lock'), 'idle': max(float(os.environ.get('TTS_SERVER_MIN_IDLE_S') or 60), idle_min * 60),
+           'threads': max(1, int(os.environ.get('TTS_THREADS') or min(8, os.cpu_count() or 1))),
+           'preload': [p for p in (os.path.join(VOICES_DIR, VOICES[k][0] + '.onnx') for k in sorted(VOICES))
+                       if os.path.isfile(p)]}
+    with open(os.path.join(CACHE, 'piper-server.log'), 'ab') as log:  # never the caller's pipes (tg-cmd waits on them)
+        subprocess.Popen([py(), '-I', '-c', SERVER, json.dumps(cfg)], stdin=subprocess.DEVNULL, stdout=log,
+                         stderr=log, cwd=CACHE, start_new_session=True, close_fds=True, env=venv_env())
+    if not wait:
+        return 0
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if server_call({'op': 'ping'}, timeout=5):
+            return 0
+        time.sleep(0.1)
+    print('tts: server did not come up (see piper-server.log)', file=sys.stderr)
+    return 1
+
+
+def synth(text, lang, model, out, max_s):
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or '.', exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='tts-') as tmpd:
+        wav = os.path.join(tmpd, 'a.wav')
+        args = {'model': model, 'text': text, 'tail': W[lang]['rest'], 'max': max_s, 'gap': 0.2, 'wav': wav,
+                'threads': max(1, int(os.environ.get('TTS_THREADS') or min(8, os.cpu_count() or 1)))}
+        info = server_call(args)
+        if info and os.path.isfile(wav):
+            info['warm'] = True
+        else:
+            r = subprocess.run([py(), '-I', '-c', SYNTH], input=json.dumps(args), capture_output=True, text=True,
+                               timeout=300, cwd=tmpd, env=venv_env())
+            if r.returncode != 0:
+                raise RuntimeError('piper failed: ' + (r.stderr.strip().splitlines() or ['?'])[-1])
+            info = json.loads(r.stdout.strip().splitlines()[-1])
+            info['warm'] = False
+        ogg = os.path.join(tmpd, 'a.ogg')
+        r = subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', wav, '-ac', '1', '-ar', '48000',
+                            '-c:a', 'libopus', '-b:a', '32k', '-application', 'voip', '-f', 'ogg', ogg],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError('ffmpeg failed: ' + (r.stderr.strip().splitlines() or ['?'])[-1])
+        tmp_out = out + '.part'
+        with open(ogg, 'rb') as src, open(tmp_out, 'wb') as dst:
+            dst.write(src.read())
+        os.replace(tmp_out, out)
+    return info
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='tts', description='Text to a Telegram voice note (local Piper TTS).')
+    ap.add_argument('text', nargs='*')
+    ap.add_argument('--lang', choices=sorted(VOICES), default='en')
+    ap.add_argument('--out', '-o')
+    ap.add_argument('--max-seconds', type=float, default=60.0)
+    ap.add_argument('--voice', help='another installed model name in the voices folder')
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--print-text', action='store_true')
+    ap.add_argument('--check', action='store_true')
+    ap.add_argument('--setup', action='store_true')
+    ap.add_argument('--server', choices=['start', 'stop', 'status'])
+    ap.add_argument('--idle', type=float, default=float(os.environ.get('TTS_SERVER_IDLE_MIN') or 30),
+                    help='server: minutes without a request before it exits')
+    ap.add_argument('--no-wait', action='store_true', help='server start: return at once')
+    a = ap.parse_args(argv)
+    if a.server:
+        return server(a.server, a.idle, not a.no_wait)
+    if a.check:
+        return check()
+    if a.setup:
+        return setup()
+    if not a.text or a.text == ['-']:
+        if sys.stdin.isatty():
+            ap.print_usage(sys.stderr)
+            return 2
+        raw = sys.stdin.read()
+    else:
+        raw = ' '.join(a.text)
+    if not 5 <= a.max_seconds <= 600:
+        print('tts: --max-seconds must be 5..600', file=sys.stderr)
+        return 2
+    spoken = normalize(raw, a.lang)
+    if a.print_text:
+        print(spoken)
+        return 0 if spoken else 2
+    if not spoken:
+        print('tts: nothing to say after removing markup and emoji', file=sys.stderr)
+        return 2
+    name = a.voice or VOICES[a.lang][0]
+    if not re.fullmatch(r'[\w.-]+', name):
+        print('tts: bad --voice name', file=sys.stderr)
+        return 2
+    model = os.path.join(VOICES_DIR, name + '.onnx')
+    if not os.path.isfile(model):
+        print(f'tts: voice {name} not installed (tts --setup)', file=sys.stderr)
+        return 1
+    if a.out:
+        out = a.out
+    else:
+        os.makedirs(CACHE, exist_ok=True)
+        prune_cache()
+        out = os.path.join(CACHE, time.strftime('tts-%Y%m%d-%H%M%S-') + f'{os.getpid()}.ogg')
+    try:
+        info = synth(spoken[:20000], a.lang, model, out, a.max_seconds)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError) as e:
+        print(f'tts: {e}', file=sys.stderr)
+        return 1
+    if a.json:
+        print(json.dumps({'file': os.path.abspath(out), 'seconds': info['seconds'], 'bytes': os.path.getsize(out),
+                          'lang': a.lang, 'voice': name, 'truncated': info['truncated'],
+                          'warm': info.get('warm', False)}))
+    else:
+        print(os.path.abspath(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""waiting-card: what is waiting on the owner right now, as a phone-sized card (token-free).
+
+  waiting-card [--json] [--max 8]
+        TODO.md's "Waiting on you" titles (+ a short status) and the Due count, at most ~10 lines. Parsed with
+        tg-status's own TODO.md reader, so the card shows exactly what the pinned board shows.
+The /waiting instant command prints it as is; the waiting-card skill sends it when he asks by text.
+Env: WAITING_TODO (default ~/workspace/TODO.md), WAITING_TGSTATUS (tg-status path, for its parser).
+Exit: 0 (an empty list is an answer too), 1 TODO.md unreadable.
+"""
+import json
+import os
+import re
+import sys
+
+HOME = os.path.expanduser("~")
+TODO = os.environ.get("WAITING_TODO") or os.path.join(HOME, "workspace/TODO.md")
+TGS = os.environ.get("WAITING_TGSTATUS") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "tg-status")
+
+
+def _strip(s):
+    s = re.sub(r"\*\*|__|`", "", s or "")
+    return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s).strip()
+
+
+def _own_parser(path):
+    """Fallback: same rules as tg-status (top-level bullets; **Title** — status)."""
+    out, sec = {"due": [], "in progress": [], "waiting on you": []}, None
+    with open(path, encoding="utf-8") as f:
+        for line in f.read().splitlines():
+            m = re.match(r"^#{1,3}\s+(.*?)\s*$", line)
+            if m:
+                sec = m.group(1).strip().lower()
+                continue
+            m = re.match(r"^[-*+]\s+(?:\[[ xX]\]\s+)?(.*)$", line) if sec in out else None
+            if not m:
+                continue
+            item = m.group(1).strip()
+            b = re.match(r"^\*\*(.+?)\*\*\s*(.*)$", item)
+            title, rest = (b.group(1), b.group(2)) if b else (re.split(r"\s+[—–]\s+", item, 1) + [""])[:2]
+            rest = re.sub(r"^\s*(?:[—–:]|-(?=\s))\s*", "", rest)
+            out[sec].append((_strip(title), _strip(rest), item))
+    return out
+
+
+def read_todo(path):
+    if not os.access(path, os.R_OK):
+        raise OSError("TODO.md unreadable")
+    try:                                   # reuse the pinned board's reader when it is there
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("tg_status_lib", TGS)
+        spec = importlib.util.spec_from_loader("tg_status_lib", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        mod.TODO = path
+        res = mod.read_todo()
+        if isinstance(res, dict) and "waiting on you" in res:
+            return res
+    except Exception:  # noqa: BLE001 - any trouble: the local copy of the same rules
+        pass
+    return _own_parser(path)
+
+
+def clip(s, n):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[:n - 1].rstrip() + "…"
+
+
+def card(todo, mx=8):
+    w, due = todo.get("waiting on you", []), todo.get("due", [])
+    if not w:
+        lines = ["✅ Nothing is waiting on you right now."]
+    else:
+        lines = [f"⏳ Waiting on you: {len(w)}"]
+        for i, (title, rest, _) in enumerate(w[:mx], 1):
+            lines.append(f"{i}. {clip(title, 40)}" + (f" — {clip(rest, 60)}" if rest else ""))
+        if len(w) > mx:
+            lines.append(f"+{len(w) - mx} more on the pinned board")
+    if due:
+        lines.append(f"📌 Due soon: {len(due)} ({clip(due[0][0], 40)}{', …' if len(due) > 1 else ''})")
+    return lines
+
+
+def main(argv):
+    as_json = "--json" in argv
+    mx = 8
+    if "--max" in argv:
+        try:
+            mx = max(1, int(argv[argv.index("--max") + 1]))
+        except (IndexError, ValueError):
+            print("usage: waiting-card [--json] [--max N]", file=sys.stderr)
+            return 2
+    try:
+        todo = read_todo(TODO)
+    except OSError as e:
+        print(f"waiting-card: {e}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps({"waiting": [{"title": t, "status": r} for t, r, _ in todo.get("waiting on you", [])],
+                          "due": [t for t, _, _ in todo.get("due", [])]}, ensure_ascii=False))
+    else:
+        print("\n".join(card(todo, mx)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

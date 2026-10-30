@@ -1,0 +1,54 @@
+# claude-hub voice (v2 Phase 3 P3-7): the voice relay in the hub. An override of compose.yaml, installed and started
+# only by the owner's voice paste (`hub kit paste voice-install`), which runs
+#   docker compose -f compose.yaml -f compose.voice.yaml [-f compose.tg.yaml] --profile voice up -d voice
+# - voice runs ops/hub/voiceloader.py (installed by the paste into HUB_ROOT/loader), which runs the release's
+#   voice/run.py (adapters/voice + its pinned wheels) with state in HUB_ROOT/voice/state.
+# - Secrets, copied by the paste BY NAME from the brain's home (never by the brain): the Gemini key, the call
+#   account's api config and the relay's env file (compose secrets, read-only) and the call account's session
+#   (HUB_ROOT/secrets/voice: a SQLite file the client writes, so a directory of its own, mounted only here).
+#   token_voice is this container's hub caller token (Cedar principal `voice`). voice-local-token stays behind:
+#   the relay's internal API answers on loopback inside this container only. voice_link_token (the brain's
+#   ~/.secrets/voice-link-token, made by `hub voice link prep`) guards the link port, 8797.
+# - Networks: hub (claude-hub: hubd, its gateway, later claude-hub-phone) + egress (Telegram MTProto, Gemini Live) +
+#   brain (until P3-8: the phone gateway in claude-bot reaches the link port, 8797: app tickets, status and /ws for
+#   app calls, link token only). Nothing is published on the host or LAN; the voice web page listens on loopback only.
+# - One runner per Telegram user session: the paste refuses while the brain's own relay runs or is switched on.
+services:
+  hub:
+    environment:
+      HUB_VOICE: "on"
+
+  voice:
+    command: ["python3", "-I", "-B", "/opt/hub-loader/voiceloader.py", "--releases", "/srv/releases", "--state", "/srv/voice/state", "--config", "/srv/voice/config/live.json"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+    secrets: [token_voice, voice_gemini_key, voice_tg_json, voice_relay_env, voice_link_token]
+    networks: [hub, egress, brain]
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/loader", target: /opt/hub-loader, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/.local/share/claude-hub/releases", target: /srv/releases, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/voice/config", target: /srv/voice/config, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/voice/state", target: /srv/voice/state, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/secrets/voice", target: /srv/voice/session, bind: {create_host_path: false}}
+    healthcheck:
+      test: ["CMD", "python3", "-I", "-c", "import json,sys,time; s=json.load(open('/srv/voice/state/voiceloader-status.json')); sys.exit(0 if s['state'] in ('running','held') and time.time()-s['ts']<90 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 1g, pids: 256}
+
+secrets:
+  token_voice:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/token_voice
+  voice_gemini_key:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/voice_gemini_key
+  voice_tg_json:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/voice_tg_json
+  voice_relay_env:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/voice_relay_env
+  voice_link_token:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/voice_link_token

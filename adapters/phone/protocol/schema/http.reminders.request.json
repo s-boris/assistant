@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.reminders.request.json",
+  "title": "POST /v1/reminders (mTLS): one change from the Reminders screen. op add (when + text; when may be a phrase: 'tomorrow evening', 'after the concert', 'when I get home'), snooze/move (rid + when), done/cancel/skip (rid; skip = a series' next occurrence), preview (when only: what the phrase means, nothing stored). id (ULID) dedupes replays of the offline queue.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "op": {
+      "enum": [
+        "add",
+        "snooze",
+        "move",
+        "done",
+        "cancel",
+        "skip",
+        "preview"
+      ]
+    },
+    "rid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}$"
+    },
+    "when": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "op"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "op": {
+            "const": "add"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "when",
+          "text"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "op": {
+            "enum": [
+              "snooze",
+              "move"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "rid",
+          "when"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "op": {
+            "enum": [
+              "done",
+              "cancel",
+              "skip"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "rid"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "op": {
+            "const": "preview"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "when"
+        ]
+      }
+    }
+  ]
+}

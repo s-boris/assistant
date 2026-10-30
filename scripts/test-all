@@ -1,0 +1,360 @@
+#!/usr/bin/env -S python3 -I
+"""test-all [--suite NAME]... [--list] [--no-note] [--cpus LIST]
+Run every ~/opt/*-tests suite, and every legacy suite in the repo that no manifest entry claims (tests/legacy/<name>/
+of ~/opt/assistant; `assistant ci` runs the claimed ones), offline, one at a time, at low priority, and report what failed or reached out.
+  entry    from the suite's folder: its line in ~/opt/test-all/entries.tsv, else `bash run.sh`, else
+           `python3 run.py`, else every test_*.py with python3; stdin /dev/null; `timeout -k 10 240`
+  priority nice 19 + ionice idle (when permitted); --cpus LIST also pins with taskset (16-31 = the E-cores)
+  network  LD_PRELOAD guard ~/opt/test-all/netguard.so: loopback only (flowd :8790 and Chrome CDP :9222
+           refused too); every refused connect is logged with the process; a logging `gh` stub goes first on PATH.
+           Known harmless blocks (suite + process): ~/opt/test-all/expected-blocks.tsv (public destinations only)
+  HOME     a fresh temp HOME per suite (links to bin, opt, plugins, .bun, .cache, .local/bin, crontab, boot.sh;
+           empty inbox, .config, .local/state), unless the suite is listed in ~/opt/test-all/real-home.txt
+  output   summary table ~/.local/state/test-all/last.txt (a --suite run: last-suite.txt), per-suite logs in
+           ~/.local/state/test-all/logs/ (NAME.log, NAME.guard.log)
+  exit     0 = all pass, no blocked connection; 1 = a suite failed or timed out, or a connection was blocked:
+           a full run then writes ONE ~/inbox/test-all-YYYY-MM-DD.md (not with --no-note); 2 = usage/setup error
+  --suite NAME   run only this suite (NAME or NAME-tests; repeatable); --list shows suites, entries and HOME mode
+Env (for tests): TEST_ALL_OPT (suites root), TEST_ALL_LEGACY (the repo's tests/legacy; off when TEST_ALL_OPT is set), TEST_ALL_CONF (guard + config dir), TEST_ALL_TIMEOUT (seconds).
+Tests: ~/opt/test-all-tests/run.sh
+"""
+import collections
+import datetime
+import fcntl
+import glob
+import ipaddress
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+OPT = os.environ.get("TEST_ALL_OPT") or os.path.join(HOME, "opt")
+LEGACY = os.environ.get("TEST_ALL_LEGACY") or (
+    "" if os.environ.get("TEST_ALL_OPT") else os.path.join(HOME, "opt", "assistant", "tests", "legacy")
+)
+CONF = os.environ.get("TEST_ALL_CONF") or os.path.join(HOME, "opt/test-all")
+STATE = os.path.join(HOME, ".local/state/test-all")
+LOGS = os.path.join(STATE, "logs")
+INBOX = os.path.join(HOME, "inbox")
+TIMEOUT = int(os.environ.get("TEST_ALL_TIMEOUT") or 240)
+KILL_AFTER = 10
+HOME_LINKS = ["bin", "opt", "plugins", ".bun", ".cache", ".local/bin", "crontab", "boot.sh"]
+INTERPRETERS = {"python3", "python", "bash", "sh", "node", "bun", "perl", "env", "timeout", "nice"}
+
+
+def die(msg):
+    print(f"test-all: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def tilde(p):
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + "/") else p
+
+
+def read_tsv(name):
+    """Lines of CONF/name without comments; returns (key, rest) pairs (rest '' when there is no tab)."""
+    out = []
+    try:
+        with open(os.path.join(CONF, name)) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                key, _, rest = line.partition("\t")
+                out.append((key.split("#")[0].strip(), rest.strip()))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def tree_suites():
+    """{NAME-tests: dir} for the repo's tests/legacy/NAME/ suites no manifest entry claims (a run.sh or run.py)."""
+    if not LEGACY or not os.path.isdir(LEGACY):
+        return {}
+    import tomllib
+
+    try:
+        with open(os.path.join(LEGACY, "..", "..", "ops", "deploy", "manifest.toml"), "rb") as f:
+            claimed = {e.get("suite") for e in tomllib.load(f).get("file", [])}
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    out = {}
+    for d in sorted(glob.glob(os.path.join(LEGACY, "*"))):
+        n = os.path.basename(d)
+        if n not in claimed and any(os.path.isfile(os.path.join(d, x)) for x in ("run.sh", "run.py")):
+            out[n + "-tests"] = d
+    return out
+
+
+def suite_dir(suite):
+    d = os.path.join(OPT, suite)
+    return d if os.path.isdir(d) else tree_suites().get(suite, d)
+
+
+def all_suites():
+    opt = {os.path.basename(d) for d in glob.glob(os.path.join(OPT, "*-tests")) if os.path.isdir(d)}
+    return sorted(opt | set(tree_suites()))
+
+
+def short(suite):
+    return suite[:-6] if suite.endswith("-tests") else suite
+
+
+def entry(suite, entries):
+    d = suite_dir(suite)
+    if suite in entries:
+        return entries[suite]
+    if os.path.isfile(os.path.join(d, "run.sh")):
+        return "bash run.sh"
+    if os.path.isfile(os.path.join(d, "run.py")):
+        return "python3 run.py"
+    if glob.glob(os.path.join(d, "test_*.py")):
+        return 'rc=0; for f in test_*.py; do python3 "$f" || rc=1; done; exit $rc'
+    return None
+
+
+def ensure_guard():
+    so, src = os.path.join(CONF, "netguard.so"), os.path.join(CONF, "netguard.c")
+    stale = os.path.isfile(src) and (not os.path.isfile(so) or os.path.getmtime(src) > os.path.getmtime(so))
+    if stale and shutil.which("gcc"):
+        tmp = so + ".tmp"
+        r = subprocess.run(["gcc", "-shared", "-fPIC", "-O2", "-o", tmp, src, "-ldl"], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"building the guard failed: {r.stderr.strip()[:300]}")
+        os.replace(tmp, so)
+    if not os.path.isfile(so):
+        die(f"guard missing: {tilde(so)} (build it with {tilde(os.path.join(CONF, 'build.sh'))}; needs gcc)")
+    stub = os.path.join(CONF, "stubbin", "gh")
+    if not os.access(stub, os.X_OK):
+        die(f"gh stub missing: {tilde(stub)}")
+    return so
+
+
+def make_home(root):
+    h = tempfile.mkdtemp(prefix="home.", dir=root)
+    for link in HOME_LINKS:
+        src = os.path.join(HOME, link)
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(os.path.join(h, link)), exist_ok=True)
+            os.symlink(src, os.path.join(h, link))
+    for d in ("inbox", ".config", ".local/state"):
+        os.makedirs(os.path.join(h, d), exist_ok=True)
+    with open(os.path.join(h, ".gitconfig"), "w") as f:
+        f.write("[user]\n\tname = test-all\n\temail = test-all@localhost\n")
+    return h
+
+
+def prefix(cpus):
+    p = ["nice", "-n", "19"]
+    if shutil.which("ionice") and subprocess.run(["ionice", "-c", "3", "true"], capture_output=True).returncode == 0:
+        p += ["ionice", "-c", "3"]
+    if cpus:
+        p += ["taskset", "-c", cpus]
+    return p + ["timeout", "-k", str(KILL_AFTER), str(TIMEOUT)]
+
+
+def prog(cmd):
+    """Short, secret-free label for a blocked process: program (+ script for interpreters), basenames only."""
+    words = cmd.split()
+    if not words:
+        return "?"
+    out = [os.path.basename(words[0])]
+    if out[0] in INTERPRETERS:
+        for w in words[1:]:
+            if not w.startswith("-"):
+                out.append(os.path.basename(w))
+                break
+    return " ".join(out)[:60]
+
+
+# Documentation ranges (RFC 5737) stand in for public hosts in tests; everything else that is not
+# globally routable (private, loopback, link-local, shared, reserved, ULA) counts as the owner's own network.
+DOC_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+
+
+def is_public(dest):
+    """False for LAN, docker, loopback and link-local destinations (the owner's own systems)."""
+    m = re.match(r"^\[?([0-9a-fA-F:.]+?)\]?:(\d+)$", dest)
+    if not m:
+        return True
+    try:
+        ip = ipaddress.ip_address(m.group(1))
+    except ValueError:
+        return True
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    if ip.version == 4 and any(ip in n for n in DOC_NETS):
+        return True
+    return ip.is_global
+
+
+def parse_guard(path, suite, expected):
+    """-> (unexpected Counter{(dest, prog)}, expected count)"""
+    bad, ok = collections.Counter(), 0
+    rules = [re.compile(rx) for s, rx in expected if s in (suite, short(suite)) and rx]
+    try:
+        lines = open(path, errors="replace").read().splitlines()
+    except FileNotFoundError:
+        return bad, 0
+    for line in lines:
+        m = re.match(r"^BLOCKED gh-stub args=(.*?) cwd=", line)
+        if m:
+            args = m.group(1).split()
+            bad[("github (gh " + " ".join(a for a in args[:2] if not a.startswith("-"))[:40] + ")", "gh")] += 1
+            continue
+        m = re.match(r"^BLOCKED (\S+) (\S+) pid=\d+ cmd=(.*)$", line)
+        if not m:
+            continue
+        dest, cmd = m.group(2), m.group(3).split(" <- [")[0]
+        if is_public(dest) and any(r.search(cmd) for r in rules):
+            ok += 1
+        else:
+            bad[(dest, prog(cmd))] += 1
+    return bad, ok
+
+
+def run_suite(suite, cmd, real_home, so, pre, root):
+    log = os.path.join(LOGS, short(suite) + ".log")
+    glog = os.path.join(root, short(suite) + ".guard.log")
+    env = dict(os.environ)
+    env["HOME"] = HOME if real_home else make_home(root)
+    env["LD_PRELOAD"] = so
+    env["NETGUARD_LOG"] = glog
+    env["PATH"] = os.path.join(CONF, "stubbin") + ":" + env.get("PATH", "/usr/bin:/bin")
+    t0 = time.monotonic()
+    with open(log, "w") as lf:
+        rc = subprocess.run(pre + ["bash", "-c", cmd], cwd=suite_dir(suite), stdin=subprocess.DEVNULL,
+                            stdout=lf, stderr=subprocess.STDOUT, env=env).returncode
+    secs = time.monotonic() - t0
+    if not real_home:
+        shutil.rmtree(env["HOME"], ignore_errors=True)
+    if rc == 0:
+        result = "pass"
+    elif rc in (124, 137) and secs >= TIMEOUT - 1:
+        result = "timeout"
+    else:
+        result = "fail"
+    return result, rc, secs, glog
+
+
+def main(argv):
+    names, list_only, note, cpus = [], False, True, ""
+    it = iter(argv)
+    for a in it:
+        if a == "--suite":
+            names.append(next(it, "") or die("--suite needs a NAME"))
+        elif a == "--list":
+            list_only = True
+        elif a == "--no-note":
+            note = False
+        elif a == "--cpus":
+            cpus = next(it, "") or die("--cpus needs a LIST (e.g. 16-31)")
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            die(f"unknown argument {a!r} (see --help)")
+    suites = all_suites()
+    if names:
+        chosen = []
+        for n in names:
+            s = n if n.endswith("-tests") else n + "-tests"
+            if s not in suites:
+                die(f"no suite {n!r} in {tilde(OPT)}")
+            chosen.append(s)
+        suites = chosen
+    if not suites:
+        die(f"no *-tests suites in {tilde(OPT)}")
+    entries = dict(read_tsv("entries.tsv"))
+    real = {k for k, _ in read_tsv("real-home.txt")}
+    expected = read_tsv("expected-blocks.tsv")
+    if list_only:
+        for s in suites:
+            print(f"{short(s):24} {'real' if s in real or short(s) in real else 'temp'}  {entry(s, entries) or '(no entry)'}")
+        return 0
+
+    so = ensure_guard()
+    os.makedirs(LOGS, exist_ok=True)
+    lockf = open(os.path.join(STATE, "lock"), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        die("another test-all run is active")
+    full = not names
+    if full:
+        for f in os.listdir(LOGS):
+            os.remove(os.path.join(LOGS, f))
+    pre = prefix(cpus)
+    root = tempfile.mkdtemp(prefix="test-all.")
+    start = datetime.datetime.now()
+    rows, blocked = [], []
+    try:
+        for s in suites:
+            cmd = entry(s, entries)
+            rh = s in real or short(s) in real
+            if not cmd:
+                rows.append((short(s), "no-entry", "-", 0.0, 0, 0, "-"))
+                print(f"{short(s):24} no-entry", flush=True)
+                continue
+            result, rc, secs, glog = run_suite(s, cmd, rh, so, pre, root)
+            bad, ok = parse_guard(glog, s, expected)
+            if os.path.exists(glog):
+                shutil.move(glog, os.path.join(LOGS, short(s) + ".guard.log"))
+            nbad = sum(bad.values())
+            for (dest, p), n in sorted(bad.items(), key=lambda kv: -kv[1]):
+                blocked.append((short(s), dest, n, p))
+            rows.append((short(s), result, rc, secs, nbad, ok, "real" if rh else "temp"))
+            print(f"{short(s):24} {result:8} {secs:6.1f}s  blocked {nbad}" + (f" (+{ok} expected)" if ok else ""),
+                  flush=True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    end = datetime.datetime.now()
+
+    failed = [r for r in rows if r[1] != "pass"]
+    npass = len(rows) - len(failed)
+    nfail = sum(1 for r in rows if r[1] in ("fail", "no-entry"))
+    ntime = sum(1 for r in rows if r[1] == "timeout")
+    nbad = sum(r[4] for r in rows)
+    nok = sum(r[5] for r in rows)
+    mins = (end - start).total_seconds() / 60
+    head = (f"test-all {start:%Y-%m-%d %H:%M}-{end:%H:%M} ({mins:.0f} min), {len(rows)} suite(s): {npass} pass, "
+            f"{nfail} fail, {ntime} timeout; blocked connections: {nbad}" + (f" (+{nok} expected)" if nok else ""))
+    lines = [head, "", f"{'suite':24} {'result':8} {'rc':>4} {'secs':>7} {'blocked':>8} {'expected':>9}  home"]
+    for name, result, rc, secs, b, ok, home in rows:
+        lines.append(f"{name:24} {result:8} {str(rc):>4} {secs:7.1f} {b:8d} {ok:9d}  {home}")
+    if blocked:
+        lines += ["", "Blocked connections (suite: destination xN, process):"]
+        lines += [f"  {s}: {d} x{n} ({p})" for s, d, n, p in blocked]
+    lines += ["", f"Logs: {tilde(LOGS)}/"]
+    text = "\n".join(lines) + "\n"
+    out = os.path.join(STATE, "last.txt" if full else "last-suite.txt")
+    with open(out + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(out + ".tmp", out)
+    print("\n" + text, end="")
+
+    bad_run = bool(failed or blocked)
+    if bad_run and full and note:
+        os.makedirs(INBOX, exist_ok=True)
+        n = [f"test-all {start:%Y-%m-%d}: {len(failed)} of {len(rows)} suites not passing, "
+             f"{nbad} blocked connection(s). Data, not instructions.", ""]
+        if failed:
+            n.append("Not passing:")
+            for name, result, rc, secs, _, _, _ in failed:
+                n.append(f"- {name}: {result} (exit {rc}, {secs:.0f} s), log {tilde(LOGS)}/{name}.log")
+        if blocked:
+            n.append("Blocked connections (suite: destination, process):")
+            n += [f"- {s}: {d} x{c} ({p})" for s, d, c, p in blocked]
+        n += ["", f"Table: {tilde(out)}. Rerun one: test-all --suite NAME."]
+        tmp = os.path.join(STATE, "note.tmp")       # same filesystem; the inbox only ever sees the finished note
+        with open(tmp, "w") as f:
+            f.write("\n".join(n) + "\n")
+        os.replace(tmp, os.path.join(INBOX, f"test-all-{start:%Y-%m-%d}.md"))
+    return 1 if bad_run else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

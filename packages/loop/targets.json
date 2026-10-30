@@ -1,0 +1,20 @@
+{
+ "_doc": "The targets the daily review measures against. Data: change by PR.",
+ "G1": {"name": "tokens per beat turn (mean)", "target": 250000, "unit": "tokens", "dir": "down", "source": "events metrics --beats --days 1", "backlog_2910": "v2 exit E7, 29.10 (28.10 16:10-29.10 17:34): mean 581k, p95 1.70M, 4.27 API calls/beat at 133k context; idle compaction blocked by notes/owner (3 of 6 compactions, the rest auto at ~367k). Idea: compact.json with_notes + lower min_tokens and fewer serial calls per notes beat (simulated ~381k)."},
+ "G1d": {"name": "beat tokens per day", "target": 12000000, "unit": "tokens", "dir": "down", "source": "events metrics --beats --days 1"},
+ "G2": {"name": "first reply to him, p95", "target": 40, "unit": "s", "dir": "down", "source": "traces report --days 1", "backlog_2910": "v2 exit E8, 29.10: p95 45.2 s (n 131); 23.1 s since 14:00 (n 19). Slow turns = 5-14 serial lookups before the first send. Idea: ack after ~12 s (conduct ackslow, landed in shadow: ~/.config/conduct/ackslow-shadow); switch it on if its shadow log shows the gain."},
+ "G3": {"name": "tool-call failures", "target": 1.0, "unit": "%", "dir": "down", "source": "traces report --days 1"},
+ "G3h": {"name": "hook blocks per day", "target": 5, "unit": "", "dir": "down", "source": "traces report --days 1"},
+ "G3p": {"name": "unexpected gateway denies", "target": 0, "unit": "", "dir": "down", "source": "tool policy --days 1"},
+ "G4": {"name": "eval cases newly failing", "target": 0, "unit": "", "dir": "down", "source": "evals summary --hours 26"},
+ "G8": {"name": "correction -> row + case", "target": 24, "unit": "h", "dir": "down", "source": "loop ls --corrections"},
+ "R1": {"name": "reflex misfires in 7 d", "target": 0, "unit": "", "dir": "down", "source": "reflex ls"},
+ "U1": {"name": "errors of an owner-facing feature (30 d)", "target": 0, "unit": "", "dir": "down", "source": "product report --feature ID"},
+ "U2": {"name": "complaints + retries of an owner-facing feature (30 d)", "target": 0, "unit": "", "dir": "down", "source": "product report --feature ID"},
+ "C2": {"name": "cost per agent run (7 d): subagent cost / runs", "target": 3.4, "unit": "$", "dir": "down", "source": "traces agents (cost per landed change from deploys.jsonl op=land ok: info only)", "baseline": "pre-v2 week 15.–22.10: 636 runs, $2,152 ($3.38/run)"},
+ "C1": {"name": "minutes every land was blocked by shared CI blockers (24 h)", "target": 30, "unit": "min", "dir": "down", "source": "assistant ci-status --json"},
+ "U3": {"name": "latency p50 of an owner-facing feature", "target": 5, "unit": "s", "dir": "down", "source": "product report --feature ID"},
+ "H1": {"name": "setup-health anomaly against its 7-day baseline", "target": 0, "unit": "", "dir": "down", "source": "self-review (h) setup health (loop.health; ~/reports/self-review/sources.md)"},
+ "E9": {"name": "typed (gateway) share of domain calls in his turns", "target": 0.8, "unit": "share", "dir": "up", "source": "traces.db owner turns (hub.* tool_counts) + usage.db transcript exec rows of CLIs with a typed twin; no rule in propose.py yet", "backlog_2910": "v2 exit E9, 29.10: 0.167 in the window (typed 3, CLI 15: media 8, reminders 4, calendar 3), 0.12 over 7 d. Idea: an slo tile typed_share + a rule here, then move the top CLI calls (reminders, cat, media, calendar) to their hub twins."},
+ "E10": {"name": "credentials on the brain beyond the declared ones", "target": 0, "unit": "keys", "dir": "down", "source": "hub egress status; no rule in propose.py yet", "backlog_2910": "v2 exit E10, 29.10: radarr in shadow, its full movie list is 13.7 MiB (2415 movies) vs the hub's 8 MiB cap; ha-local and phone-local too. Idea: hub-side paging (unlanded branch exit-e10-radarr @ 1bedf70: 2 pages, 3.4 s; protected hub code -> his card), then his OK to delete the key."}
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.sync.response.json",
+  "title": "GET /v1/sync?after=<id>: pending outbox in order (ack them via /v1/ack)",
+  "type": "object",
+  "properties": {
+    "messages": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object"
+      }
+    },
+    "more": {
+      "type": "boolean"
+    },
+    "config_rev": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "messages",
+    "more"
+  ]
+}

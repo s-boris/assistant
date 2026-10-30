@@ -1,0 +1,36 @@
+@@meta
+now=2026-10-14T17:13:00Z
+@@containers
+{"name": "/claude-bot", "image": "src-bot", "imageId": "sha256:bot", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.10 "}
+{"name": "/nodeapp", "image": "registry.example.org/acme/nodeapp:latest", "imageId": "sha256:2e3d0aba0ee91c579f5282d695e9fad2b8a5f80d0cae6882ebf2ad15d4710dbd", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.11 "}
+{"name": "/regapp", "image": "registry.example.org/acme/regapp:1.0", "imageId": "sha256:249740b1f5acb5af5aa1c3aedbbf7e9e0650cc128457c7a26cf9dd1baaa1a74c", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.12 "}
+{"name": "/histapp", "image": "registry.example.org/acme/histapp:2.0", "imageId": "sha256:25948ac829044d16d9811f6a185f16e1788269924243dcadf80ec549108a2fec", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.13 "}
+{"name": "/bunapp", "image": "oven/bun:1.4.2-slim", "imageId": "sha256:bunx", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.14 "}
+{"name": "/pyapp", "image": "python:3.11.16-slim-bookworm", "imageId": "sha256:pyx", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.15 "}
+{"name": "/oldpy", "image": "registry.example.org/acme/oldpy:latest", "imageId": "sha256:oldx", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.16 "}
+{"name": "/claude-hub-x", "image": "registry.example.org/acme/hub:1", "imageId": "sha256:hubx", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.17 "}
+{"name": "/claude-vault", "image": "claude-vault:local", "imageId": "sha256:vau", "state": "running", "startedAt": "2026-10-01T02:00:34Z", "created": "2026-09-01T12:59:13Z", "labels": {}, "net": "bridge", "ports": {}, "ips": "192.0.2.18 "}
+@@env
+/claude-bot	NODE_VERSION=24.21.0
+/nodeapp	NODE_VERSION=24.22.0
+/nodeapp	YARN_VERSION=1.22.22
+/pyapp	PYTHON_VERSION=3.11.16
+/oldpy	PYTHON_VERSION=3.9.18
+/claude-hub-x	NODE_VERSION=24.22.0
+@@images
+{"id": "sha256:bot", "tags": ["src-bot"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:2e3d0aba0ee91c579f5282d695e9fad2b8a5f80d0cae6882ebf2ad15d4710dbd", "tags": ["registry.example.org/acme/nodeapp:latest"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:249740b1f5acb5af5aa1c3aedbbf7e9e0650cc128457c7a26cf9dd1baaa1a74c", "tags": ["registry.example.org/acme/regapp:1.0"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:25948ac829044d16d9811f6a185f16e1788269924243dcadf80ec549108a2fec", "tags": ["registry.example.org/acme/histapp:2.0"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:bunx", "tags": ["oven/bun:1.4.2-slim"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:pyx", "tags": ["python:3.11.16-slim-bookworm"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:oldx", "tags": ["registry.example.org/acme/oldpy:latest"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:hubx", "tags": ["registry.example.org/acme/hub:1"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+{"id": "sha256:vau", "tags": ["claude-vault:local"], "digests": [], "created": "2026-09-30T00:00:00Z", "labels": {}}
+@@history
+@@unraid-status
+{}
+@@autoupdate
+{}
+@@mdns
+@@end

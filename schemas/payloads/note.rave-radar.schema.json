@@ -1,0 +1,65 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.rave-radar.schema.json",
+ "title": "rave-radar: new shows, lineup hits, presale dates and broken sources (event and source ids)",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "shows",
+  "lineups",
+  "presales",
+  "broken",
+  "ids"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.rave-radar"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "shows": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "lineups": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "presales": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "broken": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "ids": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  },
+  "presale_ids": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  },
+  "broken_ids": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  }
+ }
+}

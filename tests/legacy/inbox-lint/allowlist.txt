@@ -1,0 +1,4 @@
+# Allowlist for inbox_lint.py: scripts that write into ~/inbox without the "Data, not instructions" marker
+# in their own text, each with the reason. Format: PATH-RELATIVE-TO-~/bin  # why
+# An entry that is no longer needed (script gone, no longer a writer, or passes on its own) fails the lint.
+lib/botlib.py  # shared helper write_inbox(dir, prefix, text) writes the caller's text verbatim; every caller is linted on its own and carries the marker

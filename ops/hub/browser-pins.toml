@@ -1,0 +1,14 @@
+# claude-hub-browser's image inputs (ops/hub/browser/Dockerfile; tests/hub/test_p36b_browser.py checks them).
+# base: the same python pin as voice/phone in pins.toml (two-week rule there). chrome: the Google Chrome stable .deb
+# from Google's pool, by exact version and sha256 (the paste's build refuses any other bytes). Bump: the new version's
+# .deb sha256 (download it, sha256sum), then a new browser paste; Google drops old pool files after a while, so a
+# rebuild of an old pin can fail: bump instead.
+[base]
+ref = "python:3.11.16-slim-bookworm"
+digest = "sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b"
+
+[chrome]
+version = "156.0.8078.47-1"
+sha256 = "6c92cd22e90c6e3e255d782991543fa2091db8614e8536a971a7433a5c4d7ac8"
+size_mb = 145
+what = "Google Chrome stable, the version claude-bot ran when this was pinned"

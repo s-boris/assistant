@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<title>Voice</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <span id="dot" class="dot"></span>
+  <span id="state">Not connected</span>
+  <button id="conn" type="button">Connect</button>
+</header>
+<div id="working" hidden><span class="spin"></span> Assistant is working… <span id="wcount"></span></div>
+<main id="log" aria-live="polite"></main>
+<footer>
+  <label class="sw"><input type="checkbox" id="open"> Open mic</label>
+  <button id="talk" type="button" disabled>Hold to talk</button>
+  <form id="typeform" autocomplete="off">
+    <input id="typed" maxlength="1000" placeholder="…or type" enterkeyhint="send">
+    <button type="submit">Send</button>
+  </form>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,157 @@
+{
+ "zigbee_dimmers": {
+  "automation.den_remote": [
+   "den",
+   "Den Dimmer"
+  ],
+  "automation.porch_lights": [
+   "porch",
+   null
+  ]
+ },
+ "scenes": [
+  [
+   "1000000000001",
+   "Movie",
+   "mdi:movie",
+   {
+    "light.den_lamps": {
+     "state": "off"
+    },
+    "light.strip_b": {
+     "state": "off"
+    },
+    "light.strip_a": {
+     "state": "off"
+    }
+   }
+  ],
+  [
+   "1000000000002",
+   "Dim Light",
+   "mdi:desk-lamp",
+   {
+    "light.den_lamps": {
+     "state": "on",
+     "brightness": 76
+    },
+    "light.strip_b": {
+     "state": "on",
+     "brightness": 61,
+     "color_mode": "rgbw",
+     "rgbw_color": [
+      255,
+      145,
+      22,
+      160
+     ],
+     "effect": "Solid"
+    },
+    "light.strip_a": {
+     "state": "on",
+     "brightness": 51,
+     "color_mode": "rgbw",
+     "rgbw_color": [
+      255,
+      155,
+      61,
+      0
+     ],
+     "effect": "Solid"
+    }
+   }
+  ],
+  [
+   "1000000000003",
+   "Ambient",
+   "mdi:lightbulb-on-70",
+   {
+    "light.den_lamps": {
+     "state": "on",
+     "brightness": 51
+    },
+    "light.strip_b": {
+     "state": "on",
+     "brightness": 153,
+     "color_mode": "rgbw",
+     "rgbw_color": [
+      0,
+      90,
+      255,
+      0
+     ],
+     "effect": "Solid"
+    },
+    "light.strip_a": {
+     "state": "on",
+     "brightness": 153,
+     "color_mode": "rgbw",
+     "rgbw_color": [
+      0,
+      90,
+      255,
+      0
+     ],
+     "effect": "Solid"
+    }
+   }
+  ],
+  [
+   "1000000000004",
+   "Full Light",
+   "mdi:desk-lamp-on",
+   {
+    "light.loft_lamp": {
+     "state": "on",
+     "brightness": 254,
+     "color_mode": "color_temp",
+     "color_temp_kelvin": 3500
+    },
+    "light.den_lamps": {
+     "state": "on",
+     "brightness": 255
+    },
+    "light.strip_b": {
+     "state": "on",
+     "brightness": 255,
+     "color_mode": "rgbw",
+     "rgbw_color": [
+      62,
+      29,
+      0,
+      255
+     ],
+     "effect": "Solid"
+    },
+    "light.strip_a": {
+     "state": "on",
+     "brightness": 255,
+     "color_mode": "rgbw",
+     "rgbw_color": [
+      62,
+      29,
+      0,
+      255
+     ],
+     "effect": "Solid"
+    }
+   }
+  ]
+ ],
+ "zigbee_climate": {
+  "name": "Climate Sensor ({})",
+  "rooms": [
+   "Den",
+   "Loft"
+  ]
+ },
+ "hallway": {
+  "automation": "automation.den_presence",
+  "missing_light": "light.den_old",
+  "area_words": "den|study",
+  "light_words": "den|stair"
+ },
+ "remote_swap": [
+  "automation.den_lights_remote"
+ ]
+}

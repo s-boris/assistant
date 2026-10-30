@@ -1,0 +1,103 @@
+#!/usr/bin/env node
+// tutti-fetch URL [--timeout S] [--settle MS]
+// Load ONE Tutti search page (https://www.tutti.ch/{de,fr,it}/q/...) in the headed browser (~/bin/browser, CDP on
+// 127.0.0.1:$BROWSER_CDP_PORT, default 9222) and print one JSON line: {ok, status, url, title, html, challenge}.
+// It opens its own background tab, never touches the MCP's tabs, and always closes its tab (also on timeout).
+// Scope: the owner-approved exception for `deals tutti` only; any other host or path is refused (exit 2).
+// No interaction with the page: no clicks, no typing, no waiting for a challenge to clear. `challenge` = the page
+// looks like a Cloudflare / bot check; the caller stops then.
+// Exit: 0 page read (check `challenge`), 2 usage/refused URL, 3 timeout, 4 browser (CDP) unreachable, 5 other error.
+const args = process.argv.slice(2);
+let url = null, timeout = 45, settle = 2000;
+// CDP: the browser service in claude-hub-browser (browsersvc HUB_CDP, as browsersvc.route() names it for every
+// client); BROWSER_HUB_CDP overrides it, BROWSER_CDP_PORT (tests) points at a CDP on this host's loopback.
+const cdpBase = process.env.BROWSER_CDP_PORT
+  ? `http://127.0.0.1:${Number(process.env.BROWSER_CDP_PORT)}`
+  : (process.env.BROWSER_HUB_CDP || 'http://claude-hub-browser:9223').replace(/\/+$/, '');
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '--timeout') timeout = Number(args[++i]);
+  else if (a === '--settle') settle = Number(args[++i]);
+  else if (a === '-h' || a === '--help') { console.log('usage: tutti-fetch URL [--timeout S] [--settle MS]'); process.exit(0); }
+  else if (!url) url = a;
+  else { console.error('tutti-fetch: unexpected argument ' + a); process.exit(2); }
+}
+let u = null;
+try { u = new URL(url); } catch { /* handled below */ }
+if (!u || u.protocol !== 'https:' || u.hostname !== 'www.tutti.ch' || !/^\/(de|fr|it)\/q\//.test(u.pathname)) {
+  console.error('tutti-fetch: only https://www.tutti.ch/{de,fr,it}/q/... search pages are allowed');
+  process.exit(2);
+}
+if (!(timeout > 0 && timeout <= 120) || !(settle >= 0 && settle <= 10000)) { console.error('tutti-fetch: bad --timeout/--settle'); process.exit(2); }
+
+let ws = null, targetId = null, done = false;
+let nextId = 1;
+const pending = new Map(), listeners = [];
+const send = (method, params = {}, sessionId) => new Promise((res, rej) => {
+  const id = nextId++;
+  pending.set(id, { res, rej });
+  ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+});
+async function finish(obj, code) {
+  if (done) return;
+  done = true;
+  if (targetId && ws && ws.readyState === 1) {
+    try { await Promise.race([send('Target.closeTarget', { targetId }), new Promise((r) => setTimeout(r, 3000))]); } catch { /* gone */ }
+  }
+  try { if (ws) ws.close(); } catch { /* ignore */ }
+  // exit only after the write has flushed: stdout to a pipe is async, and process.exit() would cut a big page short
+  process.stdout.write(JSON.stringify(obj) + '\n', () => process.exit(code));
+  setTimeout(() => process.exit(code), 10000).unref();
+}
+setTimeout(() => finish({ ok: false, error: `timeout after ${timeout}s` }, 3), timeout * 1000);
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => finish({ ok: false, error: 'killed (' + sig + ')' }, 3));
+
+const CHALLENGE = /just a moment|einen moment|un instant|attention required|verify you are human|bestätige?n?,? dass|sicherheitsüberprüfung|access denied/i;
+const PROBE = `JSON.stringify((() => {
+  const html = document.documentElement ? document.documentElement.outerHTML : '';
+  const nd = !!document.getElementById('__NEXT_DATA__');
+  const chal = !nd && (/cf[-_]chl|challenges\\.cloudflare\\.com|id="challenge-(form|running|stage)"|cf-turnstile/i.test(html) || ${CHALLENGE}.test(document.title));
+  return {url: location.href, title: document.title, html, challenge: chal};
+})())`;
+
+(async () => {
+  let ver;
+  try {
+    const r = await fetch(`${cdpBase}/json/version`, { signal: AbortSignal.timeout(3000) });
+    ver = await r.json();
+  } catch (e) { return finish({ ok: false, error: 'browser not reachable over CDP: ' + (e.cause?.code || e.message) }, 4); }
+  ws = new WebSocket(ver.webSocketDebuggerUrl);
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.id && pending.has(m.id)) {
+      const { res, rej } = pending.get(m.id); pending.delete(m.id);
+      if (m.error) rej(new Error(m.error.message)); else res(m.result);
+    } else for (const l of listeners) l(m);
+  };
+  try {
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('websocket error')); });
+  } catch (e) { return finish({ ok: false, error: 'browser not reachable over CDP: ' + e.message }, 4); }
+  try {
+    ({ targetId } = await send('Target.createTarget', { url: 'about:blank', background: true }));
+    const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+    let status = null;
+    listeners.push((m) => {
+      if (m.sessionId === sessionId && m.method === 'Network.responseReceived' && m.params.type === 'Document'
+          && m.params.frameId === targetId) status = m.params.response.status;
+    });
+    await send('Network.enable', {}, sessionId);
+    await send('Page.enable', {}, sessionId);
+    const loaded = new Promise((res) => listeners.push((m) => {
+      if (m.sessionId === sessionId && m.method === 'Page.loadEventFired') res();
+    }));
+    const nav = await send('Page.navigate', { url }, sessionId);
+    if (nav.errorText) throw new Error('navigation failed: ' + nav.errorText);
+    await loaded;
+    await new Promise((r) => setTimeout(r, settle));
+    const r = await send('Runtime.evaluate', { expression: PROBE, returnByValue: true }, sessionId);
+    const page = JSON.parse(r.result.value);
+    return finish({ ok: true, status, ...page }, 0);
+  } catch (e) {
+    return finish({ ok: false, error: String(e.message || e) }, 5);
+  }
+})();

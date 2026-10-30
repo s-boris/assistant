@@ -1,0 +1,618 @@
+{
+ "_about": "FICTIONAL test fixture for ~/bin/deadlines (canton ZZ, town Testhausen; matches the synthetic profile-tests profile). Structure mirrors a real ch-<canton>.json; places, hosts and law references are made up. Never use real data in tests.",
+ "_format": "date: 'MM-DD' (every year) or 'YYYY-MM-DD' (once); window_end: 'MM-DD' for a period; workday: 'before' = if the date is a weekend/ZZ holiday, act on the working day before (conservative), 'after' = the legal deadline moves to the next working day; if: profile key in profile.json (null/unknown = 'if applicable', not synced); covered_by: another tool owns the reminders (sync skips it); remind: [{before: days}] lead times for `deadlines sync`; {year}/{prev}/{next}/{amount} placeholders use the occurrence year; verified: verified | partly | unverified.",
+ "region": "CH / canton ZZ (fictional)",
+ "updated": "2026-10-10",
+ "default_time": "09:00",
+ "deadlines": [
+  {
+   "id": "tax-docs",
+   "title": "Collect tax documents for the {prev} return",
+   "category": "tax",
+   "date": "01-20",
+   "window_end": "02-28",
+   "action": "Lohnausweis, 3a certificate, bank/broker year-end statements arrive now: send them to paperless. `deadlines checklist tax {prev}` shows what's missing.",
+   "remind": [
+    {
+     "before": 0
+    }
+   ],
+   "time": "18:00",
+   "notes": "Lohnausweis usually Jan; banks' tax statements (eSteuerauszug) Jan–Feb; ESTV year-end Kursliste values usually final in Jan–Feb.",
+   "verified": "partly",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "ZZ Steuerverwaltung: eSteuerauszug (import of bank statements into the ZZ tax software)",
+     "url": "https://zz.example/CMS/Webseite/Kanton-Testkanton/Beh-rde/Verwaltung/Finanzdepartement/Steuerverwaltung-3918-DE.html"
+    },
+    {
+     "title": "ESTV Kurslisten (ICTax), year-end values as of 31 Dec",
+     "url": "https://www.estv.admin.ch/de/kurslisten-ictax"
+    }
+   ],
+   "remind_text": "Lohnausweis, 3a certificate and bank/broker tax statements are arriving: send them to me for paperless."
+  },
+  {
+   "id": "tax-docs-check",
+   "title": "Tax documents for {prev}: check what's still missing",
+   "category": "tax",
+   "date": "02-25",
+   "action": "Run the checklist; chase whatever hasn't arrived (3a provider, banks, broker).",
+   "remind": [
+    {
+     "before": 0
+    }
+   ],
+   "time": "18:00",
+   "sync": true,
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "own checklist (deadlines checklist tax YEAR)",
+     "url": "file:///nonexistent/ch-zz.json"
+    }
+   ],
+   "remind_text": "Want me to run the checklist against paperless and list what's missing?"
+  },
+  {
+   "id": "dbst-due",
+   "title": "Federal tax (direkte Bundessteuer) {prev}: general due date",
+   "category": "tax",
+   "date": "03-01",
+   "sync": false,
+   "action": "Pay the federal tax bill within 30 days of receiving it. Prepaying earns nothing (0.0 % on voluntary advance payments in 2026); late interest 4 % (2026 and 2027).",
+   "notes": "EFD ordinance SR 642.124 Art. 1: general due date 1 March of the year after the tax year (text seen in the 2021 consolidation). Informational: no reminder, the bill itself is the trigger (bills tracker).",
+   "verified": "partly",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "EFD: Zinssätze für Abgaben und Steuern (4 % Verzugszins since 1 Jan 2026; 0.0 % on voluntary DBST advance payments)",
+     "url": "https://www.efd.admin.ch/de/zinssaetze-abgaben-steuern"
+    },
+    {
+     "title": "ESTV: no change to federal interest rates for 2027",
+     "url": "https://www.estv.admin.ch/de/newnsb/bCxrY5LSQCuF"
+    },
+    {
+     "title": "EFD-Verordnung über Fälligkeit und Verzinsung der direkten Bundessteuer (SR 642.124), Art. 1",
+     "url": "https://lex.zz.example/tolv/205408/de"
+    }
+   ]
+  },
+  {
+   "id": "tax-return",
+   "title": "ZZ tax return {prev} due",
+   "category": "tax",
+   "date": "03-31",
+   "workday": "after",
+   "action": "File via the ZZ tax software + eFiling (receipts uploaded as attachments), or request an extension online BEFORE the deadline: extension.zz.example/steuernnp (PID + date of birth), up to 30 Nov.",
+   "remind": [
+    {
+     "before": 24
+    },
+    {
+     "before": 7
+    }
+   ],
+   "notes": "The canton sets the deadline each year (ZZR 641.111 § 82) and prints it on the form; 31 March is the standard date for employees (A7 research, consistent with the 30 Nov online-extension cap), but no official zz.example page stating it was found: check the date printed on the 2026 form. Extensions must be asked for before the deadline (StG Art. 1.6.2.4 Fristen).",
+   "verified": "partly",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "ZZ Verordnung über die direkten Steuern (ZZR 641.111) § 82: the cantonal tax administration sets the filing deadline; extension for important reasons",
+     "url": "https://law.zz.example/app/de/texts_of_law/641.111"
+    },
+    {
+     "title": "ZZ Steuerverwaltung: eFiling (receipts digitised as attachments)",
+     "url": "https://zz.example/CMS/Webseite/Kanton-Testkanton/Beh-rde/Verwaltung/Finanzdepartement/Steuerverwaltung/eFiling-6800100-DE.html"
+    }
+   ],
+   "remind_text": "File via eFiling, or extend online first (extension.zz.example/steuernnp, up to 30 Nov)."
+  },
+  {
+   "id": "tax-extension-end",
+   "title": "Extended deadline for the tax return",
+   "category": "tax",
+   "date_from_profile": "tax_extension_until",
+   "if": "tax_extension_until",
+   "workday": "after",
+   "action": "File the return now (the online extension goes to 30 Nov at most; longer only in exceptional cases via the Gemeinde tax office).",
+   "remind": [
+    {
+     "before": 21
+    },
+    {
+     "before": 5
+    }
+   ],
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "ZZ eFristerstreckung natürliche Personen: 'Verlängerung der Einreichefrist bis maximal 30.11.'",
+     "url": "https://zz.example/CMS/Webseite/Kanton-Testkanton/Beh-rde/Verwaltung/Finanzdepartement/Steuerverwaltung-110769-DE.html"
+    },
+    {
+     "title": "Online form",
+     "url": "https://extension.zz.example/steuernnp"
+    }
+   ],
+   "remind_text": "The extended deadline is coming up: file via eFiling."
+  },
+  {
+   "id": "tax-rate-1",
+   "title": "ZZ/Gemeinde taxes {year}: 1st provisional instalment due",
+   "category": "tax",
+   "date": "06-01",
+   "action": "Pay instalment 1 of 3 from the provisional tax bill (Testhausen tax office). 30-day payment term; paying early earns Ausgleichszins.",
+   "remind": [
+    {
+     "before": 3
+    }
+   ],
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "ZZR 641.111 § 99: three instalments due on the 1st day of the 6th, 9th and 12th month; provisional bill at least 7 months before year end. StG Art. 177/178: three instalments, 30-day payment term",
+     "url": "https://law.zz.example/app/de/texts_of_law/641.111"
+    }
+   ],
+   "remind_text": "Instalment 1 of 3 (provisional bill from the Testhausen tax office); 30-day payment term.",
+   "notes": "Interest: Ausgleichszins in your favour on payments made before the final bill, against you from the Verfalltag (30 Sep); rate set yearly by the ZZ Finanzdepartement (last found: 1% Ausgleichs-/Vergütungszins, 5% Verzugszins from 1 Apr 2024; 2026 not confirmed)."
+  },
+  {
+   "id": "tax-rate-2",
+   "title": "ZZ/Gemeinde taxes {year}: 2nd provisional instalment due",
+   "category": "tax",
+   "date": "09-01",
+   "action": "Pay instalment 2 of 3. If instalments 1 and 2 are both unpaid, the whole year's tax falls due without a reminder (StG Art. 177).",
+   "remind": [
+    {
+     "before": 3
+    }
+   ],
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "ZZR 641.111 § 99; ZZR 641.100 Art. 177 Abs. 2",
+     "url": "https://law.zz.example/app/de/texts_of_law/641.100"
+    }
+   ],
+   "remind_text": "Instalment 2 of 3. If 1 and 2 are both unpaid, the whole year falls due.",
+   "notes": "Interest: Ausgleichszins in your favour on payments made before the final bill, against you from the Verfalltag (30 Sep); rate set yearly by the ZZ Finanzdepartement (last found: 1% Ausgleichs-/Vergütungszins, 5% Verzugszins from 1 Apr 2024; 2026 not confirmed)."
+  },
+  {
+   "id": "tax-rate-3",
+   "title": "ZZ/Gemeinde taxes {year}: 3rd provisional instalment due",
+   "category": "tax",
+   "date": "12-01",
+   "action": "Pay instalment 3 of 3. Interest is settled with the final bill: in your favour on what you paid early, against you from the Verfalltag (30 Sep) on anything still open.",
+   "remind": [
+    {
+     "before": 3
+    }
+   ],
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "ZZR 641.111 §§ 98–99 (Verfalltag = last day of the 9th month); ZZR 641.100 Art. 175 Ausgleichszinsen",
+     "url": "https://law.zz.example/app/de/texts_of_law/641.111"
+    }
+   ],
+   "remind_text": "Instalment 3 of 3; interest is settled with the final bill.",
+   "notes": "Interest: Ausgleichszins in your favour on payments made before the final bill, against you from the Verfalltag (30 Sep); rate set yearly by the ZZ Finanzdepartement (last found: 1% Ausgleichs-/Vergütungszins, 5% Verzugszins from 1 Apr 2024; 2026 not confirmed)."
+  },
+  {
+   "id": "pillar3a",
+   "title": "Säule 3a {year}: pay in the maximum ({amount}) — it must be credited by 31 Dec",
+   "category": "money",
+   "date": "12-31",
+   "workday": "before",
+   "amounts": {
+    "2026": "CHF 7,258",
+    "2027": "CHF 7,373"
+   },
+   "action": "Pay early (aim for mid-December: credit date counts, not debit date). Back-payment: once {year}'s full {amount} is in, you can also buy in a {prev} gap (first possible in 2026 for a 2025 gap; up to 10 years back, gaps from 2025 on only; one buy-in per gap year, max one 'small' amount per buy-in); deductible in the year paid.",
+   "remind": [
+    {
+     "before": 30
+    },
+    {
+     "before": 14
+    }
+   ],
+   "notes": "Max for employees with a pension fund: 2026 CHF 7,258 (BSV), 2027 CHF 7,373 (from 1 Jan 2027, admin.ch 5 Oct 2026). Buy-in conditions (BSV FAQ): 3a-eligible with AHV-liable income both in the buy-in year and the gap year, and the maximum paid in the buy-in year.",
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "BSV: Beiträge Säule 3a ('spätestens am 31. Dezember … verbucht'; buy-ins from tax year 2026 for 2025; deductible in the year paid)",
+     "url": "https://www.bsv.admin.ch/de/beitrag-3-sauele"
+    },
+    {
+     "title": "admin.ch 2026-10-05: Höchstabzüge Säule 3a im Steuerjahr 2027 (CHF 7,373)",
+     "url": "https://www.admin.ch/de/newnsb/6ck3kzVxBNQ4"
+    },
+    {
+     "title": "BSV FAQ: Wie lange zurück sind Einkäufe in die Säule 3a möglich?",
+     "url": "https://faq.bsv.admin.ch/de/3-saeule/einkaeufe-saeule-3a/wie-lange-zurueck-sind-einkaeufe-die-saeule-3a-moeglich"
+    },
+    {
+     "title": "BSV FAQ: Bedingungen für einen Einkauf",
+     "url": "https://faq.bsv.admin.ch/de/3-saeule/einkaeufe-saeule-3a/welches-sind-die-wichtigsten-bedingungen-die-erfuellt-sein-muessen"
+    },
+    {
+     "title": "BSV FAQ: maximaler Einkaufsbetrag ('kleiner Beitrag')",
+     "url": "https://faq.bsv.admin.ch/de/3-saeule/einkaeufe-saeule-3a/wie-hoch-ist-der-maximale-einkaufsbetrag-die-saeule-3a"
+    },
+    {
+     "title": "Bundesrat 2024-11-06: nachträgliche Einkaufsmöglichkeit in die Säule 3a (BVV 3, in force 1 Jan 2025)",
+     "url": "https://www.admin.ch/de/nsb?id=103044"
+    }
+   ],
+   "remind_text": "Max {amount} for {year}; the credit date counts, so pay by mid-Dec. A {prev} gap can be bought in once {year} is full."
+  },
+  {
+   "id": "kk-switch",
+   "title": "Krankenkasse: switching notice must ARRIVE by 30 Nov (also lowering the franchise)",
+   "category": "insurance",
+   "date": "11-30",
+   "workday": "before",
+   "covered_by": "kk-compare (reminders tag kk-2027)",
+   "action": "See kk-compare: premiums for next year arrive by 31 Oct; send the cancellation registered by mid-Nov.",
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "BAG: Versichererwechsel (Kündigung bis 30. November, Eingang massgebend)",
+     "url": "https://www.bag.admin.ch/de/praemien-und-kosten-antworten-auf-haeufige-fragen"
+    }
+   ]
+  },
+  {
+   "id": "kk-franchise-up",
+   "title": "Krankenkasse: raise the franchise for {next} (tell the insurer in writing by 31 Dec)",
+   "category": "insurance",
+   "date": "12-31",
+   "workday": "before",
+   "action": "Only if you stay with your insurer and want a higher franchise from 1 Jan (BAG recommends writing by mid-December). Lowering it needed 30 Nov. kk-compare --franchise-matrix shows the break-even.",
+   "remind": [
+    {
+     "before": 17
+    }
+   ],
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "BAG: Prämien und Kosten, häufige Fragen (höhere Franchise nur auf Jahresbeginn, spätestens Mitte Dezember mitteilen)",
+     "url": "https://www.bag.admin.ch/de/praemien-und-kosten-antworten-auf-haeufige-fragen"
+    },
+    {
+     "title": "BAG Merkblatt Versichererwechsel (höhere Franchise: schriftlich bis 31. Dezember)",
+     "url": "https://www.bag.admin.ch/dam/de/sd-web/jOFDKmdfSsFS/PG26-FB-Versichererwechsel_DE.pdf"
+    }
+   ],
+   "remind_text": "Only if you stay with your insurer and want a higher franchise from 1 Jan; tell them in writing by mid-Dec."
+  },
+  {
+   "id": "serafe",
+   "title": "Serafe household fee {year}: annual invoice ({amount})",
+   "category": "bills",
+   "date_from_profile": "serafe_invoice_date",
+   "repeat_years": true,
+   "if": "serafe_invoice_date",
+   "sync": false,
+   "amounts": {
+    "2026": "CHF 335",
+    "2027": "CHF 312",
+    "2028": "CHF 312",
+    "2029": "CHF 300"
+   },
+   "action": "Pay within 60 days (annual invoice; quarterly invoices on request, due in 30 days). The bills tracker picks the invoice up.",
+   "notes": "Households are randomly split into 12 billing groups, each invoiced in a different month, so the month is individual: set serafe_invoice_date once the invoice shows up. Fee cut to CHF 312 from 1 Jan 2027 (RTVV change) and CHF 300 from 2029; the SRG initiative (CHF 200) was rejected on 8 Mar 2026.",
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "BAKOM: amount and billing (CHF 335; 12 billing groups; annual bills due in 60 days, quarterly in 30)",
+     "url": "https://www.bakom.admin.ch/en/amount-and-billing"
+    },
+    {
+     "title": "UVEK Faktenblatt 2: Haushalts- und Unternehmensabgabe (2027: CHF 312, from 2029: CHF 300)",
+     "url": "https://www.uvek.admin.ch/dam/de/sd-web/GWq9i34XTBvg/Faktenblatt%202%20%E2%80%93%20Haushalts-%20und%20Unternehmensabgabe.pdf"
+    },
+    {
+     "title": "BAKOM: Abgabe für Radio und Fernsehen",
+     "url": "https://www.bakom.admin.ch/de/abgabe"
+    }
+   ]
+  },
+  {
+   "id": "halbtax",
+   "title": "Halbtax renews automatically: last day to cancel",
+   "category": "subscriptions",
+   "date_from_profile": "halbtax_expiry",
+   "repeat_years": true,
+   "if": "halbtax_expiry",
+   "action": "The Halbtax renews itself yearly; the invoice comes 2 months before. Cancel at least 1 month before renewal on swisspass.ch (Abos → Kündigungsinformationen) if you don't want it, or switch to a GA.",
+   "remind_text": "Keep it? Renewal invoice is out; cancel on swisspass.ch by this date if not.",
+   "remind": [
+    {
+     "before": 7
+    }
+   ],
+   "notes": "halbtax_expiry = last day of the current validity (from swisspass.ch). With eBill there's no separate cancellation reminder from SBB.",
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "SBB: Halbtax kündigen (auto-renewal, invoice 2 months before, cancel 1 month before)",
+     "url": "https://www.sbb.ch/de/hilfe-und-kontakt/meine-abos/halbtax-kuendigen.html"
+    }
+   ],
+   "offset_months": -1
+  },
+  {
+   "id": "ga",
+   "title": "GA renews automatically: last day to cancel",
+   "category": "subscriptions",
+   "date_from_profile": "ga_expiry",
+   "repeat_years": true,
+   "if": "ga_expiry",
+   "action": "Check the GA's renewal and cancellation date on swisspass.ch (assumed to work like the Halbtax: cancel about a month before renewal).",
+   "remind_text": "GA renewal coming: keep it or cancel on swisspass.ch.",
+   "remind": [
+    {
+     "before": 7
+    }
+   ],
+   "verified": "unverified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "SBB help: subscriptions (check the GA's own terms)",
+     "url": "https://www.sbb.ch/de/hilfe-und-kontakt/meine-abos/halbtax-kuendigen.html"
+    }
+   ],
+   "offset_months": -1
+  },
+  {
+   "id": "w8ben",
+   "title": "W-8BEN at your foreign broker expires",
+   "category": "money",
+   "date_from_profile": "w8ben_signed",
+   "offset_years": 3,
+   "to_year_end": true,
+   "if": "w8ben_signed",
+   "action": "Re-sign the W-8BEN in the broker's portal before it lapses, or US dividends get 30 % withheld instead of the 15 % treaty rate.",
+   "remind_text": "Re-sign the W-8BEN in your broker's portal (else 30 % US withholding instead of 15 %).",
+   "remind": [
+    {
+     "before": 45
+    },
+    {
+     "before": 10
+    }
+   ],
+   "notes": "Valid from signing until the last day of the third succeeding calendar year (IRS). Foreign withholding tax on dividends is reclaimed/credited with form DA-1 filed with the ZZ tax return; the claim lapses 3 years after the end of the tax period.",
+   "verified": "verified",
+   "checked": "2026-10-10",
+   "sources": [
+    {
+     "title": "IRS: Instructions for Form W-8BEN ('ending on the last day of the third succeeding calendar year')",
+     "url": "https://www.irs.gov/instructions/iw8ben"
+    },
+    {
+     "title": "ESTV: Formular DA-1 (Steuerperiode 2025), filed with the tax return and Wertschriftenverzeichnis",
+     "url": "https://www.estv.admin.ch/dam/de/sd-web/lHoSrqmLYYR5/dbst-form-da-1-2025-de.pdf"
+    },
+    {
+     "title": "ESTV Merkblatt DA-M (3-year lapse)",
+     "url": "https://www.estv.admin.ch/dam/de/sd-web/i-sMWISTUVAc/vst-mb-da-m-de.pdf"
+    }
+   ]
+  }
+ ],
+ "checklists": {
+  "tax": {
+   "title": "ZZ tax return {prev}: documents to collect",
+   "exclude_types": [
+    "Lohnausweis",
+    "Lohnabrechnung",
+    "Arbeitsvertrag",
+    "Arbeitszeugnis",
+    "Kündigung"
+   ],
+   "items": [
+    {
+     "id": "lohnausweis",
+     "title": "Lohnausweis {prev} (from every employer that year)",
+     "from": "employer",
+     "when": "Jan–Feb {year}",
+     "why": "Income; required attachment (Einkünfte → Lohnausweis)",
+     "paperless": {
+      "queries": [
+       "Lohnausweis",
+       "Salary certificate",
+       "Certificat de salaire"
+      ],
+      "exclude_types": [],
+      "year_mode": "period",
+      "confirm": "Lohnausweis|Salary certificate|Certificat de salaire"
+     }
+    },
+    {
+     "id": "pillar3a-cert",
+     "title": "Säule 3a certificate {prev} (Bescheinigung über 3a-Beiträge, incl. any buy-in)",
+     "from": "3a bank/foundation/app",
+     "when": "Jan {year}",
+     "why": "3a deduction (2026: max CHF 7,258), plus a buy-in for a 2025 gap",
+     "paperless": {
+      "queries": [
+       "Säule 3a",
+       "Vorsorgekonto",
+       "gebundene Vorsorge",
+       "Vorsorgestiftung",
+       "VIAC",
+       "frankly",
+       "Musterbank 3a"
+      ],
+      "confirm": "3a|gebundene (Selbst)?vorsorge|Vorsorgestiftung|Vorsorgekonto"
+     }
+    },
+    {
+     "id": "bank-statements",
+     "title": "Bank and Swiss broker tax statements {prev} (eSteuerauszug / Zins- und Saldobestätigung per 31.12.{prev})",
+     "from": "each bank and Swiss broker",
+     "when": "Jan–Feb {year}",
+     "why": "Wertschriften- und Guthabenverzeichnis (wealth and income); an eSteuerauszug imports straight into the ZZ tax software",
+     "paperless": {
+      "queries": [
+       "Steuerauszug",
+       "Saldobestätigung",
+       "Zinsausweis",
+       "Vermögensausweis",
+       "Steuerreport",
+       "Jahresauszug"
+      ],
+      "confirm": "Steuerauszug|Saldo|Zinsausweis|Vermögensausweis|Steuerreport|Kontoauszug|Zinsabschluss"
+     }
+    },
+    {
+     "id": "broker-foreign",
+     "title": "Foreign broker annual statement {prev} (positions at 31.12., dividends, withholding tax), for the securities list and form DA-1",
+     "if": "foreign_broker",
+     "from": "foreign broker (e.g. annual activity statement)",
+     "when": "Jan–Mar {year}",
+     "why": "Foreign holdings are declared at the ESTV Kursliste value; foreign withholding tax is reclaimed/credited with DA-1 (filed with the return; lapses after 3 years)",
+     "paperless": {
+      "queries": [
+       "Musterbroker",
+       "Activity Statement",
+       "1042-S",
+       "DEGIRO",
+       "Trading 212"
+      ],
+      "confirm": "Musterbroker|Activity Statement|1042-S|DEGIRO|Trading 212|Brokerage"
+     }
+    },
+    {
+     "id": "crypto",
+     "title": "Crypto balances at 31.12.{prev} (per wallet/exchange)",
+     "if": "crypto",
+     "from": "exchanges / wallets",
+     "when": "Jan {year}",
+     "why": "Declared as wealth at the ESTV year-end rate",
+     "paperless": {
+      "queries": [
+       "Bitcoin",
+       "Krypto",
+       "Coinbase",
+       "Kraken",
+       "Binance"
+      ],
+      "confirm": "Bitcoin|BTC|Krypto|crypto|Ethereum"
+     }
+    },
+    {
+     "id": "pk-buyin",
+     "title": "Pension fund (BVG) buy-in confirmation {prev}",
+     "if": "pk_buyin",
+     "from": "pension fund",
+     "when": "Jan {year}",
+     "why": "Buy-ins are fully deductible",
+     "paperless": {
+      "queries": [
+       "Einkauf Pensionskasse",
+       "Einkaufsbestätigung",
+       "Pensionskasse Einkauf"
+      ],
+      "confirm": "Einkauf"
+     }
+    },
+    {
+     "id": "commute",
+     "title": "Commuting costs {prev} (public transport pass / tickets to Testwil)",
+     "optional": true,
+     "from": "SBB / SwissPass account",
+     "when": "any time",
+     "why": "Berufskosten: travel to work by public transport (Lohnausweis box F matters)",
+     "paperless": {
+      "queries": [
+       "Halbtax",
+       "Generalabonnement",
+       "SwissPass",
+       "Z-Pass",
+       "ZVV"
+      ],
+      "confirm": "Halbtax|Generalabonnement|GA|Z-Pass|ZVV|Ostwind|Abonnement"
+     }
+    },
+    {
+     "id": "kk-premiums",
+     "title": "Krankenkasse premium statement {prev} (and medical bills if they were high)",
+     "optional": true,
+     "from": "health insurer",
+     "when": "Jan {year}",
+     "why": "Insurance premiums go into the capped ZZ insurance deduction; medical costs only count above a threshold",
+     "paperless": {
+      "queries": [
+       "Prämienbestätigung",
+       "Krankenkasse",
+       "Grundversicherung",
+       "Versicherungsausweis"
+      ],
+      "confirm": "Prämie|Krankenversicherung|Grundversicherung|KVG"
+     }
+    },
+    {
+     "id": "donations",
+     "title": "Donation receipts {prev}",
+     "optional": true,
+     "from": "charities",
+     "when": "Jan–Feb {year}",
+     "why": "Deductible above a minimum; eFiling flags a missing receipt",
+     "paperless": {
+      "queries": [
+       "Spendenbestätigung",
+       "Spendenbescheinigung",
+       "Zuwendungsbestätigung",
+       "Spende"
+      ],
+      "confirm": "Spende|Zuwendung"
+     }
+    },
+    {
+     "id": "tax-bill",
+     "title": "Provisional tax bill {prev} and instalment payments (to reconcile)",
+     "optional": true,
+     "from": "Testhausen tax office",
+     "when": "from ~May {prev}",
+     "why": "Shows what you've already paid towards {prev}",
+     "paperless": {
+      "queries": [
+       "provisorische Steuerrechnung",
+       "Steuerrechnung",
+       "Schlussrechnung",
+       "Veranlagung"
+      ],
+      "confirm": "Steuer"
+     }
+    },
+    {
+     "id": "tax-form",
+     "title": "ZZ tax return form {prev} with the eFiling code (by mail)",
+     "from": "cantonal tax administration",
+     "when": "early {year}",
+     "why": "The printed eFiling code is needed to submit online"
+    }
+   ]
+  }
+ }
+}

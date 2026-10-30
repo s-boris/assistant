@@ -1,0 +1,1075 @@
+#!/usr/bin/env python3
+"""parcels: what's coming. His shop orders and parcels in one list, pickup deadlines, one reminder per station run.
+
+  parcels [card] [--json]       the card (cache only, instant): pickups first, then what's on the way, carrier
+                                notices, recent deliveries; "as of HH:MM"; a source that failed → "⚠️ Not checked"
+  parcels refresh [--only S,..] [--no-mail] [--no-remind] [--dry-run] [--json] [--cron]
+                                read the sources and rebuild the cache, then sync the pickup reminder (locked; --cron
+                                = quiet, failures → one ~/inbox note per failing source streak)
+  parcels line                  one line for the /shop card (empty when nothing is coming)
+  parcels speak                 one or two spoken sentences for the voice fast lane (cache only; exit 4 = no cache)
+  parcels board [--json]        the app Board item for a parcel waiting for pickup ({} when none)
+  parcels picked [station|ID]   he picked them up: hide them (station = every pickup), cancel the pickup reminder
+  parcels sync-reminder [--dry-run]
+
+Sources (read-only, his own accounts): shop order pages through `shop-orders-fetch` (headed browser, own background
+tab, never logs in; Amazon.de Your Orders, Galaxus, Brack) and the vault's mail flags (`vault gmail search --json`:
+sender/date/category; `vault gmail get REF --json`: the quick card's action, pick_up = a pickup notice; `vault ask
+gmail REF --kind when`: date + where, never text). Tracking numbers, order numbers and addresses are never stored:
+ids are hashes, a destination is only home / station / other / pickup (a pickup point: its town only).
+Where: an Amazon card naming the configured station town = the parcel station; "Delivered" there = waiting for
+pickup until delivered + hold_days. Pickup notices (card action pick_up) from carriers and from pickup-only senders
+(mail.pickup_queries, default AliExpress's notice sender; their other mails are skipped) = waiting at a pickup point
+(town from the vault's venue/address) since the ready date, shown for pickup_keep_days (no deadline known).
+Pull-only: the only message is the station pickup reminder (`remind add --owner`, tag
+parcel:pickup, deduped against any 📦 reminder naming the same deadline; a store run along the station town from
+`shop plan --along` is added to its text).
+Config ~/.config/parcels/config.json (private): station {town, hold_days, remind_days_before, remind_at},
+home_town (else `profile-get home.town`), shops {name: url}, mail {queries, station_queries, pickup_queries,
+pickup_keep_days, days, max_new, budget_s}.
+State ~/.local/state/parcels/cache.json (0600). Env (tests): PARCELS_NOW, PARCELS_STATE, PARCELS_CONFIG,
+PARCELS_FETCH, PARCELS_INBOX. Exit: 0 ok, 2 usage, 3 refresh: every source failed, 4 no cache yet (speak).
+"""
+import argparse
+import datetime as dt
+import difflib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.environ.get("PARCELS_STATE") or os.path.join(HOME, ".local/state/parcels")
+CONFIG = os.environ.get("PARCELS_CONFIG") or os.path.join(HOME, ".config/parcels/config.json")
+FETCH = os.environ.get("PARCELS_FETCH") or "shop-orders-fetch"
+INBOX = os.environ.get("PARCELS_INBOX") or os.path.join(HOME, "inbox")
+CACHE = os.path.join(STATE_DIR, "cache.json")
+
+DEFAULTS = {
+    "shops": {"amazon": "https://www.amazon.de/gp/css/order-history",
+              "galaxus": "https://www.galaxus.ch/de/order",
+              "brack": "https://www.brack.ch/mein-konto/auftraege"},
+    "station": {"town": None, "hold_days": 14, "remind_days_before": 2, "remind_at": "17:30"},
+    "home_town": None,
+    "mail": {"queries": ["post.ch", "dhl", "dpd", "planzer", "ups"], "station_queries": [],
+             "pickup_queries": ["from:notice.aliexpress.com"], "pickup_keep_days": 14, "days": 7,
+             "max_new": 4, "max_cards": 20, "budget_s": 240},
+    "order_days": 45, "brack_days": 10, "delivered_keep_days": 3, "stale_hours": 6, "fail_note_after": 4,
+}
+SHOP_NAMES = {"amazon": "Amazon", "galaxus": "Galaxus", "brack": "Brack"}
+ACTIVE = ("ordered", "shipped", "out", "pickup")
+WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+WD_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+MONTHS = {}
+for _i, _names in enumerate([("january", "januar", "jan", "jän"), ("february", "februar", "feb"),
+                             ("march", "märz", "mar", "mär", "mrz"), ("april", "apr"), ("may", "mai"),
+                             ("june", "juni", "jun"), ("july", "juli", "jul"), ("august", "aug"),
+                             ("september", "sept", "sep"), ("october", "oktober", "oct", "okt"),
+                             ("november", "nov"), ("december", "dezember", "dec", "dez")], 1):
+    for _n in _names:
+        MONTHS[_n] = _i
+WEEKDAYS = {n: i for i, ns in enumerate([("monday", "montag", "mon", "mo"), ("tuesday", "dienstag", "tue", "di"),
+                                          ("wednesday", "mittwoch", "wed", "mi"), ("thursday", "donnerstag", "thu", "do"),
+                                          ("friday", "freitag", "fri", "fr"), ("saturday", "samstag", "sat", "sa"),
+                                          ("sunday", "sonntag", "sun", "so")]) for n in ns}
+
+
+# ------------------------------------------------------------------------------------------------ plumbing
+def now():
+    v = os.environ.get("PARCELS_NOW")
+    if v:
+        return dt.datetime.fromisoformat(v).replace(tzinfo=None)
+    return dt.datetime.now()
+
+
+def today():
+    return now().date()
+
+
+def hid(*parts):
+    return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()[:10]
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(CONFIG) as f:
+            mine = json.load(f)
+        for k, v in mine.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    except (OSError, ValueError):
+        pass
+    if not cfg.get("home_town"):
+        try:
+            cfg["home_town"] = subprocess.run(["profile-get", "home.town"], capture_output=True, text=True,
+                                              timeout=5).stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            cfg["home_town"] = None
+    return cfg
+
+
+def load_cache():
+    try:
+        with open(CACHE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_cache(d):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = CACHE + ".tmp%d" % os.getpid()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, CACHE)
+
+
+def usage_log(kind="exec", outcome=None, attrs=None, feature="bin.parcels", ms=None):
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+        import usage
+        ch = usage.caller_channel()
+        usage.log(feature, kind, channel=ch, actor=usage.caller_actor(ch), ms=ms, outcome=outcome, attrs=attrs or {})
+    except Exception:
+        pass
+
+
+def run(argv, timeout):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except OSError as e:
+        return 127, "", str(e)
+
+
+def iso(d):
+    return d.isoformat() if d else None
+
+
+def pdate(s):
+    try:
+        return dt.date.fromisoformat(str(s)[:10]) if s else None
+    except ValueError:
+        return None
+
+
+def fmt_day(d, t=None):
+    t = t or today()
+    if d == t:
+        return "today"
+    if d == t + dt.timedelta(days=1):
+        return "tomorrow"
+    if d == t - dt.timedelta(days=1):
+        return "yesterday"
+    return "%s %d.%d" % (WD[d.weekday()], d.day, d.month)
+
+
+def say_day(d, t=None):
+    t = t or today()
+    if d == t:
+        return "today"
+    if d == t + dt.timedelta(days=1):
+        return "tomorrow"
+    if 0 < (d - t).days < 7:
+        return WD_LONG[d.weekday()]
+    return "%s %d.%d" % (WD_LONG[d.weekday()], d.day, d.month)
+
+
+# ------------------------------------------------------------------------------------------------ date parsing
+def _year_for(month, day, ref, future):
+    """The year that puts (month, day) next to ref: future dates (ETAs) on or after ref minus a few days, past
+    dates (delivered, ordered) on or before ref plus a day."""
+    for y in (ref.year - 1, ref.year, ref.year + 1):
+        try:
+            d = dt.date(y, month, day)
+        except ValueError:
+            continue
+        if future and d >= ref - dt.timedelta(days=7) and d <= ref + dt.timedelta(days=300):
+            return d
+        if not future and d <= ref + dt.timedelta(days=1) and d >= ref - dt.timedelta(days=360):
+            return d
+    return None
+
+
+def parse_when(s, ref, future=True):
+    """'today', 'tomorrow', 'Tuesday', '27 October', 'Oct 27', '24.10.', '6.11.2026', '15 October 2026' → date."""
+    s = (s or "").strip().lower().replace(",", " ")
+    if not s:
+        return None
+    if re.match(r"(today|heute)\b", s):
+        return ref
+    if re.match(r"(tomorrow|morgen)\b", s):
+        return ref + dt.timedelta(days=1)
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})?", s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
+        try:
+            return dt.date(int(y), mo, d) if y else _year_for(mo, d, ref, future)
+        except ValueError:
+            return None
+    m = re.search(r"(\d{1,2})\.?\s+([a-zäö]+)\.?(?:\s+(\d{4}))?", s)
+    if m and m.group(2) in MONTHS:
+        d, mo = int(m.group(1)), MONTHS[m.group(2)]
+        try:
+            return dt.date(int(m.group(3)), mo, d) if m.group(3) else _year_for(mo, d, ref, future)
+        except ValueError:
+            return None
+    m = re.search(r"([a-zäö]+)\.?\s+(\d{1,2})(?:\s+(\d{4}))?\b", s)
+    if m and m.group(1) in MONTHS:
+        d, mo = int(m.group(2)), MONTHS[m.group(1)]
+        try:
+            return dt.date(int(m.group(3)), mo, d) if m.group(3) else _year_for(mo, d, ref, future)
+        except ValueError:
+            return None
+    m = re.match(r"([a-z]+)\b", s)
+    if m and m.group(1) in WEEKDAYS:
+        delta = (WEEKDAYS[m.group(1)] - ref.weekday()) % 7
+        return ref + dt.timedelta(days=delta if future else delta - 7 if delta else 0)
+    return None
+
+
+def parse_range(s, ref):
+    """'24 October - 27 October' / 'zwischen Sa, 24.10. und Fr, 6.11.' / 'Tuesday' → (from, to)."""
+    parts = re.split(r"\s+(?:-|–|und|and|bis|to)\s+", s or "", maxsplit=1)
+    a = parse_when(parts[0], ref, True)
+    b = parse_when(parts[1], ref, True) if len(parts) > 1 else None
+    if a and b and b < a:
+        b = None
+    return a, (b or a)
+
+
+# ------------------------------------------------------------------------------------------------ item names
+_NOISE = re.compile(r"(?i)^(?:(?:set|pack|packung|lot|box) of \d+|\d+\s*(?:er|x|pcs|pieces|stück|stk)\b(?:[- ]?(?:set|pack))?)\s*")
+_MEASURE = re.compile(r"(?i)\b\d+(?:[.,]\d+)?\s*(?:x\s*\d+(?:[.,]\d+)?\s*)*(?:cm|mm|m|g|kg|ml|l|w|v|mah|gb|tb|inch|zoll|\"|pcs|pieces|stück|count)?\b")
+
+
+def short_name(title, words=4):
+    """A short label for one of his own order items: no brand prefix, packs or sizes, at most `words` words."""
+    t = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", title or "")
+    for seg in re.split(r"\s*(?:,|\||;|\s-\s|\s–\s)\s*", t):
+        seg = seg.strip()
+        seg = re.sub(r"^[A-ZÄÖÜ0-9&]{3,}(?:\s+[A-ZÄÖÜ0-9&]{2,})?\s+(?=\S)", "", seg) if re.match(
+            r"^[A-ZÄÖÜ0-9&]{3,}\s+\S*[a-zäöü]", seg) else seg
+        for _ in range(3):
+            seg = _NOISE.sub("", seg).strip()
+        seg = _MEASURE.sub(" ", seg)
+        ws = [w for w in re.split(r"\s+", seg) if re.search(r"[A-Za-zÄÖÜäöü]{2,}", w)]
+        if len(ws) >= 2 or (ws and len(ws[0]) >= 4 and not re.fullmatch(r"[A-ZÄÖÜ]+", ws[0])):
+            return " ".join(ws[:words])[:36]
+    return ""
+
+
+# ------------------------------------------------------------------------------------------------ sources: shops
+def fetch(url, timeout=60):
+    rc, out, err = run([FETCH, url, "--settle", "3500"], timeout + 15)
+    if rc == 124:
+        raise RuntimeError("timeout")
+    try:
+        d = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
+    except ValueError:
+        d = {}
+    if rc != 0 or not d.get("ok"):
+        raise RuntimeError((d.get("error") or err.strip() or "exit %d" % rc)[:80])
+    if d.get("login"):
+        raise RuntimeError("sign-in needed")
+    if d.get("challenge"):
+        raise RuntimeError("bot check")
+    if d.get("status") and int(d["status"]) >= 400:
+        raise RuntimeError("http %s" % d["status"])
+    return d
+
+
+AMZ_STATUS = [
+    ("cancel", re.compile(r"(?i)\b(cancelled|canceled|storniert)\b")),
+    ("return", re.compile(r"(?i)\b(return started|return complete|refunded|refund issued|rücksendung|erstattet)\b")),
+    ("pickup", re.compile(r"(?i)(ready for (?:collection|pick-?up)|available for (?:collection|pick-?up)|abholbereit|zur abholung bereit)")),
+    ("delivered", re.compile(r"(?i)\b(?:delivered|zugestellt|geliefert)\b(?:\s+(?:on|am))?\s*([0-9]{1,2}\.?\s*[A-Za-zäö]+|[A-Za-zäö]+\.?\s+[0-9]{1,2}|today|yesterday|heute|gestern)?")),
+    ("out", re.compile(r"(?i)(out for delivery|in zustellung|wird heute zugestellt)")),
+    ("arriving", re.compile(r"(?i)(?:now arriving|arriving|now expected|expected by|arrives|lieferung|zustellung voraussichtlich|voraussichtliche zustellung)\s+(?:on\s+|am\s+|by\s+)?((?:today|tomorrow|heute|morgen|[A-Za-zäö]+\.?,?\s*\d{0,2}\.?\s*[A-Za-zäö]*\.?)(?:\s*(?:-|–|and|und|bis)\s*[A-Za-zäö]*\.?,?\s*\d{1,2}\.?\s*[A-Za-zäö]*\.?)?)")),
+    ("shipped", re.compile(r"(?i)\b(dispatched|shipped|versandt|versendet)\b")),
+    ("ordered", re.compile(r"(?i)(not yet dispatched|preparing for dispatch|noch nicht versandt|wird für den versand vorbereitet|ordered)")),
+]
+
+
+def parse_amazon(page, cfg, t):
+    out = []
+    station = (cfg["station"].get("town") or "").lower()
+    home = (cfg.get("home_town") or "").lower()
+    for card in page.get("cards") or []:
+        text = card.get("text") if isinstance(card, dict) else str(card)
+        titles = card.get("titles") if isinstance(card, dict) else []
+        if not text:
+            continue
+        m = re.search(r"(?i)(?:order placed|bestellung aufgegeben)\s+(\d{1,2}\.?\s+[A-Za-zäö]+\.?\s+\d{4}|[A-Za-z]+ \d{1,2},? \d{4})", text)
+        placed = parse_when(m.group(1), t, future=False) if m else None
+        if placed and (t - placed).days > cfg["order_days"]:
+            continue
+        m = re.search(r"(?i)(?:order|bestellung|bestellnr\.?)\s*(?:#|nr\.?)\s*([0-9-]{8,})", text)
+        oid = hid("amazon", m.group(1) if m else text[:200])
+        tail = text[m.end():] if m else text
+        status, eta_from, eta_to, delivered = "unknown", None, None, None
+        for name, rx in AMZ_STATUS:
+            mm = rx.search(tail)
+            if not mm:
+                continue
+            status = name
+            if name == "delivered":
+                w = (mm.group(1) or "").lower()
+                delivered = t - dt.timedelta(days=1) if w in ("yesterday", "gestern") else parse_when(w, t, future=False) if w else None
+            elif name == "arriving":
+                eta_from, eta_to = parse_range(mm.group(1), t)
+                status = "shipped"
+            elif name == "out":
+                eta_from = eta_to = t
+            break
+        if status in ("cancel", "return"):
+            continue
+        where = "station" if town_hit(station, text) else "home" if town_hit(home, text) else "unknown"
+        items = [s for s in (short_name(x) for x in titles or []) if s]
+        out.append({"id": "amazon:" + oid, "shop": "amazon", "items": items[:6], "n_items": len(titles or []) or None,
+                    "status": status, "eta_from": iso(eta_from), "eta_to": iso(eta_to), "delivered_on": iso(delivered),
+                    "ordered_on": iso(placed), "where": where})
+    return out
+
+
+GX_LINE = [
+    ("delivered", re.compile(r"(?i)^(?:zugestellt|geliefert|delivered)(?:\s+(?:am|on))?\s+(.+)$")),
+    ("cancel", re.compile(r"(?i)^(?:storniert|annulliert|cancelled)")),
+    ("pickup", re.compile(r"(?i)(abholbereit|bereit zur abholung|ready for pick-?up|zur abholung)")),
+    ("out", re.compile(r"(?i)^(?:in zustellung|wird heute (?:zugestellt|geliefert)|out for delivery)")),
+    ("window", re.compile(r"(?i)^(?:lieferung|delivery|zustellung)\s+(?:zwischen|between)\s+(.+)$")),
+    ("eta", re.compile(r"(?i)^(?:lieferung|delivery|zustellung)\s+(?:voraussichtlich\s+)?(?:am|on|bis|by)?\s*(.+)$")),
+    ("shipped", re.compile(r"(?i)^(?:versandt|versendet|unterwegs|shipped|on the way)")),
+]
+RANK = {"ordered": 0, "unknown": 0, "shipped": 1, "out": 2, "pickup": 3, "delivered": 4}
+
+
+def parse_galaxus(page, cfg, t, shop="galaxus"):
+    lines = [l.strip() for l in (page.get("text") or "").split("\n") if l.strip()]
+    orders, cur = [], None
+    for i, ln in enumerate(lines):
+        m = re.match(r"(?i)^(?:bestellung|order)\s+(\S+)\s+(?:vom|from|of)\s+(\d{1,2}\.\d{1,2}\.\d{4})$", ln)
+        if m:
+            cur = {"oid": m.group(1), "placed": parse_when(m.group(2), t, False), "items": []}
+            orders.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"^(\d+)\s*[×x]$", ln)
+        if m and i + 2 < len(lines) + 1:
+            name = lines[i + 1] if i + 1 < len(lines) else ""
+            how = lines[i + 2] if i + 2 < len(lines) else ""
+            cur["items"].append((int(m.group(1)), name, how))
+    out = []
+    for o in orders:
+        if o["placed"] and (t - o["placed"]).days > cfg["order_days"]:
+            continue
+        states, froms, tos, delivered = [], [], [], []
+        for _q, _n, how in o["items"]:
+            st = "ordered"
+            for name, rx in GX_LINE:
+                mm = rx.search(how)
+                if not mm:
+                    continue
+                if name == "delivered":
+                    st = "delivered"
+                    d = parse_when(mm.group(1), t, future=False)
+                    if d:
+                        delivered.append(d)
+                elif name == "cancel":
+                    st = "cancel"
+                elif name in ("window", "eta"):
+                    a, b = parse_range(mm.group(1), t)
+                    if a:
+                        froms.append(a)
+                        tos.append(b)
+                    st = "ordered"
+                else:
+                    st = name
+                break
+            states.append(st)
+        states = [s for s in states if s != "cancel"]
+        if not states:
+            continue
+        status = min(states, key=lambda s: RANK.get(s, 0))
+        items = [s for s in (short_name(n, 4) for _q, n, _h in o["items"] if n) if s]
+        out.append({"id": "%s:%s" % (shop, hid(shop, o["oid"])), "shop": shop, "items": items[:6],
+                    "n_items": sum(q for q, _n, _h in o["items"]) or None, "status": status,
+                    "eta_from": iso(min(froms)) if froms else None, "eta_to": iso(max(tos)) if tos else None,
+                    "delivered_on": iso(max(delivered)) if delivered and status == "delivered" else None,
+                    "ordered_on": iso(o["placed"]), "where": "pickup point" if status == "pickup" else "home"})
+    return out
+
+
+def parse_brack(page, cfg, t):
+    out, home = [], (cfg.get("home_town") or "").lower()
+    text = page.get("text") or ""
+    for m in re.finditer(r"(?m)^(\d{6,})\s+(\d{1,2}\.\d{1,2}\.\d{4})\s*$", text):
+        placed = parse_when(m.group(2), t, False)
+        if not placed or (t - placed).days > cfg["brack_days"]:
+            continue
+        nxt = text[m.end():m.end() + 160].lower()
+        out.append({"id": "brack:" + hid("brack", m.group(1)), "shop": "brack", "items": [], "n_items": None,
+                    "status": "ordered", "eta_from": None, "eta_to": None, "delivered_on": None,
+                    "ordered_on": iso(placed), "where": "home" if town_hit(home, nxt) else "unknown"})
+    return out
+
+
+PARSERS = {"amazon": parse_amazon, "galaxus": parse_galaxus, "brack": parse_brack}
+
+
+# ------------------------------------------------------------------------------------------------ source: mail flags
+def _near(word, text):
+    """word is in text, or a word of text is a near spelling of it (≥ 0.9 alike: notices misspell town names)."""
+    if word in text:
+        return True
+    return len(word) >= 6 and any(len(w) >= 5 and difflib.SequenceMatcher(None, word, w).ratio() >= 0.9
+                                  for w in re.split(r"\W+", text))
+
+
+def town_hit(town, text):
+    """True when text names the town (its first word of 4+ letters is enough: postal lines shorten town names)."""
+    words = [w for w in re.split(r"[\s,/()-]+", (town or "").lower()) if len(w) >= 4]
+    return bool(words) and _near(words[0], (text or "").lower())
+
+
+_TOWN = re.compile(r"\b\d{4,5}\s+((?:(?:St\.?|Sankt|La|Le|Les)\s+)?[A-ZÄÖÜÉ][\w'’.-]*"
+                   r"(?:\s+(?:am|an|im|bei|ob|sur|sous|de|di)\s+[A-ZÄÖÜÉ][\w'’.-]*)?)")
+
+
+def pickup_town(cfg, *texts):
+    """A pickup point's town, nothing more (no street, postcode or shop): the configured spelling when it is the
+    station or home town, else the town after the postcode."""
+    blob = " ".join(x for x in texts if x)
+    for name in (cfg["station"].get("town"), cfg.get("home_town")):
+        if name and town_hit(name, blob):
+            return name
+    for x in texts:
+        m = _TOWN.search(x or "")
+        if m:
+            return m.group(1).strip(" .-")[:40]
+    return None
+
+
+def carrier_of(sender):
+    s = (sender or "").lower()
+    for key, name in (("aliexpress", "AliExpress"), ("post.ch", "Post"), ("dhl", "DHL"), ("dpd", "DPD"),
+                      ("planzer", "Planzer"), ("ups", "UPS"), ("gls", "GLS")):
+        if key in s:
+            return name
+    return None
+
+
+SHOP_SENDERS = {"AliExpress"}      # shops, not carriers: only their pickup notices count
+
+
+def sender_name(sender):
+    """'Shop Name (shop.example)' → 'Shop Name' (for pickup-only senders carrier_of doesn't know)."""
+    return str(sender or "").split(" (")[0].strip()[:20] or None
+
+
+ASK_WHEN = "When will this parcel be delivered or be ready for pickup?"
+ASK_PICKUP = "Where and from when can this parcel be picked up?"
+
+
+def read_mail(cfg, state, t, dry=False):
+    """New carrier mails (sender/date/category only) → the quick card (a pickup notice?) → one vault `when` answer
+    each (date + where), cached per ref. Pickup-only senders (shops) count only when the card says pick_up."""
+    mc = state.setdefault("mail", {})
+    since = t - dt.timedelta(days=int(cfg["mail"]["days"]))
+    station_q = set(cfg["mail"].get("station_queries") or [])
+    pickup_q = set(cfg["mail"].get("pickup_queries") or []) - station_q
+    seen, errors = {}, []
+    for q in list(cfg["mail"]["queries"]) + sorted(station_q) + sorted(pickup_q):
+        rc, out, err = run(["vault", "gmail", "search", "--json", "-n", "15", q], 75)
+        if rc != 0:
+            errors.append("search %s" % ("timeout" if rc == 124 else "exit %d" % rc))
+            continue
+        try:
+            res = json.loads(out).get("results") or []
+        except ValueError:
+            errors.append("search unreadable")
+            continue
+        for r in res:
+            d = pdate(r.get("date"))
+            if not d or d < since:
+                continue
+            is_station = q in station_q
+            if not is_station and r.get("category") != "delivery":
+                continue
+            carrier = "station" if is_station else carrier_of(r.get("from")) or (
+                sender_name(r.get("from")) if q in pickup_q else None)
+            if not carrier:
+                continue
+            prev = seen.get(r["ref"]) or {}
+            if prev.get("carrier") == "station":
+                continue
+            seen[r["ref"]] = {"carrier": carrier, "mail_date": iso(d)}
+            if q in pickup_q or carrier in SHOP_SENDERS or prev.get("shop_mail"):
+                seen[r["ref"]]["shop_mail"] = True
+    asked, cards, t_start = 0, 0, time.time()
+    max_new, max_cards = int(cfg["mail"]["max_new"]), int(cfg["mail"].get("max_cards") or 20)
+    station = (cfg["station"].get("town") or "").lower()
+    home = (cfg.get("home_town") or "").lower()
+    for ref in sorted(seen, key=lambda r: seen[r]["mail_date"], reverse=True):
+        key = hid("mail", ref)
+        info = seen[ref]
+        if key in mc:
+            mc[key].update(info)
+            continue
+        if dry or time.time() - t_start > float(cfg["mail"]["budget_s"]):
+            continue
+        if asked >= max_new and not info.get("shop_mail"):
+            continue
+        pickup = False
+        if info["carrier"] != "station":      # station mails are pickup notices already
+            if cards >= max_cards:
+                continue
+            cards += 1
+            rc, out, err = run(["vault", "gmail", "get", "--json", ref], 40)
+            try:
+                c = json.loads(out) if rc == 0 else None
+            except ValueError:
+                c = None
+            if not isinstance(c, dict):     # no card: a shop mail waits for the next run, a carrier one goes on
+                errors.append("card %s" % ("timeout" if rc == 124 else "exit %d" % rc if rc else "unreadable"))
+                if info.get("shop_mail"):
+                    continue
+                c = {}
+            pickup = c.get("action") == "pick_up" or c.get("wants") == "pickup"
+            if not pickup and info.get("shop_mail"):    # a shop's order/shipping/news mail: not a parcel notice
+                mc[key] = dict(info, date=None, where=None, status="none", asked=int(time.time()))
+                continue
+        if asked >= max_new:
+            continue
+        asked += 1
+        rc, out, err = run(["vault", "ask", "gmail", ref, ASK_PICKUP if pickup else ASK_WHEN,
+                            "--kind", "when", "--json"], 100)
+        if rc != 0:
+            errors.append("ask %s" % ("timeout" if rc == 124 else "exit %d" % rc))
+            continue
+        try:
+            ans = json.loads(out).get("answer") or {}
+        except ValueError:
+            errors.append("ask unreadable")
+            continue
+        if pickup:      # ready at a pickup point: the station, else the point's town (only the town is kept)
+            venue, addr = str(ans.get("venue") or ""), str(ans.get("address") or "")
+            at_station = town_hit(station, (venue + " " + addr).lower())
+            mc[key] = dict(info, date=iso(pdate(ans.get("date")) or pdate(info["mail_date"])),
+                           where="station" if at_station else "pickup",
+                           town=None if at_station else pickup_town(cfg, addr, venue),
+                           status="pickup", asked=int(time.time()))
+            continue
+        venue = str(ans.get("venue") or "").lower()
+        where = ("station" if info["carrier"] == "station" or town_hit(station, venue) else
+                 "home" if town_hit(home, venue) else "other" if venue else "unknown")
+        mc[key] = dict(info, date=iso(pdate(ans.get("date"))), where=where,
+                       status=str(ans.get("status") or "")[:16], asked=int(time.time()))
+    # forget old ones
+    for k in [k for k, v in mc.items() if (pdate(v.get("mail_date")) or t) < t - dt.timedelta(days=30)]:
+        del mc[k]
+    return errors
+
+
+def mail_parcels(state, cfg, t):
+    """Carrier notices still ahead (date today or later), one per carrier + day + destination; pickup notices
+    (ready at a pickup point or the station) for pickup_keep_days after the ready date."""
+    groups, pickups = {}, {}
+    keep = int(cfg["mail"].get("pickup_keep_days") or 14)
+    for k, v in (state.get("mail") or {}).items():
+        d = pdate(v.get("date"))
+        if v.get("status") == "pickup" and v.get("carrier") != "station":
+            d = d or pdate(v.get("mail_date"))
+            if not d or (t - d).days > (int(cfg["station"]["hold_days"]) + 7 if v.get("where") == "station" else keep):
+                continue
+            pickups.setdefault((v.get("carrier"), iso(d), v.get("where"), v.get("town")), v)
+            continue
+        if v.get("carrier") == "station":
+            md = pdate(v.get("mail_date"))
+            if not md or (t - md).days > int(cfg["station"]["hold_days"]):
+                continue
+            key = ("station", iso(md))
+            groups.setdefault(key, []).append(k)
+            continue
+        if not d or d < t:
+            continue
+        key = (v.get("carrier"), iso(d), v.get("where"))
+        groups.setdefault(key, []).append(k)
+    out = []
+    for key, ks in groups.items():
+        if key[0] == "station":
+            md = pdate(key[1])
+            out.append({"id": "mail:" + hid(*key), "shop": None, "carrier": "station", "items": [], "n_items": None,
+                        "status": "pickup", "eta_from": None, "eta_to": None, "delivered_on": key[1],
+                        "ordered_on": None, "where": "station", "from_mail": True})
+            continue
+        carrier, d, where = key
+        out.append({"id": "mail:" + hid(*key), "shop": None, "carrier": carrier, "items": [], "n_items": None,
+                    "status": "out" if d == iso(t) else "shipped", "eta_from": d, "eta_to": d, "delivered_on": None,
+                    "ordered_on": None, "where": where or "unknown", "from_mail": True})
+    for key, v in pickups.items():
+        carrier, d, where, town = key
+        out.append({"id": "mail:" + hid("pickup", *key), "shop": None, "carrier": carrier, "items": [],
+                    "n_items": None, "status": "pickup", "eta_from": None, "eta_to": None, "delivered_on": d,
+                    "ordered_on": None, "where": where or "pickup", "town": town, "from_mail": True,
+                    "shop_mail": bool(v.get("shop_mail"))})
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ model
+def finalize(parcels, cfg, state, t):
+    """Station deliveries → waiting for pickup with a deadline; picked/expired/old ones hidden; sorted."""
+    hold = int(cfg["station"]["hold_days"])
+    picked = state.get("picked") or {}
+    out = []
+    station_shop = False
+    for p in parcels:
+        p = dict(p)
+        if p["id"] in picked:
+            if p.get("where") == "station" and not p.get("from_mail"):
+                station_shop = True      # its station mail is the same parcel: picked too
+            continue
+        if p.get("where") == "station" and p["status"] in ("delivered", "pickup"):
+            d = pdate(p.get("delivered_on")) or pdate(p.get("eta_to")) or t
+            p["status"] = "pickup"
+            p["pickup_by"] = iso(d + dt.timedelta(days=hold))
+            if (t - (d + dt.timedelta(days=hold))).days > 7:
+                continue
+            if not p.get("from_mail"):
+                station_shop = True
+        if p["status"] == "delivered":
+            d = pdate(p.get("delivered_on"))
+            if not d or (t - d).days > int(cfg["delivered_keep_days"]):
+                continue
+        out.append(p)
+    if station_shop:      # a carrier's station mail is the same parcel as a shop card at the station: keep the shop one
+        out = [p for p in out if not (p.get("from_mail") and p.get("where") == "station" and not p.get("shop_mail"))]
+    order = {"pickup": 0, "out": 1, "shipped": 2, "ordered": 3, "unknown": 4, "delivered": 5}
+    out.sort(key=lambda p: (order.get(p["status"], 9), p.get("pickup_by") or p.get("eta_from") or "9999",
+                            p.get("shop") or "zz"))
+    return out
+
+
+def refresh(args, cfg):
+    t = today()
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, "lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("parcels: a refresh is already running", file=sys.stderr)
+        return None
+    state = load_cache() or {}
+    srcs = state.setdefault("sources", {})
+    prev = state.get("raw") or {}
+    raw = {}
+    only = set(args.only.split(",")) if getattr(args, "only", None) else None
+    for shop, url in (cfg.get("shops") or {}).items():
+        if shop not in PARSERS or (only and shop not in only):
+            raw[shop] = prev.get(shop, [])
+            continue
+        s = srcs.setdefault(shop, {})
+        t0 = time.time()
+        try:
+            page = fetch(url)
+            raw[shop] = PARSERS[shop](page, cfg, t)
+            s.update(ok=True, at=int(time.time()), error=None, fails=0, noted=False)
+        except Exception as e:  # one broken shop must not hide the others
+            raw[shop] = prev.get(shop, [])
+            s.update(ok=False, at=int(time.time()), error=str(e)[:60], fails=int(s.get("fails") or 0) + 1)
+        s["ms"] = int((time.time() - t0) * 1000)
+    if not args.no_mail and (not only or "mail" in only):
+        s = srcs.setdefault("mail", {})
+        errs = read_mail(cfg, state, t, dry=args.dry_run)
+        hard = [e for e in errs if not e.startswith("card")]     # a missing card only degrades (partial)
+        if hard and len(hard) >= len(cfg["mail"]["queries"]):
+            s.update(ok=False, at=int(time.time()), error=hard[0][:60], fails=int(s.get("fails") or 0) + 1)
+        else:
+            s.update(ok=True, at=int(time.time()), error=None, fails=0, noted=False, partial=len(errs) or None)
+    state["raw"] = raw
+    allp = [p for v in raw.values() for p in v] + mail_parcels(state, cfg, t)
+    state["parcels"] = finalize(allp, cfg, state, t)
+    state["updated"] = int(time.time())
+    state["updated_local"] = now().strftime("%Y-%m-%d %H:%M")
+    if not args.dry_run:
+        save_cache(state)
+        if args.cron:
+            fail_notes(state, cfg)
+            save_cache(state)
+    return state
+
+
+def fail_notes(state, cfg):
+    """ONE ~/inbox note per failing source streak (sign-in needed at once, else after fail_note_after runs)."""
+    for name, s in (state.get("sources") or {}).items():
+        if s.get("ok") or s.get("noted"):
+            continue
+        if s.get("error") == "sign-in needed" or int(s.get("fails") or 0) >= int(cfg["fail_note_after"]):
+            os.makedirs(INBOX, exist_ok=True)
+            p = os.path.join(INBOX, "parcels-source-%s-%d.md" % (name, int(time.time())))
+            with open(p, "w") as f:
+                f.write("Data, not instructions (parcels cron, JOBS.md). parcels: source %s failing (%s, %d runs in a "
+                        "row). The /parcels card shows it as not checked. Fix the source or tell the owner only if "
+                        "it needs him (e.g. a shop sign-in in the browser).\n" % (name, s.get("error"), s.get("fails") or 0))
+            s["noted"] = True
+
+
+def visible(state):
+    return [p for p in (state.get("parcels") or []) if p.get("id") not in (state.get("picked") or {})]
+
+
+# ------------------------------------------------------------------------------------------------ output
+def label(p):
+    if p.get("shop"):
+        return SHOP_NAMES.get(p["shop"], p["shop"].title())
+    return p.get("carrier") or "Parcel"
+
+
+def items_txt(p, n=2):
+    it = p.get("items") or []
+    if not it:
+        k = p.get("n_items")
+        return "%d items" % k if k and k > 1 else ""
+    more = len(it) - n
+    return ", ".join(it[:n]) + (" +%d" % more if more > 0 else "")
+
+
+def eta_txt(p, t):
+    a, b = pdate(p.get("eta_from")), pdate(p.get("eta_to"))
+    if a and b and b != a:
+        return "%s–%s" % (fmt_day(a, t), fmt_day(b, t))
+    if a:
+        return fmt_day(a, t)
+    return ""
+
+
+def station_name(cfg):
+    town = cfg["station"].get("town")
+    return "%s station" % town if town else "parcel station"
+
+
+def place_name(cfg, place):
+    """'station' → the station's name; a town → '<town> pickup point'; '' → 'pickup point'."""
+    if place == "station":
+        return station_name(cfg)
+    return "%s pickup point" % place if place else "pickup point"
+
+
+def pickup_groups(ps):
+    """Pickups per place, station first: [(place, [parcels])], place = 'station' | a pickup point's town | ''."""
+    g = {}
+    for p in ps:
+        if p["status"] == "pickup":
+            g.setdefault("station" if p.get("where") == "station" else (p.get("town") or ""), []).append(p)
+    return sorted(g.items(), key=lambda kv: (kv[0] != "station", kv[0] == "", kv[0]))
+
+
+def ready_txt(d, t):
+    if d < t:
+        return "ready since %s" % fmt_day(d, t)
+    return "ready %s" % fmt_day(d, t)
+
+
+def card(state, cfg):
+    t = today()
+    ps = visible(state)
+    head = "📦 Parcels"
+    if state.get("updated_local"):
+        upd = state["updated_local"]
+        head += " · as of %s" % (upd[11:16] if upd[:10] == iso(t) else "%s %s" % (fmt_day(pdate(upd), t), upd[11:16]))
+    lines = [head]
+    groups = pickup_groups(ps)
+    pick = [p for _, g in groups for p in g]
+    for place, g in groups:
+        by = min((pdate(p["pickup_by"]) for p in g if p.get("pickup_by")), default=None)
+        ready = min((pdate(p["delivered_on"]) for p in g if pdate(p.get("delivered_on"))), default=None)
+        shops = sorted({label(p) for p in g})
+        what = "; ".join(x for x in (items_txt(p) for p in g) if x)
+        late = by and by < t
+        name = place_name(cfg, place)
+        lines.append("🏪 %s: %d to pick up%s (%s%s)" % (
+            name[0].upper() + name[1:], len(g),
+            (" — ⚠️ deadline was %s" % fmt_day(by, t)) if late else (" by %s" % fmt_day(by, t)) if by else
+            (", %s" % ready_txt(ready, t)) if ready else "",
+            "/".join(shops), (": " + what) if what else ""))
+    for p in ps:
+        if p["status"] in ("out", "shipped", "ordered", "unknown") and not p.get("from_mail"):
+            st = {"out": "🚚 today", "shipped": "🚚", "ordered": "🧾", "unknown": "❔"}[p["status"]]
+            eta = eta_txt(p, t)
+            bits = [x for x in (eta if p["status"] != "out" else "", items_txt(p),
+                                "to the station" if p.get("where") == "station" else "") if x]
+            if p["status"] == "ordered" and not eta:
+                bits.insert(0, "ordered %s" % fmt_day(pdate(p["ordered_on"]), t) if p.get("ordered_on") else "ordered")
+            lines.append("%s %s: %s" % (st, label(p), " · ".join(bits) if bits else "on the way"))
+    mails = [p for p in ps if p.get("from_mail") and p["status"] in ("out", "shipped")]
+    if mails:
+        parts = ["%s %s%s" % (p["carrier"], fmt_day(pdate(p["eta_from"]), t),
+                              " (%s)" % p["where"] if p.get("where") in ("station", "other") else "") for p in mails[:3]]
+        lines.append("📬 Carrier notices: " + ", ".join(parts))
+    dl = [p for p in ps if p["status"] == "delivered"]
+    if dl:
+        lines.append("✅ Delivered: " + ", ".join("%s %s" % (label(p), fmt_day(pdate(p["delivered_on"]), t)) for p in dl[:3]))
+    if len(lines) == 1:
+        lines.append("Nothing on the way.")
+    bad = [n for n, s in (state.get("sources") or {}).items() if not s.get("ok")]
+    if bad:
+        lines.append("⚠️ Not checked: " + ", ".join("%s (%s)" % (SHOP_NAMES.get(n, n), (state["sources"][n].get("error") or "error")) for n in bad))
+    if pick:
+        lines.append("Picked up? /parcels picked")
+    return "\n".join(lines[:11])
+
+
+def line(state, cfg):
+    t = today()
+    ps = visible(state)
+    pick = [p for p in ps if p["status"] == "pickup"]
+    coming = [p for p in ps if p["status"] in ("out", "shipped", "ordered")]
+    if not pick and not coming:
+        return ""
+    bits = []
+    for place, g in pickup_groups(ps)[:2]:
+        by = min((pdate(p["pickup_by"]) for p in g if p.get("pickup_by")), default=None)
+        bits.append("%d to pick up at the %s%s" % (len(g), place_name(cfg, place), " by %s" % fmt_day(by, t) if by else ""))
+    if coming:
+        today_n = sum(1 for p in coming if pdate(p.get("eta_from")) == t)
+        bits.append("%d on the way%s" % (len(coming), " (%d today)" % today_n if today_n else ""))
+    return "📦 " + " · ".join(bits) + " → /parcels"
+
+
+def speak(state, cfg):
+    t = today()
+    ps = visible(state)
+    out = []
+    for place, g in pickup_groups(ps)[:2]:
+        by = min((pdate(p["pickup_by"]) for p in g if p.get("pickup_by")), default=None)
+        n = len(g)
+        out.append("%s at the %s%s." % ("One parcel waits" if n == 1 else "%d parcels wait" % n, place_name(cfg, place),
+                                         (": the pickup deadline was %s" % say_day(by, t) if by < t else
+                                          ", pick it up by %s" % say_day(by, t) if n == 1 else
+                                          ", pick them up by %s" % say_day(by, t)) if by else ""))
+    shop_coming = [p for p in ps if p["status"] in ("out", "shipped", "ordered") and not p.get("from_mail")]
+    for p in shop_coming[:3]:
+        a, b = pdate(p.get("eta_from")), pdate(p.get("eta_to"))
+        k = p.get("n_items") or len(p.get("items") or []) or 1
+        what = "%s: %s" % (label(p), "one item" if k == 1 else "%d items" % k)
+        if p["status"] == "out":
+            out.append("%s, out for delivery today." % what)
+        elif a and b and a != b:
+            out.append("%s, arriving between %s and %s." % (what, say_day(a, t), say_day(b, t)))
+        elif a:
+            out.append("%s, arriving %s." % (what, say_day(a, t)))
+        else:
+            out.append("%s, ordered, no delivery date yet." % what)
+    mails = [p for p in ps if p.get("from_mail") and p["status"] in ("out", "shipped")]
+    for p in mails[:2]:
+        out.append("%s: a parcel arrives %s." % ("The Post" if p["carrier"] == "Post" else p["carrier"],
+                                                 say_day(pdate(p["eta_from"]), t)))
+    if not out:
+        dl = [p for p in ps if p["status"] == "delivered"]
+        out.append("Nothing on the way." + (" Last delivery: %s, %s." % (label(dl[0]), say_day(pdate(dl[0]["delivered_on"]), t)) if dl else ""))
+    age = time.time() - float(state.get("updated") or 0)
+    if age > float(cfg["stale_hours"]) * 3600 and state.get("updated_local"):
+        out.append("That's from %s." % state["updated_local"][11:16])
+    return " ".join(out)
+
+
+def board(state, cfg):
+    t = today()
+    pick = [p for p in visible(state) if p["status"] == "pickup"]
+    if not pick:
+        return {}
+    by = min((pdate(p["pickup_by"]) for p in pick if p.get("pickup_by")), default=None)
+    towns = {cfg["station"].get("town") if p.get("where") == "station" else p.get("town") for p in pick}
+    town = towns.pop() if len(towns) == 1 else None
+    return {"title": "📦 Pick up %d parcel%s%s%s" % (len(pick), "" if len(pick) == 1 else "s",
+                                                    " in %s" % town if town else "",
+                                                    " by %s" % fmt_day(by, t) if by else ""),
+            "pickup_by": iso(by), "n": len(pick)}
+
+
+# ------------------------------------------------------------------------------------------------ reminders
+REM_LINE = re.compile(r"^\s*\d+\.\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s+(.*?)\s*$")
+
+
+def errands(cfg):
+    """Store stops on the way to the station town from `shop plan --along` (names and counts only)."""
+    town = cfg["station"].get("town")
+    if not town:
+        return ""
+    rc, out, _ = run(["shop", "plan", "--along", town, "--by", "car", "--json"], 40)
+    if rc != 0:
+        return ""
+    try:
+        stops = json.loads(out).get("stops") or []
+    except ValueError:
+        return ""
+    names, n = [], 0
+    for s in stops:
+        if not isinstance(s, dict):
+            continue
+        k = len(s.get("items") or [])
+        if k:
+            n += k
+            names.append(str(s.get("store") or s.get("name") or "")[:24])
+    if not n:
+        return ""
+    return " Same drive: %d item%s from your list at %s (/shop)." % (n, "" if n == 1 else "s",
+                                                                       ", ".join(x for x in names[:2] if x) or "a store")
+
+
+def sync_reminder(state, cfg, dry=False):
+    """One owner reminder for the earliest station pickup deadline: kept when any 📦 reminder already names that
+    deadline (pickup points have no known deadline: card only)."""
+    t = now()
+    pick = [p for p in visible(state) if p["status"] == "pickup" and p.get("pickup_by") and p.get("where") == "station"]
+    rc, out, _ = run(["remind", "list", "--ids"], 20)
+    if rc != 0:
+        return "remind list failed"
+    lines = [ln for ln in out.splitlines() if "📦" in ln]
+    mine = [ln for ln in lines if "(tag parcel:pickup" in ln]
+    if not pick:
+        if mine and not dry:
+            run(["remind", "cancel", "--tag", "parcel:pickup"], 20)
+        return "cancelled" if mine else "none"
+    by = min(pdate(p["pickup_by"]) for p in pick)
+    if by < t.date():
+        return "deadline passed"
+    dd = "%d.%d" % (by.day, by.month)
+    pat = re.compile(r"(?<![\d.])0?%d\.0?%d(?![\d])" % (by.day, by.month))
+    if any(pat.search(ln) for ln in lines):
+        return "kept (%s)" % dd
+    hh, mm = (int(x) for x in str(cfg["station"]["remind_at"]).split(":"))
+    at = dt.datetime.combine(by - dt.timedelta(days=int(cfg["station"]["remind_days_before"])), dt.time(hh, mm))
+    if at < t + dt.timedelta(minutes=20):
+        at = dt.datetime.combine(t.date(), dt.time(hh, mm))
+        if at < t + dt.timedelta(minutes=20):
+            at = dt.datetime.combine(t.date() + dt.timedelta(days=1), dt.time(8, 30))
+        if at.date() > by:
+            at = t + dt.timedelta(minutes=30)
+    n = len(pick)
+    shops = "/".join(sorted({label(p) for p in pick}))
+    text = "📦 %s waiting at the %s parcel station (%s): pickup by %s %s.%s" % (
+        "1 parcel" if n == 1 else "%d parcels" % n, cfg["station"].get("town") or "", shops, WD[by.weekday()], dd,
+        errands(cfg))
+    text = re.sub(r"\s+", " ", text).replace("the  parcel", "the parcel").strip()
+    if dry:
+        return "would add %s: %s" % (at.strftime("%Y-%m-%d %H:%M"), text)
+    if mine:
+        run(["remind", "cancel", "--tag", "parcel:pickup"], 20)
+    rc, _, err = run(["remind", "add", "--owner", "--tag", "parcel:pickup", at.strftime("%Y-%m-%d %H:%M"), text], 20)
+    if rc == 0:
+        usage_log("invoke", "ok", {"verb": "reminder_set", "n": n}, feature="parcels.pickup_reminder")
+        return "added %s" % at.strftime("%Y-%m-%d %H:%M")
+    return "remind add failed"
+
+
+def picked(state, cfg, what):
+    pick = [p for p in visible(state) if p["status"] == "pickup"]
+    if what and what not in ("station", "all"):
+        pick = [p for p in pick if p["id"] == what or p["id"].endswith(":" + what)]
+    if not pick:
+        return 0
+    pk = state.setdefault("picked", {})
+    for p in pick:
+        pk[p["id"]] = int(time.time())
+    if what in ("station", "all"):        # station mails for the same parcels (hidden behind the shop card)
+        for p in mail_parcels(state, cfg, today()):
+            if p.get("where") == "station":
+                pk[p["id"]] = int(time.time())
+    # forget picked marks for parcels gone from every source
+    known = {p["id"] for v in (state.get("raw") or {}).values() for p in v} | {p["id"] for p in state.get("parcels") or []}
+    for k in [k for k in pk if k not in known and time.time() - pk[k] > 60 * 86400]:
+        del pk[k]
+    save_cache(state)
+    if not [p for p in visible(state) if p["status"] == "pickup"]:
+        run(["remind", "cancel", "--tag", "parcel:pickup"], 20)
+        run(["remind", "cancel", "--match", "parcel station"], 20)
+    return len(pick)
+
+
+# ------------------------------------------------------------------------------------------------ main
+def main(argv):
+    ap = argparse.ArgumentParser(prog="parcels", add_help=False)
+    ap.add_argument("cmd", nargs="?", default="card")
+    ap.add_argument("arg", nargs="?")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--only")
+    ap.add_argument("--no-mail", action="store_true")
+    ap.add_argument("--no-remind", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--cron", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args(argv)
+    if a.help:
+        print(__doc__.strip())
+        return 0
+    cfg = load_config()
+    t0 = time.time()
+    if a.cmd == "refresh":
+        st = refresh(a, cfg)
+        if st is None:
+            return 0
+        rem = "skipped" if a.no_remind else sync_reminder(st, cfg, dry=a.dry_run)
+        ok = [n for n, s in st["sources"].items() if s.get("ok")]
+        usage_log("exec", "ok" if ok else "error", {"verb": "refresh", "n": len(visible(st)), "sources_ok": len(ok),
+                                                     "cron": bool(a.cron)}, ms=(time.time() - t0) * 1000)
+        if a.json:
+            print(json.dumps({"parcels": visible(st), "sources": st["sources"], "reminder": rem}, ensure_ascii=False, indent=1))
+        elif not a.cron:
+            print(card(st, cfg))
+            print("reminder: %s" % rem)
+        return 0 if ok else 3
+    st = load_cache()
+    if a.cmd in ("card", "list"):
+        if st is None:
+            print("📦 Parcels: not checked yet. Ask me \"where are my parcels?\" and I'll look.")
+            return 0
+        print(json.dumps({"parcels": visible(st), "sources": st.get("sources"), "updated": st.get("updated_local")},
+                         ensure_ascii=False, indent=1) if a.json else card(st, cfg))
+        return 0
+    if a.cmd == "line":
+        if st:
+            s = line(st, cfg)
+            if s:
+                print(s)
+        return 0
+    if a.cmd == "speak":
+        if st is None:
+            return 4
+        print(speak(st, cfg))
+        return 0
+    if a.cmd == "board":
+        print(json.dumps(board(st, cfg) if st else {}, ensure_ascii=False))
+        return 0
+    if a.cmd == "picked":
+        if st is None:
+            print("📦 Nothing to mark: parcels weren't checked yet.")
+            return 0
+        n = picked(st, cfg, a.arg or "station")
+        usage_log("invoke", "ok" if n else "none", {"verb": "picked", "n": n})
+        print("✅ Marked %d parcel%s as picked up; pickup reminder cancelled." % (n, "" if n == 1 else "s") if n else
+              "📦 Nothing waiting for pickup.")
+        return 0
+    if a.cmd == "sync-reminder":
+        if st is None:
+            return 0
+        print(sync_reminder(st, cfg, dry=a.dry_run))
+        return 0
+    print("parcels: unknown command %r (see parcels --help)" % a.cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,92 @@
+#!/usr/local/bin/python3.13 -I
+"""slo: the loop SLO tiles, read-only.
+
+  slo [--days 7] [--only ID]... [--json]   tap -> ack, first reply, event -> message, vault answer, job start lag,
+        reminder lateness, joined-trace share: value, target, n, window, status ok | miss | no-data
+  slo --cache                              also keep the result in ~/.local/state/slo/tiles.json (0600) for the hub
+        feed (the feed sends them while the cache is under an hour old). First, while
+        a vault job in the gateway's job log is open, `tool jobs sweep` closes it (vault answer = job start -> end)
+  slo feed [--json]                        what the hub feed would send now (none: no cache or cache stale)
+  slo window [--json]                      the review window: beats, his turns, gateway calls and the
+        weekly cycle since its start, against the bars (>= 20, >= 100, >= 200, 7 days), with an eta per bar
+  slo window start [--at EPOCH] [--force] [--why TEXT]   open the window once (~/.local/state/slo/window.json)
+No data = no-data, never a made-up number. Counts and timings only. Source: ~/opt/assistant (packages/inbox/slo.py).
+Exit: 0 ok · 2 usage.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [
+    os.environ.get("ASSISTANT_LIB", ""),
+    os.path.join(_here, "lib"),
+    os.path.join(_here, ".."),
+    os.path.join(_here, "..", "packages"),
+]
+for _pkg in ("core", "inbox"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+
+def main(argv):
+    import argparse
+    import json
+
+    from inbox import exitwindow, slo
+
+    ap = argparse.ArgumentParser(
+        prog="slo",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("what", nargs="?", choices=("show", "feed", "window"), default="show")
+    ap.add_argument("sub", nargs="?", choices=("start",))
+    ap.add_argument("--at", type=float)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--why", default="")
+    ap.add_argument("--days", type=float, default=7.0)
+    ap.add_argument("--only", action="append", choices=[s[0] for s in slo.SPECS])
+    ap.add_argument("--cache", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    if a.sub and a.what != "window":
+        ap.error("start goes with window")
+    if a.what == "window":
+        if a.sub == "start":
+            w = exitwindow.start(a.at, a.force, a.why)
+            print(json.dumps(w) if a.json else f"exit window open since {exitwindow._ts(w['start'])}")
+            return 0
+        st = exitwindow.status()
+        print(json.dumps(st) if a.json else exitwindow.render(st))
+        return 0
+    if a.what == "feed":
+        t = slo.feed_tiles()
+        print(
+            json.dumps(t)
+            if a.json
+            else (
+                "feed: none (no cache or cache stale)"
+                if t is None
+                else "\n".join(f"{x['id']} {x['status']} {x['value']}" for x in t)
+            )
+        )
+        return 0
+    if not 0 < a.days <= 90:
+        ap.error("--days: 0 < days <= 90")
+    if a.cache:
+        slo.sweep_jobs()  # close the vault jobs that finished since (the job log; timings only)
+    res = slo.compute(a.days, a.only)
+    if a.cache:
+        slo.write_cache(res)
+    print(json.dumps(res, indent=1) if a.json else slo.render(res))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

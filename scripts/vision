@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""vision: the local paperwork gate for photos he sends (skill vision-actions).
+
+  vision gate FILE [--json]
+        Runs BEFORE I look at a photo: local OCR (tesseract, deu+eng+fra) on a downscaled grayscale copy, then
+        keyword and pattern scores. Paperwork (bills, QR-bill slips, receipts, letters, contracts, tax / salary /
+        bank / insurance papers) -> route "vault": don't Read the photo; file it privately (skill paperless) and
+        point him to the vault bot. Anything else -> route "look". Prints categories and counts only, never the
+        OCR text (the text stays in memory and is dropped).
+        Plain output: one line "route kind score" (kind "-" when none); --json: {"route", "kind", "score", "hits",
+        "words", "ms"} (hits = category names that matched, never words).
+        Exit 0 look · 10 vault (paperwork) · 2 usage / not an image · 3 OCR failed (route "look", "why": "ocr")
+        Env: VISION_THRESHOLD (default 5), VISION_LANGS (default deu+eng+fra), VISION_TIMEOUT (s, default 40),
+        VISION_MAX_SIDE (px, default 2000), USAGE=off (no usage event).
+
+Scores: a QR-bill slip's printed headings (Zahlteil, Empfangsschein, Konto / Zahlbar an, …), an IBAN- or
+AHV-shaped number and salary/tax/bank words count 5 each (one is enough); invoice, letter, contract and receipt
+words 2 each, capped per category; three or more CHF amounts add 2 (receipt). Threshold 5 by default.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
+
+FEATURE = "skill.vision-actions"
+THRESHOLD = int(os.environ.get("VISION_THRESHOLD") or 5)
+LANGS = os.environ.get("VISION_LANGS") or "deu+eng+fra"
+TIMEOUT = int(os.environ.get("VISION_TIMEOUT") or 40)
+MAX_SIDE = int(os.environ.get("VISION_MAX_SIDE") or 2000)
+
+# (category, weight per hit, cap for the category, patterns on the folded text)
+RULES = [
+    ("bill", 5, 10, [r"zahlteil", r"empfangsschein", r"payment part", r"section paiement", r"recepisse",
+                     r"konto\s*/\s*zahlbar", r"account\s*/\s*payable", r"compte\s*/\s*payable", r"annahmestelle",
+                     r"zahlbar durch", r"payable by", r"zusaetzliche informationen"]),
+    ("bill", 2, 6, [r"\brechnung", r"\binvoice\b", r"\bfacture\b", r"\bfattura\b", r"\bmahnung",
+                    r"zahlungserinnerung", r"zahlbar bis", r"zahlungsfrist", r"\bfaellig", r"rechnungsnummer",
+                    r"rechnungsdatum", r"kundennummer", r"kunden-nr", r"\besr\b", r"\breferenz\b", r"\biban\b",
+                    r"due date", r"amount due", r"\bmontant\b"]),
+    ("letter", 2, 6, [r"sehr geehrte", r"freundliche[nr]? gruess?e", r"mit freundlichen", r"\bbetreff\b",
+                      r"dear (sir|madam|mr|ms)", r"kind regards", r"madame,? monsieur", r"salutations",
+                      r"\bihr zeichen", r"\bunser zeichen"]),
+    ("contract", 2, 6, [r"\bvertrag", r"vertragsnummer", r"\bkuendigung", r"\bpolice\b", r"policennummer",
+                        r"versicherungsnummer", r"\blaufzeit", r"unterschrift", r"geschaeftsbedingungen",
+                        r"\bagb\b", r"\bcontract\b", r"\bkontrakt"]),
+    ("tax", 5, 10, [r"lohnausweis", r"lohnabrechnung", r"payslip", r"steuererklaerung", r"\bveranlagung",
+                    r"steueramt", r"kontoauszug", r"account statement", r"\bkrankenkasse", r"\bpraemie",
+                    r"\bahv[- ]?nr", r"versichertennummer"]),
+    ("receipt", 2, 6, [r"\bquittung", r"kassenbon", r"\bbeleg\b", r"\btotal\s+chf", r"\bmwst", r"\bmw?st-?nr",
+                       r"rueckgeld", r"kartenzahlung", r"\btwint\b", r"\bvisa\b", r"mastercard", r"\bbar\s+chf",
+                       r"\bkasse\b", r"\bche-\d{3}"]),
+]
+# shape patterns on the raw (folded) text; matched values are never kept
+SHAPES = [
+    ("bill", 5, re.compile(r"\bch\d{2}(?:\s?[0-9a-z]{4}){4}\s?[0-9a-z]\b")),     # IBAN (CH)
+    ("tax", 5, re.compile(r"\b756[.\s]?\d{4}[.\s]?\d{4}[.\s]?\d{2}\b")),          # AHV number
+]
+AMOUNT = re.compile(r"\d{1,6}[.,]\d{2}\b")
+
+
+def fold(s):
+    s = s.lower()
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss"), ("é", "e"), ("è", "e"), ("à", "a"),
+                 ("ç", "c"), ("ﬁ", "fi"), ("ﬂ", "fl")):
+        s = s.replace(a, b)
+    return re.sub(r"[ \t]+", " ", s)
+
+
+def score(text):
+    """OCR text -> (best kind or None, total score, sorted hit categories). Pure; the text is not kept."""
+    t = fold(text)
+    per = {}
+    for cat, w, cap, pats in RULES:
+        n = sum(1 for p in pats if re.search(p, t))
+        if n:
+            per[cat] = per.get(cat, 0) + min(n * w, cap)
+    for cat, w, rx in SHAPES:
+        if rx.search(t):
+            per[cat] = per.get(cat, 0) + w
+    if len(AMOUNT.findall(t)) >= 3 and ("chf" in t or "fr." in t or "total" in t):
+        per["receipt"] = per.get("receipt", 0) + 2
+    total = sum(per.values())
+    kind = max(per, key=lambda k: (per[k], k)) if per else None
+    return kind, total, sorted(per)
+
+
+def ocr(path):
+    """-> (text, words) or raises RuntimeError. Downscaled grayscale PNG in a private temp dir."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as e:
+        raise RuntimeError("pillow missing") from e
+    with tempfile.TemporaryDirectory(prefix="vision-") as d:
+        os.chmod(d, 0o700)
+        png = os.path.join(d, "g.png")
+        try:
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im).convert("L")
+                if max(im.size) > MAX_SIDE:
+                    im.thumbnail((MAX_SIDE, MAX_SIDE))
+                elif max(im.size) < 1000:      # tiny screenshots read better upscaled
+                    f = 1000 / max(im.size)
+                    im = im.resize((int(im.width * f), int(im.height * f)))
+                im.save(png)
+        except Exception as e:
+            raise ValueError("not an image") from e
+        try:
+            p = subprocess.run(["tesseract", png, "stdout", "-l", LANGS, "--psm", "3"], capture_output=True,
+                               timeout=TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(type(e).__name__) from e
+        if p.returncode != 0:
+            raise RuntimeError("tesseract exit %d" % p.returncode)
+        text = p.stdout.decode("utf-8", "replace")
+    return text, len(re.findall(r"\w{2,}", text))
+
+
+def gate(path):
+    t0 = time.monotonic()
+    try:
+        text, words = ocr(path)
+    except ValueError:
+        return None
+    except RuntimeError:
+        return {"route": "look", "kind": None, "score": 0, "hits": [], "words": 0,
+                "ms": int((time.monotonic() - t0) * 1000), "why": "ocr"}
+    kind, total, hits = score(text)
+    del text
+    paper = total >= THRESHOLD
+    return {"route": "vault" if paper else "look", "kind": kind if paper else None, "score": total, "hits": hits,
+            "words": words, "ms": int((time.monotonic() - t0) * 1000)}
+
+
+def log_usage(res):
+    try:
+        from usage import log
+        # the route is a result, not a failure: an exec is outcome ok (any other exec outcome counts as a failed
+        # run + an error in the usage store); the route rides in attrs. An OCR failure stays an error event.
+        ocr_failed = res.get("why") == "ocr"
+        log(FEATURE, kind="error" if ocr_failed else "exec", outcome="ocr" if ocr_failed else "ok", ms=res["ms"],
+            attrs={"gate": res.get("kind") or "none", "route": res["route"]})
+    except Exception:
+        pass
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    if len(args) != 2 or args[0] != "gate":
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    path = args[1]
+    if not os.path.isfile(path):
+        print(f"vision: no file {path}", file=sys.stderr)
+        return 2
+    res = gate(path)
+    if res is None:
+        print(f"vision: not an image: {path}", file=sys.stderr)
+        return 2
+    log_usage(res)
+    if as_json:
+        print(json.dumps(res))
+    else:
+        print(f"{res['route']} {res['kind'] or '-'} {res['score']}")
+    if res.get("why") == "ocr":
+        return 3
+    return 10 if res["route"] == "vault" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

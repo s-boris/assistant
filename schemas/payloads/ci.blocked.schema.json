@@ -1,0 +1,50 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/ci.blocked.schema.json",
+ "title": "assistant land (core.ciblock): one event per shared CI blocker sighting, deduped per key ~2 h",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "key",
+  "branch",
+  "blocker",
+  "first_seen"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "ci.blocked"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "key": {
+   "type": "string",
+   "maxLength": 200
+  },
+  "branch": {
+   "type": "string",
+   "maxLength": 120
+  },
+  "blocker": {
+   "type": "string",
+   "maxLength": 240
+  },
+  "first_seen": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "count": {
+   "type": "integer",
+   "minimum": 1
+  }
+ }
+}

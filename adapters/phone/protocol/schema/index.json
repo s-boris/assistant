@@ -1,0 +1,136 @@
+{
+  "$comment": "Contract between phonegw (Python, jsonschema) and the app (:protocol, kotlinx-serialization). Every frame = envelope.json with body = the schema below for (direction, t). Fixtures: fixtures/valid/<dir>.<t>[.<case>].json must validate; fixtures/invalid/<dir>.<t>.<case>.json must be rejected. hello and config are connection state: the gateway sends them directly on every WebSocket connect with ack false (not through the outbox), so they are not in ack_required. Privacy: no lat, lon, coords, ssid, bssid, mac, text or title key may appear in any c2s state/event schema.",
+  "version": 1,
+  "envelope": "envelope.json",
+  "s2c": {
+    "hello": "s2c.hello.json",
+    "config": "s2c.config.json",
+    "push": "s2c.push.json",
+    "push.cancel": "s2c.push.cancel.json",
+    "chat": "s2c.chat.json",
+    "probe": "s2c.probe.json",
+    "ack": "ack.json",
+    "error": "s2c.error.json",
+    "widget": "s2c.widget.json",
+    "card": "s2c.card.json",
+    "card.remove": "s2c.card.remove.json",
+    "ask": "s2c.ask.json",
+    "geofences": "s2c.geofences.json",
+    "alarms": "s2c.alarms.json",
+    "app.update": "s2c.app.update.json",
+    "call.ring": "s2c.call.ring.json",
+    "call.cancel": "s2c.call.cancel.json",
+    "open": "s2c.open.json"
+  },
+  "c2s": {
+    "hello": "c2s.hello.json",
+    "state": "c2s.state.json",
+    "event": "c2s.event.json",
+    "ack": "ack.json",
+    "action": "c2s.action.json",
+    "chat": "c2s.chat.json",
+    "card.answer": "c2s.card.answer.json",
+    "selftest": "c2s.selftest.json",
+    "crash": "c2s.crash.json",
+    "answer": "c2s.answer.json",
+    "share": "c2s.share.json",
+    "call.state": "c2s.call.state.json",
+    "usage": "c2s.usage.json",
+    "open.result": "c2s.open.result.json"
+  },
+  "http": {
+    "health": "http.health.json",
+    "pair.request": "http.pair.request.json",
+    "pair.response": "http.pair.response.json",
+    "error": "http.error.json",
+    "sync.response": "http.sync.response.json",
+    "batch.request": "http.batch.request.json",
+    "batch.response": "http.batch.response.json",
+    "geo.response": "http.geo.response.json",
+    "app.latest": "s2c.app.update.json",
+    "trackid.response": "http.trackid.response.json",
+    "divelog.request": "http.divelog.request.json",
+    "divelog.response": "http.divelog.response.json",
+    "trip.sites.response": "http.trip.sites.response.json",
+    "reminders.response": "http.reminders.response.json",
+    "reminders.request": "http.reminders.request.json",
+    "reminders.op.response": "http.reminders.op.response.json"
+  },
+  "ack_required": {
+    "s2c": [
+      "push",
+      "push.cancel",
+      "chat",
+      "probe",
+      "widget",
+      "card",
+      "card.remove",
+      "geofences",
+      "alarms",
+      "app.update",
+      "call.ring",
+      "call.cancel"
+    ],
+    "c2s": [
+      "action",
+      "chat",
+      "card.answer",
+      "event",
+      "share",
+      "call.state",
+      "usage"
+    ]
+  },
+  "rules": {
+    "max_frame_bytes": 262144,
+    "ack_batch_ms": 1000,
+    "dedupe_days": 7,
+    "offline_after": "2 x keepalive_s + 30 s",
+    "lockscreen": {
+      "title_max": 40,
+      "body_max": 80,
+      "applies_to": "urgent"
+    },
+    "private_below_urgent": true,
+    "unlock_verbs": [
+      "done",
+      "snooze",
+      "ha_off"
+    ],
+    "voice": {
+      "path": "/v1/voice",
+      "query": "call_id (optional: an answered call.ring) | resume=<v_ id>&gap_ms=N (re-attach a call whose connection dropped; any route, same device)",
+      "up": "binary PCM16 LE mono 16 kHz, <= 64000 bytes per frame; text {\"type\":\"hangup\"}",
+      "down": "binary PCM16 LE mono 24 kHz; text JSON type state|transcript|turn|status|metric|error|flush|hangup",
+      "flush": "stop playback and drop queued audio (barge-in)",
+      "resume": "gateway frames: {type:resume, id, grace_s} first (the call's id), {type:resumed, id, gap_ms} on a resume; a dropped connection is held grace_s (the relay hears link lost/back), buffered mic audio goes up after resumed",
+      "close_codes": {
+        "4404": "unknown or used call_id",
+        "4408": "stalled: no audio up for a few seconds (resume)",
+        "4409": "replaced by a resume on another socket",
+        "4410": "resume refused: the call has ended",
+        "4429": "busy or daily limit",
+        "4503": "relay or voice provider down"
+      }
+    },
+    "trackid": {
+      "path": "/v1/trackid",
+      "body": "raw audio (audio/mp4, audio/aac, audio/ogg, audio/wav, audio/webm), 1-20 s, <= 2 MiB",
+      "response": "http.trackid.response.json"
+    },
+    "trip": {
+      "pack": "GET /v1/trip/pack (text/html, ETag/If-None-Match -> 304; 404 = no pack built)",
+      "conditions": "GET /v1/trip/conditions (text/plain, ETag; 404 = none)",
+      "sites": "GET /v1/trip/sites (http.trip.sites.response, ETag; the dive quick-log's site chips, dive count and the last dive day before flying)",
+      "divelog": "POST /v1/divelog (http.divelog.request -> http.divelog.response)",
+      "saver": "roaming or a foreign network country: keepalive 540 s, uploads <= 100 KB, photos wait for Wi-Fi"
+    },
+    "nfc": "event nfc.tag = the NDEF URI id of claudeapp://tag/<id>, or 'h' + 15 hex of sha256('claude-nfc:' + UID hex) for a blank tag; the UID never leaves the phone",
+    "health": "health.daily only when the gateway config health is true AND the app switch is on; the gateway drops it otherwise",
+    "reminders": {
+      "list": "GET /v1/reminders (http.reminders.response, ETag)",
+      "op": "POST /v1/reminders (http.reminders.request -> http.reminders.op.response; 422 schema, 503 remind unavailable)"
+    },
+    "open": "s2c open goes out only on a live socket (not queued, ack false) and is answered by c2s open.result (ack false) within the gateway's wait; no answer = a stale socket: the gateway closes it and the caller falls back (Telegram URL button). The app never opens after until (clock skew allowance 0)."
+  }
+}

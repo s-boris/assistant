@@ -1,0 +1,458 @@
+#!/usr/bin/python3 -I
+"""hb-gate: token-free pre-check before a heartbeat wakes the main session (Hermes "wakeAgent:false").
+
+  hb-gate [--json] [--dry-run] [--notes N] [--last-beat MS] [--first] [--running N --finished N [--ids a,b]]
+          [--now-only]
+        decide `wake` or `skip` for the beat about to be sent; prints "wake: <reason>" (or one JSON line with
+        --json: {"decision", "reason", "checks"}), always exit 0; every decision goes to the log unless --dry-run
+  hb-gate log [N]      last N log lines (default 20)
+  hb-gate stats        today's wakes and skips (Zurich), from the log
+
+Called by the heartbeat mod (~/plugins/heartbeat, hooks/register.js) once a beat is otherwise due. The mod passes what
+it knows in-process: new notes it counted, its last beat, --first for its first beat in this session, and the
+background agents from $.agent.list() (--running/--finished; without them the gate asks `agent-watch status`).
+Wake, in this order, if:
+  (a) ~/inbox holds notes (regular, non-hidden files) or --notes > 0
+  (b) TODO.md "## Due" has an item whose time has come. The board's due phrase wins (~/bin/board due_of): "due
+      HH:MM DD.MM" anywhere in the line, else "**Title** — [due] DD.MM HH:MM" or "— [due] HH:MM DD.MM" right after
+      the title; other dates and times in the line (history notes, file names) don't count then. Without one, path-like
+      words (a "/" and a letter) left out: no date/time in its line = due now; a date (YYYY-MM-DD, DD.MM[.YYYY]) = due
+      from that day (at its first HH:MM if any); only a time = due once that time passed today (Zurich);
+      "tomorrow"/"morgen" without a date = TODO.md's mtime day + 1. DD.MM without a year = the nearest such day, so
+      in December 05.01 is next January and in January 28.12 is last December
+  (d) a background agent finished since the last beat (or the main session's last turn: its task notification
+      already started one), i.e. --finished > 0, or in fallback mode agent-watch shows one ended after the last beat
+  (e) --first: the mod's first beat after a (re)start
+  (f) safety valve: the last beat (max of --last-beat and /tmp/heartbeat's mtime) is >= 3 h old, or none on record
+Then skip if a background agent is still running (fallback: agent-watch running, or stalled <= 45 min);
+else (c) wake if there's startable work: an open GOALS.md step "- [ ]" not marked blocked, an Idea or a Night backlog
+item in TODO.md; else skip ("nothing startable").
+Wake rules (the brain's own data, written with `wake`; source ~/opt/assistant packages/inbox/wake.py): unless
+~/.config/hb-gate/wake-rules-off exists, the gate asks `wake check --json --inbox INBOX` for each note's delivery class
+(kind registry + the brain's rules; a kind outside the registry is beat) and the active hold, and then:
+  now-class notes wake first ("now: ..."), even while an agent runs or a hold is set; beat-class notes wake as (a);
+  digest and mute notes don't count (they wait for a beat that comes anyway; the agenda lists them); a `wake next`
+  hold skips only (c), the idle work beat; (b), (d), (e) and the 3 h safety valve (f) wake as before.
+  --now-only (the mod's now lane, while background agents keep the session from idling): wake only for a now-class
+  note, else skip; these skips are not logged, and with the rules off or unreadable it always skips.
+Rules unreadable (no `wake`, exit != 0, timeout, bad JSON): today's rules, the reason marked "[wake rules unreadable]".
+With the switch file present the gate behaves exactly as without wake rules.
+Fail open: any error -> wake ("gate error: ..."). Off switch: touch ~/.config/hb-gate/off (always wake).
+Log: ~/.local/state/hb-gate.log, one line per decision ("YYYY-MM-DD HH:MM:SS wake|skip reason"), trimmed at 512 KB.
+Tests: ~/plugins/heartbeat/test/hb-gate.test.mjs (fixtures), tests/legacy/hb-gate/run.sh in ~/opt/assistant (CLI, rules, fail-open). Env overrides: HB_GATE_INBOX, HB_GATE_TODO, HB_GATE_GOALS,
+HB_GATE_MARKER, HB_GATE_LOG, HB_GATE_OFF, HB_GATE_AGENT_WATCH, HB_GATE_NOW (epoch s or "YYYY-MM-DD HH:MM" Zurich),
+HB_GATE_WAKE (the wake CLI), HB_GATE_RULES_OFF (the wake-rules switch file).
+"""
+import json, os, re, subprocess, sys, time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+
+
+def _owner_tz():
+    """The owner's zone: profile locale.tz (bin/lib/assistant_profile: next to the ~/bin link, from the plugin's ops
+    dir, else ~/bin/lib; it never raises). Only when no helper is found: UTC (the zone name lives in the helper alone).
+    Never the process TZ; never fails."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.path.join(here, 'lib'), os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../../bin/lib'),
+              os.path.join(HOME, 'bin/lib')):
+        if os.path.isfile(os.path.join(d, 'assistant_profile.py')):
+            try:
+                sys.path.insert(0, d)
+                import assistant_profile
+                return assistant_profile.tz()
+            except Exception:
+                break
+            finally:
+                if sys.path and sys.path[0] == d:
+                    sys.path.pop(0)
+    return ZoneInfo('UTC')
+
+
+TZ = _owner_tz()
+ENV = os.environ.get
+INBOX = ENV('HB_GATE_INBOX') or os.path.join(HOME, 'inbox')
+TODO = ENV('HB_GATE_TODO') or os.path.join(HOME, 'workspace/TODO.md')
+GOALS = ENV('HB_GATE_GOALS') or os.path.join(HOME, 'workspace/GOALS.md')
+MARKER = ENV('HB_GATE_MARKER') or '/tmp/heartbeat'
+LOG = ENV('HB_GATE_LOG') or os.path.join(HOME, '.local/state/hb-gate.log')
+OFF = ENV('HB_GATE_OFF') or os.path.join(HOME, '.config/hb-gate/off')
+AGENT_WATCH = ENV('HB_GATE_AGENT_WATCH') or os.path.join(HOME, 'bin/agent-watch')
+WAKE = ENV('HB_GATE_WAKE') or os.path.join(HOME, 'bin/wake')
+RULES_OFF = ENV('HB_GATE_RULES_OFF') or os.path.join(HOME, '.config/hb-gate/wake-rules-off')
+WAKE_TIMEOUT_S = 5
+CLASSES = ('now', 'beat', 'digest', 'mute')
+SAFETY_H = 3
+STALLED_MAX_MIN = 45
+LOG_MAX = 512 * 1024
+ENDED = {'done', 'failed', 'killed', 'stopped', 'interrupted', 'orphaned'}
+# An open goal step or idea that waits on the owner or on a date isn't startable.
+BLOCKED = re.compile(r'\b(ask(ed)?\b|waiting|wait for|blocked|after (his|the owner|he|bookings|~)|once (he|his|the owner)'
+                     r'|when he\b|needs? (his|the owner|owner)|owner:? later|not picked|offered|on hold)|\bfine\.', re.I)
+TIME = re.compile(r'(?<![\d:.])([01]?\d|2[0-3]):([0-5]\d)(?![\d:])')
+ISO = re.compile(r'(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)')
+DOT = re.compile(r'(?<![\w.])(\d{1,2})\.(\d{1,2})(?:\.(\d{4})(?!\d)|\.(?!\d))?(?!\w|\.\d)')
+TOMORROW = re.compile(r'\b(tomorrow|morgen)\b', re.I)
+_HM = r'(?P<H>[01]?\d|2[0-3]):(?P<M>[0-5]\d)(?!\d)'
+_DM = r'(?P<d>\d{1,2})\.(?P<m>\d{1,2})(?:\.(?P<y>\d{4}))?(?!\d)'
+DUE_PHRASE = (   # ~/bin/board DUE_RES, in its order (same as core.todo in ~/opt/assistant)
+    re.compile(rf'\bdue\s+{_HM}\s+{_DM}'),
+    re.compile(rf'^\s*\*\*[^*]+\*\*\s+—\s+(?:due\s+)?{_DM}\.?\s+{_HM}'),
+    re.compile(rf'^\s*\*\*[^*]+\*\*\s+—\s+(?:due\s+)?{_HM}\s+{_DM}'),
+)
+PATHISH = re.compile(r'(?<!\S)(?=\S*/)(?=\S*[^\W\d_])\S+')   # ~/reports/x-2026-11-05.md, a/b.json, https://…
+
+
+def now_dt():
+    v = ENV('HB_GATE_NOW')
+    if v:
+        if re.fullmatch(r'\d+(\.\d+)?', v):
+            return datetime.fromtimestamp(float(v), TZ)
+        return datetime.strptime(v, '%Y-%m-%d %H:%M').replace(tzinfo=TZ)
+    return datetime.now(TZ)
+
+
+def to_sec(v):   # ms or s since the epoch
+    v = float(v or 0)
+    return v / 1000 if v > 1e11 else v
+
+
+def sections(path):
+    """{heading: [top-level bullet lines]} of a markdown file ("## X" headings; sub-bullets and prose dropped)."""
+    out, cur = {}, None
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            if line.startswith('## '):
+                cur = line[3:].strip()
+                out[cur] = []
+            elif cur is not None and line.startswith('- '):
+                out[cur].append(line[2:].strip())
+    return out
+
+
+def section(secs, name):
+    """The bullets of the first heading starting with `name` (case-insensitive), [] if none."""
+    for k, v in secs.items():
+        if k.lower().startswith(name.lower()):
+            return v
+    return []
+
+
+def day_of(d, m, y, today):
+    """DD.MM[.YYYY] as a date; no year given = the nearest such day (across the year boundary too)."""
+    cands = []
+    for yy in [int(y)] if y else [today.year - 1, today.year, today.year + 1]:
+        try:
+            cands.append(datetime(yy, int(m), int(d), tzinfo=TZ).date())
+        except ValueError:
+            pass
+    return min(cands, key=lambda c: abs((c - today).days)) if cands else None
+
+
+def due_at(item, today, anchor):
+    """When a Due item falls due (an aware datetime), or None = due now (no date, no time)."""
+    for rx in DUE_PHRASE:
+        mt = rx.search(item)
+        day = day_of(mt['d'], mt['m'], mt['y'], today) if mt else None
+        if mt and day:
+            return datetime(day.year, day.month, day.day, int(mt['H']), int(mt['M']), tzinfo=TZ)
+    item = PATHISH.sub(' ', item)
+    dates = []
+    for y, m, d in ISO.findall(item):
+        try:
+            dates.append(datetime(int(y), int(m), int(d), tzinfo=TZ).date())
+        except ValueError:
+            pass
+    for d, m, y in DOT.findall(item):
+        day = day_of(d, m, y, today)
+        if day:
+            dates.append(day)
+    times = [(int(h), int(mi)) for h, mi in TIME.findall(item)]
+    if not dates and TOMORROW.search(item):
+        dates = [anchor + timedelta(days=1)]
+    if not dates and not times:
+        return None
+    day = min(dates) if dates else today
+    h, mi = min(times) if times else (0, 0)
+    return datetime(day.year, day.month, day.day, h, mi, tzinfo=TZ)
+
+
+def due_reached(at, now):
+    """Has the clock reached Due time `at` (aware, Zurich)? The first instant the wall clock shows it: a time in
+    the repeated autumn hour is due at its first pass (an aware comparison within one zone is wall-clock only, so
+    the epoch check catches the second pass), a time in the skipped spring hour at 03:00."""
+    return at.replace(tzinfo=None) <= now.replace(tzinfo=None) or at.timestamp() <= now.timestamp()
+
+
+def due_items(now):
+    secs = sections(TODO)
+    anchor = datetime.fromtimestamp(os.stat(TODO).st_mtime, TZ).date()
+    out = []
+    for item in section(secs, 'Due'):
+        at = due_at(item, now.date(), anchor)
+        if at is None or due_reached(at, now):
+            out.append(item)
+    return out, secs
+
+
+def title(item, n=40):
+    m = re.match(r'\*\*(.+?)\*\*', item)
+    t = (m.group(1) if m else item).strip()
+    return t if len(t) <= n else t[:n - 1] + '…'
+
+
+def startable(secs):
+    goals = 0
+    try:
+        with open(GOALS, encoding='utf-8') as f:
+            goals = sum(1 for l in f if l.startswith('- [ ]') and not BLOCKED.search(l))
+    except FileNotFoundError:
+        pass
+    ideas = sum(1 for i in section(secs, 'Ideas') if not BLOCKED.search(i))
+    night = len(section(secs, 'Night backlog'))
+    return {'goals': goals, 'ideas': ideas, 'night': night}
+
+
+def inbox_notes():
+    try:
+        with os.scandir(INBOX) as it:
+            return sum(1 for e in it if not e.name.startswith('.') and e.is_file(follow_symlinks=False))
+    except FileNotFoundError:
+        return 0
+
+
+def agents_fallback(now_s, since_s):
+    """(running ids, finished ids) from `agent-watch status` (transcript metadata) when the mod passed none."""
+    r = subprocess.run([AGENT_WATCH, 'status', '--hours', '6'], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise RuntimeError(f'agent-watch status exit {r.returncode}')
+    lines = r.stdout.splitlines()
+    hdr = next((i for i, l in enumerate(lines) if l.split()[:2] == ['ID', 'STATE']), None)
+    if hdr is None:
+        if any('(none)' in l for l in lines):
+            return [], []
+        raise RuntimeError('agent-watch status: no table')
+    running, finished = [], []
+    for l in lines[hdr + 1:]:
+        p = l.split()
+        if len(p) < 4 or not p[3].endswith('m'):
+            continue
+        aid, state, silent = p[0], p[1], int(p[3][:-1])
+        if state == 'running' or (state == 'stalled' and silent <= STALLED_MAX_MIN):
+            running.append(aid)
+        elif state in ENDED and now_s - silent * 60 > since_s:
+            finished.append(aid)
+    return running, finished
+
+
+def wake_view():
+    """The brain's wake rules as the gate needs them: (view, '') from `wake check --json`, else (None, why)."""
+    try:
+        r = subprocess.run([WAKE, 'check', '--json', '--inbox', INBOX], capture_output=True, text=True,
+                           timeout=WAKE_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f'wake check: {type(e).__name__}'
+    if r.returncode != 0:
+        return None, f'wake check exit {r.returncode}'
+    try:
+        v = json.loads((r.stdout or '').strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None, 'wake check: bad output'
+    if not isinstance(v, dict) or v.get('ok') is not True or not isinstance(v.get('counts'), dict):
+        return None, 'wake check: bad output'
+    return v, ''
+
+
+def kinds_of(view, cls, n=3):
+    ks = (view.get('kinds') or {}).get(cls) or {}
+    if not isinstance(ks, dict):
+        return '?'
+    items = [f'{k} ×{c}' if c > 1 else k for k, c in list(ks.items())[:n]]
+    return ', '.join(items) + (f' +{len(ks) - n}' if len(ks) > n else '')
+
+
+def decide(o):
+    now = now_dt()
+    if os.path.exists(OFF):
+        return 'wake', 'gate off (~/.config/hb-gate/off)', {}
+    if os.path.exists(RULES_OFF):                                                           # exactly as before
+        if o.get('now_only'):
+            return 'skip', 'now lane: wake rules off', {}
+        return decide_today(o, now)
+    view, err = wake_view()
+    if view is None:                                                                        # fail open: as before
+        if o.get('now_only'):
+            return 'skip', f'now lane: wake rules unreadable ({err})', {}
+        decision, reason, checks = decide_today(o, now)
+        checks['rules'] = 'unreadable'
+        return decision, f'{reason} [wake rules unreadable: {err}]'[:200], checks
+    return decide_rules(o, now, view)
+
+
+def decide_today(o, now):
+    checks = {}
+    notes = max(inbox_notes(), int(o.get('notes') or 0))
+    checks['notes'] = notes
+    if notes:
+        return 'wake', f'inbox: {notes} note(s)', checks                                   # (a)
+    return decide_rest(o, now, checks)
+
+
+def decide_rules(o, now, view):
+    """(a) by delivery class: the gate's own classified scan (`wake check`) replaces --notes."""
+    counts = view.get('counts') or {}
+    n = {c: int(counts.get(c) or 0) for c in CLASSES}
+    checks = {'notes': n['beat'], 'now_notes': n['now'], 'digest': n['digest'], 'mute': n['mute'],
+              'rules': int(view.get('rules') or 0)}
+    if n['now']:
+        return 'wake', f"now: {n['now']} note(s) ({kinds_of(view, 'now')})" + (' [now lane]' if o.get('now_only')
+                                                                               else ''), checks
+    if o.get('now_only'):
+        return 'skip', 'now lane: no now-class note', checks
+    quiet = n['digest'] + n['mute']
+    if n['beat']:
+        return 'wake', f"inbox: {n['beat']} note(s)" + (f' (+{quiet} digest/mute)' if quiet else ''), checks   # (a)
+    hold = view.get('hold') if isinstance(view.get('hold'), dict) else None
+    return decide_rest(o, now, checks, hold)
+
+
+def decide_rest(o, now, checks, hold=None):
+    now_s = now.timestamp()
+    due, secs = due_items(now)
+    checks['due'] = len(due)
+    if due:
+        return 'wake', f'due: {title(due[0])}' + (f' (+{len(due) - 1})' if len(due) > 1 else ''), checks   # (b)
+    try:
+        marker = os.stat(MARKER).st_mtime
+    except FileNotFoundError:
+        marker = 0
+    last = max(to_sec(o.get('last_beat')), marker)
+    if o.get('running') is not None:
+        running = int(o['running'])
+        finished = int(o.get('finished') or 0)
+        ids = [i for i in (o.get('ids') or '').split(',') if i]
+    else:
+        r_ids, f_ids = agents_fallback(now_s, last)
+        running, finished, ids = len(r_ids), len(f_ids), r_ids
+    checks.update(running=running, finished=finished)
+    if finished:
+        return 'wake', f'{finished} agent(s) finished since the last beat', checks         # (d)
+    if o.get('first'):
+        return 'wake', 'first beat after a restart', checks                                # (e)
+    ago = now_s - last
+    checks['last_beat_min'] = round(ago / 60) if last else None
+    if not last:
+        return 'wake', 'safety valve: no beat on record', checks                           # (f)
+    if ago >= SAFETY_H * 3600:
+        return 'wake', f'safety valve: last beat {ago / 3600:.1f} h ago', checks
+    if hold is not None:                                       # `wake next`: only the idle work beat (c) waits
+        until = float(hold.get('until') or 0)
+        if until > now_s:
+            checks['hold_until'] = round(until)
+            why = str(hold.get('why') or '')[:60]
+            return 'skip', f'held until {datetime.fromtimestamp(until, TZ):%d.%m %H:%M}' + (f': {why}' if why else ''), \
+                checks
+    if running:
+        tag = ' (' + ', '.join(i[:8] for i in ids[:3]) + ')' if ids else ''
+        return 'skip', f'agent running: {running}{tag}', checks
+    work = startable(secs)
+    checks.update(work)
+    if any(work.values()):                                                                 # (c)
+        return 'wake', 'no agent running; startable: goals {goals}, ideas {ideas}, night {night}'.format(**work), checks
+    return 'skip', 'no agent running, nothing startable', checks
+
+
+def log_line(decision, reason):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, 'a', encoding='utf-8') as f:
+            f.write(f'{now_dt():%Y-%m-%d %H:%M:%S} {decision} {reason}\n')
+        if os.path.getsize(LOG) > LOG_MAX:
+            with open(LOG, encoding='utf-8') as f:
+                keep = f.readlines()[-2000:]
+            tmp = LOG + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                f.writelines(keep)
+            os.replace(tmp, LOG)
+    except OSError:
+        pass
+
+
+def parse(argv):
+    o, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ('--json', '--dry-run', '--first', '--now-only'):
+            o[a[2:].replace('-', '_')] = True
+        elif a in ('--notes', '--last-beat', '--running', '--finished', '--ids'):
+            i += 1
+            if i >= len(argv):
+                raise ValueError(f'{a} needs a value')
+            o[a[2:].replace('-', '_')] = argv[i]
+        else:
+            raise ValueError(f'unknown argument {a}')
+        i += 1
+    for k in ('notes', 'running', 'finished'):
+        if k in o:
+            o[k] = int(o[k])
+    if 'last_beat' in o:
+        o['last_beat'] = float(o['last_beat'])
+    return o
+
+
+def cmd_log(argv):
+    n = int(argv[0]) if argv else 20
+    try:
+        with open(LOG, encoding='utf-8') as f:
+            sys.stdout.writelines(f.readlines()[-n:] if n > 0 else [])
+    except FileNotFoundError:
+        print('(no log yet)')
+    return 0
+
+
+def cmd_stats():
+    day = f'{now_dt():%Y-%m-%d}'
+    c = {'wake': 0, 'skip': 0}
+    try:
+        with open(LOG, encoding='utf-8') as f:
+            for l in f:
+                p = l.split(' ', 3)
+                if len(p) > 2 and p[0] == day and p[2] in c:
+                    c[p[2]] += 1
+    except FileNotFoundError:
+        pass
+    print(f'{day}: {c["wake"]} wake, {c["skip"]} skip')
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ['log']:
+        return cmd_log(argv[1:])
+    if argv[:1] == ['stats']:
+        return cmd_stats()
+    if argv[:1] in (['-h'], ['--help'], ['help']):
+        print(__doc__)
+        return 0
+    o = {}
+    try:
+        o = parse(argv)
+        decision, reason, checks = decide(o)
+    except Exception as e:   # fail open
+        decision, reason, checks = 'wake', f'gate error: {type(e).__name__}: {e}'[:200], {}
+    quiet = '--now-only' in argv and not (decision == 'wake' and reason.startswith('now:'))   # now-lane misses
+    if not o.get('dry_run') and not quiet:
+        log_line(decision, reason)
+    if o.get('json') or '--json' in argv:
+        print(json.dumps({'decision': decision, 'reason': reason, 'checks': checks}))
+    else:
+        print(f'{decision}: {reason}')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as e:   # even printing failed: still a wake for anyone parsing
+        print(json.dumps({'decision': 'wake', 'reason': f'gate crash: {e}'[:200]}))
+        sys.exit(0)

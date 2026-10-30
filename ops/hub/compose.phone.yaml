@@ -1,0 +1,54 @@
+# claude-hub phone (v2 Phase 3 P3-8): the phone gateway in the hub. An override of compose.yaml, installed and started
+# only by the owner's phone paste (`hub kit paste phone-install`), which runs
+#   docker compose -f compose.yaml -f compose.phone.yaml [-f compose.voice.yaml] [-f compose.tg.yaml] --profile phone up -d phone
+# - phone runs ops/hub/phoneloader.py (installed by the paste into HUB_ROOT/loader), which runs the release's
+#   phone/run.py (adapters/phone + the app protocol schemas + its pinned wheels) with state in HUB_ROOT/phone/state
+#   (phonegw.db with the paired devices, gw.log, shares, the gateway's own config.json).
+# - Keys, copied by the paste BY NAME from the brain's home (never by the brain): the gateway's CA, server and public
+#   keys (the same ones, so his paired app keeps working) and internal.token = the brain's ~/.secrets/phone-cli-token
+#   (`hub phone token prep`: the `phone` CLI's own token for the internal API) in HUB_ROOT/secrets/phone (a directory
+#   of its own, mounted only here); token_phone = this container's hub caller token (Cedar principal `phone`);
+#   phone_voice_link_token = the voice relay's link token (P3-7: app calls through claude-hub-voice:8797).
+# - Ports (D-x): only the app's front (TLS -> the mTLS app API, PROXY v1 from the web VM -> the public TLS site,
+#   plain HTTP -> browser view), the one host port claude-bot published until the paste moved it, so the app,
+#   WireGuard, the web VM's proxy and his router stay untouched. The public route's port (public.port in the gateway
+#   config) is the web VM's nginx stream listener, not a host port here: it forwards to this front. Docker's port
+#   publishing keeps client addresses (the front's LAN/WG allowlist and the public route's proxy check still see real
+#   sources).
+# - Networks: hub (hubd, its gateway, claude-hub-voice) + brain (claude-bot: its `phone` CLI reaches the internal API
+#   :8796 with its own token; browser view's noVNC; outbound for geocoding) - the brain network also carries the ports.
+services:
+  hub:
+    environment:
+      HUB_PHONE: "on"
+
+  phone:
+    command: ["python3", "-I", "-B", "/opt/hub-loader/phoneloader.py", "--releases", "/srv/releases", "--state", "/srv/phone/state", "--config", "/srv/phone/config/live.json"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+    secrets: [token_phone, phone_voice_link_token]
+    networks: [hub, brain]
+    ports:
+      - "@@FRONT_PORT@@:@@FRONT_PORT@@"
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/loader", target: /opt/hub-loader, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/.local/share/claude-hub/releases", target: /srv/releases, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/phone/config", target: /srv/phone/config, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/phone/state", target: /srv/phone/state, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/secrets/phone", target: /srv/phone/secrets, bind: {create_host_path: false}}
+    healthcheck:
+      test: ["CMD", "python3", "-I", "-c", "import json,sys,time; s=json.load(open('/srv/phone/state/phoneloader-status.json')); sys.exit(0 if s['state'] in ('running','held') and time.time()-s['ts']<90 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 1g, pids: 256}
+
+secrets:
+  token_phone:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/token_phone
+  phone_voice_link_token:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/phone_voice_link_token

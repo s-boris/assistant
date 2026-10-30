@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""whereabouts: his coarse whereabouts in the `vault ha now --json` schema: phone app first, the vault as fallback.
+
+  whereabouts [ha] now [--json] [--max-age MIN] [--for CONSUMER] [--fresh-only]   (`whereabouts ha now --json` drops in for `vault ha now --json`)
+  whereabouts status [--for CONSUMER] [--fresh-only]                           which source answers now, and why (no values)
+
+Order: WHEREABOUTS_ORDER ("phone,vault" | "vault" | "phone"), else ~/.config/whereabouts/config.json {"order": ...,
+"consumers": {"driving": "vault", ...}} (--for / WHEREABOUTS_FOR picks a consumer's entry), else phone,vault.
+The phone counts when its state is <= --max-age (WHEREABOUTS_MAX_AGE_MIN, default 30) minutes old and has a place.
+When every source fails a stale phone answer is the last resort; --fresh-only (WHEREABOUTS_FRESH_ONLY=1) drops it.
+Exit: 0 an answer printed · 1 no source answered · 2 usage. Details: ~/bin/lib/whereabouts.py.
+"""
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import whereabouts  # noqa: E402
+
+
+def main(argv):
+    args = list(argv)
+    if args[:1] == ["ha"]:
+        args = args[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    cmd, rest = args[0], args[1:]
+    as_json, max_age, consumer, fresh_only = False, None, None, None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--json":
+            as_json = True
+        elif a == "--fresh-only":
+            fresh_only = True
+        elif a in ("--max-age", "--for") and i + 1 < len(rest):
+            if a == "--max-age":
+                if not rest[i + 1].isdigit():
+                    print("whereabouts: --max-age MIN", file=sys.stderr)
+                    return 2
+                max_age = int(rest[i + 1])
+            else:
+                consumer = rest[i + 1]
+            i += 1
+        else:
+            print("whereabouts: unknown argument %s" % a[:30], file=sys.stderr)
+            return 2
+        i += 1
+    if cmd not in ("now", "status"):
+        print("whereabouts: now | status", file=sys.stderr)
+        return 2
+    log = []
+    d = whereabouts.now(max_age_min=max_age, consumer=consumer, explain=log, fresh_only=fresh_only)
+    if cmd == "status":
+        print("order: %s" % ",".join(whereabouts.order(consumer)))
+        for line in log:
+            print("  " + line)
+        print("answer: %s" % (d.get("source") if d else "none"))
+        return 0 if d else 1
+    if d is None:
+        print("whereabouts: no source answered", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(d, ensure_ascii=False))
+    else:
+        p = d.get("place") or {}
+        print("%s: %s%s · drive %s · age %s min" % (d.get("source"), p.get("zone") or p.get("kind") or "?",
+                                                  " (%s)" % p["band"] if p.get("band") else "",
+                                                  (d.get("drive") or {}).get("active"), d.get("age_min")))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,6 @@
+#!/bin/sh
+# voice-tg: second Telegram account for the call bridge. login start [PHONE] | login finish CODE [--password-file F] | status | harden
+D="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$D" || exit 2
+PY="$D/.venv/bin/python"; [ -x "$PY" ] || PY="${VOICE_RELAY_PYTHON:-python3}"  # the monorepo copy has no venv of its own
+exec "$PY" -E -s -m voice_relay.userbot "$@"

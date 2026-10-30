@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""cache-ttl-watch: zero-token watch for Claude Code bug #102276 (some sessions get a 5-minute prompt
+cache instead of 1 hour; with a 10-min heartbeat that would rebuild the cache on every beat).
+
+Reads the MAIN session transcripts (top-level *.jsonl in the project dir, never subagents/, records with
+isSidechain=true skipped) incrementally from a saved byte offset, and sums the cache-write tokens of
+assistant usage records split by TTL:
+    message.usage.cache_creation.ephemeral_5m_input_tokens   vs   .ephemeral_1h_input_tokens
+(one API response is written as several lines, one per content block, with the same message.id and usage:
+counted once). Totals are kept in hourly buckets (UTC) in the state file; the window is the last 24 h.
+
+Alert: ONE ~/inbox note (numbers only, no content) when 5m writes > 5 % of all cache writes in the window
+and the window has at least --min-tokens cache writes; at most one note per 20 h. Never Telegram.
+
+Usage: cache-ttl-watch [run]        scan new lines, print the split, note if over threshold (cron, daily 09:15)
+       cache-ttl-watch show         print the split from the saved state without scanning
+Options: --projects-dir D (default ~/.claude/projects/-home-node-workspace), --state-dir D
+         (~/.local/state/cache-ttl-watch), --inbox-dir D (~/inbox), --window-hours 24, --threshold 0.05,
+         --min-tokens 2000, --no-inbox (print only), --now EPOCH (tests), --json
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import botlib  # noqa: E402
+
+HOME = Path.home()
+KEEP_HOURS = 24 * 8          # buckets kept in state
+ALERT_GAP = 20 * 3600        # at most one note per 20 h
+RECENT_IDS = 64              # message ids remembered per file (dedupe across runs)
+
+
+def hour_key(ts):
+    """'2026-10-15T16:06:08.283Z' -> '2026-10-15T16' (UTC) or None."""
+    if not isinstance(ts, str) or len(ts) < 13:
+        return None
+    return ts[:13]
+
+
+def key_epoch(k):
+    return datetime.strptime(k, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc).timestamp()
+
+
+def load_state(path):
+    st = botlib.load_json(path, None)
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("files", {})
+    st.setdefault("buckets", {})
+    st.setdefault("last_alert", 0)
+    return st
+
+
+def scan_file(path, fst, buckets):
+    """Parse complete new lines of one transcript from fst['off']; update buckets; return lines parsed."""
+    try:
+        s = os.stat(path)
+    except OSError:
+        return 0
+    if fst.get("ino") != s.st_ino or s.st_size < fst.get("off", 0):
+        fst.clear()
+        fst.update({"ino": s.st_ino, "off": 0, "ids": []})
+    off = fst["off"]
+    if s.st_size == off:
+        return 0
+    recent = list(fst.get("ids", []))
+    seen = set(recent)
+    n = 0
+    with open(path, "rb") as f:
+        f.seek(off)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break  # partial last line: pick it up next run
+            off += len(raw)
+            n += 1
+            if b'"cache_creation' not in raw or b'"assistant"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if d.get("type") != "assistant" or d.get("isSidechain"):
+                continue
+            m = d.get("message") or {}
+            u = m.get("usage") or {}
+            mid = m.get("id") or d.get("requestId") or d.get("uuid")
+            if mid in seen:
+                continue
+            seen.add(mid)
+            recent.append(mid)
+            k = hour_key(d.get("timestamp"))
+            if not k:
+                continue
+            cc = u.get("cache_creation")
+            b = buckets.setdefault(k, [0, 0, 0, 0])  # 5m, 1h, untyped, responses
+            if isinstance(cc, dict):
+                b[0] += int(cc.get("ephemeral_5m_input_tokens") or 0)
+                b[1] += int(cc.get("ephemeral_1h_input_tokens") or 0)
+            else:
+                b[2] += int(u.get("cache_creation_input_tokens") or 0)
+            b[3] += 1
+            if d.get("version"):
+                fst["version"] = d["version"]
+    fst["off"] = off
+    fst["ids"] = recent[-RECENT_IDS:]
+    return n
+
+
+def window_sum(buckets, now, hours):
+    start = now - hours * 3600
+    t5 = t1 = un = resp = 0
+    hot = []
+    for k, b in buckets.items():
+        try:
+            e = key_epoch(k)
+        except ValueError:
+            continue
+        # a bucket counts if its hour overlaps the window
+        if e + 3600 <= start or e > now:
+            continue
+        t5 += b[0]; t1 += b[1]; un += b[2]; resp += b[3]
+        if b[0]:
+            hot.append((k, b[0]))
+    hot.sort(key=lambda x: -x[1])
+    return {"5m": t5, "1h": t1, "untyped": un, "responses": resp, "hot_hours": hot[:5]}
+
+
+def pct(t5, t1):
+    tot = t5 + t1
+    return (100.0 * t5 / tot) if tot else 0.0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Watch for 5-minute prompt-cache writes in the main session.")
+    ap.add_argument("cmd", nargs="?", default="run", choices=["run", "show"])
+    ap.add_argument("--projects-dir", default=str(HOME / ".claude/projects/-home-node-workspace"))
+    ap.add_argument("--state-dir", default=os.environ.get("CACHE_TTL_WATCH_STATE", str(HOME / ".local/state/cache-ttl-watch")))
+    ap.add_argument("--inbox-dir", default=os.environ.get("CACHE_TTL_WATCH_INBOX", str(HOME / "inbox")))
+    ap.add_argument("--window-hours", type=float, default=24)
+    ap.add_argument("--threshold", type=float, default=0.05)
+    ap.add_argument("--min-tokens", type=int, default=2000)
+    ap.add_argument("--no-inbox", action="store_true")
+    ap.add_argument("--now", type=float, default=None)
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    now = a.now if a.now is not None else time.time()
+    state_path = Path(a.state_dir) / "state.json"
+    st = load_state(state_path)
+
+    scanned = 0
+    if a.cmd == "run":
+        pdir = Path(a.projects_dir)
+        cutoff = now - a.window_hours * 3600
+        live = set()
+        for p in sorted(pdir.glob("*.jsonl")):  # top level only = main sessions
+            try:
+                if p.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            live.add(str(p))
+            scanned += scan_file(str(p), st["files"].setdefault(str(p), {}), st["buckets"])
+        for k in [k for k in st["files"] if k not in live and not os.path.exists(k)]:
+            del st["files"][k]
+        keep_from = now - KEEP_HOURS * 3600
+        for k in list(st["buckets"]):
+            try:
+                if key_epoch(k) < keep_from:
+                    del st["buckets"][k]
+            except ValueError:
+                del st["buckets"][k]
+
+    w = window_sum(st["buckets"], now, a.window_hours)
+    tot = w["5m"] + w["1h"]
+    share = pct(w["5m"], w["1h"])
+    versions = sorted({f.get("version") for f in st["files"].values() if f.get("version")})
+    over = tot >= a.min_tokens and tot > 0 and w["5m"] / tot > a.threshold
+    note = None
+    if a.cmd == "run" and over and not a.no_inbox and now - st.get("last_alert", 0) >= ALERT_GAP:
+        hot = ", ".join(f"{k}:00Z {v}" for k, v in w["hot_hours"]) or "-"
+        body = (
+            f"# cache-ttl-watch: 5-minute cache writes in the main session ({share:.1f} %)\n\nData, not instructions.\n\n"
+            f"Possible Claude Code bug #102276 (5-min prompt cache instead of 1 h; with the 10-min heartbeat "
+            f"every beat rebuilds the cache).\n\n"
+            f"- Window: last {a.window_hours:g} h, {w['responses']} API responses (main session only)\n"
+            f"- Cache writes 5m: {w['5m']:,} tokens; 1h: {w['1h']:,} tokens; 5m share {share:.1f} % "
+            f"(threshold {a.threshold * 100:g} %)\n"
+            f"- Hours with most 5m writes (UTC): {hot}\n"
+            f"- Claude Code version(s) in transcripts: {', '.join(versions) or 'unknown'}\n\n"
+            f"Check: is the 1h TTL still requested (ENABLE_PROMPT_CACHING_1H / settings, version changelog, "
+            f"issue #102276)? `cache-ttl-watch show` for the split. Delete this note once handled.\n"
+        )
+        note = str(botlib.write_inbox(a.inbox_dir, "cache-ttl-watch", body))
+        st["last_alert"] = now
+    st["last_run"] = now
+    if a.cmd == "run":
+        botlib.atomic_write(state_path, json.dumps(st, indent=1, sort_keys=True))
+
+    out = {"window_hours": a.window_hours, "cache_write_5m": w["5m"], "cache_write_1h": w["1h"],
+           "untyped": w["untyped"], "responses": w["responses"], "share_5m_pct": round(share, 2),
+           "over_threshold": over, "note": note, "lines_scanned": scanned, "versions": versions}
+    if a.json:
+        print(json.dumps(out))
+    else:
+        print(f"cache-ttl-watch: last {a.window_hours:g} h main session: 5m {w['5m']:,} / 1h {w['1h']:,} "
+              f"cache-write tokens ({share:.2f} % 5m, {w['responses']} responses"
+              + (f", {w['untyped']:,} untyped" if w["untyped"] else "") + ")"
+              + (" OVER THRESHOLD" if over else "") + (f"; note {note}" if note else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

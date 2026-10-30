@@ -1,0 +1,72 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.unraid-health.schema.json",
+ "title": "unraid-health: what = unreachable | issues | reachable | crashed; counts and flags only",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "what"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.unraid-health"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "what": {
+   "enum": [
+    "unreachable",
+    "issues",
+    "reachable",
+    "crashed"
+   ]
+  },
+  "failures": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "texted": {
+   "type": "boolean"
+  },
+  "new": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "crit": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "warn": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "cats": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "integer",
+    "minimum": 0
+   }
+  },
+  "ongoing": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "acked": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "error": {
+   "type": "string"
+  }
+ }
+}

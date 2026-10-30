@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""lists: the owner's local lists (shopping, todo, anything else). No tokens, no network.
+
+  lists add LIST "item" ["item"...]     add items; an item already on the list (case-insensitive) is skipped,
+                                        a checked one is reopened
+  lists show [LIST] [--json]            numbered open items, then checked ones (✓); no LIST = every list
+  lists done LIST N|"text" ...          check items off by number (from `show`) or text (exact, else a unique
+                                        part of one item); all or nothing: one unknown reference changes nothing
+  lists rm LIST N|"text" ...            remove items outright (a wrong entry); same matching as `done`
+  lists clear LIST --done               drop the checked items now
+  lists ls [--json]                     every list with its open / checked counts
+
+List names: lowercase, spaces become "-", a trailing "list"/"liste" is dropped. Aliases:
+  shopping  = einkauf, einkaufen, einkaufsliste, groceries, grocery, kupovina, nabavka, namirnice
+  todo      = to-do, todos, aufgaben, tasks, zadaci, obaveze
+Checked items stay visible for 7 days, then they are dropped. A list without items disappears.
+
+Data: ~/.local/state/lists/lists.json (0600; written atomically under a lock).
+  {"lists": {"shopping": [{"text": "Milk", "added": "YYYY-MM-DD HH:MM", "done": null | "YYYY-MM-DD HH:MM"}]}}
+Times are owner wall time (profile locale.tz).
+Env (tests): LISTS_DB (state file), LISTS_NOW ("YYYY-MM-DD HH:MM", owner wall time).
+Exit: 0 ok, 1 item not found / ambiguous (nothing changed), 2 usage.
+"""
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+
+DB = os.environ.get("LISTS_DB") or os.path.expanduser("~/.local/state/lists/lists.json")
+FMT = "%Y-%m-%d %H:%M"
+KEEP_DONE = timedelta(days=7)
+MAX_NAME = 40
+MAX_ITEM = 200
+
+ALIASES = {
+    "shopping": ("shopping", "einkauf", "einkaufen", "einkaufsliste", "groceries", "grocery", "kupovina",
+                 "nabavka", "namirnice"),
+    "todo": ("todo", "to-do", "todos", "to-dos", "aufgaben", "tasks", "zadaci", "obaveze"),
+}
+ALIAS = {a: name for name, al in ALIASES.items() for a in al}
+EMOJI = {"shopping": "🛒", "todo": "☑️"}
+DEFAULT_EMOJI = "🗒️"
+
+
+class UsageError(Exception):
+    pass
+
+
+class NotFound(Exception):
+    pass
+
+
+def now_local():
+    fake = os.environ.get("LISTS_NOW")
+    if fake:
+        return datetime.strptime(fake, FMT)
+    return datetime.fromtimestamp(time.time(), assistant_profile.tz()).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def norm_list(name):
+    """User list name -> canonical key ("Einkaufsliste" -> shopping, "Packing List" -> packing)."""
+    s = re.sub(r"\s+", " ", str(name or "")).strip().lower()
+    if s in ALIAS:
+        return ALIAS[s]
+    s = re.sub(r"[\s_-]+(list|liste)$", "", s).strip() or s
+    s = re.sub(r"[\s_]+", "-", s).strip("-")
+    s = ALIAS.get(s, s)
+    if not s or len(s) > MAX_NAME or "/" in s or s.startswith("."):
+        raise UsageError(f'bad list name "{name}"')
+    return s
+
+
+def emoji(name):
+    return EMOJI.get(name, DEFAULT_EMOJI)
+
+
+def title(name):
+    return name[:1].upper() + name[1:]
+
+
+def key(text):
+    """Dedupe key: case-insensitive, whitespace-collapsed."""
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def clean_item(text):
+    t = re.sub(r"\s+", " ", str(text)).strip()
+    if not t:
+        raise UsageError("empty item")
+    if len(t) > MAX_ITEM:
+        raise UsageError(f"item longer than {MAX_ITEM} characters")
+    return t
+
+
+# ------------------------------------------------------------------ storage
+
+def lock():
+    os.makedirs(os.path.dirname(DB), mode=0o700, exist_ok=True)
+    fd = os.open(DB + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def load():
+    try:
+        with open(DB) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {"lists": {}}
+    except ValueError:
+        raise SystemExit(f"lists: {DB} is not valid JSON; fix or move it (nothing changed)")
+    if not isinstance(data, dict) or not isinstance(data.get("lists"), dict):
+        raise SystemExit(f"lists: {DB} is not a lists file; fix or move it (nothing changed)")
+    return data
+
+
+def save(data):
+    tmp = DB + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, DB)
+
+
+def prune(data, now):
+    """Drop checked items older than KEEP_DONE and empty lists. Returns True when something changed."""
+    changed = False
+    cutoff = (now - KEEP_DONE).strftime(FMT)
+    for name in list(data["lists"]):
+        items = data["lists"][name]
+        keep = [i for i in items if not i.get("done") or i["done"] > cutoff]
+        if len(keep) != len(items):
+            changed = True
+        if keep:
+            data["lists"][name] = keep
+        else:
+            del data["lists"][name]
+            changed = True
+    return changed
+
+
+def open_items(items):
+    return [i for i in items if not i.get("done")]
+
+
+def done_items(items):
+    return sorted((i for i in items if i.get("done")), key=lambda i: i["done"], reverse=True)
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_add(data, name, texts, now):
+    items = data["lists"].setdefault(name, [])
+    by_key = {key(i["text"]): i for i in items}
+    added, reopened, already = [], [], []
+    for raw in texts:
+        t = clean_item(raw)
+        k = key(t)
+        hit = by_key.get(k)
+        if hit is None:
+            hit = {"text": t, "added": now.strftime(FMT), "done": None}
+            items.append(hit)
+            by_key[k] = hit
+            added.append(t)
+        elif hit.get("done"):
+            hit["done"] = None
+            reopened.append(hit["text"])
+        else:
+            already.append(hit["text"])
+    parts = []
+    if added:
+        parts.append(f"+{len(added)} ({', '.join(added)})")
+    if reopened:
+        parts.append(f"back on: {', '.join(reopened)}")
+    if already:
+        parts.append(f"already there: {', '.join(already)}")
+    return f"{emoji(name)} {name}: " + "; ".join(parts)
+
+
+def resolve(items, refs):
+    """References (numbers from `show`, or text) -> item dicts among the open items. Raises NotFound."""
+    opened = open_items(items)
+    out, errors = [], []
+    for ref in refs:
+        r = str(ref).strip()
+        if re.fullmatch(r"\d+", r):
+            n = int(r)
+            if 1 <= n <= len(opened):
+                hit = opened[n - 1]
+            else:
+                errors.append(f"no item {n} (list has {len(opened)} open)")
+                continue
+        else:
+            k = key(r)
+            if not k:
+                errors.append("empty reference")
+                continue
+            exact = [i for i in opened if key(i["text"]) == k]
+            part = exact or [i for i in opened if k in key(i["text"])]
+            if len(part) == 1:
+                hit = part[0]
+            elif not part:
+                errors.append(f'"{r}" is not on the list')
+                continue
+            else:
+                errors.append(f'"{r}" matches {len(part)} items: ' + ", ".join(i["text"] for i in part[:5]))
+                continue
+        if any(hit is o for o in out):
+            continue
+        out.append(hit)
+    if errors:
+        raise NotFound("; ".join(errors))
+    return out
+
+
+def cmd_done(data, name, refs, now):
+    items = data["lists"].get(name, [])
+    hits = resolve(items, refs)
+    for h in hits:
+        h["done"] = now.strftime(FMT)
+    left = len(open_items(items))
+    return f"{emoji(name)} {name}: ✓ " + ", ".join(h["text"] for h in hits) + f" ({left} open)"
+
+
+def cmd_rm(data, name, refs):
+    items = data["lists"].get(name, [])
+    hits = resolve(items, refs)
+    data["lists"][name] = [i for i in items if not any(i is h for h in hits)]
+    return f"{emoji(name)} {name}: removed " + ", ".join(h["text"] for h in hits)
+
+
+def cmd_clear_done(data, name):
+    items = data["lists"].get(name, [])
+    gone = len(done_items(items))
+    data["lists"][name] = open_items(items)
+    return f"{emoji(name)} {name}: cleared {gone} checked item{'s' if gone != 1 else ''}"
+
+
+def list_json(name, items):
+    return {
+        "list": name,
+        "open": [{"n": n, "text": i["text"], "added": i.get("added")} for n, i in enumerate(open_items(items), 1)],
+        "done": [{"text": i["text"], "done": i["done"]} for i in done_items(items)],
+    }
+
+
+def render_list(name, items):
+    opened, checked = open_items(items), done_items(items)
+    if not opened and not checked:
+        return f"{emoji(name)} {title(name)}: empty"
+    lines = [f"{emoji(name)} {title(name)} ({len(opened)})"]
+    lines += [f"{n}. {i['text']}" for n, i in enumerate(opened, 1)]
+    lines += [f"✓ {i['text']}" for i in checked]
+    return "\n".join(lines)
+
+
+def take_flag(args, flag):
+    if flag in args:
+        args.remove(flag)
+        return True
+    return False
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if args else 2
+    cmd = args.pop(0)
+    as_json = take_flag(args, "--json")
+    if cmd not in ("add", "show", "done", "rm", "clear", "ls"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    try:
+        now = now_local()
+    except ValueError:
+        print('lists: LISTS_NOW must be "YYYY-MM-DD HH:MM"', file=sys.stderr)
+        return 2
+    lk = lock()
+    try:
+        data = load()
+        changed = prune(data, now)
+        out = None
+        if cmd == "add":
+            if len(args) < 2:
+                raise UsageError('usage: lists add LIST "item" ["item"...]')
+            out = cmd_add(data, norm_list(args[0]), args[1:], now)
+            changed = True
+        elif cmd in ("done", "rm"):
+            if len(args) < 2:
+                raise UsageError(f'usage: lists {cmd} LIST N|"text" ...')
+            name = norm_list(args[0])
+            out = cmd_done(data, name, args[1:], now) if cmd == "done" else cmd_rm(data, name, args[1:])
+            prune(data, now)
+            changed = True
+        elif cmd == "clear":
+            done_flag = take_flag(args, "--done")
+            if len(args) != 1 or not done_flag:
+                raise UsageError("usage: lists clear LIST --done")
+            name = norm_list(args[0])
+            out = cmd_clear_done(data, name)
+            prune(data, now)
+            changed = True
+        elif cmd == "show":
+            if len(args) > 1:
+                raise UsageError("usage: lists show [LIST] [--json]")
+            if args:
+                name = norm_list(args[0])
+                items = data["lists"].get(name, [])
+                out = json.dumps(list_json(name, items), ensure_ascii=False) if as_json else render_list(name, items)
+            else:
+                names = sorted(data["lists"], key=lambda n: (n not in EMOJI, n))
+                if as_json:
+                    out = json.dumps({"lists": [list_json(n, data["lists"][n]) for n in names]}, ensure_ascii=False)
+                else:
+                    out = "\n\n".join(render_list(n, data["lists"][n]) for n in names) or "(no lists)"
+        elif cmd == "ls":
+            if args:
+                raise UsageError("usage: lists ls [--json]")
+            names = sorted(data["lists"], key=lambda n: (n not in EMOJI, n))
+            rows = [{"list": n, "open": len(open_items(data["lists"][n])), "done": len(done_items(data["lists"][n]))}
+                    for n in names]
+            if as_json:
+                out = json.dumps(rows, ensure_ascii=False)
+            else:
+                out = "\n".join(f"{emoji(r['list'])} {r['list']}: {r['open']} open"
+                                + (f", {r['done']} checked" if r["done"] else "") for r in rows) or "(no lists)"
+        if changed:
+            save(data)
+    except UsageError as e:
+        print(f"lists: {e}", file=sys.stderr)
+        return 2
+    except NotFound as e:
+        print(f"lists: {e}; nothing changed", file=sys.stderr)
+        return 1
+    finally:
+        os.close(lk)
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

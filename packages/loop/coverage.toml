@@ -1,0 +1,490 @@
+# Loop coverage map: every part of the system and the loop steps that read it (`loop coverage`).
+#
+# A part claims registry members; the drift test (tests/loop/test_coverage.py) and the self-review collector
+# `coverage` derive the members from the live registries and fail / raise a finding when one is unclaimed or a part
+# has no loop step. Registries: core/schedules.toml (job features, job names), the hub kit's containers
+# (packages/hubkit CONTAINERS + ops/*/compose*.yaml container_name), the typed tools (packages/tools/domains, by
+# domain), the egress bindings (packages/hub/policy/egress.toml), and when present on the box: the skills and
+# agents dirs and the enabled plugins.
+#
+# Steps (ids below): review = self-review (docs = (a)-(e) over CLAUDE/JOBS/TOOLS.md, skills, agents, memory;
+# f = eval regression; g:* = loop signals; h:* = setup-health collectors), scorecard = loop.scorecard metric,
+# ideas = idea-scan input, cleanup = self-cleanup check, stack = stack research topic, evals = eval area.
+# Derived per run from schedules.toml (not listed by hand): h:joberr for every job, h:cronlogs for jobs with a
+# `>>` log, h:hubjobs for keeper and hub-schedule jobs, scorecard cron_fail for jobs run through cron-fail.
+# status = "in-progress" marks a part whose sources another change is adding (it may have no step yet).
+# No personal values here: the repo is exported publicly.
+
+schema = 1
+external_containers = ["claude-vault"]
+
+[steps.review]
+docs = "(a)-(e) changed lines of CLAUDE.md, JOBS.md, TOOLS.md, skills, agents, memory"
+f = "(f) eval regression of the latest self-evals run"
+"g:traces" = "loop signal: first reply, hook blocks, heartbeat turns (traces report)"
+"g:beats" = "loop signal: heartbeat beats (events metrics --beats)"
+"g:usage" = "loop signal: per-feature usage flags broken/slow/friction (product report)"
+"g:evals" = "loop signal: eval summary"
+"g:denials" = "loop signal: gateway denials per tool domain (tool policy)"
+"g:reflexes" = "loop signal: reflex firings"
+"g:corrections" = "loop signal: owner corrections -> fact rows + eval cases"
+"g:health" = "loop signal: the (h) findings as H1 candidates"
+"g:ci" = "loop signal: shared CI blockers"
+"g:cost" = "loop signal: cost per agent run"
+"h:land" = "(h) land/deploy log, CI records, shared CI blockers"
+"h:hubjobs" = "(h) hub workflow runs, catch-up, keepers"
+"h:joberr" = "(h) job .err files, failure notes"
+"h:cronlogs" = "(h) crontab logs"
+"h:traces" = "(h) traces.db: tool errors, hook blocks, first reply, agents"
+"h:phoenix" = "(h) Phoenix spans: latency, errors, tokens, cost"
+"h:agents" = "(h) agent-watch transitions"
+"h:events" = "(h) event ledger: unacked, emit errors, restarts"
+"h:slo" = "(h) SLO tiles 24 h vs 7 d"
+"h:evals" = "(h) evals history: infra errors"
+"h:hub" = "(h) hub health: checks ci/pg/phoenix, gateway, runner, egress counters"
+"h:server" = "(h) server health: docker, disks, VMs (read-only verb)"
+"h:hooks" = "(h) hook decisions by rule name"
+"h:board" = "(h) board-lint"
+"h:vault" = "(h) vault health counts: status, metrics, alerts, audit per event, log signatures, repo"
+"h:parts" = "(h) part checks: own containers by name, media, voice, web agent, reminders overdue, HA health watch"
+"h:coverage" = "(h) this map against the live registries"
+"h:phone" = "(h) phone app: gateway up/restarts, self-test check ids, push p95, connects, crashes, phone-inbox, phone.* tools"
+
+[steps.scorecard]
+reply_p95 = "first reply to his messages, p95"
+helper_p95 = "helper run time, p95"
+cost_day = "cost per 24 h"
+tokens_day = "tokens per 24 h"
+land_p95 = "land time of green lands, p95"
+land_fail = "failed share of land attempts"
+vault_wait_p95 = "vault LLM wait (live lane), p95"
+cron_fail = "failed share of cron runs"
+push_p95 = "phone push delivery (send to the app's ack), p95"
+
+# marker = text the live agent file must contain for the input or check to count (checked when the file is present)
+[steps.ideas]
+context = { desc = "0 context snapshot: server, weather, next 7 days, HN", marker = "~/.local/state/context/today.md" }
+signals = { desc = "0 signal categories (counts per type/topic)", marker = "signals.json" }
+calendar = { desc = "0 next 7 days of calendar", marker = "list_events" }
+goals = { desc = "1 GOALS.md", marker = "~/workspace/GOALS.md" }
+problems = { desc = "2 PROBLEMS.md", marker = "~/workspace/PROBLEMS.md" }
+todo = { desc = "3 TODO.md Ideas + Waiting", marker = "~/workspace/TODO.md" }
+changelog = { desc = "4 PROACTIVE/CHANGELOG tails", marker = "CHANGELOG.md" }
+unraid-report = { desc = "5 newest Unraid report", marker = "~/reports/unraid/" }
+vault = { desc = "5b vault health counts, repo log, open issues", marker = "vault metrics --days 7" }
+phone = { desc = "5c the phone app: readings, status, usage, repo log", marker = "5c. The phone app" }
+health = { desc = "5d setup health findings, scorecard, coverage gaps", marker = "loop coverage --gaps" }
+inventory = { desc = "6 ~/bin, skills, agents, crontab, earlier scans", marker = "ls ~/bin ~/.claude/skills ~/.claude/agents" }
+memory = { desc = "7 MEMORY.md index", marker = "MEMORY.md" }
+product = { desc = "7b product review + per-feature usage", marker = "product report --days 30" }
+web = { desc = "8 web news on his stack (stack topics)", marker = "new releases and notable changes for his stack" }
+
+[steps.cleanup]
+usage = { desc = "1 usage of ~/bin scripts, skills, agents, cron lines", marker = "Usage evidence for each ~/bin script" }
+config = { desc = "2 dead config, watches, reminders, state dirs, old reports", marker = "Dead config" }
+duplication = { desc = "3 duplication, overlong docs", marker = "Duplication and mess" }
+workspace = { desc = "4 TODO/GOALS/PROBLEMS, memory", marker = "Workspace hygiene" }
+slim = { desc = "6 slim ~/bin", marker = "Slim the code" }
+disk = { desc = "7 disk: cache, state, logs", marker = "Disk:" }
+findings = { desc = "8 open self-review findings", marker = "self-review open" }
+menu = { desc = "9 Telegram menu usage", marker = "menu-usage --brief" }
+product = { desc = "10 product usage", marker = "product report --days 30" }
+vault = { desc = "11 vault repo, health counts, issues", marker = "The vault (see" }
+phone = { desc = "12 the phone app: red checks, push delay, crashes, tests", marker = "12. The phone app" }
+monorepo = { desc = "13 monorepo + hub registries, ~/jobs, coverage gaps", marker = "loop coverage --gaps" }
+
+# match = regex on ~/reports/stack/*.md file names; the rotation takes the topic whose newest report is oldest
+[steps.stack]
+unraid = { desc = "Unraid OS, plugins, Nvidia driver", match = "unraid" }
+arr = { desc = "Sonarr, Radarr, Seerr, Bazarr, SABnzbd, Tracearr", match = "arr|sonarr|radarr|seerr|bazarr" }
+emby = { desc = "Emby server and clients", match = "emby" }
+paperless = { desc = "paperless-ngx", match = "paperless" }
+ha = { desc = "Home Assistant core/OS, ZHA, WLED, Matter", match = "-ha-|-ha\\.|home-assistant|wled" }
+firefly = { desc = "Firefly III, data importer", match = "firefly" }
+unifi = { desc = "UniFi OS Server, Network app", match = "unifi" }
+claude-code = { desc = "Claude Code, MCP, Agent SDK, plugins", match = "claude-code|mcp" }
+vault-stack = { desc = "llama.cpp server, Gemma GGUF + embedding models, Telethon, sqlite-vec, Debian base, pinned deps", match = "vault|llama|gemma|embedding" }
+hub-stack = { desc = "Phoenix, Postgres, FastMCP, Python 3.13 deps (requirements.lock), uv", match = "hub|phoenix|postgres|fastmcp" }
+browser = { desc = "Chrome in claude-hub-browser, the browser MCP", match = "browser|chrome" }
+voice-stack = { desc = "whisper server, the voice relay's realtime model", match = "voice|whisper" }
+edge = { desc = "nginx VM, tunnel, dashboard publish", match = "nginx|tunnel|dash" }
+android = { desc = "the phone app's Android stack", match = "android|phone" }
+swiss-admin = { desc = "e-banking exports, eBill, tax software for his canton", match = "ebill|tax|admin" }
+
+# ------------------------------------------------------------------------------------------------ parts
+[[part]]
+id = "bot-session"
+title = "claude-bot: main session, sessions, model, tokens, sleep-in"
+containers = ["claude-bot"]
+features = ["brain", "tokens", "sleep-in", "usage-watch"]
+review = ["h:traces", "h:phoenix", "h:agents", "h:slo", "h:parts", "g:traces", "g:cost", "g:reflexes"]
+scorecard = ["reply_p95", "helper_p95", "cost_day", "tokens_day"]
+ideas = ["context", "changelog", "inventory", "health"]
+cleanup = ["usage", "config", "disk"]
+stack = ["claude-code"]
+evals = ["conduct", "core-context"]
+
+[[part]]
+id = "hooks"
+title = "hooks: vault-guard, risk-check, subagent rules, hub stamp, usage, conduct"
+review = ["docs", "h:hooks", "h:traces"]
+ideas = ["health"]
+cleanup = ["duplication"]
+stack = ["claude-code"]
+evals = ["security"]
+
+[[part]]
+id = "heartbeat"
+title = "heartbeat plugin, hb-gate, wake rules"
+plugins = ["heartbeat"]
+review = ["g:beats", "h:events"]
+ideas = ["health"]
+cleanup = ["usage"]
+stack = ["claude-code"]
+evals = ["heartbeat"]
+
+[[part]]
+id = "rotation"
+title = "nightly session rotation"
+features = ["rotation"]
+ideas = ["changelog"]
+cleanup = ["usage"]
+stack = ["claude-code"]
+
+[[part]]
+id = "memory"
+title = "memory: FACTS rows, memory2, recall, kb"
+features = ["memory"]
+skills = ["kb"]
+review = ["docs", "g:corrections"]
+ideas = ["memory"]
+cleanup = ["workspace"]
+evals = ["memory", "core-context"]
+
+[[part]]
+id = "loop"
+title = "the loop: self-review, loop review, scorecard, idea scan, self-cleanup, product, skillforge, context"
+features = ["loop", "scorecard", "goals", "self-cleanup", "skills", "product", "telemetry", "context"]
+agents = ["idea-scan", "self-cleanup"]
+review = ["docs", "h:coverage", "g:usage", "g:health"]
+ideas = ["goals", "todo", "product", "health"]
+cleanup = ["findings", "product", "menu", "monorepo"]
+
+[[part]]
+id = "evals"
+title = "self-evals"
+features = ["evals"]
+review = ["f", "g:evals", "h:evals"]
+ideas = ["health"]
+cleanup = ["usage"]
+stack = ["claude-code"]
+
+[[part]]
+id = "hub-core"
+title = "claude-hub: gateway daemon, store, approvals, workflows, keepers"
+containers = ["claude-hub"]
+features = ["hub", "keepers"]
+tools = ["workflow"]
+review = ["h:hub", "h:events", "h:parts"]
+ideas = ["health"]
+cleanup = ["monorepo"]
+stack = ["hub-stack"]
+
+[[part]]
+id = "hub-pg"
+title = "claude-hub-pg"
+containers = ["claude-hub-pg"]
+review = ["h:hub", "h:parts"]
+ideas = ["health"]
+cleanup = ["monorepo"]
+stack = ["hub-stack"]
+
+[[part]]
+id = "hub-phoenix"
+title = "claude-hub-phoenix + traces"
+containers = ["claude-hub-phoenix"]
+features = ["traces"]
+tools = ["traces"]
+review = ["h:hub", "h:phoenix", "h:traces", "h:parts"]
+ideas = ["health"]
+cleanup = ["monorepo"]
+stack = ["hub-stack"]
+
+[[part]]
+id = "hub-ci"
+title = "claude-hub-ci: CI runner, lands, deploys, test suites"
+containers = ["claude-hub-ci"]
+features = ["ci", "tests"]
+tools = ["deploy"]
+review = ["h:land", "h:hub", "h:parts", "g:ci"]
+scorecard = ["land_p95", "land_fail"]
+ideas = ["health"]
+cleanup = ["monorepo"]
+stack = ["hub-stack"]
+
+[[part]]
+id = "typed-tools"
+title = "the hub's typed tools (gateway, policy, worker)"
+features = ["gateway"]
+review = ["h:traces", "h:phoenix", "h:hub", "g:denials"]
+ideas = ["health"]
+cleanup = ["monorepo"]
+stack = ["claude-code"]
+
+[[part]]
+id = "telegram"
+title = "claude-hub-tg + telegram-plus plugin, menus"
+containers = ["claude-hub-tg"]
+features = ["telegram"]
+plugins = ["telegram-plus"]
+review = ["h:parts", "h:slo", "g:traces"]
+scorecard = ["reply_p95"]
+ideas = ["product"]
+cleanup = ["menu"]
+stack = ["claude-code"]
+evals = ["conduct"]
+
+[[part]]
+id = "voice"
+title = "claude-hub-voice: calls, voice inbox, whisper"
+containers = ["claude-hub-voice"]
+features = ["voice"]
+tools = ["voice"]
+review = ["h:parts", "g:usage"]
+ideas = ["product", "health"]
+cleanup = ["product"]
+stack = ["voice-stack"]
+evals = ["voice"]
+
+[[part]]
+id = "phone"
+title = "claude-hub-phone + the phone app"
+containers = ["claude-hub-phone"]
+features = ["phone"]
+tools = ["phone"]
+egress = ["phone"]
+review = ["h:phone", "h:parts"]
+scorecard = ["push_p95"]
+ideas = ["phone"]
+cleanup = ["phone"]
+stack = ["android"]
+evals = ["voice"]
+
+[[part]]
+id = "browser"
+title = "claude-hub-browser + web agent"
+containers = ["claude-hub-browser"]
+features = ["browser", "web-agent"]
+tools = ["web"]
+skills = ["browser", "web-agent"]
+review = ["docs", "h:parts", "h:traces", "g:usage"]
+ideas = ["product", "health"]
+cleanup = ["usage"]
+stack = ["browser"]
+evals = ["approvals"]
+
+[[part]]
+id = "vault"
+title = "claude-vault: private data, local LLM, vault bot"
+containers = ["claude-vault"]
+features = ["vault", "vault-llm"]
+tools = ["vault"]
+egress = ["vault"]
+skills = ["vault", "tgread", "llm-local"]
+review = ["docs", "h:vault", "h:parts", "h:slo"]
+scorecard = ["vault_wait_p95"]
+ideas = ["vault"]
+cleanup = ["vault"]
+stack = ["vault-stack"]
+evals = ["vault"]
+
+[[part]]
+id = "unraid"
+title = "Unraid server: disks, docker, capacity"
+features = ["server-health", "capacity"]
+tools = ["server"]
+skills = ["server-health", "unraid-capacity"]
+review = ["docs", "h:server"]
+ideas = ["unraid-report", "context"]
+cleanup = ["usage"]
+stack = ["unraid"]
+evals = ["server"]
+
+[[part]]
+id = "unifi"
+title = "UniFi OS Server VM"
+features = ["network"]
+review = ["h:server"]
+ideas = ["web"]
+cleanup = ["usage"]
+stack = ["unifi"]
+
+[[part]]
+id = "dashboard"
+title = "dashboard, live flow, nginx VM"
+features = ["dashboard"]
+egress = ["dash"]
+review = ["h:server"]
+ideas = ["health"]
+cleanup = ["usage"]
+stack = ["edge"]
+
+[[part]]
+id = "security"
+title = "security: exposure, CVEs, container updates"
+features = ["security"]
+skills = ["container-watch", "security-watch"]
+review = ["docs", "h:hooks"]
+ideas = ["unraid-report"]
+cleanup = ["usage"]
+stack = ["unraid", "unifi"]
+evals = ["security"]
+
+[[part]]
+id = "home"
+title = "Home Assistant: control, autopilots, HA packages, cat"
+features = ["home", "home-autopilot", "cat"]
+tools = ["ha", "cat"]
+egress = ["ha"]
+skills = ["home-assistant", "cat-supplies"]
+review = ["docs", "h:parts", "g:usage"]
+ideas = ["product", "web"]
+cleanup = ["usage", "product"]
+stack = ["ha"]
+evals = ["home"]
+
+[[part]]
+id = "media"
+title = "media stack: Seerr, Radarr, Sonarr, Emby, remux"
+features = ["media"]
+tools = ["media"]
+egress = ["radarr", "sonarr", "seerr", "emby", "bazarr", "sabnzbd", "tracearr"]
+skills = ["media-requests", "media-help"]
+review = ["docs", "h:parts", "h:server", "g:usage"]
+ideas = ["web", "unraid-report", "product"]
+cleanup = ["usage", "product"]
+stack = ["arr", "emby"]
+evals = ["media"]
+
+[[part]]
+id = "calendar"
+title = "calendar, plans, birthdays, gifts"
+features = ["calendar", "gifts"]
+tools = ["calendar"]
+skills = ["calendar", "calendar-gap-pass"]
+review = ["docs", "g:usage"]
+ideas = ["calendar"]
+cleanup = ["usage"]
+evals = ["calendar"]
+
+[[part]]
+id = "reminders"
+title = "reminders (hub timers, place reminders)"
+features = ["reminders"]
+tools = ["reminders"]
+skills = ["reminders"]
+review = ["docs", "h:slo", "h:parts", "g:usage"]
+ideas = ["product"]
+cleanup = ["config"]
+evals = ["reminders"]
+
+[[part]]
+id = "trips"
+title = "trips, driving, nights out, tickets"
+features = ["trips", "driving", "nights", "tickets"]
+skills = ["night-plan"]
+review = ["docs", "g:usage"]
+ideas = ["calendar", "product"]
+cleanup = ["usage"]
+evals = ["calendar"]
+
+[[part]]
+id = "admin-money"
+title = "admin and money: paperless, bills, deadlines, letters, health insurance"
+features = ["paperless", "bills", "deadlines"]
+tools = ["paperless"]
+skills = ["paperless", "bills", "deadlines", "admin-desk", "kk-compare"]
+review = ["docs", "g:usage"]
+ideas = ["product", "web"]
+cleanup = ["usage"]
+stack = ["paperless", "firefly", "swiss-admin"]
+evals = ["vault"]
+
+[[part]]
+id = "shopping"
+title = "shopping, deals, parcels"
+features = ["shopping", "deals", "parcels"]
+skills = ["shopping", "deals"]
+review = ["docs", "g:usage"]
+ideas = ["product"]
+cleanup = ["usage"]
+evals = ["shopping"]
+
+[[part]]
+id = "music"
+title = "rave radar, track id"
+features = ["rave-radar"]
+skills = ["rave-radar", "trackid"]
+review = ["docs", "g:usage"]
+ideas = ["product"]
+cleanup = ["usage"]
+
+[[part]]
+id = "fitness"
+title = "gym and health data"
+features = ["fitness", "health"]
+egress = ["gym"]
+review = ["g:usage"]
+ideas = ["product"]
+cleanup = ["usage"]
+
+[[part]]
+id = "knowledge"
+title = "research, weekly digest, web watches, AI releases"
+features = ["ai-releases", "scrapers", "watch", "weekly-digest"]
+skills = ["research", "watch"]
+agents = ["weekly-digest"]
+review = ["docs", "g:usage"]
+ideas = ["inventory"]
+cleanup = ["usage", "config"]
+stack = ["claude-code"]
+
+[[part]]
+id = "capture"
+title = "photo and voice-note capture, dive log"
+skills = ["vision-actions", "voice-action", "voice-notes", "divelog"]
+review = ["docs", "g:usage"]
+ideas = ["product"]
+cleanup = ["usage"]
+evals = ["shopping"]
+
+[[part]]
+id = "status-board"
+title = "status board, waiting card, night log"
+features = ["status-board"]
+skills = ["night-log", "waiting-card"]
+review = ["docs", "h:board", "g:usage"]
+ideas = ["todo"]
+cleanup = ["workspace"]
+
+[[part]]
+id = "events-slo"
+title = "event ledger, SLO tiles"
+features = ["events", "slo"]
+review = ["h:events", "h:slo", "g:beats"]
+ideas = ["health"]
+cleanup = ["monorepo"]
+
+[[part]]
+id = "backups"
+title = "brain backups, public repo export"
+features = ["backup", "publish"]
+ideas = ["health"]
+cleanup = ["disk"]
+
+[[part]]
+id = "housekeeping"
+title = "log rotation, tmp tidy, transcript compaction, cron run records"
+features = ["housekeeping"]
+jobs = ["cron-runs"]
+cleanup = ["disk", "config"]

@@ -1,0 +1,22 @@
+{
+ "architecture": "amd64",
+ "os": "linux",
+ "created": "2026-09-30T00:00:00Z",
+ "config": {
+  "Env": [
+   "PATH=/usr/bin",
+   "DATABASE_URL=postgres://app:app@db.example.org/app"
+  ]
+ },
+ "history": [
+  {
+   "created_by": "RUN |1 DENO_VERSION=2.1.4 /bin/sh -c curl -fsSL https://example.org/deno.zip -o /tmp/d.zip"
+  },
+  {
+   "created_by": "COPY /usr/local/bin/bun /usr/local/bin/bun # buildkit"
+  },
+  {
+   "created_by": "CMD [\"app\"]"
+  }
+ ]
+}

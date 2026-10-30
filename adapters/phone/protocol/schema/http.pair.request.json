@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.pair.request.json",
+  "title": "POST /v1/pair (no client cert needed)",
+  "type": "object",
+  "properties": {
+    "code": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z]{4}[- ]?[0-9A-Za-z]{4}$"
+    },
+    "pub": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/=]{40,800}$",
+      "description": "base64 DER SubjectPublicKeyInfo of Keystore key claude_device (EC P-256)"
+    },
+    "bio_pub": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/=]{40,800}$",
+      "description": "base64 DER SPKI of claude_bio (EC P-256, user auth required)"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "sdk": {
+      "type": "integer",
+      "minimum": 21,
+      "maximum": 99
+    },
+    "app_code": {
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "code",
+    "pub",
+    "name"
+  ]
+}

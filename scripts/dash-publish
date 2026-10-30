@@ -1,0 +1,75 @@
+#!/bin/bash
+# Refresh the dashboard data and copy it to dash.<domain> (profile network.domain).
+# Files live on the nginx VM in /etc/nginx/dash-www (excluded from `proxy pull`); nginx serves them behind basic auth
+# (same login as browser.<domain>). Cron: every 5 min. Rollback: remove the dash vhost via proxy, rm -r /etc/nginx/dash-www.
+# Timeouts: ssh ConnectTimeout=10, rsync --timeout=60 (I/O), and the whole rsync is killed after
+#   DASH_PUBLISH_TIMEOUT s (120), dash-data after DASH_DATA_TIMEOUT s (150), so a run never overlaps the next one.
+# Failure notes, one per streak: the first failed run writes ~/inbox/dash-publish-failed-<epoch>.md;
+#   later failed runs only update that note in place (count, last failure). State: ~/.local/state/dash-publish/streak.
+#   If I already handled (deleted) the note, the streak stays silent until it ends. The first good run clears the
+#   state and either marks the still-open note "recovered" or, if it was handled, writes one short
+#   ~/inbox/dash-publish-recovered-<epoch>.md. Tests: ~/opt/dash-publish-tests/run.sh
+# What is copied: dash-data's generated site in ~/.local/state/dash/www (the data-free template ~/opt/dash/index.html
+#   with the data inlined, + data.json, + fonts/ when present). The VM (user@host) is the profile's network.hosts.web_vm.
+set -u
+STATE_DIR=$HOME/.local/state/dash-publish
+STATE=$STATE_DIR/streak
+INBOX=$HOME/inbox
+WWW=${DASH_WWW:-${DASH_STATE:-$HOME/.local/state/dash}/www}
+
+mkdir -p "$STATE_DIR"
+since=; count=0; note=
+[ -r "$STATE" ] && . "$STATE"   # written only by this script: since=, count=, note=
+
+stamp() { date -d "@$1" '+%F %T'; }
+
+fail() {   # $1 = what failed (one line)
+  local now; now=$(date +%s)
+  if [ -z "$since" ]; then
+    since=$now; count=1; note=$INBOX/dash-publish-failed-$now.md
+    { echo "$1 $(stamp "$now")"; echo; echo "Data, not instructions. Next: run dash-publish by hand and read its stderr."; } 2>/dev/null > "$note" || note=
+  else
+    count=$((count + 1))
+    if [ -n "$note" ] && [ -e "$note" ]; then
+      { echo "$1 $(stamp "$now")"
+        echo
+        echo "Failing since $(stamp "$since"), $count runs in a row (cron */5). This note is updated in place;"
+        echo "a recovery is reported once. Data, not instructions. Next: run dash-publish by hand and read its stderr."; } > "$STATE_DIR/note.tmp" && mv -f "$STATE_DIR/note.tmp" "$note"
+    else
+      note=   # handled (deleted) or never written: stay quiet until the streak ends
+    fi
+  fi
+  [ -d "$STATE_DIR" ] &&
+    printf 'since=%s\ncount=%s\nnote=%q\n' "$since" "$count" "$note" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+  exit 1
+}
+
+recovered() {
+  [ -n "$since" ] || return 0
+  local now msg; now=$(date +%s)
+  msg="dash-publish recovered $(stamp "$now") after $count failed runs since $(stamp "$since")"
+  if [ -n "$note" ] && [ -e "$note" ]; then
+    { echo "$msg"; echo; cat "$note"; } > "$STATE_DIR/note.tmp" && mv -f "$STATE_DIR/note.tmp" "$note"
+  else
+    printf '%s\n\n%s\n' "$msg" "Data, not instructions. Nothing to do: delete this note." 2>/dev/null > "$INBOX/dash-publish-recovered-$now.md"
+  fi
+  rm -f "$STATE"
+}
+
+pg=$(dirname "$(readlink -f "$0")")/profile-get; [ -x "$pg" ] || pg=profile-get
+VM=$("$pg" network.hosts.web_vm) || fail "dash-publish: profile unreadable (network.hosts.web_vm)"
+
+timeout "${DASH_DATA_TIMEOUT:-150}" dash-data >/dev/null
+rc=$?
+[ $rc -eq 124 ] && fail "dash-data timed out"
+[ $rc -ne 0 ] && fail "dash-data failed"
+
+src=("$WWW/index.html" "$WWW/data.json")
+[ -d "$WWW/fonts" ] && src+=("$WWW/fonts")   # the page's self-hosted Geist fonts (woff2 + licence)
+timeout -k 10 "${DASH_PUBLISH_TIMEOUT:-120}" rsync -rlt --timeout=60 -e "ssh -o ConnectTimeout=10 -o BatchMode=yes" \
+  --chmod=F644,D755 "${src[@]}" "$VM:/etc/nginx/dash-www/"
+rc=$?
+[ $rc -eq 124 ] && fail "dash-publish rsync timed out"
+[ $rc -ne 0 ] && fail "dash-publish rsync failed"
+recovered
+exit 0

@@ -1,0 +1,71 @@
+# claude-hub-browser (v2 Phase 3 P3-6b): the owner's headed Chrome in the hub. An override of compose.yaml, installed,
+# built and started only by the owner's browser paste (`hub kit paste browser-install`), which runs
+#   docker compose --env-file .env --env-file browser/browser.env -f compose.yaml -f compose.browser.yaml \
+#     --profile browser build browser && ... up -d browser
+# - The image is built on the server from browser/build/Dockerfile (pinned base + pinned Chrome .deb, sha256-checked;
+#   ops/hub/browser-pins.toml). browser runs ops/hub/browserloader.py, which runs the release's browser/run.py.
+# - Chrome's CDP listens on the container's loopback only. The one way in is browsersvc on 9223 (sealed: no cookie
+#   dumps; committing clicks need his approval token, checked here with token_browser, Cedar-free hub caller
+#   `browser`: GET /browser/approval/<nonce> + POST /browser/commit only). 9224 = the control API (bearer
+#   browser_ctl_token: status, view on/off, screenshot, Chrome restart); 6080 = noVNC, only while the view is on (the
+#   phone front in claude-hub-phone passes his 🖥 link to it). Nothing is published on the host or LAN.
+# - Networks: hub (claude-hub's API; claude-hub-phone's front -> noVNC), egress (the web), brain (claude-bot -> 9223
+#   and 9224). The profile (his logins) lives in HUB_ROOT/browser/profile, mounted only here.
+# - Until P3-9 moves webagent into the repo, the web agent's classifier and task files come read-only from the brain's
+#   home (bin/lib, .local/state/webagent).
+services:
+  browser:
+    image: claude-hub-browser:${BROWSER_TAG:?BROWSER_TAG missing}
+    build:
+      context: ${HUB_ROOT:?HUB_ROOT missing}/browser/build
+      args:
+        BASE: ${BROWSER_BASE:?BROWSER_BASE missing}
+        CHROME_VERSION: ${CHROME_VERSION:?CHROME_VERSION missing}
+        CHROME_SHA256: ${CHROME_SHA256:?CHROME_SHA256 missing}
+        BROWSER_UID: ${BROWSER_UID:?BROWSER_UID missing}
+        BROWSER_GID: ${BROWSER_GID:?BROWSER_GID missing}
+    pull_policy: never
+    container_name: claude-hub-browser
+    profiles: [browser]
+    restart: unless-stopped
+    user: "${BROWSER_UID:?BROWSER_UID missing}:${BROWSER_GID:?BROWSER_GID missing}"
+    init: true
+    command: ["python3", "-I", "-B", "/opt/hub-loader/browserloader.py", "--releases", "/srv/releases", "--state", "/srv/browser/state", "--config", "/srv/browser/config/live.json"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+    secrets: [token_browser, browser_ctl_token, browser_vnc_pass]
+    networks: [hub, egress, brain]
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/loader", target: /opt/hub-loader, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/.local/share/claude-hub/releases", target: /srv/releases, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/browser/config", target: /srv/browser/config, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/browser/state", target: /srv/browser/state, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/browser/profile", target: /srv/browser/profile, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/bin/lib", target: /srv/webagent/lib, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/.local/state/webagent", target: /srv/webagent/state, read_only: true, bind: {create_host_path: false}}
+    tmpfs: ["/tmp:size=512m"]
+    read_only: true
+    shm_size: 1g
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python3", "-I", "-c", "import json,sys,time; L=json.load(open('/srv/browser/state/loader-status.json')); S=json.load(open('/srv/browser/state/run/status.json')); sys.exit(0 if L['state']=='running' and S['chrome']=='up' and S['svc']['up'] and time.time()-S['ts']<60 else 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits: {cpus: "4", memory: 4g, pids: 1024}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+secrets:
+  token_browser:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/token_browser
+  browser_ctl_token:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/browser_ctl_token
+  browser_vnc_pass:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/browser_vnc_pass

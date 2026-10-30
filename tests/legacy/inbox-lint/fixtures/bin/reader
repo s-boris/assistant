@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Placeholder fixture: only reads the inbox (counts notes); not a writer."""
+import os
+
+INBOX = os.path.join(os.path.expanduser("~"), "inbox")
+STATE = "/tmp/example-state"
+
+
+def count():
+    n = len(os.listdir(INBOX))
+    with open(STATE, "w") as f:
+        f.write(str(n))
+    return n

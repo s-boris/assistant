@@ -1,0 +1,39 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/job.recovered.schema.json",
+ "title": "core.jobfail: the first good run after a job.failed streak",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "job",
+  "runs",
+  "since",
+  "recovered"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "job.recovered"
+  },
+  "v": {
+   "const": 1
+  },
+  "job": {
+   "type": "string",
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+  },
+  "runs": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "since": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "recovered": {
+   "type": "integer",
+   "minimum": 0
+  }
+ }
+}

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.action.json",
+  "title": "tap on a push action",
+  "type": "object",
+  "properties": {
+    "push_id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}$"
+    },
+    "verb": {
+      "enum": [
+        "seen",
+        "done",
+        "snooze",
+        "call",
+        "crate",
+        "ha_off",
+        "open",
+        "dismissed"
+      ]
+    },
+    "arg": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[A-Za-z0-9_:.+-]{1,64}$"
+    },
+    "at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "sig": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "push_id",
+    "nonce",
+    "verb"
+  ]
+}

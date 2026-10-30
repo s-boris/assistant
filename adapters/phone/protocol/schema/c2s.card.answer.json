@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.card.answer.json",
+  "title": "decision card answer (M2)",
+  "type": "object",
+  "properties": {
+    "card_id": {
+      "type": "string",
+      "pattern": "^c_[A-Za-z0-9_-]{1,40}$"
+    },
+    "option": {
+      "type": "string",
+      "pattern": "^[a-z0-9_-]{1,16}$"
+    },
+    "at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "sig": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 200
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "card_id",
+    "option"
+  ]
+}

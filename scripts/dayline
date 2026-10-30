@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""dayline: today's work summary for the dashboard ("Today I did"). No tokens, no messages, read-only inputs.
+
+  dayline                    write ~/.local/state/dash/dayline.json for today (cron 21:07)
+  dayline --date YYYY-MM-DD  summarize another day
+  dayline --stdout           print the JSON instead of writing it (dash-data uses this for a live view)
+
+Reads: ~/workspace/PROACTIVE.md entries dated that day ("- YYYY-MM-DD HH:MM [done|started|…:] text", or the short
+"- DD.MM HH:MM text"), ~/workspace/CHANGELOG.md lines dated that day ("- YYYY-MM-DD — text" or "- DD.MM HH:MM text"), and agent runs from agent-watch
+(agent-watch.log transitions/progress pings that day + state.json run starts). Texts are only shortened
+here; dash-data masks them (clean()) and secretscan-gates the published JSON.
+Env (tests): DAYLINE_WORKSPACE, DAYLINE_AW_DIR, DAYLINE_OUT.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+TZ = assistant_profile.tz()
+WORKSPACE = os.environ.get('DAYLINE_WORKSPACE', os.path.join(HOME, 'workspace'))
+AW_DIR = os.environ.get('DAYLINE_AW_DIR', os.path.join(HOME, '.local', 'state', 'agent-watch'))
+OUT = os.environ.get('DAYLINE_OUT', os.path.join(HOME, '.local', 'state', 'dash', 'dayline.json'))
+MAXLEN = 160
+RX_ENTRY = re.compile(r'^- (\d{4}-\d\d-\d\d)(?:[ T]~?(\d\d:\d\d))?\s*(?:—|–|-|:)?\s*(.*)$')
+# the short form most log lines use since 18.10: "- DD.MM[.][ HH:MM] text" (year from the day asked for)
+RX_ENTRY_DM = re.compile(r'^- (\d\d)\.(\d\d)\.?(?:[ T]~?(\d\d:\d\d))?\s*(?:—|–|-|:)?\s*(.*)$')
+RX_KIND = re.compile(r'(started|done|finished|failed|restart|night report sent)(?=[\s:]|$)\s*:?\s*(.*)$', re.I)  # whole word: "Failed-login …" is no kind
+
+
+def read(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+def short(s, n=MAXLEN):
+    s = re.sub(r'\*\*|`', '', s or '')
+    s = re.sub(r'\s+', ' ', s).strip()
+    if len(s) > n:
+        cut = s[:n - 1]
+        sp = cut.rfind(' ')
+        s = (cut[:sp] if sp > n * 0.6 else cut).rstrip(' ,;:-—') + '…'
+    return s
+
+
+def entries(path, day):
+    out = []
+    for line in read(path).splitlines():
+        m = RX_ENTRY.match(line)
+        if m:
+            date, hhmm, text = m.group(1), m.group(2), m.group(3)
+        else:
+            m = RX_ENTRY_DM.match(line)
+            if not m:
+                continue
+            date, hhmm, text = f'{day[:4]}-{m.group(2)}-{m.group(1)}', m.group(3), m.group(4)
+        if date != day:
+            continue
+        text = text.strip()
+        kind = None
+        km = RX_KIND.match(text)
+        if km and km.group(1).lower() in ('started', 'done', 'finished', 'failed'):
+            kind = km.group(1).lower()
+            text = km.group(2)
+        out.append({'time': hhmm, 'kind': 'done' if kind == 'finished' else kind, 'text': short(text)})
+    return out
+
+
+def agent_counts(day):
+    c = {'started': 0, 'finished': 0, 'stalled': 0, 'progress_pings': 0}
+    for line in read(os.path.join(AW_DIR, 'agent-watch.log')).splitlines():
+        if not line.startswith(day + ' '):
+            continue
+        if re.search(r' -> done\b', line):
+            c['finished'] += 1
+        elif re.search(r'\bstalled \S+ silent', line):
+            c['stalled'] += 1
+        elif re.search(r'\bprogress \S+ sent', line):
+            c['progress_pings'] += 1
+    try:
+        st = json.loads(read(os.path.join(AW_DIR, 'state.json')) or '{}')
+    except ValueError:
+        st = {}
+    for a in (st.get('agents') or {}).values():
+        rs = a.get('run_start') if isinstance(a, dict) else None
+        if isinstance(rs, (int, float)) and dt.datetime.fromtimestamp(rs, TZ).strftime('%Y-%m-%d') == day:
+            c['started'] += 1
+    return c
+
+
+def plural(n, one, many=None):
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def build(day):
+    now = dt.datetime.now(TZ)
+    pro = entries(os.path.join(WORKSPACE, 'PROACTIVE.md'), day)
+    chg = entries(os.path.join(WORKSPACE, 'CHANGELOG.md'), day)
+    agents = agent_counts(day)
+    done = [e for e in pro if e['kind'] in ('done', None)]
+    return {
+        'schema': 1,
+        'date': day,
+        'generated_at': now.isoformat(timespec='seconds'),
+        'proactive': pro,
+        'changes': [e['text'] for e in chg],
+        'agents': agents,
+        'counts': {'proactive': len(pro), 'done': len([e for e in pro if e['kind'] == 'done']),
+                   'started': len([e for e in pro if e['kind'] == 'started']), 'changes': len(chg)},
+        'summary': ', '.join([plural(len(done), 'thing done', 'things done'), plural(len(chg), 'setup change'),
+                              plural(agents['finished'], 'agent run finished', 'agent runs finished')]),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Write today's work summary to dayline.json (no tokens).")
+    ap.add_argument('--date', help='YYYY-MM-DD (default: today in the owner time zone)')
+    ap.add_argument('--stdout', action='store_true', help='print the JSON instead of writing it')
+    a = ap.parse_args()
+    day = a.date or dt.datetime.now(TZ).strftime('%Y-%m-%d')
+    if not re.fullmatch(r'\d{4}-\d\d-\d\d', day):
+        sys.exit('dayline: --date must be YYYY-MM-DD')
+    text = json.dumps(build(day), ensure_ascii=False, indent=1)
+    if a.stdout:
+        print(text)
+        return
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(OUT), prefix='.dayline')
+    with os.fdopen(fd, 'w') as f:
+        f.write(text + '\n')
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, OUT)
+    d = json.loads(text)
+    print(f"{dt.datetime.now(TZ):%F %T} dayline {day}: {d['summary']} -> {OUT}")
+
+
+if __name__ == '__main__':
+    main()

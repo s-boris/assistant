@@ -1,0 +1,418 @@
+#!/usr/local/bin/python3.13 -I
+"""browser-hub: the brain's side of claude-hub-browser, his headed Chrome in its own hub container.
+
+~/bin/browser hands every command to this script, and every CDP client (the browser MCP, abx, securefill) reaches
+Chrome only through the container's browsersvc (browsersvc.route() -> http://claude-hub-browser:9223).
+
+  browser-hub status [--json]          the container (Chrome, version, service, view), the CDP route
+  browser-hub prep                     make ~/.secrets/browser-ctl-token (0600; the browser paste copies it by name)
+  browser-hub mcp hub|status           the browser MCP's --cdp-endpoint in ~/.claude.json (a session restart applies it)
+  browser-hub ensure                   exit 0 when the container answers with Chrome up (the browser keeper, 5 min)
+  browser-hub start|restart            restart Chrome in the container (clean close first)
+  browser-hub stop                     refused: the container keeps Chrome up
+  browser-hub url                      open tabs (title + URL) through the service
+  browser-hub open URL                 a new tab with URL
+  browser-hub screenshot [FILE]        the whole display as PNG (default ~/reports/browser/screen-<time>.png)
+  browser-hub view on [MIN]|off|status the owner view (noVNC through the phone front, port 6080)
+  browser-hub link [--json] [--min N]  view on (30 min default) + the 🖥 URL, checked to load
+  browser-hub audit [--hours N] [--json]   the container service's counts (commits with/without token, denials)
+  browser-hub update                   Chrome is pinned in the image: says how to bump it
+
+Env (tests): BROWSER_HUB_CTL (http://claude-hub-browser:9224), BROWSER_HUB_CTL_TOKEN (file), BROWSER_HUB_STATE (dir),
+BROWSER_LINK_HOST, BROWSER_VIEW_PORT, CLAUDE_JSON (file). Exit: 0 ok, 1 failed/not up, 2 usage or refused, 3 down.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [os.environ.get("ASSISTANT_LIB", ""), os.path.join(_here, "lib"), os.path.join(_here, ".."),
+          os.path.join(_here, "..", "packages")]  # fmt: skip
+for _pkg in ("core", "browsersvc"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+import json  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.parse  # noqa: E402
+import urllib.request  # noqa: E402
+
+import browsersvc as B  # noqa: E402
+
+from core import http  # noqa: E402
+
+HOME = os.path.expanduser("~")
+CTL = "http://claude-hub-browser:9224"
+
+
+def _env(name, default):
+    return os.environ.get(name) or default
+
+
+def ctl_url():
+    return _env("BROWSER_HUB_CTL", CTL).rstrip("/")
+
+
+def token_path():
+    return _env("BROWSER_HUB_CTL_TOKEN", os.path.join(HOME, ".secrets", "browser-ctl-token"))
+
+
+def state_dir():
+    d = _env("BROWSER_HUB_STATE", os.path.join(HOME, ".local", "state", "browser"))
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+class Down(Exception):
+    pass
+
+
+def ctl(method, path, body=None, timeout=10.0, raw=False):
+    try:
+        with open(token_path(), encoding="utf-8") as f:
+            tok = f.read().strip()
+    except OSError:
+        raise Down("no control token (browser-hub prep)") from None
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(ctl_url() + path, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {tok}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with http.open(req, timeout=timeout) as r:
+            got = r.read()
+            return got if raw else json.loads(got or b"null")
+    except urllib.error.HTTPError as e:
+        raise Down(f"control API answered {e.code}") from None
+    except (OSError, ValueError) as e:
+        raise Down(f"claude-hub-browser unreachable ({type(e).__name__})") from None
+
+
+def cdp(method, path, timeout=8.0):
+    req = urllib.request.Request(B.hub_cdp() + path, method=method)
+    with http.open(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"null")
+
+
+def usage(*args):
+    u = os.path.join(_here, "usage")
+    if os.access(u, os.X_OK):
+        subprocess.run([u, "log", *args], capture_output=True, timeout=10, check=False)
+
+
+# ------------------------------------------------------------------------------------------------ commands
+
+
+def cmd_status(a):
+    try:
+        c = ctl("GET", "/status", timeout=5)
+    except Down as e:
+        c = {"error": str(e)}
+    st = {"route": B.route(), "container": c}
+    if "--json" in a:
+        print(json.dumps(st))
+        return 0
+    print(f"clients -> {st['route']['cdp']} ({st['route']['via']})")
+    if "error" in c:
+        print(f"claude-hub-browser: {c['error']}")
+        return 3
+    v = c.get("view") or {}
+    left = max(0, int(((v.get("until") or 0) - time.time()) / 60)) if v.get("on") else 0
+    print(
+        f"claude-hub-browser: chrome {c.get('chrome')} ({c.get('version') or '?'}) · service "
+        f"{'up' if (c.get('svc') or {}).get('up') else 'down'} ({(c.get('svc') or {}).get('mode')}) · view "
+        f"{'on, ' + str(left) + ' min left' if v.get('on') else 'off'}"
+    )
+    return 0 if c.get("chrome") == "up" else 1
+
+
+def cmd_prep(a):
+    p = token_path()
+    if os.path.isfile(p) and os.path.getsize(p) > 0:
+        print(f"browser-hub: control token kept ({p}, 0600)")
+        return 0
+    os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(os.urandom(32).hex() + "\n")
+    print(f"browser-hub: control token made ({p}, 0600; the browser paste copies it by name)")
+    return 0
+
+
+def claude_json():
+    return _env("CLAUDE_JSON", os.path.join(HOME, ".claude.json"))
+
+
+def mcp_get(d):
+    m = (d.get("mcpServers") or {}).get("browser") or {}
+    a = m.get("args") or []
+    if "--cdp-endpoint" in a and a.index("--cdp-endpoint") + 1 < len(a):
+        return a, a.index("--cdp-endpoint") + 1
+    return a, None
+
+
+def cmd_mcp(a):
+    if not a or a[0] not in ("hub", "status"):
+        print("usage: browser-hub mcp hub|status", file=sys.stderr)
+        return 2
+    p = claude_json()
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        print(f"browser-hub: no readable {p}")
+        return 1
+    args, i = mcp_get(d)
+    if i is None:
+        print("browser-hub: the browser MCP has no --cdp-endpoint argument: nothing changed")
+        return 1
+    if a[0] == "status":
+        print(f"browser MCP --cdp-endpoint {args[i]}")
+        return 0
+    want = B.hub_cdp()
+    if args[i] == want:
+        print(f"browser MCP --cdp-endpoint {want} (unchanged)")
+        return 0
+    args[i] = want
+    tmp = f"{p}.browser-hub.{os.getpid()}"
+    mode = os.stat(p).st_mode & 0o777
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, p)
+    print(f'browser MCP --cdp-endpoint {want}: a session restart applies it (restart "browser MCP -> {a[0]}")')
+    return 0
+
+
+def cmd_ensure(a):
+    try:
+        c = ctl("GET", "/status", timeout=5)
+    except Down as e:
+        print(f"browser-hub: {e}", file=sys.stderr)
+        return 3
+    return 0 if c.get("chrome") == "up" else 1
+
+
+def cmd_restart(a):
+    try:
+        c = ctl("POST", "/chrome/restart", {}, timeout=90)
+    except Down as e:
+        print(f"browser-hub: {e}")
+        return 3
+    print(f"chrome {c.get('chrome')} ({c.get('version') or '?'}) in claude-hub-browser")
+    return 0 if c.get("chrome") == "up" else 1
+
+
+def cmd_stop(a):
+    print(
+        "browser-hub: refused: Chrome runs in claude-hub-browser and stays up there (`browser-hub restart` restarts it)"
+    )
+    return 2
+
+
+def cmd_url(a):
+    try:
+        tabs = cdp("GET", "/json/list")
+    except (OSError, ValueError) as e:
+        print(f"browser-hub: the service does not answer ({type(e).__name__})")
+        return 3
+    for t in tabs or []:
+        if t.get("type") == "page":
+            print(f"{t.get('title', '')[:60]} | {t.get('url', '')}")
+    return 0
+
+
+def cmd_open(a):
+    if not a:
+        print("usage: browser-hub open URL", file=sys.stderr)
+        return 2
+    try:
+        cdp("PUT", "/json/new?" + urllib.parse.quote(a[0], safe=":/?&=%#+,;@"))
+    except (OSError, ValueError) as e:
+        print(f"browser-hub: could not open it ({type(e).__name__})")
+        return 1
+    print(f"opened {a[0]}")
+    return 0
+
+
+def cmd_screenshot(a):
+    out = a[0] if a else os.path.join(HOME, "reports", "browser", time.strftime("screen-%Y%m%d-%H%M%S.png"))
+    try:
+        png = ctl("GET", "/screen", timeout=30, raw=True)
+    except Down as e:
+        print(f"browser-hub: {e}")
+        return 3
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(png)
+    print(os.path.abspath(out))
+    return 0
+
+
+def _mark_file():
+    return os.path.join(state_dir(), "hub-link.json")
+
+
+def view_on(mins):
+    return ctl("POST", "/view", {"on": True, "minutes": mins})
+
+
+def link_outcome():
+    """After a link: was the view opened (a websocket connect) before it went off? (usage tg.browser.open)"""
+    try:
+        with open(_mark_file(), encoding="utf-8") as f:
+            mark = int(json.load(f).get("conns", 0))
+    except (OSError, ValueError, AttributeError):
+        return
+    try:
+        now = int((ctl("GET", "/status", timeout=5).get("view") or {}).get("conns") or 0)
+    except Down:
+        return
+    n = max(0, now - mark) if now >= mark else now
+    usage("tg.browser.open", "notify_opened" if n else "ignored", "--channel", "telegram", "--outcome",
+          "opened" if n else "unopened", "--attr", f"conns={n}")  # fmt: skip
+    os.unlink(_mark_file())
+
+
+def cmd_view(a):
+    sub = a[0] if a else "status"
+    mins = a[1] if sub == "on" and len(a) > 1 else "60"
+    if sub not in ("on", "off", "status") or not (mins.isascii() and mins.isdigit()):
+        print("usage: browser-hub view on [MIN]|off|status", file=sys.stderr)
+        return 2
+    try:
+        if sub == "on":
+            v = view_on(int(mins))
+        elif sub == "off":
+            link_outcome()
+            v = ctl("POST", "/view", {"on": False})
+        else:
+            v = (ctl("GET", "/status", timeout=5) or {}).get("view") or {}
+    except Down as e:
+        print(f"browser-hub: {e}")
+        return 3
+    if v.get("on"):
+        print(
+            f"view: on until {time.strftime('%H:%M', time.localtime(v.get('until') or 0))} (claude-hub-browser; "
+            "noVNC asks for the VNC password)"
+        )
+    else:
+        print("view: off")
+    return 0
+
+
+def link_host():
+    h = os.environ.get("BROWSER_LINK_HOST")
+    if h:
+        return h
+    pg = os.path.join(_here, "profile-get")
+    r = subprocess.run([pg, "network.server_host"], capture_output=True, text=True, timeout=10, check=False)
+    return r.stdout.strip()
+
+
+def cmd_link(a):
+    js, mins = "--json" in a, 30
+    if "--min" in a:
+        try:
+            mins = int(a[a.index("--min") + 1])
+        except (IndexError, ValueError):
+            mins = 0
+    if not 1 <= mins <= 240:
+        print("browser-hub: --min must be 1-240", file=sys.stderr)
+        return 2
+    t0 = time.time()
+    try:
+        st = ctl("GET", "/status", timeout=5)
+        v = st.get("view") or {}
+        left = int(((v.get("until") or 0) - time.time()) / 60) if v.get("on") else 0
+        if not v.get("on") or left < 10:
+            v = view_on(mins)
+            left = mins
+    except Down as e:
+        print(f"browser-hub: {e}", file=sys.stderr)
+        return 3
+    if not os.path.exists(_mark_file()):
+        with open(_mark_file(), "w", encoding="utf-8") as f:
+            json.dump({"conns": int(v.get("conns") or 0), "ts": round(time.time())}, f)
+    host = link_host()
+    if not host:
+        print("browser-hub: no host (profile network.server_host)", file=sys.stderr)
+        return 1
+    port = _env("BROWSER_VIEW_PORT", "6080")
+    url = f"http://{host}:{port}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+    code = "000"
+    for _ in range(6):  # websockify needs a moment after view on
+        try:
+            with http.open(f"http://{host}:{port}/vnc.html", timeout=5) as r:
+                code = str(r.status)
+        except urllib.error.HTTPError as e:
+            code = str(e.code)
+        except OSError:
+            code = "000"
+        if code == "200":
+            break
+        time.sleep(1)
+    usage("tg.browser.open", "exec", "--channel", "telegram", "--ms", str(int((time.time() - t0) * 1000)),
+          "--outcome", "ok" if code == "200" else "error", "--attr", f"http={code}")  # fmt: skip
+    if js:
+        print(json.dumps({"url": url, "verified": code == "200", "http": code, "view_minutes_left": left,
+                          "password": "noVNC asks for the VNC password (never in the URL)", "session_persists": True,
+                          "button": "🖥 Open my browser", "where": "claude-hub-browser"}))  # fmt: skip
+    else:
+        print(url)
+        if code != "200":
+            print(f"browser-hub: view page did not load on {host}:{port} (http {code})", file=sys.stderr)
+    return 0 if code == "200" else 1
+
+
+def cmd_audit(a):
+    hours = 24.0
+    if "--hours" in a:
+        try:
+            hours = float(a[a.index("--hours") + 1])
+        except (IndexError, ValueError):
+            print("usage: browser-hub audit [--hours N] [--json]", file=sys.stderr)
+            return 2
+    try:
+        r = ctl("GET", f"/audit?hours={hours:g}", timeout=10)
+    except Down as e:
+        print(f"browser-hub: {e}")
+        return 3
+    print(json.dumps(r) if "--json" in a else " · ".join(f"{k} {v}" for k, v in r.items()))
+    return 1 if r.get("unguarded") else 0
+
+
+def cmd_update(a):
+    print(
+        "browser-hub: Chrome is pinned in claude-hub-browser's image (ops/hub/browser-pins.toml: version + .deb "
+        "sha256). Bump the pin, then the owner's browser-install paste rebuilds it."
+    )
+    return 0
+
+
+CMDS = {"status": cmd_status, "prep": cmd_prep, "mcp": cmd_mcp, "ensure": cmd_ensure,
+        "start": cmd_restart, "restart": cmd_restart, "stop": cmd_stop, "url": cmd_url, "tabs": cmd_url,
+        "open": cmd_open, "screenshot": cmd_screenshot, "shot": cmd_screenshot, "view": cmd_view, "link": cmd_link,
+        "audit": cmd_audit, "update": cmd_update}  # fmt: skip
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    fn = CMDS.get(argv[0])
+    if fn is None:
+        print(f"browser-hub: unknown command {argv[0]} (browser-hub --help)", file=sys.stderr)
+        return 2
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

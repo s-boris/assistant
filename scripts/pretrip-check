@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""pretrip-check: READ-ONLY readiness check of the owner's Unraid server before he travels.
+Built for a multi-week trip; run it a few days before you leave.
+
+Nothing is changed anywhere: no updates, no restarts, no writes on the server, no Telegram. It reuses the
+existing tools and only adds one tiny read-only ssh script (`--show-collector`):
+  space      unraid-capacity forecast --live (array total + pools; never single disks), projected to --until;
+             docker.img also by its daily steps (unraid-capacity's samples.jsonl): a >= 5 GB/day rise in 7 days
+  health     unraid-health --json --dry-run (no state, no report, no text) -> active, non-baseline issues
+  disk errs  hwtrend's daily samples (~/.local/state/hwtrend) + its counters(): any counter that rose in 14 days
+  parity     unraid-health's parity metrics (last check, last sync/rebuild, running, overdue by trip end); a
+             disabled/emulated member (its array metrics' "degraded") warns whatever the last check said
+  backups    brain-backup --list (newest archive age) + brain-backup --verify (test-restore, ~2 s);
+             appdata: the appdata.backup / CA Backup plugin's newest dated backup folder (lockdown: verb `pretrip`)
+  services   containers not running that Unraid autostarts (or that crashed); Home Assistant watchdog
+             (HomeAssistant_inabox :2 running, its v2 watcher process, a VM check logged < 50 min ago, VM up);
+             vault status --json
+  updates    Unraid OS: releases.unraid.net (what unraid-update-check asks; falls back to its state file);
+             containers: container-watch --json --dry-run (Unraid's update status + advisories). Report only.
+  reminders  ~/bin/remind's store, recurring ones expanded with remind's own rules, plus ~/crontab:
+             anything in the trip window that looks like it needs the owner at home (AT_HOME_RX)
+
+Usage: pretrip-check [--from YYYY-MM-DD] [--until YYYY-MM-DD] [--md FILE] [--json] [--no-verify]
+  --from / --until   trip window; default: "from" / "until" (YYYY-MM-DD) in the trip file
+                     ~/.config/pretrip-check/trip.json (space is projected to the end of --until)
+  --md FILE          also write the report + details as Markdown
+  --json             print JSON instead of the short report
+  --no-verify        skip the brain-backup test-restore
+  --save-facts FILE  save the collected raw inputs (for tests); --facts FILE evaluates saved inputs (no ssh)
+  --show-collector   print the read-only script run on the server
+Env (tests): PRETRIP_BIN_DIR (where the reused tools live), PRETRIP_HOST, PRETRIP_CRONTAB, PRETRIP_NOW, PRETRIP_TRIP
+  (the trip file), PRETRIP_CAPACITY_SAMPLES (unraid-capacity's samples.jsonl), plus the
+  tools' own HWTREND_STATE_DIR, UNRAID_HEALTH_STATE_DIR, REMIND_DB, UNRAID_SSH_BIN.
+Exit: 0 all OK, 1 at least one warning (or a check that could not run), 2 usage error or crash.
+Tests: ~/opt/assistant/tests/legacy/pretrip-check/run.sh (offline, synthetic fixtures).
+Cron: a commented-out line in ~/crontab; a one-off reminder a few days before the trip.
+"""
+import argparse
+import concurrent.futures
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+sys.path.append(os.path.expanduser("~/bin/lib"))   # a scratch copy outside ~/bin still finds botlib
+import botlib  # noqa: E402
+import assistant_profile  # noqa: E402  (next to botlib; tz() never raises)
+TZ = assistant_profile.tz()
+try:   # guarded: a broken profile falls back to a neutral name
+    SERVER_NAME = assistant_profile.get("network.server_name")
+except Exception:
+    SERVER_NAME = "the server"
+
+HOME = Path.home()
+BIN = Path(os.environ.get("PRETRIP_BIN_DIR", HOME / "bin"))
+SSH_HOST = os.environ.get("PRETRIP_HOST", "unraid")
+UNRAID_SSH = os.environ.get("UNRAID_SSH_BIN") or str(HOME / "bin/unraid-ssh")
+HWTREND_DIR = Path(os.environ.get("HWTREND_STATE_DIR", HOME / ".local/state/hwtrend"))
+CAPACITY_SAMPLES = Path(os.environ.get("PRETRIP_CAPACITY_SAMPLES")
+                        or HOME / ".local/state/unraid-capacity/samples.jsonl")
+UH_STATE = Path(os.environ.get("UNRAID_HEALTH_STATE_DIR", HOME / ".local/state/unraid-health"))
+REMIND_DB = os.environ.get("REMIND_DB") or str(HOME / ".local/state/remind/reminders.json")
+CRONTAB = Path(os.environ.get("PRETRIP_CRONTAB", HOME / "crontab"))
+TRIP_FILE = Path(os.environ.get("PRETRIP_TRIP") or HOME / ".config/pretrip-check/trip.json")
+SELF_CONTAINER = "claude-bot"
+
+ARRAY_MIN_LEFT = 1e12        # array: warn if less than 1 TB usable is projected at the trip end ...
+ARRAY_MARGIN_DAYS = 14       # ... or less than 14 days of growth (rates swing; he can't add a disk from abroad)
+POOL_MIN_FREE_PCT = 10.0     # pools/docker.img: warn if projected free at the end < 10% of size ...
+POOL_MARGIN_DAYS = 7         # ... or < 7 days of growth; without a trend: warn if >= 90% used now
+POOL_NOW_PCT = 90.0
+# docker.img fills in steps (a container writing into its own layer, pulls, builds) that the 30-day trend smooths
+# away: a rise of >= 5 GB per day in the last 7 days (unraid-capacity's daily samples + the live reading) is named
+# on the line, and warns while less than twice that rise is free (two more such days would fill it)
+DOCKER_JUMP, DOCKER_JUMP_DAYS = 5e9, 7
+HW_DAYS, HW_STALE_DAYS = 14, 2
+BRAIN_MAX_AGE_DAYS = 2
+APPDATA_MAX_AGE_DAYS = 14
+HA_CONTAINER, HA_VM, HA_TAG = "HomeAssistant_inabox", "Home Assistant", ":2"
+CMD_TIMEOUT = 200            # per tool call; never more than 4 min
+HEALTH_SKIP_CATS = {"parity", "space", "ctr"}   # own lines: Parity, Array/Pools, Containers
+
+# Words that suggest the owner must be physically at home (EN + DE). Matched case-insensitively on word starts.
+AT_HOME_RX = re.compile(
+    r"\b(?:at home|zu ?hause|daheim|in person|vor ort|physical(?:ly)?|on site|hardware|disks?|hdds?|"
+    r"preclear\w*|cables?|kabel\w*|fans?|lüfter\w*|unplug\w*|plug in|power ?cycle|reboot\w*|wizard|gui|parcels?|"
+    r"packages?|paket\w*|deliver(?:y|ies)|lieferung\w*|pick ?up|abhol\w*|post office|briefkasten|mailbox|print\w*|"
+    r"drucke?n?|unterschreib\w*|sign the|handwerker\w*|techniker\w*|technicians?|plumber|electrician|"
+    r"meter reading|zähler\w*|ablesen|wohnungsabnahme|besichtigung|inspection|schlüssel\w*|plants?|"
+    r"pflanzen|waschküche|laundry)\b", re.I)
+
+# ----------------------------------------------------------------------------- the one extra server script
+EXTRA_COLLECTOR = r'''# pretrip-check collector: STRICTLY READ-ONLY. Reads Unraid's docker autostart list, counts the
+# HomeAssistant_inabox watcher processes and its recent VM-check log lines (counts only, no log text leaves the
+# server), and finds the newest dated appdata-backup folder (names only). Writes nothing, changes nothing.
+set -u
+export LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+echo "@@autostart"
+cat /var/lib/docker/unraid-autostart 2>/dev/null
+echo "@@ha_top"
+timeout 20 docker top HomeAssistant_inabox -o pid,args 2>/dev/null | grep -c 'unraid\.sh'
+echo "@@ha_log"
+timeout 20 docker logs --since 50m HomeAssistant_inabox 2>&1 | grep -c 'current status of VM'
+echo "@@ab_plugins"
+for p in appdata.backup ca.backup2 ca.backup; do [ -e "/boot/config/plugins/$p.plg" ] && echo "$p"; done
+echo "@@ab_dest"
+# only the destination keys (grep -o), never the whole config
+grep -ho '"destination"[[:space:]]*:[[:space:]]*"[^"]*"' /boot/config/plugins/appdata.backup/config.json 2>/dev/null
+grep -ho '"destinationShare"[[:space:]]*:[[:space:]]*"[^"]*"' /boot/config/plugins/ca.backup2/BackupOptions.json 2>/dev/null
+echo "@@ab_dirs"
+# appdata.backup names its runs ab_YYYYMMDD_HHMMSS, CA Backup v2 YYYY-MM-DD@HH.MM
+dests=$( { grep -ho '"destination"[[:space:]]*:[[:space:]]*"[^"]*"' /boot/config/plugins/appdata.backup/config.json
+           grep -ho '"destinationShare"[[:space:]]*:[[:space:]]*"[^"]*"' /boot/config/plugins/ca.backup2/BackupOptions.json
+         } 2>/dev/null | sed 's/.*:[[:space:]]*"\(.*\)"$/\1/' | sed 's#^\([^/]\)#/mnt/user/\1#')
+for d in $dests /mnt/user/backup/*/; do
+  [ -d "$d" ] && timeout 20 find "$d" -mindepth 1 -maxdepth 1 -type d \( -name 'ab_[0-9]*' -o -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]@*' \) 2>/dev/null
+done | sort -u
+echo "@@end"
+'''
+
+
+# ----------------------------------------------------------------------------- small helpers
+def load_module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+_UC = None
+
+
+def uc():
+    """~/bin/unraid-capacity as a module (its byte/rate formatting)."""
+    global _UC
+    if _UC is None:
+        _UC = load_module("unraid_capacity", BIN / "unraid-capacity")
+    return _UC
+
+
+def fmt_b(n):
+    return uc().fmt_bytes(n)
+
+
+def fmt_rate(r):
+    return uc().fmt_rate(r)
+
+
+def dm(d):
+    """Swiss short date: 6.12."""
+    return f"{d.day}.{d.month}."
+
+
+def day(ts):
+    return dm(dt.datetime.fromtimestamp(ts, TZ))
+
+
+def run(cmd, timeout=CMD_TIMEOUT, stdin=None):
+    """-> (rc, stdout, stderr); rc None = could not run / timed out."""
+    try:
+        p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
+                           stdin=None if stdin is not None else subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return None, "", f"timed out after {timeout}s"
+    except OSError as e:
+        return None, "", str(e)
+
+
+def short(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def vtuple(v):
+    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.\-]", v or "")[:4])
+
+
+def window_bounds(frm, until):
+    start = dt.datetime.combine(frm, dt.time(0, 0), TZ).timestamp()
+    end = dt.datetime.combine(until, dt.time(23, 59), TZ).timestamp()
+    return start, end
+
+
+# ----------------------------------------------------------------------------- collectors (raw facts)
+def c_capacity():
+    rc, out, err = run([str(BIN / "unraid-capacity"), "forecast", "--live"])
+    if rc != 0 or not out.strip():
+        rc, out, err = run([str(BIN / "unraid-capacity"), "forecast"])
+    try:
+        r = json.loads(out)
+    except ValueError:
+        return {"error": short(err or f"unraid-capacity exit {rc}", 120)}
+    if not r.get("ok"):
+        return {"error": r.get("error") or "forecast not ok"}
+    keep = {k: r.get(k) for k in ("as_of", "as_of_local", "host", "floor")}
+    a = r["array"]
+    keep["array"] = {k: a.get(k) for k in ("size", "used", "free", "usable", "pct", "primary", "eta")}
+    keep["array"]["rate"] = (a.get(f"trend{a['primary']}") or {}).get("rate") if a.get("primary") else None
+    keep["docker_days"] = docker_days()
+    keep["pools"] = {n: {"kind": p["kind"], "size": p["size"], "free": p["free"], "pct": p["pct"],
+                         "rate": p["trend30"].get("rate") if p["trend30"].get("ok") else None,
+                         "need_days": p["trend30"].get("need_days")} for n, p in (r.get("pools") or {}).items()}
+    return keep
+
+
+def docker_days(path=None):
+    """docker.img free bytes per day from unraid-capacity's samples (first sample of each local day), last 8 days
+    of samples: [{"ts", "free"}]; [] when there are none."""
+    try:
+        lines = Path(path or CAPACITY_SAMPLES).read_text(encoding="utf-8", errors="replace").splitlines()[-16:]
+    except OSError:
+        return []
+    out, seen = [], set()
+    for ln in lines:
+        try:
+            s = json.loads(ln)
+            ts, free = s["ts"], s["docker_img"]["free"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        if not isinstance(ts, (int, float)) or not isinstance(free, (int, float)):
+            continue
+        d = dt.datetime.fromtimestamp(ts, TZ).date()
+        if d not in seen:
+            seen.add(d)
+            out.append({"ts": ts, "free": free})
+    return sorted(out, key=lambda x: x["ts"])[-(DOCKER_JUMP_DAYS + 1):]
+
+
+def docker_jump(days, live_free, as_of):
+    """Biggest rise of docker.img per 24 h between consecutive points (12+ h apart; a longer gap is scaled down to
+    24 h) ending in the 7 days up to as_of, the live reading last: (bytes, ts of the later point) or (0, None)."""
+    pts = list(days)
+    if live_free is not None and as_of:
+        pts.append({"ts": as_of, "free": live_free})
+    best = (0.0, None)
+    for a, b in zip(pts, pts[1:], strict=False):
+        hours = (b["ts"] - a["ts"]) / 3600
+        if hours < 12 or (as_of and as_of - b["ts"] > DOCKER_JUMP_DAYS * 86400):
+            continue
+        rise = (a["free"] - b["free"]) * 24 / max(24.0, hours)
+        if rise > best[0]:
+            best = (rise, b["ts"])
+    return best
+
+
+def c_health():
+    rc, out, err = run([str(BIN / "unraid-health"), "--json", "--dry-run"])
+    try:
+        r = json.loads(out)
+    except ValueError:
+        return {"error": short(err.strip().splitlines()[-1] if err.strip() else f"unraid-health exit {rc}", 120)}
+    m = r.get("metrics") or {}
+    items = []
+    for a in (r.get("alerts") or []) + (r.get("ongoing") or []):
+        items.append({k: a.get(k) for k in ("key", "level", "cat", "subject", "title", "baseline", "kind")})
+    return {"now": r.get("now"), "items": items, "gaps": r.get("gaps") or [], "info": r.get("info") or [],
+            "parity": m.get("parity"), "containers": m.get("containers") or {}, "vms": m.get("vms") or {},
+            "degraded": [{k: i.get(k) for k in ("slot", "what", "since", "days", "rebuilding")}
+                         for i in (m.get("array") or {}).get("degraded") or []],
+            "version": (m.get("system") or {}).get("version")}
+
+
+def c_hwtrend(now):
+    """Flattened counters of the samples from the last HW_DAYS days, oldest first."""
+    try:
+        hw = load_module("hwtrend", BIN / "hwtrend")
+    except Exception as e:
+        return {"error": f"cannot load hwtrend: {e}"}
+    cutoff = dt.datetime.fromtimestamp(now, TZ).date() - dt.timedelta(days=HW_DAYS)
+    out = []
+    for f in sorted(HWTREND_DIR.glob("????-??-??.json")):
+        try:
+            if dt.date.fromisoformat(f.stem) < cutoff:
+                continue
+            s = json.loads(f.read_text())
+            cs = {k: [v, label, bool(res)] for k, (v, label, res) in hw.counters(s).items()}
+        except Exception:
+            continue
+        out.append({"date": f.stem, "ts": s.get("ts"), "counters": cs})
+    return {"samples": out}
+
+
+def c_update(version):
+    cur = version
+    st = None
+    try:
+        st = (UH_STATE / "update-notified").read_text().strip() or None
+    except OSError:
+        pass
+    if cur:
+        rc, out, err = run(["curl", "-fsS", "--max-time", "20",
+                            f"https://releases.unraid.net/os?branch=stable&current_version={cur}"], timeout=40)
+        if rc == 0:
+            try:
+                j = json.loads(out)
+                return {"current": cur, "latest": j.get("version"), "is_newer": bool(j.get("isNewer")),
+                        "source": "live", "notified": st}
+            except ValueError:
+                pass
+    return {"current": cur, "latest": st, "source": "state", "notified": st,
+            "is_newer": bool(cur and st and vtuple(st) > vtuple(cur))}
+
+
+def c_container_watch():
+    rc, out, err = run([str(BIN / "container-watch"), "--json", "--dry-run"])
+    if rc not in (0, 1) or not out.strip():
+        rc, out, err = run([str(BIN / "container-watch"), "--json", "--dry-run", "--offline"])
+    try:
+        r = json.loads(out)
+    except ValueError:
+        return {"error": short(err.strip().splitlines()[-1] if err.strip() else f"container-watch exit {rc}", 120)}
+    rows = [{k: x.get(k) for k in ("container", "state", "unraid", "unraid_since", "auto_update", "installed",
+                                   "latest", "behind", "pinned")} for x in r.get("rows") or []]
+    act = [{k: x.get(k) for k in ("container", "kind", "ids", "sev", "fixed", "installed", "latest")}
+           for x in r.get("actionable") or []]
+    return {"rows": rows, "actionable": act, "errors": r.get("errors") or []}
+
+
+def parse_extra(text):
+    sec, d = None, {}
+    for line in text.splitlines():
+        if line.startswith("@@"):
+            sec = line[2:].strip()
+            d.setdefault(sec, [])
+            continue
+        if sec:
+            d[sec].append(line.rstrip())
+    if "end" not in d:
+        return {"error": "server script output incomplete"}
+
+    def num(k):
+        v = [x for x in d.get(k, []) if x.strip()]
+        return int(v[0]) if v and v[0].strip().isdigit() else None
+    return {"autostart": [x.split()[0] for x in d.get("autostart", []) if x.strip()],
+            "ha_top": num("ha_top"), "ha_log": num("ha_log"),
+            "ab_plugins": [x for x in d.get("ab_plugins", []) if x.strip()],
+            "ab_dirs": [x for x in d.get("ab_dirs", []) if x.strip()]}
+
+
+def c_extra():
+    mode = botlib.lockdown_mode(UNRAID_SSH)
+    if mode == "root":
+        rc, out, err = run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", SSH_HOST, "bash -s"],
+                           timeout=90, stdin=EXTRA_COLLECTOR)
+    else:   # owner's SSH lockdown: the read-only `pretrip` verb runs this same collector (copied in by its build)
+        rc, out, err = run([UNRAID_SSH, "--host", SSH_HOST, "run", "pretrip"], timeout=90)
+    if rc is None or rc == 255 or (mode != "root" and (rc != 0 or "@@end" not in out)):
+        return {"mode": mode, "error": short(err.strip() or f"ssh failed (exit {rc})", 120)}
+    r = parse_extra(out)
+    r["mode"] = mode
+    return r
+
+
+def c_vault():
+    rc, out, err = run([str(BIN / "vault"), "status", "--json"], timeout=60)
+    try:
+        j = json.loads(out)
+    except ValueError:
+        return {"error": short(err.strip().splitlines()[-1] if err.strip() else f"vault exit {rc}", 120)}
+    tg = j.get("tg") or {}
+    last = (tg.get("sync") or {}).get("last") or {}
+    return {"uptime": (j.get("vault") or {}).get("uptime_seconds"), "llm_healthy": (j.get("llm") or {}).get("healthy"),
+            "llm_state": (j.get("llm") or {}).get("state"), "tg_logged_in": tg.get("logged_in"),
+            "tg_last_at": last.get("at"), "tg_last_exit": last.get("exit_code"),
+            "gmail_error": (j.get("gmail") or {}).get("error"), "alerts": j.get("alerts"),
+            "raw_pending": (j.get("raw") or {}).get("pending")}
+
+
+def c_brain(verify):
+    rc, out, err = run([str(BIN / "brain-backup"), "--list"], timeout=60)
+    names = sorted(set(re.findall(r"claude-bot-\d{4}-\d{2}-\d{2}\.tar\.gz", out or "")))
+    r = {"archives": names, "list_error": None if names or rc == 0 else short(err or f"exit {rc}", 120)}
+    if verify:
+        rc, out, err = run([str(BIN / "brain-backup"), "--verify"], timeout=CMD_TIMEOUT)
+        lines = (out or "").strip().splitlines()
+        r["verify"] = {"rc": rc, "summary": short(lines[-1] if lines else err or "no output", 120),
+                       "fails": [short(x, 100) for x in lines if x.startswith("FAIL")][:5]}
+    return r
+
+
+def c_reminders(start, end):
+    """Occurrences of ~/bin/remind reminders inside [start, end] (recurring ones expanded with remind's rules)."""
+    try:
+        rm = load_module("remind_mod", BIN / "remind")
+        items = json.loads(Path(REMIND_DB).read_text())
+    except FileNotFoundError:
+        return {"items": []}
+    except Exception as e:
+        return {"error": f"cannot read reminders: {short(e, 80)}"}
+    fmt = "%Y-%m-%d %H:%M"
+    s_naive = dt.datetime.fromtimestamp(start, TZ).replace(tzinfo=None)
+    e_naive = dt.datetime.fromtimestamp(end, TZ).replace(tzinfo=None)
+    out = []
+    for r in items:
+        try:
+            at = dt.datetime.strptime(r["at"], fmt)
+        except (KeyError, ValueError):
+            continue
+        rule, until = r.get("every"), r.get("until")
+        n = 0
+        while at <= e_naive and n < 400:
+            if until and at.date() > dt.date.fromisoformat(until):
+                break
+            if at >= s_naive:
+                out.append({"at": at.strftime(fmt), "text": r.get("text", ""), "owner": bool(r.get("owner")),
+                            "every": rule})
+            if not rule:
+                break
+            at, n = rm.succ(rule, at), n + 1
+    out.sort(key=lambda x: x["at"])
+    return {"items": out}
+
+
+def c_crontab():
+    """Active ~/crontab lines with their comment block (the trip-window question is whether any needs him home)."""
+    try:
+        lines = CRONTAB.read_text().splitlines()
+    except OSError as e:
+        return {"error": str(e)}
+    jobs, comment = [], []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            comment = []
+        elif s.startswith("#"):
+            comment.append(s.lstrip("# "))
+        elif re.match(r"^[A-Z_]+=", s):
+            comment = []
+        else:
+            jobs.append({"line": s, "comment": " ".join(comment)})
+            comment = []
+    return {"jobs": jobs}
+
+
+def collect(args, start, end):
+    fake = os.environ.get("PRETRIP_NOW")      # tests: "YYYY-MM-DD HH:MM" (Zurich)
+    now = dt.datetime.strptime(fake, "%Y-%m-%d %H:%M").replace(tzinfo=TZ).timestamp() if fake else time.time()
+    facts = {"now": now, "window": [args.frm.isoformat(), args.until.isoformat()]}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {"capacity": ex.submit(c_capacity), "health": ex.submit(c_health),
+                "container_watch": ex.submit(c_container_watch), "extra": ex.submit(c_extra),
+                "vault": ex.submit(c_vault), "brain": ex.submit(c_brain, not args.no_verify)}
+        for k, f in futs.items():
+            try:
+                facts[k] = f.result(timeout=CMD_TIMEOUT * 2 + 60)
+            except Exception as e:
+                facts[k] = {"error": f"{type(e).__name__}: {short(e, 100)}"}
+    facts["hwtrend"] = c_hwtrend(now)
+    facts["update"] = c_update((facts["health"] or {}).get("version"))
+    facts["reminders"] = c_reminders(start, end)
+    facts["crontab"] = c_crontab()
+    return facts
+
+
+# ----------------------------------------------------------------------------- evaluation (pure: facts -> checks)
+def chk(key, ok, line, details=None):
+    return {"key": key, "status": "ok" if ok else "warn", "line": ("✅ " if ok else "⚠️ ") + line,
+            "details": details or []}
+
+
+def e_array(f, end):
+    c = f.get("capacity") or {}
+    if c.get("error"):
+        return chk("space_array", False, f"Array space: couldn't check ({short(c['error'], 60)})")
+    a = c["array"]
+    usable, rate = a["usable"], a.get("rate")
+    days = max(0.0, (end - c["as_of"]) / 86400)
+    det = [f"as of {c.get('as_of_local')}: {fmt_b(a['free'])} free, {fmt_b(usable)} usable above the share floor "
+           f"({fmt_b(c.get('floor'))}/disk), {a['pct']:.1f}% used",
+           f"trend: {fmt_rate(rate)} ({a.get('primary')}-day window)" if rate else "trend: none yet"]
+    if not rate or rate <= 0:
+        ok = usable >= ARRAY_MIN_LEFT
+        return chk("space_array", ok, f"Array: {fmt_b(usable)} usable, not filling" if ok
+                   else f"Array: only {fmt_b(usable)} usable", det)
+    left = usable - rate * days
+    tdate = day(end)
+    det.append(f"projected usable on {tdate}: {fmt_b(left)} ({days:.0f} days ahead)")
+    if left <= 0:
+        full = day(c["as_of"] + usable / rate * 86400)
+        return chk("space_array", False, f"Array full ~{full}, before {tdate} ({fmt_b(usable)} usable, "
+                   f"{fmt_rate(rate)})", det)
+    margin = max(ARRAY_MIN_LEFT, ARRAY_MARGIN_DAYS * rate)
+    if left < margin:
+        return chk("space_array", False, f"Array: only ~{fmt_b(left)} left on {tdate} ({fmt_rate(rate)})", det)
+    return chk("space_array", True, f"Array: {fmt_b(usable)} usable, ~{fmt_b(left)} left on {tdate} "
+               f"({fmt_rate(rate)})", det)
+
+
+def e_pools(f, end):
+    c = f.get("capacity") or {}
+    if c.get("error"):
+        return chk("space_pools", False, "Pools: couldn't check (capacity data missing)")
+    pools = c.get("pools") or {}
+    if not pools:
+        return chk("space_pools", True, "Pools: none found")
+    days = max(0.0, (end - c["as_of"]) / 86400)
+    bad, parts, det, notrend = [], [], [], []
+    for n, p in pools.items():
+        label = n
+        rate = p.get("rate")
+        jump, jts = docker_jump(c.get("docker_days") or [], p["free"], c.get("as_of")) if p.get("kind") == "docker" \
+            else (0.0, None)
+        if jump >= DOCKER_JUMP:
+            det.append(f"{label}: rose {fmt_b(jump)} in a day up to {day(jts)} (steps; the 30-day trend smooths "
+                       f"them away), {fmt_b(p['free'])} free now")
+            if p["free"] < 2 * jump:
+                bad.append(f"{label} rose {fmt_b(jump)} in a day ({day(jts)}), {fmt_b(p['free'])} free")
+        if rate and rate > 0:
+            left = p["free"] - rate * days
+            warn = left < max(p["size"] * POOL_MIN_FREE_PCT / 100, POOL_MARGIN_DAYS * rate)
+            det.append(f"{label}: {fmt_b(p['free'])} free ({p['pct']:.0f}% used), {fmt_rate(rate)}, "
+                       f"projected {fmt_b(max(left, 0))} at trip end")
+            if warn:
+                bad.append(f"{label} ~{fmt_b(max(left, 0))} left at end")
+        else:
+            warn = p["pct"] >= POOL_NOW_PCT
+            notrend.append(label)
+            det.append(f"{label}: {fmt_b(p['free'])} free ({p['pct']:.0f}% used), "
+                       + (f"no steady growth, but a {fmt_b(jump)} step on {day(jts)}" if jump >= DOCKER_JUMP else
+                          "not growing" if rate is not None else "no trend yet"))
+            if warn:
+                bad.append(f"{label} {p['pct']:.0f}% full")
+        parts.append(f"{label} {fmt_b(p['free'])}")
+    if bad:
+        return chk("space_pools", False, "Pools: " + "; ".join(bad), det)
+    tail = " free" + (" (no trend yet)" if notrend and len(notrend) == len(pools) else "")
+    return chk("space_pools", True, "Pools: " + ", ".join(parts) + tail, det)
+
+
+def e_health(f):
+    h = f.get("health") or {}
+    if h.get("error"):
+        return chk("health", False, f"Health: couldn't check ({short(h['error'], 60)})")
+    act = [i for i in h["items"] if i.get("level") in ("warn", "crit") and not i.get("baseline")
+           and i.get("cat") not in HEALTH_SKIP_CATS]
+    known = [i for i in h["items"] if i.get("baseline")]
+    det = [f"[{i['level']}] {i['title']}" for i in act] + [f"[known, stable] {i['title']}" for i in known]
+    det += [f"(info) {x}" for x in h.get("info") or []] + [f"(gap) {x}" for x in h.get("gaps") or []]
+    if not act:
+        return chk("health", True, "Health: no active issues" + (f" ({len(known)} known, stable)" if known else ""),
+                   det)
+    act.sort(key=lambda i: i["level"] != "crit")
+    names = ", ".join(short(re.sub(r"\s*\((WDC|ST|TOSHIBA|HGST|Samsung)[^)]*\)", "", i["title"]), 34) for i in act[:2])
+    more = f" +{len(act) - 2} more" if len(act) > 2 else ""
+    return chk("health", False, f"Health: {len(act)} issue{'s' if len(act) > 1 else ''}: {names}{more}", det)
+
+
+def e_hwtrend(f):
+    hw = f.get("hwtrend") or {}
+    if hw.get("error"):
+        return chk("disk_errors", False, f"Disk errors: couldn't check ({short(hw['error'], 60)})")
+    ss = hw.get("samples") or []
+    if not ss:
+        return chk("disk_errors", False, "Disk errors: no hwtrend samples in 14 days")
+    rising, det = [], []
+    keys = {k for s in ss for k in s["counters"]}
+    for k in sorted(keys):
+        series = [(s["date"], s["counters"][k]) for s in ss if k in s["counters"]]
+        vals = [v[0] for _, v in series]
+        label, resettable = series[-1][1][1], series[-1][1][2]
+        hit = None
+        for i in range(1, len(vals)):
+            prev = vals[i - 1] if resettable else max(vals[:i])
+            if vals[i] is not None and prev is not None and vals[i] > prev and vals[i] > 0:
+                hit = (series[i][0], prev, vals[i])
+        if hit:
+            rising.append(f"{label} {hit[1]}→{hit[2]}")
+            det.append(f"{label}: {hit[1]} → {hit[2]} on {hit[0]}")
+    newest = ss[-1]["date"]
+    age = (dt.datetime.fromtimestamp(f["now"], TZ).date() - dt.date.fromisoformat(newest)).days
+    det.append(f"{len(ss)} daily samples, newest {newest}")
+    if rising:
+        return chk("disk_errors", False, "Disk errors rising: " + short("; ".join(rising), 70), det)
+    if age > HW_STALE_DAYS:
+        return chk("disk_errors", False, f"Disk errors: hwtrend stale (newest sample {newest})", det)
+    return chk("disk_errors", True, f"Disk errors: none rose in {HW_DAYS} days ({len(ss)} samples)", det)
+
+
+def e_parity(f, end):
+    h = f.get("health") or {}
+    p = h.get("parity")
+    if h.get("error") or not p:
+        return chk("parity", False, "Parity: couldn't check")
+    log = p.get("log") or []
+    lo, lt, run_ = p.get("last_ok"), p.get("last_try"), p.get("running")
+    syncs = [e for e in log if str(e.get("action", "")).startswith(("recon", "clear"))]
+    ls = syncs[-1] if syncs else None
+    det = [f"{e['when']}: {e['action']} exit {e['exit']}, {e['errors']} errors" for e in log]
+    det.append(f"schedule: {(p.get('schedule') or {}).get('mode')}; overdue after {p.get('max_age')} days")
+    if run_:
+        eta = run_.get("eta")
+        left = f", ~{eta / 3600:.0f} h left" if eta else ""
+        return chk("parity", False, f"Parity: {run_['kind']} running ({run_.get('pct') or 0:.0f}%{left})", det)
+    deg = [i for i in h.get("degraded") or [] if not i.get("rebuilding")]
+    if deg:   # a clean last check says nothing while a member is emulated: the array runs without full parity
+        det.insert(0, "degraded: " + ", ".join(f"{i['slot']} {i.get('what') or 'disabled'} since {day(i['since'])} "
+                                                f"({i.get('days')} days)" for i in deg))
+        return chk("parity", False, "Parity: array degraded, " + ", ".join(
+            f"{i['slot']} {'emulated' if 'emulated' in str(i.get('what')) else 'out'} since {day(i['since'])}"
+            for i in deg) + "; rebuild before the trip", det)
+    if not lo:
+        return chk("parity", False, "Parity: no completed check on record", det)
+    when = p.get("last_end") or lo.get("ts")
+    base = f"last check {day(when)}" + (f", {lo['errors']} errors" if lo.get("errors") else ", 0 errors")
+    if (lo.get("errors") or 0) > 0:
+        return chk("parity", False, f"Parity: {base}", det)
+    if lt and lt != lo and lt.get("exit") not in (0, -4) and (lt.get("ts") or 0) > (lo.get("ts") or 0):
+        return chk("parity", False, f"Parity: last check {day(lt['ts'])} failed (exit {lt['exit']})", det)
+    if ls and (ls.get("ts") or 0) > (lo.get("ts") or 0) and ls.get("exit") != 0:
+        return chk("parity", False, f"Parity: {ls['action']} on {day(ls['ts'])} didn't finish "
+                   f"(exit {ls['exit']})", det)
+    if when and p.get("max_age") and (end - when) / 86400 > p["max_age"]:
+        return chk("parity", False, f"Parity: {base}; overdue before the trip ends", det)
+    extra = f"; {ls['action']} {day(ls['ts'])} OK" if ls and (ls.get("ts") or 0) > (lo.get("ts") or 0) else ""
+    return chk("parity", True, f"Parity: {base}{extra}", det)
+
+
+def e_brain(f):
+    b = f.get("brain") or {}
+    names = b.get("archives") or []
+    if not names:
+        return chk("backup_brain", False, "Bot backup: no archive found" +
+                   (f" ({short(b.get('list_error'), 50)})" if b.get("list_error") else ""))
+    d = dt.date.fromisoformat(re.search(r"\d{4}-\d{2}-\d{2}", names[-1]).group(0))
+    age = (dt.datetime.fromtimestamp(f["now"], TZ).date() - d).days
+    det = [f"{len(names)} archives on the server, newest {names[-1]}"]
+    v = b.get("verify")
+    vtxt = ""
+    ok = age <= BRAIN_MAX_AGE_DAYS
+    if v:
+        det.append(f"verify: {v['summary']}")
+        det += [f"verify {x}" for x in v.get("fails") or []]
+        vtxt = ", test-restore OK" if v["rc"] == 0 else ", test-restore FAILED"
+        ok = ok and v["rc"] == 0
+    return chk("backup_brain", ok, f"Bot backup: {dm(d)} ({age} d old){vtxt}", det)
+
+
+AB_RX = re.compile(r"(?:ab_(\d{4})(\d{2})(\d{2})_\d{6}|(\d{4})-(\d{2})-(\d{2})@[\d.]+)/?$")
+
+
+def e_appdata(f):
+    x = f.get("extra") or {}
+    if x.get("skipped") or x.get("error"):
+        return chk("backup_appdata", False, f"Appdata backup: couldn't check ({short(x.get('skipped') or x['error'], 50)})")
+    dates = []
+    for p in x.get("ab_dirs") or []:
+        m = AB_RX.search(p)
+        if m:
+            g = [v for v in m.groups() if v]
+            dates.append((dt.date(int(g[0]), int(g[1]), int(g[2])), p))
+    plugins = x.get("ab_plugins") or []
+    det = [f"plugins: {', '.join(plugins) or 'none (appdata.backup / CA Backup not installed)'}"]
+    det += [f"newest backup folder: {max(dates)[1]}"] if dates else ["no dated backup folders found"]
+    if not dates:
+        return chk("backup_appdata", False, "Appdata backup: none found" + ("" if plugins else ", no backup plugin"), det)
+    d = max(dates)[0]
+    age = (dt.datetime.fromtimestamp(f["now"], TZ).date() - d).days
+    ok = age <= APPDATA_MAX_AGE_DAYS and bool(plugins)
+    tail = "" if plugins else ", no backup plugin installed"
+    return chk("backup_appdata", ok, f"Appdata backup: last {dm(d)}{d.year} ({age} d old){tail}", det)
+
+
+def e_containers(f):
+    h, x = f.get("health") or {}, f.get("extra") or {}
+    if h.get("error"):
+        return chk("containers", False, "Containers: couldn't check")
+    cs = {n: c for n, c in h["containers"].items() if n != SELF_CONTAINER and not c.get("self")}
+    auto = set(x.get("autostart") or [])
+    bad, det = [], []
+    for n, c in sorted(cs.items()):
+        st = c.get("status")
+        why = None
+        if st == "restarting":
+            why = "restarting (crash loop?)"
+        elif st != "running" and n in auto:
+            why = f"{st}, but set to autostart"
+        elif st == "exited" and (c.get("exit") or 0) != 0:
+            why = f"exited with code {c.get('exit')}" + (" (out of memory)" if c.get("oom") else "")
+        elif st == "running" and c.get("health") == "unhealthy":
+            why = "unhealthy"
+        if why:
+            bad.append(n)
+            det.append(f"{n}: {why}")
+    running = sum(1 for c in cs.values() if c.get("status") == "running")
+    gone = sorted(auto - set(cs) - {SELF_CONTAINER})
+    if gone:
+        det.append(f"autostart entries without a container (ignored): {', '.join(gone)}")
+    if not auto:
+        det.append("autostart list not read (SSH lockdown or error): judged by exit codes only")
+    if bad:
+        return chk("containers", False, f"Containers down: {short(', '.join(bad), 60)}", det)
+    return chk("containers", True, f"Containers: {running}/{len(cs)} running, none missing", det)
+
+
+def e_ha(f):
+    h, x = f.get("health") or {}, f.get("extra") or {}
+    if h.get("error"):
+        return chk("ha_watchdog", False, "HA watchdog: couldn't check")
+    c = h["containers"].get(HA_CONTAINER)
+    vm = (h.get("vms") or {}).get(HA_VM)
+    probs, det = [], [f"container: {c.get('status') if c else 'missing'}, image {c.get('image') if c else '-'}",
+                      f"VM '{HA_VM}': {vm or 'not found'}"]
+    if not c or c.get("status") != "running":
+        probs.append("watchdog container not running")
+    elif not str(c.get("image", "")).endswith(HA_TAG):
+        probs.append(f"image not pinned to {HA_TAG} (v3 notice page, no watchdog?)")
+    if vm != "running":
+        probs.append(f"HA VM {vm or 'missing'}")
+    verified = ""
+    if x.get("ha_top") is not None:
+        det.append(f"v2 watcher processes: {x['ha_top']}; VM checks logged in 50 min: {x.get('ha_log')}")
+        if c and c.get("status") == "running":
+            if not x["ha_top"]:
+                probs.append("watcher process missing")
+            elif not x.get("ha_log"):
+                probs.append("no VM check logged in 50 min")
+            else:
+                verified = ", last VM check < 50 min"
+    else:
+        det.append("watcher process/log not checked (SSH lockdown or error)")
+    if probs:
+        return chk("ha_watchdog", False, "HA watchdog: " + "; ".join(probs), det)
+    return chk("ha_watchdog", True, f"HA watchdog: running{verified}, VM up", det)
+
+
+def e_vault(f):
+    v = f.get("vault") or {}
+    if v.get("error"):
+        return chk("vault", False, f"Vault: couldn't check ({short(v['error'], 60)})")
+    probs = []
+    if not v.get("llm_healthy"):
+        probs.append(f"local LLM {v.get('llm_state') or 'down'}")
+    if not v.get("tg_logged_in"):
+        probs.append("Telegram not logged in")
+    if v.get("tg_last_exit") not in (0, None):
+        probs.append(f"Telegram sync failing (exit {v['tg_last_exit']})")
+    if v.get("gmail_error"):
+        probs.append("Gmail error")
+    if v.get("alerts"):
+        probs.append(f"{v['alerts']} alert(s)")
+    det = [f"uptime {int((v.get('uptime') or 0) // 3600)} h, LLM {v.get('llm_state')}, TG sync {v.get('tg_last_at')}"
+           f" exit {v.get('tg_last_exit')}, raw pending {v.get('raw_pending')}"]
+    if probs:
+        return chk("vault", False, "Vault: " + "; ".join(probs), det)
+    return chk("vault", True, "Vault: OK (LLM healthy, Telegram synced, 0 alerts)", det)
+
+
+def e_os_update(f):
+    u = f.get("update") or {}
+    if not u.get("current"):
+        return chk("update_os", False, "Unraid update: couldn't check (version unknown)")
+    src = "" if u.get("source") == "live" else " (from last daily check)"
+    if u.get("is_newer"):
+        return chk("update_os", False, f"Unraid {u['latest']} available (runs {u['current']}){src}",
+                   [f"source: {u.get('source')}"])
+    return chk("update_os", True, f"Unraid {u['current']}: up to date{src}", [f"source: {u.get('source')}"])
+
+
+def e_ctr_updates(f):
+    cw = f.get("container_watch") or {}
+    if cw.get("error"):
+        return chk("update_containers", False, f"Container updates: couldn't check ({short(cw['error'], 50)})")
+    pend = [r for r in cw["rows"] if r.get("unraid") == "false" or (r.get("behind") or 0) > 0]
+    sec = {}
+    for a in cw.get("actionable") or []:
+        sec.setdefault(a["container"], []).append(a)
+    det = [f"{r['container']}: {r.get('installed')} → {r.get('latest')}"
+           + (f", Unraid shows update since {r['unraid_since'][:10]}" if r.get("unraid_since") else "")
+           + ("" if r.get("auto_update") else ", no CA auto-update") for r in pend]
+    for n, al in sec.items():
+        ids = [i for a in al for i in (a.get("ids") or [])]
+        fix = next((a.get("fixed") for a in al if a.get("fixed")), None)
+        det.append(f"{n}: {len(al)} advisory item(s) {', '.join(ids[:6])}" + (f"; fixed in {fix}" if fix else ""))
+    det += [f"container-watch error: {e}" for e in cw.get("errors") or []]
+    if not pend and not sec:
+        return chk("update_containers", True, f"Container updates: none pending ({len(cw['rows'])} checked)", det)
+    parts = []
+    for n, al in sec.items():
+        ids = {i for a in al for i in (a.get("ids") or [])} or {a.get("kind") for a in al}
+        parts.append(f"{n} {len(ids)} CVE{'s' if len(ids) > 1 else ''}")
+    parts += [r["container"] for r in pend if r["container"] not in sec]
+    return chk("update_containers", False, "Container updates: " + short(", ".join(parts), 70), det)
+
+
+def e_reminders(f):
+    r, cr = f.get("reminders") or {}, f.get("crontab") or {}
+    if r.get("error"):
+        return chk("reminders", False, f"Reminders: couldn't check ({short(r['error'], 50)})")
+    items = r.get("items") or []
+    home = [i for i in items if AT_HOME_RX.search(i["text"])]
+    cron_home = [j for j in cr.get("jobs") or [] if AT_HOME_RX.search(j["comment"] + " " + j["line"])
+                 and re.search(r"\btg\b|--owner|/usr/local/bin/tg", j["line"])]
+    det = [f"{i['at']}{' [owner]' if i['owner'] else ''}{' (recurring)' if i.get('every') else ''}: "
+           f"{short(i['text'], 110)}" + ("  ← needs home?" if i in home else "") for i in items]
+    det += [f"cron (texts owner, mentions home tasks): {short(j['line'], 100)}" for j in cron_home]
+    if home or cron_home:
+        first = home[0] if home else None
+        what = (f"{first['at'][8:10]}.{first['at'][5:7]}. {short(first['text'], 40)}" if first
+                else short(cron_home[0]["line"], 40))
+        n = len(home) + len(cron_home)
+        return chk("reminders", False, f"Trip window: {n} item{'s' if n > 1 else ''} may need you home: {what}", det)
+    return chk("reminders", True, f"Trip window: {len(items)} reminder{'s' if len(items) != 1 else ''}, "
+               "none need you home", det)
+
+
+def evaluate(facts):
+    frm, until = (dt.date.fromisoformat(x) for x in facts["window"])
+    _, end = window_bounds(frm, until)
+    checks = [e_array(facts, end), e_pools(facts, end), e_health(facts), e_hwtrend(facts), e_parity(facts, end),
+              e_brain(facts), e_appdata(facts), e_containers(facts), e_ha(facts), e_vault(facts),
+              e_os_update(facts), e_ctr_updates(facts), e_reminders(facts)]
+    warns = sum(c["status"] != "ok" for c in checks)
+    host = (facts.get("capacity") or {}).get("host") or SERVER_NAME
+    head = (f"🧳 Pre-trip check {host} ({dm(frm)}–{dm(until)}): "
+            + ("all OK" if not warns else f"{warns} warning{'s' if warns > 1 else ''}"))
+    return {"generated": dt.datetime.fromtimestamp(facts["now"], TZ).isoformat(timespec="seconds"),
+            "window": {"from": frm.isoformat(), "until": until.isoformat()}, "ok": warns == 0,
+            "warnings": warns, "headline": head, "checks": checks}
+
+
+def render_text(res):
+    return "\n".join([res["headline"]] + [c["line"] for c in res["checks"]]) + "\n"
+
+
+def render_md(res):
+    L = [f"# Pre-trip check — {res['generated'][:16].replace('T', ' ')}", "", res["headline"], ""]
+    L += [f"- {c['line']}" for c in res["checks"]]
+    L += ["", "## Details", ""]
+    for c in res["checks"]:
+        L.append(f"**{c['line']}**")
+        L += [f"- {d}" for d in c["details"]] or ["- (nothing more)"]
+        L.append("")
+    L.append("Read-only check by ~/bin/pretrip-check; nothing was changed. Fixes need the owner's OK.")
+    return "\n".join(L) + "\n"
+
+
+# ----------------------------------------------------------------------------- main
+def load_trip(path=None):
+    """(from, until) as dates from the trip file; (None, None) when there is no file. ValueError if malformed."""
+    p = Path(path or TRIP_FILE)
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{p}: {e}") from None
+    try:
+        return dt.date.fromisoformat(d["from"]), dt.date.fromisoformat(d["until"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"{p}: needs \"from\" and \"until\" as YYYY-MM-DD ({e})") from None
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Read-only pre-trip readiness check of the Unraid server.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--from", dest="frm", type=dt.date.fromisoformat)
+    ap.add_argument("--until", type=dt.date.fromisoformat)
+    ap.add_argument("--md", metavar="FILE")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--facts", metavar="FILE", help="evaluate saved facts instead of collecting (tests)")
+    ap.add_argument("--save-facts", metavar="FILE")
+    ap.add_argument("--show-collector", action="store_true")
+    args = ap.parse_args(argv)
+    if args.show_collector:
+        sys.stdout.write(EXTRA_COLLECTOR)
+        return 0
+    if args.frm is None or args.until is None:
+        try:
+            frm, until = load_trip()
+        except ValueError as e:
+            print(f"pretrip-check: bad trip file {e}", file=sys.stderr)
+            return 2
+        args.frm, args.until = args.frm or frm, args.until or until
+    if (args.frm is None or args.until is None) and not (args.facts and args.frm is None and args.until is None):
+        print(f"pretrip-check: no trip window: pass --from and --until or write {TRIP_FILE}", file=sys.stderr)
+        return 2
+    if args.frm and args.until and args.until < args.frm:
+        print("pretrip-check: --until is before --from", file=sys.stderr)
+        return 2
+    if args.facts:
+        facts = json.loads(Path(args.facts).read_text())
+        if any(a.startswith(("--from", "--until")) for a in (argv if argv is not None else sys.argv[1:])):
+            facts["window"] = [args.frm.isoformat(), args.until.isoformat()]
+    else:
+        start, end = window_bounds(args.frm, args.until)
+        facts = collect(args, start, end)
+    if args.save_facts:
+        botlib.atomic_write(args.save_facts, json.dumps(facts, indent=1, default=str))
+        os.chmod(args.save_facts, 0o600)
+    res = evaluate(facts)
+    if args.md:   # details quote my reminder texts: owner-only file
+        botlib.atomic_write(args.md, render_md(res))
+        os.chmod(args.md, 0o600)
+    if args.json:
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+    else:
+        sys.stdout.write(render_text(res))
+    return 0 if res["ok"] else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        sys.exit(2)

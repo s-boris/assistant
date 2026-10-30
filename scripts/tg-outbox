@@ -1,0 +1,235 @@
+#!/usr/local/bin/python3.13 -I
+"""tg-outbox: the script senders' way into the live Telegram outbox. Source: ~/opt/assistant
+(core/tg.py, scripts/tg-outbox).
+
+  tg-outbox gate SENDER [--json]   exit 0 = the outbox path is on for SENDER (no switch, and the live tg-adapter
+                                   runs and sends, or in hub mode the hub answers and its adapter drains the outbox);
+                                   1 = direct path. Prints why. Read-only (one hub read in hub mode).
+  tg-outbox send SENDER [--soft | --urgent] [--text TEXT] [--buttons ROWS_JSON] [--on-press mark|keep|remove]
+                 [--format text|html|markdownv2] [--silent] [--reply-to ID] [--link-preview off]
+                 [--file PATH [--caption TEXT] [--duration S]] [--idem KEY] [--wait S]
+                                   one message to the owner through the outbox. Text: --text, else stdin (none with
+                                   --file). Default urgent (alerts, answers: never held); --soft = the rules hold it
+                                   in quiet hours and sleep-in. Repeats of the same text within the dedupe window are
+                                   skipped either way. Prints the sent message_id (the last one).
+  tg-outbox status [--json]        the gate per sender, the stores and the hub outbox's consumer, and the outbox rows
+                                   of the last 24 h per sender and status (counts only; the hub's rows in hub mode)
+
+Senders: tg, tg-buttons, tg-voice, event-card, tg-status. Switch files ~/.config/tg-adapter/direct-<sender> (or
+direct-all) send that sender (every sender) the direct way again; no restart.
+Exit (send): 0 sent, skipped as a repeat, or queued (held, or the adapter is busy: it goes later) · 1 the adapter
+failed it (Telegram's reason on stderr) · 2 usage · 75 take the direct path (gate closed, the outbox could not take
+it, or it was withdrawn unsent because its adapter stopped: the live one, or the hub's). Stdlib only; reads no bot
+token.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _r in (os.environ.get("ASSISTANT_LIB", ""), os.path.join(_here, "lib"), os.path.join(_here, "..")):
+    if _r and os.path.isfile(os.path.join(_r, "core", "__init__.py")):
+        sys.path.insert(0, os.path.abspath(_r))
+        break
+
+from core import tg  # noqa: E402
+
+SENDERS = ("tg", "tg-buttons", "tg-voice", "event-card", "tg-status")
+SOFT_WAIT, URGENT_WAIT = 3.0, 10.0
+
+
+def _err(msg: str) -> None:
+    print(f"tg-outbox: {msg}", file=sys.stderr)
+
+
+def cmd_gate(a: argparse.Namespace) -> int:
+    on, why = tg.outbox_on(a.sender)
+    print(
+        json.dumps({"sender": a.sender, "outbox": on, "why": why})
+        if a.json
+        else f"{'outbox' if on else 'direct'}: {why}"
+    )
+    return 0 if on else 1
+
+
+def _body(a: argparse.Namespace) -> tuple[dict, list[str] | None] | None:
+    body: dict = {}
+    files = None
+    if a.file:
+        f = os.path.abspath(a.file)
+        if not os.path.isfile(f):
+            _err(f"no such file: {a.file}")
+            return None
+        files = [f]
+        body["text"] = a.text or ""
+        if a.caption:
+            body["caption"] = a.caption
+        if a.duration:
+            body["duration"] = a.duration
+    else:
+        text = a.text if a.text is not None else sys.stdin.read()
+        if not text.strip():
+            _err("empty text")
+            return None
+        body["text"] = text
+    if a.format != "text":
+        body["format"] = a.format
+    if a.buttons:
+        try:
+            rows = json.loads(a.buttons)
+        except ValueError as e:
+            _err(f"--buttons is not JSON: {e}")
+            return None
+        if not isinstance(rows, list) or not rows:
+            _err("--buttons must be a list of rows")
+            return None
+        body["buttons"] = rows
+        if a.on_press:
+            body["on_press"] = a.on_press
+    if a.silent:
+        body["silent"] = True
+    if a.reply_to:
+        body["reply_to"] = a.reply_to
+    if a.link_preview:
+        body["link_preview"] = a.link_preview
+    return body, files
+
+
+def cmd_send(a: argparse.Namespace) -> int:
+    got = _body(a)
+    if got is None:
+        return 2
+    body, files = got
+    urgent = not a.soft
+    wait = a.wait if a.wait is not None else (URGENT_WAIT if urgent else SOFT_WAIT)
+    out = tg.send(a.sender, "send", body, urgent=urgent, idem=a.idem, files=files, wait=wait)
+    if out.direct:
+        if a.verbose:
+            _err(f"direct path: {out.error}")
+        return tg.DIRECT
+    if out.status == "sent":
+        if out.ids:
+            print(out.ids[-1])
+        return 0
+    if out.status == "failed":
+        _err(f"not sent (outbox #{out.row_id}): {out.error}")
+        return 1
+    if out.status == "skipped":
+        _err(f"skipped (outbox #{out.row_id}): {out.error}")
+        return 0
+    _err(f"queued as outbox #{out.row_id}: not sent yet (held in quiet hours / sleep-in, or the adapter is busy)")
+    return 0
+
+
+def _sender_of(body: object) -> str:
+    try:
+        d = json.loads(body) if isinstance(body, str) else body
+    except ValueError:
+        return "-"
+    return str(d.get("sender") or "-") if isinstance(d, dict) else "-"
+
+
+def _rows_24h(src: str) -> dict:
+    """Live outbox rows of the last 24 h as counts per sender and status (src hub: the hub's rows); never the text."""
+    since = time.time() - 86400
+    if src == "hub":
+        from core import hub
+
+        got = hub.tg_q("outbox_live", since=since, until=time.time() + 60)
+        pairs = [(r.get("body"), r.get("status")) for r in got if r.get("bot") == tg.BOT_KEY]
+    else:
+        from core import db
+
+        p = tg.events_db()
+        if not p.exists():
+            return {}
+        con = db.connect(p, ro=True)
+        try:
+            pairs = con.execute(
+                "SELECT body, status FROM outbox WHERE mode='live' AND bot=? AND ts >= ?", (tg.BOT_KEY, since)
+            ).fetchall()
+        finally:
+            con.close()
+    rows: dict = {}
+    for body, status in pairs:
+        n = rows.setdefault(_sender_of(body), {})
+        n[str(status)] = n.get(str(status), 0) + 1
+    return rows
+
+
+def cmd_status(a: argparse.Namespace) -> int:
+    from core import hub
+
+    gates = {s: dict(zip(("outbox", "why"), tg.outbox_on(s), strict=True)) for s in SENDERS}
+    store: dict = {"outbox": hub.backend("outbox"), "tg": hub.backend("tg")}
+    if "hub" in (store["outbox"], store["tg"]):  # the hub outbox serves only while its consumer drains it
+        live, why = tg.hub_consumer()
+        store["hub_consumer"], store["hub_consumer_why"] = live is True, why
+    src = "hub" if store["tg"] == "hub" else "sqlite"
+    try:
+        rows = _rows_24h(src)
+    except Exception as e:  # noqa: BLE001 (status always prints)
+        rows = {"error": type(e).__name__}
+    if a.json:
+        print(json.dumps({"gates": gates, "rows_24h": rows, "rows_from": src, "store": store}, sort_keys=True))
+        return 0
+    line = f"store: outbox {store['outbox']} · tg {store['tg']}"
+    if "hub_consumer" in store:
+        line += f" · hub outbox: {store['hub_consumer_why']}"
+    print(line)
+    for s, g in gates.items():
+        print(f"{s}: {'outbox' if g['outbox'] else 'direct'} ({g['why']})")
+    print(
+        f"live outbox ({src}), 24 h: "
+        + (", ".join(f"{s} {json.dumps(v, sort_keys=True)}" for s, v in rows.items()) or "none")
+    )
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="tg-outbox", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("gate")
+    p.add_argument("sender")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("send")
+    p.add_argument("sender")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--soft", action="store_true")
+    g.add_argument("--urgent", action="store_true")
+    p.add_argument("--text")
+    p.add_argument("--buttons")
+    p.add_argument("--on-press", choices=("mark", "keep", "remove"))
+    p.add_argument("--format", choices=("text", "html", "markdownv2"), default="text")
+    p.add_argument("--silent", action="store_true")
+    p.add_argument("--reply-to", type=int)
+    p.add_argument("--link-preview", choices=("off",))
+    p.add_argument("--file")
+    p.add_argument("--caption")
+    p.add_argument("--duration", type=int)
+    p.add_argument("--idem")
+    p.add_argument("--wait", type=float)
+    p.add_argument("-v", "--verbose", action="store_true")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    if a.cmd == "gate":
+        return cmd_gate(a)
+    if a.cmd == "send":
+        return cmd_send(a)
+    if a.cmd == "status":
+        return cmd_status(a)
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)

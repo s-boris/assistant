@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.call.cancel.json",
+  "title": "stop ringing (M3)",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "type": "string",
+      "pattern": "^k_[A-Za-z0-9]{8,32}$"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "call_id"
+  ]
+}

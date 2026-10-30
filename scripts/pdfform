@@ -1,0 +1,580 @@
+#!/usr/local/bin/python3.13
+"""pdfform: list, fill, flatten and sign PDF forms; overlay text on PDFs without form fields.
+
+  pdfform fields X.pdf [--json | --template]          list AcroForm fields (--template: JSON to edit + fill)
+  pdfform fill X.pdf --data fields.json --out Y.pdf [--flatten] [--ignore-unknown]
+  pdfform sign X.pdf --page N --pos x,y --out Y.pdf [--width 45] [--image PNG]
+  pdfform text X.pdf --page N --pos x,y --text "..." --out Y.pdf [--size 10]
+  pdfform grid X.pdf [--page N] --out grid.png|grid.pdf   mm grid overlay to find positions (view the PNG)
+  fill/sign/text also take: [--file [--title T] [--create-tag]] [--send-by YYYY-MM-DD]
+
+Positions are in mm from the TOP-LEFT corner of the page as you see it (a ruler on paper); --units pt uses
+native PDF points from the bottom-left. Text positions are the baseline start; sign positions are the
+top-left corner of the signature image.
+
+fields.json: {"Field name": "text", "Checkbox": true, "Radio group": "Choice2", ...,
+              "_overlay": [{"page": 1, "x": 30, "y": 52, "text": "Alex Doe", "size": 10}, ...]}
+  Checkboxes take true/false (or yes/no/ja/nein/x); radio groups take one of the states listed by
+  `fields`; choice fields one of the options. A PDF without fields takes only "_overlay" (or a plain list
+  of overlay items). Overlay items: page, x, y, text, size (10), bold (false), align (left|center|right),
+  or {"page", "x", "y", "image": PNG, "width": mm} for an image.
+--flatten bakes the values into the page (no longer editable).
+Signature image default: ~/.config/letter/signature.png (absent until the owner sends a photo of his
+signature; `letter signature import PHOTO`). Nothing is ever sent anywhere.
+"""
+import argparse, difflib, json, os, shutil, subprocess, sys, tempfile
+from collections import OrderedDict
+
+# Runs in ~/opt/letter-venv (reportlab, pypdf, pikepdf, Pillow; ops/requirements/letter.txt, built by boot.sh or
+# ops/install.sh --venvs letter): re-exec there when started by another interpreter.
+_VENV = os.path.join(os.path.expanduser("~"), "opt", "letter-venv")
+if os.path.realpath(sys.prefix) != os.path.realpath(_VENV):
+    if os.access(os.path.join(_VENV, "bin", "python"), os.X_OK):
+        os.execv(os.path.join(_VENV, "bin", "python"), [os.path.join(_VENV, "bin", "python"), os.path.realpath(__file__), *sys.argv[1:]])
+    if {"-h", "--help"} & set(sys.argv[1:]):
+        print(__doc__.strip())
+        sys.exit(0)
+    try:
+        import pypdf, reportlab  # noqa: F401, E401
+    except ImportError:
+        sys.exit(f"{os.path.basename(__file__)}: needs ~/opt/letter-venv: sh ~/opt/assistant/ops/install.sh --venvs letter")
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _admindesk as ad  # noqa: E402
+
+from pypdf import PdfReader, PdfWriter  # noqa: E402
+from pypdf.generic import NameObject  # noqa: E402
+
+MM = ad.MM
+TRUE = {"1", "true", "yes", "ja", "x", "on", "y", "checked", "an"}
+FALSE = {"0", "false", "no", "nein", "", "off", "n", "unchecked", "aus"}
+
+
+# ------------------------------------------------------------------------------------------ fields
+
+def field_kind(ft, ff):
+    ff = ff or 0
+    if ft == "/Tx":
+        return "text"
+    if ft == "/Btn":
+        if ff & (1 << 16):
+            return "pushbutton"
+        return "radio" if ff & (1 << 15) else "checkbox"
+    if ft == "/Ch":
+        return "combo" if ff & (1 << 17) else "list"
+    if ft == "/Sig":
+        return "signature"
+    return str(ft or "?")
+
+
+def walk_fields(reader):
+    """All widget-backed fields, keyed by fully qualified name, in page order."""
+    fields = OrderedDict()
+    for pno, page in enumerate(reader.pages, 1):
+        cb = page.cropbox
+        for ref in page.get("/Annots") or []:
+            annot = ref.get_object()
+            if annot.get("/Subtype") != "/Widget":
+                continue
+            names, node, ft, ff, v, opt, maxlen = [], annot, None, None, None, None, None
+            seen = 0
+            while node is not None and seen < 50:
+                seen += 1
+                if "/T" in node:
+                    names.append(str(node["/T"]))
+                ft = ft if ft is not None else node.get("/FT")
+                ff = ff if ff is not None else node.get("/Ff")
+                if v is None and "/T" in node:  # the value lives on the field, not on radio kid widgets
+                    v = node.get("/V")
+                opt = opt if opt is not None else node.get("/Opt")
+                maxlen = maxlen if maxlen is not None else node.get("/MaxLen")
+                par = node.get("/Parent")
+                node = par.get_object() if par is not None else None
+            if not names:
+                continue
+            name = ".".join(reversed(names))
+            kind = field_kind(ft, int(ff) if ff is not None else 0)
+            ap = annot.get("/AP")
+            states = []
+            if ap is not None and "/N" in ap.get_object():
+                n = ap.get_object()["/N"].get_object()
+                if hasattr(n, "keys"):
+                    states = [str(k) for k in n.keys() if str(k) != "/Off"]
+            r = [float(x) for x in annot.get("/Rect", [0, 0, 0, 0])]
+            rect_mm = [round((min(r[0], r[2]) - float(cb.left)) / MM, 1), round((float(cb.top) - max(r[1], r[3])) / MM, 1),
+                       round(abs(r[2] - r[0]) / MM, 1), round(abs(r[3] - r[1]) / MM, 1)]
+            f = fields.get(name)
+            if f is None:
+                options = []
+                for o in (opt or []):
+                    o = o.get_object() if hasattr(o, "get_object") else o
+                    options.append(str(o[0]) if isinstance(o, list) else str(o))  # [export, display] or text
+                f = fields[name] = {"name": name, "type": kind, "value": None if v is None else str(v),
+                                    "states": [], "options": options, "page": pno, "rect_mm": rect_mm,
+                                    "readonly": bool((int(ff) if ff is not None else 0) & 1)}
+                if maxlen is not None:
+                    f["maxlen"] = int(maxlen)
+            for s in states:
+                if s not in f["states"]:
+                    f["states"].append(s)
+    return fields
+
+
+def cmd_fields(a):
+    r = PdfReader(a.pdf)
+    fields = walk_fields(r)
+    if a.json:
+        print(json.dumps(list(fields.values()), ensure_ascii=False, indent=2))
+        return
+    if a.template:
+        tpl = OrderedDict()
+        for f in fields.values():
+            if f["type"] in ("pushbutton", "signature"):
+                continue
+            if f["type"] == "checkbox":
+                tpl[f["name"]] = (f["value"] or "/Off") != "/Off"
+            else:
+                tpl[f["name"]] = "" if f["value"] in (None, "/Off") else f["value"].lstrip("/") if f["type"] == "radio" else f["value"]
+        print(json.dumps(tpl, ensure_ascii=False, indent=2))
+        return
+    if not fields:
+        print(f"{a.pdf}: no form fields ({len(r.pages)} pages). Use `pdfform text`/_overlay positions; "
+              f"`pdfform grid` helps find them.")
+        return
+    print(f"{a.pdf}: {len(fields)} fields, {len(r.pages)} pages")
+    for f in fields.values():
+        extra = []
+        if f["states"] and f["type"] in ("checkbox", "radio"):
+            extra.append("states " + "|".join(s.lstrip("/") for s in f["states"]))
+        if f["options"]:
+            extra.append("options " + "|".join(f["options"][:12]) + (" …" if len(f["options"]) > 12 else ""))
+        if f.get("maxlen"):
+            extra.append(f"maxlen {f['maxlen']}")
+        if f["readonly"]:
+            extra.append("read-only")
+        x, y, w, h = f["rect_mm"]
+        val = "" if f["value"] is None else f" = {f['value']!r}"
+        print(f"  p{f['page']} [{f['type']}] {f['name']}{val}  @ {x},{y} mm ({w}x{h})" + (f"  {'; '.join(extra)}" if extra else ""))
+
+
+# ------------------------------------------------------------------------------------------ fill
+
+def convert_value(f, value):
+    """JSON value -> what pypdf expects for this field kind. Returns (value, message, fatal)."""
+    kind = f["type"]
+    if kind == "checkbox":
+        on = (f["states"] or ["/Yes"])[0]
+        if isinstance(value, bool):
+            truthy = value
+        else:
+            sv = str(value).strip().lower()
+            for s in f["states"]:
+                if s.lstrip("/").lower() == sv.lstrip("/"):
+                    return s, None, False
+            if sv in TRUE:
+                truthy = True
+            elif sv in FALSE:
+                truthy = False
+            else:
+                return None, f"{f['name']}: checkbox value {value!r} not understood (use true/false)", True
+        return (on if truthy else "/Off"), None, False
+    if kind == "radio":
+        if value in (None, False, "") or str(value).lower() in ("off", "/off"):
+            return "/Off", None, False
+        want = str(value).lstrip("/")
+        for s in f["states"]:
+            if s.lstrip("/").lower() == want.lower():
+                return s, None, False
+        return None, f"{f['name']}: radio value {value!r} not one of {', '.join(s.lstrip('/') for s in f['states'])}", True
+    if kind in ("combo", "list"):
+        sv = str(value)
+        if f["options"] and sv not in f["options"]:
+            m = [o for o in f["options"] if o.lower() == sv.lower()]
+            if m:
+                return m[0], None, False
+            if kind == "list":
+                return None, f"{f['name']}: {value!r} not in options {f['options'][:12]}", True
+            return sv, f"{f['name']}: {value!r} is not one of the listed options (combo box, kept)", False
+        return sv, None, False
+    if kind in ("pushbutton", "signature"):
+        return None, f"{f['name']}: {kind} fields can't be filled (use `pdfform sign` for a signature image)", True
+    if isinstance(value, bool):
+        value = "X" if value else ""
+    sv = str(value)
+    if f.get("maxlen") and len(sv) > f["maxlen"]:
+        return sv[:f["maxlen"]], f"{f['name']}: cut to maxlen {f['maxlen']}", False
+    return sv, None, False
+
+
+def pick_font(texts):
+    try:
+        "".join(texts).encode("cp1252")
+        return "Helvetica", "Helvetica-Bold"
+    except UnicodeEncodeError:
+        pass
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import reportlab
+    for reg, bold in (("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+                      (os.path.join(os.path.dirname(reportlab.__file__), "fonts", "Vera.ttf"),
+                       os.path.join(os.path.dirname(reportlab.__file__), "fonts", "VeraBd.ttf"))):
+        if os.path.isfile(reg) and os.path.isfile(bold):
+            pdfmetrics.registerFont(TTFont("FormSans", reg))
+            pdfmetrics.registerFont(TTFont("FormSans-Bold", bold))
+            return "FormSans", "FormSans-Bold"
+    return "Helvetica", "Helvetica-Bold"
+
+
+def apply_overlays(writer, items, units="mm"):
+    """Draw text/image overlay items onto writer's pages (positions per module docstring)."""
+    from io import BytesIO
+    from reportlab.pdfgen import canvas as rl_canvas
+    if not items:
+        return 0
+    by_page = OrderedDict()
+    for it in items:
+        try:
+            pno = int(it.get("page", 1))
+        except (TypeError, ValueError):
+            ad.die(f"overlay item has a bad page: {it}", 2)
+        if not 1 <= pno <= len(writer.pages):
+            ad.die(f"overlay page {pno} out of range (1..{len(writer.pages)})", 2)
+        if "x" not in it or "y" not in it:
+            ad.die(f"overlay item needs x and y: {it}", 2)
+        if not it.get("text") and not it.get("image"):
+            ad.die(f"overlay item needs text or image: {it}", 2)
+        by_page.setdefault(pno, []).append(it)
+    F, FB = pick_font([str(i.get("text", "")) for i in items])
+    for pno, its in by_page.items():
+        page = writer.pages[pno - 1]
+        if page.get("/Rotate", 0) % 360:
+            page.transfer_rotation_to_content()
+        cb = page.cropbox
+        left, topy = float(cb.left), float(cb.top)
+        buf = BytesIO()
+        mb = page.mediabox
+        c = rl_canvas.Canvas(buf, pagesize=(float(mb.right), float(mb.top)))
+        for it in its:
+            x, y = float(it["x"]), float(it["y"])
+            if units == "pt":
+                px, py = x, y
+            else:
+                px, py = left + x * MM, topy - y * MM
+            if it.get("image"):
+                img = os.path.expanduser(it["image"])
+                if not os.path.isfile(img):
+                    ad.die(f"image not found: {img}")
+                from PIL import Image
+                iw, ih = Image.open(img).size
+                w = float(it.get("width", 45)) * (MM if units != "pt" else 1)
+                h = float(it["height"]) * (MM if units != "pt" else 1) if it.get("height") else w * ih / iw
+                c.drawImage(img, px, py - h, width=w, height=h, mask="auto")
+            else:
+                size = float(it.get("size", 10))
+                c.setFont(FB if it.get("bold") else F, size)
+                for k, line in enumerate(str(it["text"]).split("\n")):
+                    yy = py - k * size * 1.2
+                    al = it.get("align", "left")
+                    if al == "right":
+                        c.drawRightString(px, yy, line)
+                    elif al == "center":
+                        c.drawCentredString(px, yy, line)
+                    else:
+                        c.drawString(px, yy, line)
+        c.showPage()
+        c.save()
+        buf.seek(0)
+        page.merge_page(PdfReader(buf).pages[0])
+    return len(items)
+
+
+def qualified_name(node):
+    names, seen = [], 0
+    while node is not None and seen < 50:
+        seen += 1
+        if "/T" in node:
+            names.append(str(node["/T"]))
+        par = node.get("/Parent")
+        node = par.get_object() if par is not None else None
+    return ".".join(reversed(names))
+
+
+def fix_buttons(writer, conv, fields):
+    """pypdf writes a button's /V as a text string on the field and as a name on each kid widget; the spec
+    wants one name object on the field. Normalise that so viewers and re-reads agree."""
+    for page in writer.pages:
+        for ref in page.get("/Annots") or []:
+            annot = ref.get_object()
+            if annot.get("/Subtype") != "/Widget":
+                continue
+            field = annot if "/T" in annot else (annot.get("/Parent").get_object() if annot.get("/Parent") is not None else None)
+            if field is None:
+                continue
+            name = None
+            for k, f in fields.items():
+                if f["type"] in ("checkbox", "radio") and k in conv and (
+                        qualified_name(field) == k or str(field.get("/T")) == k):
+                    name = k
+                    break
+            if not name:
+                continue
+            field[NameObject("/V")] = NameObject(conv[name])
+            if annot is not field and "/V" in annot:
+                del annot["/V"]
+
+
+def flatten(path):
+    import pikepdf
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        if "/AcroForm" in pdf.Root:
+            pdf.generate_appearance_streams()
+            pdf.flatten_annotations("all")
+            if "/AcroForm" in pdf.Root:
+                del pdf.Root["/AcroForm"]
+        pdf.save(path, deterministic_id=True)   # /ID from the content: same input, same bytes
+
+
+def out_path(a):
+    out = os.path.abspath(os.path.expanduser(a.out))
+    if os.path.abspath(a.pdf) == out:
+        ad.die("--out must differ from the input file", 2)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    return out
+
+
+def write(writer, out):
+    tmp = out + ".tmp"
+    with open(tmp, "wb") as f:
+        writer.write(f)
+    os.replace(tmp, out)
+
+
+def cmd_fill(a):
+    try:
+        with open(a.data, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        ad.die(f"can't read --data: {e}", 2)
+    if isinstance(data, list):
+        values, overlays = {}, data
+    elif isinstance(data, dict):
+        overlays = data.pop("_overlay", None) or data.pop("_overlays", None) or []
+        values = data
+    else:
+        ad.die("--data must be a JSON object (fields) or a list (overlays)", 2)
+    out = out_path(a)
+    reader = PdfReader(a.pdf)
+    fields = walk_fields(reader)
+    if values and not fields:
+        ad.die(f"{a.pdf} has no form fields; put positioned text under \"_overlay\" instead "
+               f"(see `pdfform --help`; `pdfform grid` shows mm positions)", 2)
+    unknown = [k for k in values if k not in fields]
+    if unknown:
+        msg = []
+        for k in unknown:
+            close = difflib.get_close_matches(k, list(fields), n=3, cutoff=0.5)
+            msg.append(f"{k!r}" + (f" (did you mean {', '.join(repr(c) for c in close)}?)" if close else ""))
+        if not a.ignore_unknown:
+            ad.die("unknown fields: " + "; ".join(msg) + "\n(`pdfform fields` lists them; --ignore-unknown skips)", 2)
+        for m in msg:
+            ad.warn(f"skipped unknown field {m}")
+    conv, hard = {}, []
+    for k, v in values.items():
+        if k not in fields:
+            continue
+        val, msg, fatal = convert_value(fields[k], v)
+        if msg:
+            (hard.append(msg) if fatal else ad.warn(msg))
+        if val is not None:
+            conv[k] = val
+    if hard:
+        if not a.ignore_unknown:
+            ad.die("; ".join(hard) + "\n(--ignore-unknown skips these)", 2)
+        for m in hard:
+            ad.warn(f"skipped: {m}")
+    writer = PdfWriter(clone_from=reader)
+    if conv:
+        writer.update_page_form_field_values(None, conv, auto_regenerate=True)
+        fix_buttons(writer, conv, fields)
+        writer.set_need_appearances_writer(True)
+    n_over = apply_overlays(writer, overlays, a.units)
+    write(writer, out)
+    if a.flatten:
+        flatten(out)
+    print(f"filled {len(conv)} field(s)" + (f", {n_over} overlay(s)" if n_over else "") +
+          (", flattened" if a.flatten else "") + f": {out}")
+    if not a.flatten and conv:
+        back = walk_fields(PdfReader(out))
+        bad = [k for k, v in conv.items() if (back.get(k) or {}).get("value") != str(v)]
+        if bad:
+            ad.warn("values not read back as written: " + ", ".join(bad))
+    post(a, out)
+
+
+def cmd_sign(a):
+    img = os.path.expanduser(a.image) if a.image else ad.signature_path()
+    if not img or not os.path.isfile(img):
+        ad.die(ad.NO_SIGNATURE_HINT if not a.image else f"image not found: {a.image}")
+    x, y = parse_pos(a.pos)
+    out = out_path(a)
+    writer = PdfWriter(clone_from=PdfReader(a.pdf))
+    item = {"page": a.page, "x": x, "y": y, "image": img, "width": a.width}
+    if a.height:
+        item["height"] = a.height
+    apply_overlays(writer, [item], a.units)
+    write(writer, out)
+    if a.flatten:
+        flatten(out)
+    print(f"signed page {a.page} at {a.pos} {a.units}: {out}")
+    print("note: a printed/pasted signature image is not a handwritten signature (Art. 14 OR) where written "
+          "form is legally required")
+    post(a, out)
+
+
+def cmd_text(a):
+    x, y = parse_pos(a.pos)
+    out = out_path(a)
+    writer = PdfWriter(clone_from=PdfReader(a.pdf))
+    apply_overlays(writer, [{"page": a.page, "x": x, "y": y, "text": a.text.replace("\\n", "\n"), "size": a.size,
+                             "bold": a.bold, "align": a.align}], a.units)
+    write(writer, out)
+    if a.flatten:
+        flatten(out)
+    print(f"text on page {a.page} at {a.pos} {a.units}: {out}")
+    post(a, out)
+
+
+def cmd_grid(a):
+    from io import BytesIO
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.colors import Color
+    reader = PdfReader(a.pdf)
+    n = len(reader.pages)
+    pages = [a.page] if a.page else list(range(1, n + 1))
+    for p in pages:
+        if not 1 <= p <= n:
+            ad.die(f"page {p} out of range (1..{n})", 2)
+    writer = PdfWriter(clone_from=reader)
+    for p in pages:
+        page = writer.pages[p - 1]
+        if page.get("/Rotate", 0) % 360:
+            page.transfer_rotation_to_content()
+        cb = page.cropbox
+        left, bottom, right, topy = (float(v) for v in (cb.left, cb.bottom, cb.right, cb.top))
+        buf = BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=(float(page.mediabox.right), float(page.mediabox.top)))
+        wmm, hmm = (right - left) / MM, (topy - bottom) / MM
+        for i in range(0, int(wmm) + 1, 5):
+            major = i % 10 == 0
+            c.setStrokeColor(Color(1, 0, 0, alpha=0.45 if major else 0.18))
+            c.setLineWidth(0.4 if major else 0.2)
+            c.line(left + i * MM, bottom, left + i * MM, topy)
+            if major and i:
+                c.setFillColor(Color(0.85, 0, 0))
+                c.setFont("Helvetica", 5.5)
+                for yy in range(0, int(hmm), 50):
+                    c.drawString(left + i * MM + 0.6, topy - (yy + 3) * MM, str(i))
+        for j in range(0, int(hmm) + 1, 5):
+            major = j % 10 == 0
+            c.setStrokeColor(Color(0, 0, 1, alpha=0.45 if major else 0.18))
+            c.setLineWidth(0.4 if major else 0.2)
+            c.line(left, topy - j * MM, right, topy - j * MM)
+            if major and j:
+                c.setFillColor(Color(0, 0, 0.85))
+                c.setFont("Helvetica", 5.5)
+                for xx in range(0, int(wmm), 50):
+                    c.drawString(left + (xx + 0.6) * MM, topy - j * MM + 0.8, str(j))
+        c.showPage()
+        c.save()
+        buf.seek(0)
+        page.merge_page(PdfReader(buf).pages[0])
+    out = os.path.abspath(os.path.expanduser(a.out))
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    if out.lower().endswith(".png"):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = os.path.join(td, "grid.pdf")
+            write(writer, tmp)
+            p = pages[0]
+            if len(pages) > 1:
+                ad.warn("PNG output shows page 1 only; pass --page N for another page")
+            r = subprocess.run(["pdftoppm", "-r", str(a.dpi), "-f", str(p), "-l", str(p), "-png", "-singlefile",
+                                tmp, out[:-4]], capture_output=True, text=True)
+            if r.returncode != 0:
+                ad.die(f"pdftoppm failed: {r.stderr.strip()}")
+    else:
+        write(writer, out)
+    print(f"grid (mm from top-left; red = x, blue = y, every 10 mm labelled): {out}")
+
+
+def parse_pos(s):
+    try:
+        x, y = (float(v) for v in s.split(","))
+        return x, y
+    except ValueError:
+        ad.die(f"bad --pos {s!r} (want x,y)", 2)
+
+
+def post(a, out):
+    """Optional --file (paperless) and --send-by (owner reminder)."""
+    if getattr(a, "file", False):
+        title = a.title or os.path.splitext(os.path.basename(out))[0]
+        line, notes = ad.paperless_file(out, title, ad.today(), None, a.create_tag)
+        print(f"paperless: {line}")
+        for n in notes:
+            print(f"paperless: {n}")
+    if getattr(a, "send_by", None):
+        sb = ad.parse_date(a.send_by, "--send-by")
+        title = a.title or os.path.basename(out)
+        msg = f"📮 Send «{title}» by post by {sb:%a %d.%m.%Y} (registered mail if it has a deadline). PDF: {out}"
+        at, o = ad.send_reminder(sb, msg, f"pdfform:{ad.slug(title, 30)}")
+        print(f"reminder: {o}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="pdfform", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    post_args = argparse.ArgumentParser(add_help=False)
+    post_args.add_argument("--out", required=True)
+    post_args.add_argument("--flatten", action="store_true", help="bake form fields into the page")
+    post_args.add_argument("--units", choices=("mm", "pt"), default="mm")
+    post_args.add_argument("--file", action="store_true", help="upload the result to paperless")
+    post_args.add_argument("--title", help="paperless title / reminder name (default: file name)")
+    post_args.add_argument("--create-tag", action="store_true", help="with --file: create tag Korrespondenz if missing")
+    post_args.add_argument("--send-by", help="YYYY-MM-DD: owner reminder 2 days before to post it")
+    f = sp.add_parser("fields")
+    f.add_argument("pdf")
+    g = f.add_mutually_exclusive_group()
+    g.add_argument("--json", action="store_true")
+    g.add_argument("--template", action="store_true", help="JSON skeleton for `fill --data`")
+    fi = sp.add_parser("fill", parents=[post_args])
+    fi.add_argument("pdf")
+    fi.add_argument("--data", required=True)
+    fi.add_argument("--ignore-unknown", action="store_true")
+    s = sp.add_parser("sign", parents=[post_args])
+    s.add_argument("pdf")
+    s.add_argument("--page", type=int, required=True)
+    s.add_argument("--pos", required=True, help="x,y of the image's top-left corner")
+    s.add_argument("--width", type=float, default=45, help="image width (mm; default 45)")
+    s.add_argument("--height", type=float, help="image height (default: from aspect ratio)")
+    s.add_argument("--image", help="signature PNG (default ~/.config/letter/signature.png)")
+    t = sp.add_parser("text", parents=[post_args])
+    t.add_argument("pdf")
+    t.add_argument("--page", type=int, required=True)
+    t.add_argument("--pos", required=True, help="x,y of the text baseline start")
+    t.add_argument("--text", required=True)
+    t.add_argument("--size", type=float, default=10)
+    t.add_argument("--bold", action="store_true")
+    t.add_argument("--align", choices=("left", "center", "right"), default="left")
+    gr = sp.add_parser("grid")
+    gr.add_argument("pdf")
+    gr.add_argument("--page", type=int)
+    gr.add_argument("--out", required=True)
+    gr.add_argument("--dpi", type=int, default=110)
+    a = ap.parse_args()
+    if not os.path.isfile(a.pdf):
+        ad.die(f"no such file: {a.pdf}", 2)
+    {"fields": cmd_fields, "fill": cmd_fill, "sign": cmd_sign, "text": cmd_text, "grid": cmd_grid}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

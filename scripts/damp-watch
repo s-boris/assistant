@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""damp-watch: mould / condensation watch per room from Home Assistant. Read-only (`ha list` only), no tokens.
+
+Usage:
+  damp-watch [status] [--json]   table per room: temperature, RH, dew point, cold-wall surface RH, streaks, flag
+                                 (live `ha list`; falls back to the last stored sample when HA is unreadable)
+  damp-watch run [--dry-run]     cron (every 10 min): one sample -> state file (7 days; window-watch reads the same
+                                 samples right after); ONE ~/inbox note per run
+                                 only when a room newly crosses a threshold (deduped per room until it recovers),
+                                 plus ONE "48 h while away" note per episode in trip mode; silent otherwise
+  damp-watch line                one line for tg-cmd /home from the state file only (no HA call); empty when stale
+  damp-watch trip [--json]       is trip mode on now, and from which source
+  damp-watch init [--force]      write the private config from HA: temperature + humidity sensor pairs per area,
+                                 an outdoor-named area (balcony, garden, ...) = the outdoor reference
+
+Math: dew point by Magnus (a 17.62, b 243.12 °C, over water). Cold-wall estimate: surface temp
+  Tsi = Tout + fRsi x (Tin - Tout), the outdoor sensor standing in for the outdoor temperature (fRsi 0.7 = the
+  usual minimum for thermal bridges); surface RH = room vapour pressure / saturation pressure at Tsi (capped 100).
+Flags per room: "surface" = surface RH >= surface_max (80 %) for >= surface_hours (12 h); "humid" = RH >= rh_max
+  (65 %) for >= rh_hours (24 h). A streak is the run of valid samples at/over the threshold ending at the newest one;
+  a sample with a missing value is skipped, a gap > max_gap_h between valid samples breaks it, and a value missing
+  for longer than max_gap_h means "no data" (never a new flag, never a recovery). A flagged room recovers when every
+  flagged kind is below its threshold minus hysteresis (2 points). The outdoor reference is never flagged.
+Trip mode (away): a trip in trip-conditions' trips.json holds today (dates inclusive), or the calendar cache has a
+  run of trip_min_days (3) consecutive away nights from today's night or earlier up to its last night (core.away, the
+  rule cat-corner shares: away_overnight all-day events per day, timed ones per midnight crossed). Notes then say
+  "away"; a flagged room whose streak reaches away_hours (48 h) while away gets ONE more note (JOBS.md: only that
+  one goes to the owner).
+
+Config ~/.config/damp-watch/config.json (0600; household entity ids, never in ~/bin):
+  {"rooms": {"NAME": {"temp": "sensor.a", "rh": "sensor.b"}}, "outdoor": {"name": "NAME", "temp": "sensor.c",
+   "rh": "sensor.d"}, "frsi": 0.7, "rh_max": 65, "rh_hours": 24, "surface_max": 80, "surface_hours": 12,
+   "hysteresis": 2, "max_gap_h": 3, "away_hours": 48, "retention_days": 7, "trip_min_days": 3}
+State ~/.local/state/damp-watch/state.json (0600): {"samples": [{ts, rooms {NAME: {t, rh}}, out {t, rh}}],
+  "alerts": {NAME: {since, kinds, noted, away, escalated}}}.
+Exit: 0 ok, 1 HA unreadable (run: nothing stored), 2 usage or config error.
+Env (tests): HA_BIN, DAMP_WATCH_CONFIG, DAMP_WATCH_STATE_DIR, DAMP_WATCH_INBOX, DAMP_WATCH_NOW (epoch),
+  DAMP_WATCH_TRIPS, CALCACHE_DIR, OWNER_TZ.
+Tests: ~/opt/damp-watch-tests/run.sh
+"""
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(HERE, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(HERE))            # the repo checkout (scripts/): its own core
+from core import jsonstate  # noqa: E402
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+from core import away  # noqa: E402  (the calendar away rule, shared with cat-corner)
+
+HA = os.environ.get('HA_BIN', 'ha')
+CONFIG = os.environ.get('DAMP_WATCH_CONFIG') or os.path.join(HOME, '.config/damp-watch/config.json')
+STATE_DIR = os.environ.get('DAMP_WATCH_STATE_DIR') or os.path.join(HOME, '.local/state/damp-watch')
+STATE = os.path.join(STATE_DIR, 'state.json')
+INBOX = os.environ.get('DAMP_WATCH_INBOX') or os.path.join(HOME, 'inbox')
+TRIPS = os.environ.get('DAMP_WATCH_TRIPS') or os.path.join(HOME, '.config/trip-conditions/trips.json')
+CALCACHE = os.path.join(os.environ.get('CALCACHE_DIR') or os.path.join(HOME, '.local/state/calcache'), 'events.json')
+
+DEFAULTS = {'frsi': 0.7, 'rh_max': 65.0, 'rh_hours': 24.0, 'surface_max': 80.0, 'surface_hours': 12.0,
+            'hysteresis': 2.0, 'max_gap_h': 3.0, 'away_hours': 48.0, 'retention_days': 7.0, 'trip_min_days': 3}
+A, B = 17.62, 243.12  # Magnus coefficients (water, -45..60 °C)
+DOWN = ('unavailable', 'unknown', '<hidden>', '', 'None', 'none')
+OUTDOOR_RE = re.compile(r'balcon|terrace|terrasse|patio|garden|garten|yard|outdoor|outside|aussen|roof|veranda', re.I)
+SKIP_RE = re.compile(r'cpu|chip|processor|internal|board|nvme|disk|gpu|\bsoc\b|battery|nozzle|printer|fridge|freezer|'
+                     r'water|device temp', re.I)
+KIND_TEXT = {'humid': 'humid', 'surface': 'cold-wall risk'}
+ACTION = ('air 5–10 min with the windows wide open (not tilted), 2–3× a day; keep the room door open; '
+          'a dehumidifier if it stays high')
+
+
+class Fail(Exception):
+    pass
+
+
+class HAError(Fail):
+    pass
+
+
+# ----------------------------------------------------------------------------- math
+def es(t):
+    """Saturation vapour pressure over water, hPa (Magnus)."""
+    return 6.112 * math.exp(A * t / (B + t))
+
+
+def dew_point(t, rh):
+    if t is None or rh is None or rh <= 0:
+        return None
+    g = math.log(rh / 100.0) + A * t / (B + t)
+    return B * g / (A - g)
+
+
+def surface_temp(t_in, t_out, frsi):
+    return t_out + frsi * (t_in - t_out)
+
+
+def surface_rh(t_in, rh, t_out, frsi):
+    """Estimated RH at the coldest inside wall surface, % (capped at 100); None without all inputs."""
+    if t_in is None or rh is None or t_out is None:
+        return None
+    return min(100.0, rh * es(t_in) / es(surface_temp(t_in, t_out, frsi)))
+
+
+# ----------------------------------------------------------------------------- small helpers
+def owner_tz():
+    name = os.environ.get('OWNER_TZ')
+    if name:
+        return ZoneInfo(name)
+    try:
+        import assistant_profile
+        return assistant_profile.tz()
+    except Exception:
+        return ZoneInfo('UTC')
+
+
+def now_ts():
+    return int(float(os.environ.get('DAMP_WATCH_NOW') or time.time()))
+
+
+def local(ts):
+    return dt.datetime.fromtimestamp(ts, owner_tz())
+
+
+def fmt(v, nd=1, unit=''):
+    return '–' if v is None else f'{v:.{nd}f}{unit}'
+
+
+def hrs(h):
+    return '–' if h is None else (f'{h:.0f} h' if h >= 10 else f'{h:.1f} h')
+
+
+def slug(s):
+    return re.sub(r'[^a-z0-9]+', '-', str(s).lower()).strip('-') or 'room'
+
+
+def read_json(path, default):
+    """Parsed JSON (core.jsonstate); default when missing; unreadable or broken = Fail."""
+    try:
+        return jsonstate.load(path, default, strict=True)
+    except (OSError, ValueError) as e:
+        raise Fail(f'{os.path.basename(path)}: unreadable ({type(e).__name__})')
+
+
+def write_json(path, data):
+    """Private state (0600), atomic (core.jsonstate)."""
+    jsonstate.save(path, data, mode=0o600, ensure_ascii=False, separators=(',', ':'))
+
+
+# window-watch imports this file as a module and calls these names.
+load_json = read_json
+save_json = write_json
+
+
+def load_config():
+    cfg = read_json(CONFIG, None)
+    if not isinstance(cfg, dict) or not isinstance(cfg.get('rooms'), dict) or not cfg['rooms']:
+        raise Fail(f'no rooms configured: run `damp-watch init` ({CONFIG})')
+    out = dict(DEFAULTS)
+    out.update({k: v for k, v in cfg.items() if v is not None})
+    for k in DEFAULTS:
+        out[k] = float(out[k])
+    out['outdoor'] = cfg.get('outdoor') if isinstance(cfg.get('outdoor'), dict) else {}
+    return out
+
+
+# ----------------------------------------------------------------------------- HA reads (read-only)
+def ha_states():
+    try:
+        r = subprocess.run([HA, 'list', 'sensor', '--json', '--limit', '100000'], capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise HAError(f'ha list: {type(e).__name__}')
+    if r.returncode != 0:
+        raise HAError(f'ha list: exit {r.returncode}')
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        raise HAError('ha list: no JSON')
+    if not isinstance(data, list):
+        raise HAError('ha list: unexpected JSON')
+    return {s['entity_id']: s for s in data if isinstance(s, dict) and s.get('entity_id')}
+
+
+def reading(states, eid, kind):
+    """Plausible °C / % value of one entity, else None (missing, unavailable, out of range)."""
+    s = states.get(eid) if eid else None
+    if not s or str(s.get('state')) in DOWN:
+        return None
+    try:
+        v = float(s['state'])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(v):
+        return None
+    if kind == 't':
+        if str((s.get('attributes') or {}).get('unit_of_measurement') or '') == '°F':
+            v = (v - 32) * 5 / 9
+        return round(v, 2) if -50 <= v <= 70 else None
+    return round(v, 2) if 0 < v <= 100 else None
+
+
+def take_sample(cfg, states, ts):
+    rooms = {name: {'t': reading(states, r.get('temp'), 't'), 'rh': reading(states, r.get('rh'), 'rh')}
+             for name, r in cfg['rooms'].items() if isinstance(r, dict)}
+    o = cfg['outdoor']
+    return {'ts': ts, 'rooms': rooms, 'out': {'t': reading(states, o.get('temp'), 't'),
+                                              'rh': reading(states, o.get('rh'), 'rh')}}
+
+
+# ----------------------------------------------------------------------------- streaks
+def value(s, room, key, frsi):
+    r = (s.get('rooms') or {}).get(room) or {}
+    if key == 'rh':
+        return r.get('rh')
+    return surface_rh(r.get('t'), r.get('rh'), (s.get('out') or {}).get('t'), frsi)
+
+
+def streak(samples, room, key, thr, cfg):
+    """{hours, since, value, fresh} for the run of valid values >= thr that ends at the newest valid sample.
+    hours None = not over the threshold now; fresh False = the value is missing for longer than max_gap_h."""
+    gap = cfg['max_gap_h'] * 3600
+    vals = [(s['ts'], v) for s in samples if (v := value(s, room, key, cfg['frsi'])) is not None]
+    newest = samples[-1]['ts'] if samples else None
+    if not vals:
+        return {'hours': None, 'since': None, 'value': None, 'fresh': False}
+    last_ts, last_v = vals[-1]
+    fresh = newest - last_ts <= gap
+    if not fresh or last_v < thr:
+        return {'hours': None, 'since': None, 'value': last_v if fresh else None, 'fresh': fresh}
+    start = prev = last_ts
+    for ts, v in reversed(vals[:-1]):
+        if v < thr or prev - ts > gap:
+            break
+        start = prev = ts
+    return {'hours': (last_ts - start) / 3600, 'since': start, 'value': last_v, 'fresh': True}
+
+
+def room_eval(samples, room, cfg):
+    hum = streak(samples, room, 'rh', cfg['rh_max'], cfg)
+    sur = streak(samples, room, 'surface', cfg['surface_max'], cfg)
+    active = []
+    if hum['hours'] is not None and hum['hours'] >= cfg['rh_hours']:
+        active.append('humid')
+    if sur['hours'] is not None and sur['hours'] >= cfg['surface_hours']:
+        active.append('surface')
+    return {'humid': hum, 'surface': sur, 'active': active}
+
+
+def recovered(ev, kinds, cfg):
+    lim = {'humid': cfg['rh_max'], 'surface': cfg['surface_max']}
+    for k in kinds:
+        s = ev[k]
+        if not s['fresh'] or s['value'] is None or s['value'] >= lim[k] - cfg['hysteresis']:
+            return False
+    return True
+
+
+# ----------------------------------------------------------------------------- trip mode
+def _d(s):
+    return dt.date.fromisoformat(str(s)[:10])
+
+
+def trip_now(ts, cfg=None):
+    """{source, name, from, to} when the owner is away today, else None."""
+    today = local(ts).date()
+    try:
+        data = read_json(TRIPS, {})
+    except Fail:
+        data = {}
+    trips = data.get('trips', data) if isinstance(data, dict) else data
+    items = trips.values() if isinstance(trips, dict) else (trips if isinstance(trips, list) else [])
+    for t in items:
+        try:
+            if isinstance(t, dict) and _d(t['from']) <= today <= _d(t['to']):
+                return {'source': 'trips', 'name': str(t.get('name') or 'trip'), 'from': str(t['from'])[:10],
+                        'to': str(t['to'])[:10]}
+        except (KeyError, ValueError):
+            continue
+    min_days = int((cfg or DEFAULTS)['trip_min_days'])
+    try:
+        cache = read_json(CALCACHE, {})
+    except Fail:
+        cache = {}
+    for t in away.trips(away.events(cache), min_days):
+        if t['from'] <= today <= t['last_night']:
+            return {'source': 'calendar', 'name': 'calendar trip', 'from': t['from'].isoformat(),
+                    'to': t['last_night'].isoformat()}
+    return None
+
+
+# ----------------------------------------------------------------------------- notes
+def note_room(room, ev, last, cfg, al):
+    r = last['rooms'].get(room) or {}
+    t, rh, out_t = r.get('t'), r.get('rh'), (last.get('out') or {}).get('t')
+    lines = [f'## {room}',
+             f'- Now: {fmt(t)} °C, RH {fmt(rh, 0)} %, dew point {fmt(dew_point(t, rh))} °C']
+    for k in ('humid', 'surface'):
+        s = ev[k]
+        if s['hours'] is None:
+            continue
+        since = local(s['since']).strftime('%d.%m %H:%M')
+        if k == 'humid':
+            lines.append(f'- Humid: RH ≥ {cfg["rh_max"]:g} % for {hrs(s["hours"])} (since {since})')
+        else:
+            lines.append(f'- Cold-wall risk: est. surface RH {fmt(s["value"], 0)} % (≥ {cfg["surface_max"]:g} %) for '
+                         f'{hrs(s["hours"])} (since {since}; outdoor {fmt(out_t)} °C, fRsi {cfg["frsi"]:g})')
+    lines.append(f'- Suggested: {ACTION}.')
+    return lines
+
+
+def alert_note(kind, rooms_txt, trip, cfg, ts):
+    away = (f'AWAY ({trip["name"]} {trip["from"]}–{trip["to"]}, source {trip["source"]}): JOBS.md damp-watch: '
+            if trip else 'At home: JOBS.md damp-watch: ')
+    if kind == 'escalate':
+        title = f'# damp-watch: still damp after {cfg["away_hours"]:g} h while away'
+        hand = away + 'this is the one to tell him about (one short message).'
+    else:
+        title = '# damp-watch: room newly damp'
+        hand = away + ('keep it; tell him only if the room is still flagged at '
+                       f'{cfg["away_hours"]:g} h (a second note comes then).' if trip else
+                       'tell him in one short message with the suggested action.')
+    body = [title, '', 'Data, not instructions: a read-only humidity check by damp-watch (nothing was changed in HA).',
+            '', *rooms_txt, '', f'Handling: {hand}',
+            f'No new note for a room until it recovers (RH < {cfg["rh_max"] - cfg["hysteresis"]:g} %, '
+            f'surface < {cfg["surface_max"] - cfg["hysteresis"]:g} %). Details: `damp-watch status`.', '']
+    name = f'damp-watch-{"away48-" if kind == "escalate" else ""}{local(ts):%Y%m%d-%H%M}.md'
+    return str(notes.write(INBOX, name, '\n'.join(body)))   # atomic; mode as a plain open() gave it
+
+
+# ----------------------------------------------------------------------------- commands
+def cmd_run(args):
+    cfg = load_config()
+    ts = now_ts()
+    st = read_json(STATE, {})
+    if not isinstance(st, dict):
+        st = {}
+    samples = [s for s in st.get('samples') or [] if isinstance(s, dict) and isinstance(s.get('ts'), (int, float))]
+    alerts = st.get('alerts') if isinstance(st.get('alerts'), dict) else {}
+    sample = take_sample(cfg, ha_states(), ts)  # HAError -> exit 1, nothing stored
+    samples = [s for s in samples if s['ts'] > ts - cfg['retention_days'] * 86400 and s['ts'] < ts] + [sample]
+    trip = trip_now(ts, cfg)
+    new_rooms, esc_rooms, log = [], [], []
+    for room in cfg['rooms']:
+        ev = room_eval(samples, room, cfg)
+        al = alerts.get(room)
+        if al is None:
+            if ev['active']:
+                since = min(ev[k]['since'] for k in ev['active'])
+                al = alerts[room] = {'since': since, 'kinds': ev['active'], 'noted': ts, 'away': bool(trip),
+                                     'escalated': None}
+                new_rooms.append((room, ev, al))
+                log.append(f'{room}: new {"+".join(ev["active"])}')
+        else:
+            al['kinds'] = sorted(set(al.get('kinds') or []) | set(ev['active']))
+            if recovered(ev, al['kinds'], cfg):
+                del alerts[room]
+                log.append(f'{room}: recovered')
+                continue
+        if al is not None and trip and not al.get('escalated'):
+            h = max((ev[k]['hours'] or 0) for k in al['kinds'])
+            if h >= cfg['away_hours']:
+                al['escalated'] = ts
+                esc_rooms.append((room, ev, al))
+                log.append(f'{room}: {h:.0f} h while away')
+    esc_names = {r for r, _, _ in esc_rooms}
+    new_rooms = [x for x in new_rooms if x[0] not in esc_names]  # one note per room per run
+    paths = []
+    for kind, lst in (('new', new_rooms), ('escalate', esc_rooms)):
+        if not lst:
+            continue
+        txt = []
+        for room, ev, al in lst:
+            txt += note_room(room, ev, sample, cfg, al) + ['']
+        if args.dry_run:
+            paths.append(f'(dry run) {kind}: ' + ', '.join(r for r, _, _ in lst))
+        else:
+            paths.append(alert_note(kind, txt[:-1], trip, cfg, ts))
+    if not args.dry_run:
+        write_json(STATE, {'version': 1, 'samples': samples, 'alerts': alerts})
+    ok = sum(1 for r in sample['rooms'].values() if r['t'] is not None and r['rh'] is not None)
+    print(f'{local(ts):%Y-%m-%d %H:%M} damp-watch: {ok}/{len(sample["rooms"])} rooms read'
+          f'{", away" if trip else ""}; ' + ('; '.join(log) if log else 'no change') +
+          ''.join(f'\n  note: {p}' for p in paths))
+    return 0
+
+
+def rows(cfg, samples, cur, alerts):
+    out = []
+    o_t = (cur.get('out') or {}).get('t')
+    for room in cfg['rooms']:
+        r = (cur.get('rooms') or {}).get(room) or {}
+        t, rh = r.get('t'), r.get('rh')
+        ev = room_eval(samples, room, cfg) if samples else None
+        al = alerts.get(room)
+        flag = ('⚠️ ' + '+'.join(KIND_TEXT[k] for k in al.get('kinds') or [])) if al else (
+            'no data' if t is None or rh is None else 'ok')
+        out.append({'room': room, 't': t, 'rh': rh, 'dew': dew_point(t, rh),
+                    'surface_t': None if t is None or o_t is None else surface_temp(t, o_t, cfg['frsi']),
+                    'surface_rh': surface_rh(t, rh, o_t, cfg['frsi']),
+                    'humid_h': ev['humid']['hours'] if ev else None,
+                    'surface_h': ev['surface']['hours'] if ev else None,
+                    'flag': flag, 'flag_since': al.get('since') if al else None})
+    return out
+
+
+def cmd_status(args):
+    cfg = load_config()
+    ts = now_ts()
+    st = read_json(STATE, {}) or {}
+    samples = st.get('samples') or []
+    alerts = st.get('alerts') or {}
+    src = 'live'
+    try:
+        cur = take_sample(cfg, ha_states(), ts)
+    except HAError as e:
+        if not samples:
+            raise
+        cur, src = samples[-1], f'HA unreadable ({e}); last sample {local(samples[-1]["ts"]):%d.%m %H:%M}'
+    trip = trip_now(ts, cfg)
+    R = rows(cfg, samples, cur, alerts)
+    o = cfg['outdoor']
+    out_t, out_rh = (cur.get('out') or {}).get('t'), (cur.get('out') or {}).get('rh')
+    if args.json:
+        print(json.dumps({'time': local(ts).isoformat(timespec='minutes'), 'source': src, 'trip': trip,
+                          'frsi': cfg['frsi'], 'outdoor': {'name': o.get('name'), 't': out_t, 'rh': out_rh,
+                                                           'dew': dew_point(out_t, out_rh)},
+                          'rooms': R, 'samples': len(samples),
+                          'thresholds': {k: cfg[k] for k in ('rh_max', 'rh_hours', 'surface_max', 'surface_hours',
+                                                             'away_hours')}}, ensure_ascii=False, indent=1))
+        return 0
+    mode = f'away ({trip["name"]} {trip["from"]}–{trip["to"]})' if trip else 'at home'
+    print(f'damp-watch · {local(ts):%d.%m %H:%M} · {src} · {mode}')
+    print(f'Outdoor ref ({o.get("name") or "none"}): {fmt(out_t)} °C, RH {fmt(out_rh, 0)} % · fRsi {cfg["frsi"]:g} · '
+          f'flags: RH ≥ {cfg["rh_max"]:g} % {cfg["rh_hours"]:g} h, wall ≥ {cfg["surface_max"]:g} % '
+          f'{cfg["surface_hours"]:g} h')
+    w = max([len(r['room']) for r in R] + [4])
+    print(f'{"Room":<{w}}  {"°C":>5}  {"RH%":>4}  {"Dew°":>5}  {"Wall°":>5}  {"WallRH":>6}  '
+          f'{"RH≥" + format(cfg["rh_max"], "g"):>6}  {"Wall≥" + format(cfg["surface_max"], "g"):>7}  Flag')
+    for r in R:
+        print(f'{r["room"]:<{w}}  {fmt(r["t"]):>5}  {fmt(r["rh"], 0):>4}  {fmt(r["dew"]):>5}  '
+              f'{fmt(r["surface_t"]):>5}  {fmt(r["surface_rh"], 0):>6}  {hrs(r["humid_h"]):>6}  '
+              f'{hrs(r["surface_h"]):>7}  {r["flag"]}')
+    if samples:
+        print(f'Samples: {len(samples)} since {local(samples[0]["ts"]):%d.%m %H:%M} · streak columns = hours over '
+              f'the threshold now (stored samples)')
+    else:
+        print('Samples: none yet (cron every 30 min)')
+    return 0
+
+
+def cmd_line(args):
+    try:
+        cfg = load_config()
+        st = read_json(STATE, {}) or {}
+    except Fail:
+        return 0
+    samples, alerts, ts = st.get('samples') or [], st.get('alerts') or {}, now_ts()
+    if not samples or ts - samples[-1]['ts'] > 2 * 3600:
+        return 0
+    R = rows(cfg, samples, samples[-1], alerts)
+    bad = [r for r in R if r['flag'].startswith('⚠️')]
+    if bad:
+        bits = []
+        for r in bad:
+            h = max(x for x in (r['humid_h'], r['surface_h'], 0) if x is not None)
+            bits.append(f'{r["room"]} {r["flag"][3:]}' + (f' {hrs(h)}' if h else '') +
+                        (f' (RH {r["rh"]:.0f} %)' if r['rh'] is not None else ''))
+        print('💧 ⚠️ ' + ' · '.join(bits) + ' · air 5–10 min')
+        return 0
+    rh = [r['rh'] for r in R if r['rh'] is not None]
+    sr = [r['surface_rh'] for r in R if r['surface_rh'] is not None]
+    if not rh:
+        return 0
+    span = f'{min(rh):.0f}' + (f'–{max(rh):.0f}' if round(max(rh)) != round(min(rh)) else '')
+    print(f'💧 Damp ok · RH {span} %' + (f' · walls ≤ {max(sr):.0f} %' if sr else ''))
+    return 0
+
+
+def cmd_trip(args):
+    cfg = None
+    try:
+        cfg = load_config()
+    except Fail:
+        pass
+    t = trip_now(now_ts(), cfg)
+    if args.json:
+        print(json.dumps({'away': bool(t), 'trip': t}, ensure_ascii=False))
+    else:
+        print(f'away: {t["name"]} {t["from"]}–{t["to"]} (source {t["source"]})' if t else 'at home (no trip today)')
+    return 0
+
+
+def cmd_init(args):
+    if os.path.exists(CONFIG) and not args.force:
+        raise Fail(f'{CONFIG} exists (use --force to rebuild it)')
+    per = {}
+    for eid, s in ha_states().items():
+        a, area = s.get('attributes') or {}, s.get('area')
+        dc = a.get('device_class')
+        if not area or dc not in ('temperature', 'humidity') or SKIP_RE.search(f'{eid} {s.get("name") or ""}'):
+            continue
+        key = 'temp' if dc == 'temperature' else 'rh'
+        sl = re.sub(r'[^a-z0-9]+', '_', area.lower()).strip('_')
+        rank = 0 if eid == f'sensor.{sl}_{"temperature" if key == "temp" else "humidity"}' else 1
+        cur = per.setdefault(area, {})
+        if key not in cur or rank < cur[key][0] or (rank == cur[key][0] and eid < cur[key][1]):
+            cur[key] = (rank, eid)
+    rooms, outdoor = {}, {}
+    for area in sorted(per):
+        p = {k: v[1] for k, v in per[area].items()}
+        if OUTDOOR_RE.search(area):
+            if not outdoor and 'temp' in p:
+                outdoor = {'name': area, **p}
+        elif 'temp' in p and 'rh' in p:
+            rooms[area] = p
+    if not rooms:
+        raise Fail('no area with both a temperature and a humidity sensor found')
+    cfg = {'rooms': rooms, 'outdoor': outdoor, **{k: v for k, v in DEFAULTS.items()}}
+    write_json(CONFIG, cfg)
+    print(f'wrote {CONFIG}: {len(rooms)} rooms ({", ".join(rooms)}); outdoor: {outdoor.get("name") or "none"}')
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='damp-watch', description='Mould / condensation watch (read-only HA).')
+    sub = ap.add_subparsers(dest='cmd')
+    p = sub.add_parser('status')
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('run')
+    p.add_argument('--dry-run', action='store_true')
+    sub.add_parser('line')
+    p = sub.add_parser('trip')
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('init')
+    p.add_argument('--force', action='store_true')
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 0
+    if not argv or argv[0].startswith('--'):
+        argv = ['status'] + list(argv)
+    args = ap.parse_args(argv)
+    fn = {'status': cmd_status, 'run': cmd_run, 'line': cmd_line, 'trip': cmd_trip, 'init': cmd_init}[args.cmd]
+    try:
+        return fn(args)
+    except HAError as e:
+        print(f'damp-watch: {e}', file=sys.stderr)
+        return 1
+    except Fail as e:
+        print(f'damp-watch: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

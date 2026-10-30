@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""mail-migration-check: did the mail move from one Gmail account to another? A short report from the vault's
+aggregates (POST /gmail/compare, job op gmail.compare): per year, per label and the gaps as (sender domain, month,
+count). The match runs inside the vault by Message-ID (mails without one: same day + sender domain); only counts,
+labels, months and domains come out. Never a name, a subject or an address.
+
+  mail-migration-check [--old L] [--new L] [--top N] [--wait S] [--out FILE | --no-write] [--print]
+  mail-migration-check --job ID [...]          wait for (or pick up) a comparison already running in the vault
+  mail-migration-check --from-json FILE [...]  render a saved answer (the route's answer or `vault job wait --json`)
+  mail-migration-check --quick [--old L] [--new L] [--years A-B]
+                                               no Message-ID match: per-year totals of each account from the
+                                               vault's search (works on any vault version)
+
+Defaults: --old/--new from ~/.config/mail-migration-check/accounts (lines old=LABEL, new=LABEL), else old=main
+new=personal; --top 150; --wait 220 (one call never waits longer than 230 s); report
+~/reports/admin/mail-migration-<date>.md.
+Exit: 0 report written (or printed), 3 the running vault has no /gmail/compare yet (not deployed), 12 still running
+(rerun with --job ID), 1 other failure, 2 usage.
+Test seams: MMC_VAULT (the vault CLI), MMC_HOME (home dir), MMC_TODAY (YYYY-MM-DD)."""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HOME = os.environ.get('MMC_HOME') or os.path.expanduser('~')
+VAULT = os.environ.get('MMC_VAULT') or 'vault'
+CONF = os.path.join(HOME, '.config', 'mail-migration-check', 'accounts')
+ADDR = re.compile(r'[A-Za-z0-9._%+\-]+@([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,})')
+NOT_DEPLOYED = 3
+RUNNING = 12
+
+
+def today():
+    return os.environ.get('MMC_TODAY') or dt.date.today().isoformat()
+
+
+def defaults():
+    d = {'old': 'main', 'new': 'personal'}
+    try:
+        with open(CONF, encoding='utf-8') as f:
+            for line in f:
+                k, _, v = line.strip().partition('=')
+                if k.strip() in d and re.fullmatch(r'[a-z0-9_-]{1,20}', v.strip().lower()):
+                    d[k.strip()] = v.strip().lower()
+    except OSError:
+        pass
+    return d
+
+
+def vault(*args, timeout=240):
+    """-> (rc, stdout, stderr). Every call is bounded (no single wait over 4 min)."""
+    try:
+        p = subprocess.run([VAULT, *args], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, '', f'vault {" ".join(args[:3])}: timed out after {timeout} s'
+    except OSError as e:
+        return 127, '', f'cannot run {VAULT}: {e}'
+
+
+def not_deployed(err):
+    e = err or ''
+    return (('op must be one of' in e and 'gmail.compare' not in e) or 'no such route' in e.lower()
+            or ('--async is not available' in e and 'compare' in e))
+
+
+def say_not_deployed():
+    print('mail-migration-check: the running vault has no /gmail/compare yet (the comparison endpoint is not '
+          'deployed).\n  Needed: the vault commit that adds app/mailcompare.py, deployed by the owner '
+          '(vault deploy request <commit>, his ✅).\n  Meanwhile: mail-migration-check --quick (per-year totals only, '
+          'no Message-ID match).', file=sys.stderr)
+    return NOT_DEPLOYED
+
+
+def wait_job(jid, wait):
+    """-> (exit, result or None). Polls `vault job wait` in calls of at most 230 s until `wait` s are over."""
+    end = time.monotonic() + max(0, wait)
+    while True:
+        left = max(1, min(230, int(end - time.monotonic())))
+        rc, out, err = vault('job', 'wait', jid, '--max', str(left), '--json', timeout=left + 60)
+        if rc == 0:
+            try:
+                j = json.loads(out)
+            except ValueError:
+                print(f'mail-migration-check: unreadable job answer for {jid}', file=sys.stderr)
+                return 1, None
+            return 0, j.get('result')
+        if rc == RUNNING and time.monotonic() < end - 1:
+            continue
+        if rc == RUNNING:
+            print(f'mail-migration-check: still running in the vault (job {jid}). Pick it up later: '
+                  f'mail-migration-check --job {jid}', file=sys.stderr)
+            return RUNNING, None
+        if not_deployed(err):
+            return say_not_deployed(), None
+        print(f'mail-migration-check: job {jid} failed: {(err or out).strip()[:300]}', file=sys.stderr)
+        return 1, None
+
+
+def submit(old, new, top):
+    rc, out, err = vault('--async', 'gmail', 'compare', '--old', old, '--new', new, '--top', str(top), timeout=90)
+    if rc != 0:
+        if not_deployed(err):
+            return say_not_deployed(), None
+        print(f'mail-migration-check: vault refused: {(err or out).strip()[:300]}', file=sys.stderr)
+        return 1, None
+    jid = out.strip().splitlines()[0] if out.strip() else ''
+    if not re.fullmatch(r'[0-9a-f]{16}', jid):
+        print(f'mail-migration-check: no job id from the vault ({out.strip()[:80]!r})', file=sys.stderr)
+        return 1, None
+    return 0, jid
+
+
+# ------------------------------------------------------------------------------------------------ rendering
+
+def pct(a, b):
+    return f'{100.0 * a / b:.0f} %' if b else '–'
+
+
+def table(head, rows):
+    out = ['| ' + ' | '.join(head) + ' |', '|' + '|'.join('---:' if i else '---' for i in range(len(head))) + '|']
+    out += ['| ' + ' | '.join(str(x) for x in r) + ' |' for r in rows]
+    return out
+
+
+def safe(s):
+    """Last guard before anything is written: an address keeps only its domain."""
+    return ADDR.sub(lambda m: '…@' + m.group(1).lower(), str(s))
+
+
+def render(r, date):
+    old, new, c = r['old'], r['new'], r['compare']
+    ao, an = r['accounts'][old], r['accounts'][new]
+    L = [f'# Mail migration check: {old} → {new} ({date})', '',
+         f'Matched inside the vault by Message-ID ({c["moved_by_bucket"]} mails without one: same day + sender '
+         f'domain). Source: each account\'s All Mail (Gmail leaves Spam and Trash out). Aggregates only: counts, '
+         f'labels, months, sender domains. Scan {r.get("scanned_at", "?")}, {r.get("seconds", "?")} s.', '',
+         '## Summary', '']
+    L += table(['', 'mails'], [
+        [f'in {old} (old)', c['old_mails']],
+        ['moved (found in both)', f'{c["moved"]} ({pct(c["moved"], c["old_mails"])})'],
+        [f'**missing in {new}**', f'**{c["missing"]}** ({pct(c["missing"], c["old_mails"])})'],
+        [f'in {new} (new)', c['new_mails']],
+        [f'only in {new} (arrived after the move or from elsewhere)', c['new_only']]])
+    L += ['', '## By year (Date header; a broken one: the day the mail reached that account)', '']
+    L += table(['year', old, new, 'moved', 'missing', 'missing %'],
+               [[y, v['old'], v['new'], v['moved'], v['missing'], pct(v['missing'], v['old'])]
+                for y, v in c['by_year'].items()])
+    if c.get('by_label'):
+        L += ['', f'## Missing by label ({old})', '']
+        L += table(['label', f'in {old}', 'missing'],
+                   [[x['label'], x['old'], x['missing']] for x in c['by_label'] if x['old']])
+    months = sorted(c.get('missing_by_month', {}).items(), key=lambda kv: (-kv[1], kv[0]))[:12]
+    if months:
+        L += ['', '## Months with the most missing mails', '']
+        L += table(['month', 'missing'], months)
+    if c.get('top_domains'):
+        L += ['', '## Sender domains with the most missing mails', '']
+        L += table(['sender domain', 'missing'], [[x['domain'], x['missing']] for x in c['top_domains']])
+    L += ['', f'## Gaps: sender domain × month (top {len(c["gaps"])} of {c["gap_rows"]} rows, '
+              f'{c["gap_domains"]} domains)', '']
+    L += table(['month', 'sender domain', 'missing'], [[g['month'], g['domain'], g['missing']] for g in c['gaps']])
+    L += ['', '## Accounts', '']
+    for lab, a in ((old, ao), (new, an)):
+        labs = ', '.join(f'{x["label"]} {x["mails"]}' for x in a.get('labels', [])[:12])
+        L.append(f'- **{lab}** (…@{a.get("domain") or "?"}): {a["mails"]} mails, {a["no_message_id"]} without '
+                 f'Message-ID, {a["sent"]} sent; labels: {labs or "–"}'
+                 + (f' (+{a["labels_more"]} more)' if a.get('labels_more') else ''))
+    L += ['', '## Reading it', '',
+          '- "(sent)" = mails he sent from that account; "(none)" = no sender address.',
+          '- An import label in the new account shows as "…@domain" (Gmail\'s import labels mails with the old '
+          'address).',
+          '- Missing = in the old account\'s All Mail with no copy (same Message-ID) in the new one.', '']
+    return safe('\n'.join(L))
+
+
+def summary(r):
+    c = r['compare']
+    worst = sorted(((y, v['missing']) for y, v in c['by_year'].items() if v['missing']), key=lambda x: -x[1])[:3]
+    doms = ', '.join(f"{x['domain']} {x['missing']}" for x in c.get('top_domains', [])[:3])
+    return safe(f"{r['old']} → {r['new']}: {c['missing']} of {c['old_mails']} mails missing "
+                f"({pct(c['missing'], c['old_mails'])}), {c['moved']} moved, {c['new_only']} only in {r['new']}"
+                + (f"; worst years: {', '.join(f'{y} {n}' for y, n in worst)}" if worst else '')
+                + (f"; top domains: {doms}" if doms else ''))
+
+
+# ------------------------------------------------------------------------------------------------ quick mode
+
+def quick(old, new, years):
+    """Per-year totals per account from the vault's search (All Mail): no Message-ID match, counts only."""
+    folder = '[Gmail]/All Mail'
+    rows, total = [], {}
+    for y in years:
+        row = [y]
+        for acc in (old, new):
+            rc, out, err = vault('gmail', 'search', f'after:{y}/01/01 before:{y + 1}/01/01', '--account', acc,
+                                 '-n', '1', '--folder', folder, '--json', timeout=90)
+            try:
+                n = int(json.loads(out).get('total')) if rc == 0 else None
+            except (ValueError, TypeError, AttributeError):
+                n = None
+            row.append(n)
+            total[acc] = total.get(acc, 0) + (n or 0)
+        rows.append(row)
+    return rows, total
+
+
+def render_quick(old, new, rows, total, date):
+    L = [f'# Mail migration check (quick): {old} → {new} ({date})', '',
+         'Per-year totals of each account\'s All Mail from the vault\'s search. No Message-ID match: a year where '
+         f'{new} holds far fewer mails than {old} is a candidate gap, not proof. Counts only.', '']
+    L += table(['year', old, new, f'{new} − {old}'],
+               [[y, '?' if a is None else a, '?' if b is None else b,
+                 '?' if a is None or b is None else b - a] for y, a, b in rows])
+    L += ['', f'Totals over these years: {old} {total.get(old, 0)}, {new} {total.get(new, 0)}.', '']
+    return safe('\n'.join(L))
+
+
+# ------------------------------------------------------------------------------------------------ main
+
+def write(text, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def main(argv=None):
+    d = defaults()
+    p = argparse.ArgumentParser(prog='mail-migration-check', description=__doc__.split('\n\n')[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--old', default=d['old'])
+    p.add_argument('--new', default=d['new'])
+    p.add_argument('--top', type=int, default=150)
+    p.add_argument('--wait', type=int, default=220, help='seconds to wait for the vault (default 220)')
+    p.add_argument('--job', help='a running comparison\'s job id')
+    p.add_argument('--from-json', help='render a saved answer')
+    p.add_argument('--quick', action='store_true', help='per-year totals only (any vault version)')
+    p.add_argument('--years', default=f'2004-{dt.date.today().year}', help='--quick: year range A-B')
+    p.add_argument('--out', help='report path (default ~/reports/admin/mail-migration-<date>.md)')
+    p.add_argument('--no-write', action='store_true')
+    p.add_argument('--print', action='store_true', help='print the whole report')
+    a = p.parse_args(argv)
+    if a.old == a.new:
+        p.error('--old and --new must differ')
+    if not 1 <= a.top <= 1000:
+        p.error('--top must be 1-1000')
+    date = today()
+    out = a.out or os.path.join(HOME, 'reports', 'admin', f'mail-migration-{date}' + ('-quick' if a.quick else '')
+                                + '.md')
+    if a.quick:
+        m = re.fullmatch(r'(\d{4})-(\d{4})', a.years)
+        if not m or int(m.group(1)) > int(m.group(2)):
+            p.error('--years must look like 2004-2026')
+        rows, total = quick(a.old, a.new, range(int(m.group(1)), int(m.group(2)) + 1))
+        if all(x is None for r in rows for x in r[1:]):
+            print('mail-migration-check: the vault search answered nothing (vault status)', file=sys.stderr)
+            return 1
+        text = render_quick(a.old, a.new, rows, total, date)
+        line = f'{a.old} {total.get(a.old, 0)} vs {a.new} {total.get(a.new, 0)} mails ({a.years}, quick totals)'
+    else:
+        if a.from_json:
+            try:
+                with open(a.from_json, encoding='utf-8') as f:
+                    r = json.load(f)
+            except (OSError, ValueError) as e:
+                print(f'mail-migration-check: cannot read {a.from_json}: {e}', file=sys.stderr)
+                return 1
+            r = r.get('result', r) if isinstance(r, dict) else r
+        else:
+            jid = a.job
+            if jid is None:
+                rc, jid = submit(a.old, a.new, a.top)
+                if rc:
+                    return rc
+                print(f'mail-migration-check: comparing in the vault (job {jid})', file=sys.stderr)
+            elif not re.fullmatch(r'[0-9a-f]{16}', jid):
+                p.error('--job takes a 16-hex job id')
+            rc, r = wait_job(jid, a.wait)
+            if rc:
+                return rc
+        if not isinstance(r, dict) or 'compare' not in r:
+            print('mail-migration-check: the answer has no comparison in it', file=sys.stderr)
+            return 1
+        text, line = render(r, date), summary(r)
+    if not a.no_write:
+        write(text, out)
+        line += f'\nreport: {out}'
+    print(text if a.print else line)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

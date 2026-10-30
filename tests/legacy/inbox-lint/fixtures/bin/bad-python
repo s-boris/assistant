@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Placeholder fixture: a Python writer without the marker."""
+import os
+
+INBOX = os.path.expanduser("~/inbox")
+
+
+def write_example(text):
+    path = os.path.join(INBOX, "example-bad.md")
+    with open(path, "w") as f:
+        f.write(text)

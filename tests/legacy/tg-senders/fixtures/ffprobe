@@ -1,0 +1,9 @@
+#!/bin/sh
+# ffprobe stand-in for hosts without ffmpeg (the CI runner): answers tg-voice's three queries as the real ffprobe
+# does for fixtures/note.ogg (2 s of 440 Hz, OGG/Opus mono). test_outbox.py puts it on PATH only when ffprobe is missing.
+case "$*" in
+  *codec_name*) echo opus ;;
+  *format_name*) echo ogg ;;
+  *duration*) echo 2.006500 ;;
+  *) exit 1 ;;
+esac

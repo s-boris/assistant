@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""voice-say: speak an answer to the owner as Telegram voice note(s): `tts` + `tg-voice` in one call.
+
+  voice-say TEXT|- [--lang auto|en|de] [--caption LINE] [--reply-to ID] [--silent] [--dry-run] [--json]
+  voice-say --stats [DAYS]     latency of the last DAYS (default 7) days from the log (counts and times only)
+
+Language: auto (default) picks de or en from common words and umlauts (a tie = en); --lang forces one.
+Length: ≤ 60 s per note. Text estimated over ~58 s is split at a sentence boundary into 2 notes (a note that still
+comes back cut is re-split once); past 2 notes tts keeps whole sentences and ends "The rest is in the text.".
+--caption = the one line of text under the first note (plain text; the session's reply tool is for links/buttons).
+--reply-to quotes his voice note (first note only). Prints the message_id of each note, one per line
+(--json: {lang, notes: [{file, seconds, message_id}], tts_ms, send_ms, warm}). --dry-run: make the notes, send nothing.
+Speed: uses the warm Piper server (tts --server) and starts it in the background when it is not running
+(VOICE_SAY_WARM=0 = never), so only the first answer pays the ~1 s model load.
+Log: one counts-only JSON line per call (no text) in ~/.local/state/voice-mode/latency.jsonl (VOICE_SAY_LOG).
+Exit: 0 sent, 1 tts failed (nothing sent), tg-voice's code when the first note failed, 3 = a later note failed.
+Tests: VOICE_SAY_TTS, VOICE_SAY_TG_VOICE (commands), TTS_CACHE, TG_VOICE_*; ~/opt/voice-mode-tests/run.sh.
+"""
+import argparse
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser('~')
+TTS = os.environ.get('VOICE_SAY_TTS') or f'{HOME}/bin/tts'
+TG_VOICE = os.environ.get('VOICE_SAY_TG_VOICE') or f'{HOME}/bin/tg-voice'
+LOG = os.environ.get('VOICE_SAY_LOG') or f'{HOME}/.local/state/voice-mode/latency.jsonl'
+CACHE = os.environ.get('TTS_CACHE', f'{HOME}/.cache/tts')
+CAP_S = 60
+SPLIT_S = 58
+CPS = {'en': 16.0, 'de': 15.0}  # raw characters per spoken second (Piper medium voices, measured)
+
+DE_WORDS = set('''der das und ist nicht ich du ein eine einen einem einer mit auf für von zu zum zur den dem des im
+ja nein bitte danke heute morgen gestern wann wie wo warum noch schon auch aber oder wir ihr sie es bin bist sind
+hast hat habe haben wird werden kann kannst muss musst soll uhr zug gleis heim nach bei über unter jetzt dann wenn
+weil dass sich mir dich dir mich uns euch kein keine nichts etwas viel mehr sehr gut alles wieder hier dort gerade
+minuten stunden tage'''.split())
+EN_WORDS = set('''the and is not you a with on for of to at yes please thanks today tomorrow yesterday when how what
+where why still already but or we they it are have has will can must should train platform home after before now
+then if because that this my your me us no nothing something much more very good everything again here there just
+minutes hours days are be been was'''.split())
+
+
+def pick_lang(text):
+    words = re.findall(r"[a-zäöüß]+", text.lower())
+    de = sum(w in DE_WORDS for w in words) + 2 * len(re.findall(r'[äöüß]', text.lower()))
+    en = sum(w in EN_WORDS for w in words)
+    return 'de' if de > en else 'en'
+
+
+def clean(text):  # rough spoken length: no URLs, markup or emoji
+    text = re.sub(r'https?://\S+|`[^`]*`|[*_#>|~\[\]()]', ' ', text)
+    text = ''.join(ch for ch in text if ord(ch) < 0x2190 or ch in '€…–—')
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def est_s(text, lang):
+    return len(clean(text)) / CPS[lang]
+
+
+def split2(text, lang):
+    """Two parts at the sentence (else comma, else word) boundary nearest the target length."""
+    total = len(text)
+    target = min(total / 2, SPLIT_S * CPS[lang])
+    for pat in (r'(?<=[.!?…:;])\s+|\n+', r'(?<=,)\s+', r'\s+'):
+        cuts = [m.start() for m in re.finditer(pat, text) if 0 < m.start() < total]
+        if cuts:
+            c = min(cuts, key=lambda x: abs(x - target))
+            a, b = text[:c].strip(), text[c:].strip()
+            if a and b:
+                return [a, b]
+    c = int(target)
+    return [text[:c].strip(), text[c:].strip()]
+
+
+def tts(part, lang):
+    r = subprocess.run([TTS, '--json', '--lang', lang, '--max-seconds', str(CAP_S), '-'], input=part,
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr.strip().splitlines() or [f'exit {r.returncode}'])[-1])
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def warm_up():
+    if os.environ.get('VOICE_SAY_WARM') == '0':
+        return
+    try:
+        subprocess.Popen([TTS, '--server', 'start', '--no-wait'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def log(rec):
+    try:
+        os.makedirs(os.path.dirname(LOG), mode=0o700, exist_ok=True)
+        with open(LOG, 'a') as f:
+            f.write(json.dumps(rec) + '\n')
+        if os.path.getsize(LOG) > 400_000:  # keep the newest ~1000 lines
+            lines = open(LOG).read().splitlines()[-1000:]
+            with open(LOG + '.part', 'w') as f:
+                f.write('\n'.join(lines) + '\n')
+            os.replace(LOG + '.part', LOG)
+    except OSError:
+        pass
+
+
+def stats(days):
+    since = time.time() - days * 86400
+    recs = []
+    try:
+        for line in open(LOG):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get('ts', 0) >= since and r.get('ok') and not r.get('dry'):
+                recs.append(r)
+    except OSError:
+        pass
+    if not recs:
+        print(f'voice-say: no answers sent in the last {days} days')
+        return 0
+    med = lambda k: round(statistics.median(r[k] for r in recs) / 1000, 2)
+    warm = sum(1 for r in recs if r.get('warm'))
+    print(f"voice-say, last {days} days: {len(recs)} answers ({sum(r['notes'] for r in recs)} notes, {warm} warm); "
+          f"median tts {med('tts_ms')} s, send {med('send_ms')} s, audio {round(statistics.median(r['audio_s'] for r in recs), 1)} s")
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='voice-say', description='Speak an answer as Telegram voice note(s).')
+    ap.add_argument('text', nargs='*')
+    ap.add_argument('--lang', choices=['auto', 'en', 'de'], default='auto')
+    ap.add_argument('--caption', default='')
+    ap.add_argument('--reply-to')
+    ap.add_argument('--silent', action='store_true')
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--stats', type=int, nargs='?', const=7)
+    a = ap.parse_args(argv)
+    if a.stats is not None:
+        return stats(max(1, a.stats))
+    if a.reply_to and not a.reply_to.isdigit():
+        print('voice-say: --reply-to takes a message id', file=sys.stderr)
+        return 2
+    raw = sys.stdin.read() if (not a.text or a.text == ['-']) and not sys.stdin.isatty() else ' '.join(a.text)
+    text = raw.strip()
+    if not clean(text):
+        print('voice-say: nothing to say', file=sys.stderr)
+        return 2
+    lang = pick_lang(text) if a.lang == 'auto' else a.lang
+    t0 = time.monotonic()
+    spawned = not os.path.exists(os.path.join(CACHE, 'piper.sock'))
+    if spawned:
+        warm_up()
+    parts = split2(text, lang) if est_s(text, lang) > SPLIT_S else [text]
+    try:
+        notes = [tts(p, lang) for p in parts]
+        if len(notes) == 1 and notes[0].get('truncated'):
+            parts = split2(text, lang)
+            notes = [tts(p, lang) for p in parts]
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        print(f'voice-say: tts failed: {e}', file=sys.stderr)
+        log({'ts': int(time.time()), 'lang': lang, 'ok': False, 'stage': 'tts'})
+        return 1
+    tts_ms = int((time.monotonic() - t0) * 1000)
+    warm = all(n.get('warm') for n in notes)
+    if not warm and not spawned:
+        warm_up()  # missing or stale server: the next answer is warm
+    rc, ids = 0, []
+    t1 = time.monotonic()
+    if not a.dry_run:
+        for i, n in enumerate(notes):
+            cmd = [TG_VOICE, n['file']]
+            if i == 0 and a.caption.strip():
+                cmd.append(' '.join(a.caption.split()))
+            if a.silent:
+                cmd.append('--silent')
+            if i == 0 and a.reply_to:
+                cmd += ['--reply-to', a.reply_to]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=130)
+            if r.returncode != 0:
+                sys.stderr.write(r.stderr)
+                rc = r.returncode if i == 0 else 3
+                break
+            ids.append(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else '')
+    send_ms = int((time.monotonic() - t1) * 1000)
+    log({'ts': int(time.time()), 'lang': lang, 'notes': len(notes), 'chars': len(text),
+         'audio_s': round(sum(n.get('seconds', 0) for n in notes), 1), 'warm': warm, 'tts_ms': tts_ms,
+         'send_ms': send_ms, 'ok': rc == 0, **({'dry': True} if a.dry_run else {})})
+    if a.json:
+        print(json.dumps({'lang': lang, 'tts_ms': tts_ms, 'send_ms': send_ms, 'warm': warm,
+                          'notes': [{'file': n['file'], 'seconds': n.get('seconds'),
+                                     'message_id': ids[i] if i < len(ids) else None} for i, n in enumerate(notes)]}))
+    elif a.dry_run:
+        for n in notes:
+            print(f"{n['file']}\t{n.get('seconds')} s")
+    else:
+        print('\n'.join(ids))
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

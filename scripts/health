@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""health: the owner's sleep & energy insights from the phone app's Health Connect summaries (token-free, local).
+
+  health ingest [--received EPOCH]     one health.daily JSON body on stdin -> the store (phonegw calls this; also tags
+                                       late nights from `sleepin status`)
+  health tag [--cron]                  late-night tags from `sleepin status --json` (kinds only; cron daily)
+  health status [--json]               counts only: days stored, range, nights, late nights, sync lag (safe to show)
+  health card [--json]                 the /sleep text card (<= 10 lines; his own data: only to him)
+  health board [--json]                the app Board's morning line ({} unless he is up, before early afternoon,
+                                       and the sleep-in guard is not holding)
+  health recap [--cron] [--dry-run]    weekly recap; opt-in: ~/.config/health/config.json "weekly_recap": off | app |
+                                       telegram (default off -> nothing). app = `phone push --level info --private`,
+                                       telegram = `tg --soft` (waits for the sleep-in guard)
+  health config [KEY VALUE]            show or set weekly_recap / board_line / board_until_h
+
+Insights: sleep debt (last 7 nights vs his own 28-night median, after 7 nights), bedtime drift (this week's median
+bedtime vs the 3 weeks before), late nights (sleepin's calendar/place/hold mornings) and gym days (strength workouts,
+gym.db sessions) vs ordinary nights, steps trend (7 days vs the 21 before). Store and privacy: ~/bin/lib/healthlib.py.
+Exit: 0 ok, 1 failure / nothing to ingest, 2 usage.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import healthlib as H  # noqa: E402
+
+
+def ulog(feature, kind="invoke", t0=None, outcome=None, attrs=None):
+    try:
+        import usage
+        usage.log(feature, kind, channel=usage.caller_channel() if hasattr(usage, "caller_channel") else None,
+                  ms=(time.time() - t0) * 1000 if t0 else None, outcome=outcome, attrs=attrs)
+    except Exception:
+        pass
+
+
+def cmd_ingest(a):
+    raw = sys.stdin.read()
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        print("health ingest: not JSON", file=sys.stderr)
+        return 1
+    con = H.connect()
+    try:
+        day = H.ingest(body, a.received, con=con)
+        if day is None:
+            print("health ingest: not a health.daily body", file=sys.stderr)
+            return 1
+        st = H.sleepin_status()
+        if st:
+            H.tag_nights(st, con)
+    finally:
+        con.close()
+    ulog("health.sync", "exec", outcome="ok", attrs={"sleep": bool(body.get("sleep")), "steps": "steps" in body})
+    print("ok")
+    return 0
+
+
+def cmd_tag(a):
+    st = H.sleepin_status()
+    if not st:
+        if not a.cron:
+            print("health tag: sleepin status unavailable", file=sys.stderr)
+        return 1
+    con = H.connect()
+    try:
+        n = H.tag_nights(st, con)
+    finally:
+        con.close()
+    if not a.cron:
+        print("%d late night(s) tagged" % n)
+    return 0
+
+
+def cmd_status(a):
+    s = H.status()
+    s["config"] = {k: v for k, v in H.config().items()}
+    if a.json:
+        print(json.dumps(s))
+    elif not s.get("store"):
+        print("no health data yet (app switch off, or the gateway's health is off)")
+    else:
+        lag = s["sleep_end_lag_min"]
+        print("%d days (%s … %s), %d nights, %d late nights; sleep-end lag median %s min (n=%d); weekly recap %s" % (
+            s["days"], s["first"], s["last"], s["nights"], s["late_nights"], lag["median"], lag["n"],
+            s["config"]["weekly_recap"]))
+    return 0
+
+
+def current():
+    tz = H.zone()
+    t = H.now()
+    rows, tags = H.load(t=t)
+    since = time.strftime("%Y-%m-%d", time.localtime(t - 40 * 86400))
+    return tz, t, rows, H.insights(rows, tags, tz, t, gym=H.gym_days(since))
+
+
+def cmd_card(a):
+    tz, t, rows, ins = current()
+    lines = H.card_lines(ins, tz)
+    if a.json:
+        print(json.dumps({"lines": lines, "tone": ins.get("tone"), "nights": ins.get("nights")}, ensure_ascii=False))
+    else:
+        print("\n".join(lines))
+    return 0          # his /sleep taps are logged by tg-cmd (tg.sleep); a direct run is not his use
+
+
+def cmd_board(a):
+    out = H.board()
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+def cmd_recap(a):
+    cfg = H.config()
+    mode = cfg["weekly_recap"]
+    if mode == "off" and not a.dry_run:
+        return 0
+    tz, t, rows, ins = current()
+    lines = H.recap_lines(ins, tz)
+    if not lines:
+        return 0
+    if a.dry_run:
+        print("mode: %s\n%s" % (mode, "\n".join(lines)))
+        return 0
+    if mode == "app":
+        argv = [H.tool("PHONE_BIN", "phone"), "push", "--level", "info", "--private", "--title", lines[0],
+                "--body", "\n".join(lines[1:]), "--tag", "health-recap"]
+    else:
+        soft = [os.environ["TG_SOFT_BIN"]] if os.environ.get("TG_SOFT_BIN") else [H.tool("TG_BIN", "tg"), "--soft"]
+        argv = soft + ["\n".join(lines)]
+    try:
+        p = subprocess.run(argv, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        rc = p.returncode
+    except (OSError, subprocess.SubprocessError):
+        rc = 1
+    ulog("health.recap", "notify_sent" if rc == 0 else "error", outcome=mode)
+    return 0 if rc == 0 else 1
+
+
+def cmd_config(a):
+    p = os.environ.get("HEALTH_CONFIG") or os.path.join(H.HOME, ".config", "health", "config.json")
+    cur = {}
+    try:
+        with open(p) as fh:
+            cur = json.load(fh) or {}
+    except (OSError, ValueError):
+        pass
+    if a.key is None:
+        print(json.dumps(dict(H.DEFAULTS, **cur), indent=1))
+        return 0
+    if a.key == "weekly_recap" and a.value in H.RECAP_MODES:
+        cur[a.key] = a.value
+    elif a.key == "board_line" and a.value in ("on", "off", "true", "false"):
+        cur[a.key] = a.value in ("on", "true")
+    elif a.key == "board_until_h" and (a.value or "").isdigit() and 9 <= int(a.value) <= 23:
+        cur[a.key] = int(a.value)
+    else:
+        print("health config: weekly_recap off|app|telegram, board_line on|off, board_until_h 9-23", file=sys.stderr)
+        return 2
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(cur, fh, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+    print("%s = %s" % (a.key, cur[a.key]))
+    return 0
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="health", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("ingest"); s.add_argument("--received", type=int)
+    s = sub.add_parser("tag"); s.add_argument("--cron", action="store_true")
+    s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("card"); s.add_argument("--json", action="store_true"); s.add_argument("--no-log", action="store_true")
+    s = sub.add_parser("board"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("recap"); s.add_argument("--cron", action="store_true"); s.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("config"); s.add_argument("key", nargs="?"); s.add_argument("value", nargs="?")
+    a = p.parse_args(argv[1:])
+    return {"ingest": cmd_ingest, "tag": cmd_tag, "status": cmd_status, "card": cmd_card, "board": cmd_board,
+            "recap": cmd_recap, "config": cmd_config}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

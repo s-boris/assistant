@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.geofences.json",
+  "title": "the full fence set (replaces the previous one). Coordinates go server -> app only",
+  "type": "object",
+  "properties": {
+    "rev": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "fences": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,23}(:[a-z0-9_-]{1,32})?$"
+          },
+          "kind": {
+            "enum": [
+              "home",
+              "office",
+              "gym",
+              "venue",
+              "station",
+              "airport",
+              "place"
+            ]
+          },
+          "lat": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90
+          },
+          "lon": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180
+          },
+          "r_m": {
+            "type": "integer",
+            "minimum": 50,
+            "maximum": 5000
+          },
+          "until": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 4102444800
+          },
+          "dwell_s": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "kind",
+          "lat",
+          "lon",
+          "r_m"
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "rev",
+    "fences"
+  ]
+}

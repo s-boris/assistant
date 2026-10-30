@@ -1,0 +1,1979 @@
+#!/usr/bin/env python3
+"""ha-apply: the owner-approved WRITE tool for the Home Assistant cleanup (one group per approved
+poll item). ha-audit stays read-only; this is the only path for HA config and registry writes.
+
+Usage:
+  ha-apply GROUP [--apply]
+  ha-apply show backups|backup-config
+  ha-apply registry [--apply]
+Groups (one per approved poll item):
+  backup-config  automatic backups daily 03:15, keep 7, all add-ons + database, local agent
+Home autopilot (owner-approved package; undo section "autopilot"):
+  autopilot      create the package's helpers (input_boolean / input_text / input_datetime) and autopilot_* automations from
+                 ~/.config/ha-apply/autopilot.json (HA_AUTOPILOT_PACKAGE); --only away,left-on,arrival picks parts;
+                 --apply needs --sha PREFIX of the package the owner approved (printed by the dry run)
+                 scene.create snapshots in the package (literal scene_id autopilot_*) count as its own refs;
+                 a package may also carry "scripts" ({id: script config} -> script.<id>, POST /api/config/script/
+                 config/<id>; a part lists them under "scripts"); --package FILE picks another package file;
+                 "display_aliases": [ids] lets EXISTING automations carry a free name (entity stays automation.<id>)
+  autopilot-undo delete what `autopilot` created (automations and scripts it replaced get their before-config
+                 back; helpers only if it created them and no other automation uses them)
+  remote-swap    the remote automation from the private plan: --replace-device OLD=NEW swaps a removed device id for a
+                 re-paired one (OLD: id or its 8+ hex hash from the dry run; NEW: id, hash or exact device name;
+                 same model + integration required); --undo --apply posts the before-config back
+  registry       the private plan's "registry" section: device name/area, entity id renames and disables (disabled_by
+                 user, never deleted; skipped while an automation, script, scene or group still uses the entity), UI group
+                 helper members (options flow; only drops members) and an entity swap in a non-generated dashboard;
+                 before-state in undo section "registry" (dashboard before-config also as a file); verify by a read
+  automation-delete --automation automation.x
+                 delete ONE owner-approved UI automation (config store, automations.yaml): the dry run shows its
+                 config id + alias; --apply saves the full config to a 0600 file in ~/.config/ha-apply/backups/
+                 (HA_APPLY_AUTO_BACKUP_DIR), DELETEs /api/config/automation/config/<id>, reads back that the config,
+                 the entity and its repair issues are gone (record: undo section "automation-delete").
+                 --undo [--backup FILE] --apply POSTs the newest backup of that entity back under the same id.
+                 Refused: no config id (YAML-only), not in the config store, autopilot_* (use autopilot-undo)
+  group-helper --group DOMAIN.x (--members A,B,... | --delete | --undo [--backup FILE])
+                 ONE UI group helper (config entry, domain group): --members sets the full member list through the
+                 options flow (same-domain live entities; any/all + hide-members kept, read back); --delete removes the
+                 helper only while no automation/script/scene/group, dashboard or local package names it. --apply
+                 first saves its options to a 0600 file in ~/.config/ha-apply/backups/ (group-DOMAIN-x-STAMP.json);
+                 record: undo section "group-helper". --undo --apply: members back via the options flow, or a deleted
+                 helper recreated by the group config flow (same title/options; renamed to the old entity id)
+  lint          read-only drift check of every package in ~/.config/ha-apply (HA_APPLY_PKG_DIR or --packages):
+                 applied ones (in HA or in the undo record) = configs and helpers still identical, referenced
+                 entities/devices still there; staged ones = the dry run still passes. Prints findings (exit 1)
+                 or "all fine"; --cron: silent when fine, else one ~/inbox/ha-package-lint-DATE.md note (exit 0)
+Default = dry run (reads only, prints the plan). --apply: write the before-state into the undo file,
+make the change, verify it with a read.
+
+Safety by construction (Guard): websocket types WS_READ/WS_WRITE, services CALL_SERVICE_ALLOW and REST
+REST_ALLOW are explicit allowlists; any write additionally needs --apply AND a target (entity/device/
+person/automation id) that this run's plan approved. Anything else raises NotAllowed before a byte is sent.
+Tests: ~/opt/assistant/tests/legacy/ha-apply/run.sh. Undo record: ~/reports/ha/ha-cleanup-undo-2026-10-15.json
+(privacy-scrubbed; a full restore = the HA backup "Before cleanup 2026-10-15").
+Privacy: no coordinates, addresses, SSIDs, IPs, BT names/MACs or emails are printed or stored
+(BT entity ids are hashed like ha-audit does; ZHA IEEE only as a hash).
+Token: ~/.secrets/ha-admin-token (never printed). Reuses ha-audit's websocket framing and scrubbers
+(imported unchanged from ~/bin/ha-audit).
+"""
+import argparse
+import datetime as dt
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import contextlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.dont_write_bytecode = True
+
+
+def _load_audit():
+    path = os.environ.get('HA_AUDIT_LIB', os.path.expanduser('~/bin/ha-audit'))
+    loader = importlib.machinery.SourceFileLoader('ha_audit_lib', path)
+    spec = importlib.util.spec_from_loader('ha_audit_lib', loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+A = _load_audit()
+
+AUDIT_JSON = os.path.expanduser('~/reports/ha/ha-cleanup-audit-2026-10-15.json')
+UNDO = os.path.expanduser(os.environ.get('HA_APPLY_UNDO', '~/reports/ha/ha-cleanup-undo-2026-10-15.json'))
+
+
+class NotAllowed(Exception):
+    """Raised before anything off the allowlist / outside the approved plan could be sent."""
+
+
+# ----------------------------------------------------------------------------- allowlists
+WS_READ = {
+    'get_states': set(),
+    'config/entity_registry/list': set(),
+    'config/device_registry/list': set(),
+    'config/area_registry/list': set(),
+    'config_entries/get': {'domain', 'type_filter'},
+    'person/list': set(),
+    'backup/info': set(),
+    'backup/config/info': set(),
+    'backup/agents/info': set(),
+    'hacs/repositories/list': set(),            # round 3
+    'lovelace/dashboards/list': set(),
+    'lovelace/config': {'url_path', 'force'},
+    'input_boolean/list': set(),
+    'input_text/list': set(),                   # autopilot
+    'input_datetime/list': set(),               # autopilot
+    'repairs/list_issues': set(),               # remote-swap: repair cleared?
+}
+WS_WRITE = {
+    'config/entity_registry/remove': {'entity_id'},
+    'config/device_registry/remove_config_entry': {'device_id', 'config_entry_id'},
+    'person/update': {'person_id', 'name', 'user_id', 'device_trackers', 'picture'},
+    'backup/config/update': {'create_backup', 'retention', 'schedule', 'automatic_backups_configured'},
+    'call_service': {'domain', 'service', 'service_data'},
+    # round 3: every one of these needs the EXACT message approved by the plan (target_key = canonical params)
+    'config/device_registry/update': {'device_id', 'name_by_user', 'area_id'},
+    'config/entity_registry/update': {'entity_id', 'new_entity_id', 'hidden_by', 'disabled_by'},
+    'hacs/repository/remove': {'repository'},
+    'input_boolean/delete': {'input_boolean_id'},
+    'lovelace/config/save': {'url_path', 'config'},
+    # autopilot: helpers from the approved package only (exact message approved by the plan)
+    'input_boolean/create': {'name', 'icon'},
+    'input_text/create': {'name', 'icon', 'min', 'max', 'mode'},
+    'input_text/delete': {'input_text_id'},
+    'input_datetime/create': {'name', 'icon', 'has_date', 'has_time'},
+    'input_datetime/delete': {'input_datetime_id'},
+}
+EXACT_TYPES = {'config/device_registry/update', 'config/entity_registry/update', 'hacs/repository/remove',
+               'input_boolean/delete', 'lovelace/config/save',
+               'input_boolean/create', 'input_text/create', 'input_text/delete',
+               'input_datetime/create', 'input_datetime/delete'}
+CALL_SERVICE_ALLOW = {('zha', 'remove'): {'ieee'}}  # no scene or automation service calls
+SCENE_PATH = r'/api/config/scene/config/[0-9A-Za-z_\-]{1,40}'
+AUTOMATION_PATH = r'/api/config/automation/config/[A-Za-z0-9_.\-]{1,80}'
+ENTRY_PATH = r'/api/config/config_entries/entry/[0-9A-Za-z]{20,40}'  # config entry delete (round 2)
+AUTOPILOT_PATH = r'/api/config/automation/config/autopilot_[a-z0-9_]{1,60}'  # the only automations ha-apply deletes
+SCRIPT_PATH = r'/api/config/script/config/[a-z0-9_]{1,60}'  # package scripts (written/deleted only as planned)
+REST_ALLOW = (
+    ('GET', re.compile(AUTOMATION_PATH)),
+    ('GET', re.compile(r'/api/states/automation\.[a-z0-9_]{1,80}')),
+    ('POST', re.compile(AUTOMATION_PATH)),
+    ('DELETE', re.compile(ENTRY_PATH)),
+    ('DELETE', re.compile(AUTOPILOT_PATH)),                                    # autopilot-undo
+    ('GET', re.compile(SCRIPT_PATH)),                                          # package scripts
+    ('POST', re.compile(SCRIPT_PATH)),
+    ('DELETE', re.compile(SCRIPT_PATH)),
+    ('GET', re.compile(SCENE_PATH)),                                           # registry: scene refs (read only)
+    ('POST', re.compile(r'/api/config/config_entries/options/flow')),
+    ('POST', re.compile(r'/api/config/config_entries/options/flow/[0-9a-f]{32}')),
+    ('DELETE', re.compile(r'/api/config/config_entries/options/flow/[0-9a-f]{32}')),
+    ('POST', re.compile(r'/api/config/config_entries/flow')),                  # group-helper --undo of a delete:
+    ('POST', re.compile(r'/api/config/config_entries/flow/[0-9a-f]{32}')),     # recreate (handler group only)
+    ('DELETE', re.compile(r'/api/config/config_entries/flow/[0-9a-f]{32}')),
+)
+BODY_KEYED = (re.compile(r'/api/config/config_entries/options/flow(?:/[0-9a-f]{32})?'),
+              re.compile(r'/api/config/config_entries/flow(?:/[0-9a-f]{32})?'),
+              re.compile(AUTOMATION_PATH), re.compile(SCRIPT_PATH))  # POST: the exact body is part of the approved target
+
+
+def target_key(t, p):
+    if t == 'config/entity_registry/remove':
+        return (t, p.get('entity_id'))
+    if t == 'config/device_registry/remove_config_entry':
+        return (t, p.get('device_id'), p.get('config_entry_id'))
+    if t == 'person/update':
+        return (t, p.get('person_id'))
+    if t == 'backup/config/update':
+        return (t,)
+    if t == 'call_service':
+        dom, svc = p.get('domain'), p.get('service')
+        allowed = CALL_SERVICE_ALLOW.get((dom, svc))
+        if allowed is None:
+            raise NotAllowed(f'service {dom}.{svc} is not on the allowlist')
+        data = p.get('service_data') or {}
+        if not isinstance(data, dict) or set(data) - allowed:
+            raise NotAllowed(f'service {dom}.{svc}: data keys not allowed')
+        return (t, dom, svc, json.dumps(data, sort_keys=True))
+    if t in EXACT_TYPES:
+        if t == 'lovelace/config/save' and p.get('url_path') == 'home-mobile':
+            raise NotAllowed('home-mobile belongs to ha-dashboard-gen')
+        if t == 'config/entity_registry/update' and p.get('hidden_by') not in (None, 'user'):
+            raise NotAllowed('hidden_by may only be set to user')
+        if t == 'config/entity_registry/update' and p.get('disabled_by') not in (None, 'user'):
+            raise NotAllowed('disabled_by may only be set to user')
+        return (t, json.dumps(p, sort_keys=True, default=str))
+    raise NotAllowed(f'no target rule for {t!r}')
+
+
+class Guard:
+    def __init__(self, writes=False):
+        self.writes = writes
+        self.targets = set()
+        self.delete_one = None  # automation-delete: the ONE automation config path this run may DELETE
+
+    def approve(self, key):
+        self.targets.add(key)
+
+    def arm_delete(self, path):
+        """automation-delete only: allow one DELETE of one automation config path (still needs --apply + approve)"""
+        if not re.fullmatch(AUTOMATION_PATH, path or ''):
+            raise NotAllowed(f'arm_delete: {path!r} is not an automation config path')
+        if self.delete_one not in (None, path):
+            raise NotAllowed('arm_delete: one automation per run')
+        self.delete_one = path
+
+    def check_ws(self, t, p):
+        if t in WS_READ:
+            if set(p) - WS_READ[t]:
+                raise NotAllowed(f'websocket {t}: keys {sorted(set(p) - WS_READ[t])} not allowed')
+            return
+        if t not in WS_WRITE:
+            raise NotAllowed(f'websocket type {t!r} is not on the allowlist')
+        if set(p) - WS_WRITE[t]:
+            raise NotAllowed(f'websocket {t}: keys {sorted(set(p) - WS_WRITE[t])} not allowed')
+        key = target_key(t, p)
+        if not self.writes:
+            raise NotAllowed(f'{t}: dry run, writes need --apply')
+        if key not in self.targets:
+            raise NotAllowed(f'{t}: target is not in this run\'s approved plan')
+
+    def check_rest(self, method, path, body=None):
+        if method == 'DELETE' and self.delete_one and path == self.delete_one:
+            if not self.writes:
+                raise NotAllowed('REST DELETE: dry run, writes need --apply')
+            if ('rest', method, path) not in self.targets:
+                raise NotAllowed(f'REST DELETE {path!r}: not in this run\'s approved plan')
+            return
+        if not any(m == method and rx.fullmatch(path or '') for m, rx in REST_ALLOW):
+            raise NotAllowed(f'REST {method} {path!r} is not on the allowlist')
+        if method == 'POST' and path == '/api/config/config_entries/flow' and body != {'handler': 'group'}:
+            raise NotAllowed('config flows: only the group helper flow may start')
+        if method != 'GET':
+            if not self.writes:
+                raise NotAllowed(f'REST {method}: dry run, writes need --apply')
+            key = ('rest', method, path)
+            if method == 'POST' and any(rx.fullmatch(path) for rx in BODY_KEYED):
+                key = ('rest', method, path, json.dumps(body, sort_keys=True, default=str))
+            if key not in self.targets:
+                raise NotAllowed(f'REST {method} {path!r}: not in this run\'s approved plan')
+
+
+# ----------------------------------------------------------------------------- clients
+class WS(A.WSClient):
+    def __init__(self, base, token, guard):
+        self.guard = guard
+        super().__init__(base, token)
+
+    def call(self, msg_type, **params):
+        self.guard.check_ws(msg_type, params)
+        self._id += 1
+        mid = self._id
+        self._send_json(dict(params, id=mid, type=msg_type))
+        while True:
+            msg = self._recv_json()
+            if msg.get('id') == mid and msg.get('type') == 'result':
+                if not msg.get('success'):
+                    err = msg.get('error') or {}
+                    raise A.HAError(f"{msg_type}: {err.get('code', 'error')} {A.short_err(err.get('message'), 120)}")
+                return msg.get('result')
+
+
+class Rest:
+    def __init__(self, base, token, guard, timeout=60):
+        self.base, self._token, self.guard, self.timeout = base.rstrip('/'), token, guard, timeout
+        self._opener = urllib.request.build_opener(A._NoRedirect())
+
+    def request(self, method, path, body=None):
+        self.guard.check_rest(method, path, body)
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            'Authorization': 'Bearer ' + self._token, 'Content-Type': 'application/json'})
+        try:
+            with self._opener.open(req, timeout=self.timeout) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            raise A.HAError(f'HTTP {e.code} on {method} {path}') from None
+        return json.loads(raw.decode()) if raw else None
+
+
+# ----------------------------------------------------------------------------- helpers
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec='seconds')
+
+
+def h(s, n=12):
+    return hashlib.sha1(str(s).encode()).hexdigest()[:n]
+
+
+ROUND2 = 'round2'
+ROUND2_ABOUT = ('HA cleanup round 2 (owner-approved poll): before-state per '
+                'group, written by ha-apply before each write. Deleted config entries/devices cannot be re-added '
+                'via the API (devices can be re-paired); full undo = restore the HA backup "Before cleanup '
+                '2026-10-15" (15.10 23:38, predates rounds 1 and 2). Privacy-scrubbed.')
+
+
+def undo_save(group, record, section=None):
+    d = {}
+    if os.path.exists(UNDO):
+        with open(UNDO) as f:
+            d = json.load(f)
+    d.setdefault('about', 'HA cleanup 2026-10-15 (owner-approved poll): before-state per group, written by '
+                          'ha-apply before each write. Removed registry entries cannot be re-added via the API: '
+                          'full undo = restore the HA backup "Before cleanup 2026-10-15" (23:38). Privacy-scrubbed.')
+    if section:
+        sec = d.setdefault(section, {})
+        sec.setdefault('about', {ROUND2: ROUND2_ABOUT, 'round3': globals().get('ROUND3_ABOUT'),
+                                 'autopilot': globals().get('AUTOPILOT_ABOUT'),
+                                 'remote-swap': globals().get('REMOTE_SWAP_ABOUT'),
+                                 'registry': globals().get('REGISTRY_ABOUT'),
+                                 'automation-delete': globals().get('AUTO_DELETE_ABOUT'),
+                                 'group-helper': globals().get('GROUP_HELPER_ABOUT')}.get(section) or section)
+        sec.setdefault('groups', {})[group] = record
+    else:
+        d.setdefault('groups', {})[group] = record
+    text, _late = A.privacy_gate(json.dumps(d, indent=1, ensure_ascii=False, default=str))
+    tmp = UNDO + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write(text + '\n')
+    os.replace(tmp, UNDO)
+
+
+class Ctx:
+    def __init__(self, ws, rest):
+        self.ws, self.rest = ws, rest
+        self.refresh()
+        with open(AUDIT_JSON) as f:
+            self.audit = json.load(f)
+
+    def refresh(self):
+        self.reg = {e['entity_id']: e for e in self.ws.call('config/entity_registry/list')}
+        self.devs = {d['id']: d for d in self.ws.call('config/device_registry/list')}
+        self.entries = {e['entry_id']: e for e in self.ws.call('config_entries/get')}
+        sts = self.ws.call('get_states')
+        self.states = {s['entity_id']: s.get('state') for s in sts}
+        self.attrs = {s['entity_id']: s.get('attributes') or {} for s in sts}  # in memory only, never printed
+
+    def dev_entities(self, dev_id):
+        return [e for e in self.reg.values() if e.get('device_id') == dev_id]
+
+    def entry_domain(self, entry_id):
+        return (self.entries.get(entry_id) or {}).get('domain')
+
+
+def p(*a):
+    print(*a, flush=True)
+
+
+# ----------------------------------------------------------------------------- groups
+def _walk_replace(obj, old, new):
+    if isinstance(obj, str):
+        return new if obj == old else obj
+    if isinstance(obj, list):
+        return [_walk_replace(x, old, new) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _walk_replace(v, old, new) for k, v in obj.items()}
+    return obj
+
+
+def _count(obj, s):
+    return json.dumps(obj).count(json.dumps(s))
+
+
+def _bk_view(info):
+    cfg = (info or {}).get('config', {})
+    cb = dict(cfg.get('create_backup') or {})
+    cb['password'] = 'set' if cb.get('password') else 'none'
+    return {'create_backup': cb, 'retention': cfg.get('retention'), 'schedule': cfg.get('schedule'),
+            'automatic_backups_configured': cfg.get('automatic_backups_configured'),
+            'last_attempted_automatic_backup': cfg.get('last_attempted_automatic_backup'),
+            'last_completed_automatic_backup': cfg.get('last_completed_automatic_backup'),
+            'next_automatic_backup': cfg.get('next_automatic_backup'),
+            'agents': sorted((cfg.get('agents') or {}).keys())}
+
+
+def g_backup_config(c, guard, apply, show_only=False):
+    info = c.ws.call('backup/config/info')
+    agents = [a.get('agent_id') for a in (c.ws.call('backup/agents/info') or {}).get('agents', [])]
+    view = _bk_view(info)
+    p('backup-config now:', json.dumps(view, indent=1))
+    p('agents available:', agents)
+    if show_only:
+        return
+    local = 'hassio.local' if 'hassio.local' in agents else 'backup.local'
+    if local not in agents:
+        raise SystemExit('no local backup agent found')
+    cur_ids = list((view['create_backup'] or {}).get('agent_ids') or [])
+    agent_ids = cur_ids + [local] if local not in cur_ids else cur_ids
+    upd = {'create_backup': {'agent_ids': agent_ids, 'include_all_addons': True, 'include_addons': None,
+                             'include_database': True},
+           'retention': {'copies': 7, 'days': None},
+           'schedule': {'recurrence': 'daily', 'time': '03:15:00', 'days': []},
+           'automatic_backups_configured': True}
+    p('planned update:', json.dumps(upd))
+    if not apply:
+        return
+    before = {'at': now_iso(), 'config': view}
+    undo_save('backup-config', {'before': before})
+    guard.approve(('backup/config/update',))
+    c.ws.call('backup/config/update', **upd)
+    after = _bk_view(c.ws.call('backup/config/info'))
+    cb, sch = after['create_backup'], after['schedule'] or {}
+    ok = (local in (cb.get('agent_ids') or []) and cb.get('include_all_addons') is True
+          and cb.get('include_database') is True and (after['retention'] or {}).get('copies') == 7
+          and sch.get('recurrence') == 'daily' and str(sch.get('time') or '').startswith('03:15'))
+    undo_save('backup-config', {'before': before, 'applied': upd, 'verify': {'config': after, 'ok': ok}})
+    p('after:', json.dumps(after, indent=1))
+    p('verify:', 'OK' if ok else 'MISMATCH')
+
+
+# ----------------------------------------------------------------------------- shared
+def _settle(c, still):
+    """re-read the registries until still() is empty (<= ~30 s); returns what is left"""
+    left = []
+    for _ in range(10):
+        c.refresh()
+        left = still()
+        if not left:
+            break
+        time.sleep(3)
+    return left
+
+
+def canon(x):
+    return json.dumps(x, sort_keys=True, default=str)
+
+
+def _dom(eid):
+    return eid.split('.', 1)[0]
+
+
+def _attrs(c, eid):
+    return (getattr(c, 'attrs', None) or {}).get(eid) or {}
+
+
+def _automations(c):
+    out = []
+    for eid in sorted(x for x in c.states if x.startswith('automation.')):
+        aid = _attrs(c, eid).get('id')
+        if aid and re.fullmatch(r'[A-Za-z0-9_.\-]{1,80}', str(aid)):
+            try:
+                out.append((eid, str(aid), c.rest.request('GET', f'/api/config/automation/config/{aid}')))
+            except A.HAError:
+                pass
+    return out
+
+
+# --- one-off cleanup plan: household-specific ids live in a private file (0600), not in this script.
+# Neutral example of ~/.config/ha-apply/plans/cleanup.json (HA_APPLY_PLAN overrides the path):
+#   {"remote_swap": ["automation.den_remote"],
+#    "registry": {"devices": [{"device_id": "<32 hex>", "name_by_user": "Den Strip", "area_id": "den"}],
+#                 "entities": [{"entity_id": "switch.old_strip_freeze", "new_entity_id": "switch.den_strip_freeze"},
+#                              {"entity_id": "light.den_old_group", "disabled_by": "user"}],
+#                 "group_members": {"light.den_lights": ["light.den_lamp"]},
+#                 "dashboard_swap": [{"url_path": "den-board", "old": "light.den_old", "new": "light.den_lamp"}]}}
+# remote_swap: remote automations remote-swap may change (first = default)
+# (its "scenes" and "hallway" sections belong to the archived scene-create and hallway groups and are ignored here)
+# registry: device name/area, entity renames/disables, group helper members to keep, dashboard entity swaps (group registry)
+# It sits in a subdirectory because lint reads every *.json in ~/.config/ha-apply as a package.
+PLAN_FILE = os.path.expanduser(os.environ.get('HA_APPLY_PLAN', '~/.config/ha-apply/plans/cleanup.json'))
+PLAN_KEYS = ('SWAP_AUTOMATIONS', 'REGISTRY_PLAN')
+SWAP_AUTOMATIONS = REGISTRY_PLAN = None  # loaded on first use (tests set them)
+
+
+def load_plan(path=None):
+    """{PLAN_KEYS name: section} from the private plan file; every section empty when the file does not exist."""
+    try:
+        with open(path or PLAN_FILE) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raw = {}
+    return {
+        'SWAP_AUTOMATIONS': tuple(raw.get('remote_swap') or ()),
+        'REGISTRY_PLAN': dict(raw.get('registry') or {}),
+    }
+
+
+def _plan(key):
+    """One plan section by its PLAN_KEYS name; sections a test set are kept."""
+    g = globals()
+    if any(g[k] is None for k in PLAN_KEYS):
+        loaded = load_plan()
+        for k in PLAN_KEYS:
+            if g[k] is None:
+                g[k] = loaded[k]
+    return g[key]
+
+
+# ----------------------------------------------------------------------------- home autopilot (package)
+AUTOPILOT = 'autopilot'
+AUTOPILOT_ABOUT = ('Home autopilot (owner-approved package): helpers via input_boolean/input_text/input_datetime create, automations '
+                   'via POST /api/config/automation/config/autopilot_*. Undo: `ha-apply autopilot-undo --apply` '
+                   '(DELETE the created automations, POST replaced configs back, delete helpers it created).')
+AUTOPILOT_PKG = os.path.expanduser(os.environ.get('HA_AUTOPILOT_PACKAGE', '~/.config/ha-apply/autopilot.json'))
+HELPER_TYPES = {'input_boolean': {'name', 'icon'}, 'input_text': {'name', 'icon', 'min', 'max', 'mode'},
+                'input_datetime': {'name', 'icon', 'has_date', 'has_time'}}  # no 'initial': it overrides restore
+AP_ID_RX = re.compile(r'autopilot_[a-z0-9_]{1,60}')
+SCRIPT_ID_RX = re.compile(r'[a-z0-9_]{1,60}')
+SCRIPT_KEYS = {'alias', 'description', 'icon', 'mode', 'max', 'fields', 'variables', 'sequence'}
+REF_DOMAINS = ('light', 'switch', 'media_player', 'binary_sensor', 'sensor', 'person', 'zone', 'sun', 'input_boolean',
+               'input_text', 'vacuum', 'notify', 'scene', 'script', 'device_tracker', 'calendar', 'input_datetime',
+               'select')
+REF_RX = re.compile(r"(?<![a-z0-9_.])((?:%s)\.[a-z0-9_]+)(?![a-z0-9_(])" % '|'.join(REF_DOMAINS))
+
+
+def _slugify(s):
+    return re.sub(r'[^a-z0-9]+', '_', str(s).lower()).strip('_')
+
+
+def ap_load(path=None):
+    """the approved package, validated; returns (pkg, sha256 hex of its canonical form)"""
+    path = path or AUTOPILOT_PKG
+    try:
+        with open(path) as f:
+            pkg = json.load(f)
+    except (OSError, ValueError) as ex:
+        raise SystemExit(f'autopilot: cannot read the package {path}: {ex.__class__.__name__}')
+    helpers, autos, parts = pkg.get('helpers') or {}, pkg.get('automations') or {}, pkg.get('parts') or {}
+    if not parts:
+        raise SystemExit('autopilot: package has no parts')
+    for hid, hcfg in helpers.items():
+        if not re.fullmatch(r'[a-z0-9_]{1,60}', hid) or hcfg.get('type') not in HELPER_TYPES:
+            raise SystemExit(f'autopilot: bad helper {hid!r}')
+        if set(hcfg.get('create') or {}) - HELPER_TYPES[hcfg['type']] or not (hcfg.get('create') or {}).get('name'):
+            raise SystemExit(f'autopilot: helper {hid}: create keys not allowed')
+        if _slugify(hcfg['create']['name']) != hid:
+            raise SystemExit(f'autopilot: helper {hid}: name must slugify to its id')
+    display = pkg.get('display_aliases') or []
+    if not isinstance(display, list) or set(display) - set(autos):
+        raise SystemExit('autopilot: display_aliases must list automation ids of this package')
+    for aid, cfg in autos.items():
+        if not AP_ID_RX.fullmatch(aid):
+            raise SystemExit(f'autopilot: automation id {aid!r} must match autopilot_[a-z0-9_]+')
+        if not str(cfg.get('alias') or '').strip():
+            raise SystemExit(f'autopilot: {aid}: needs an alias')
+        if _slugify(cfg.get('alias')) != aid and aid not in display:
+            raise SystemExit(f'autopilot: {aid}: alias must slugify to the id (so the entity is automation.{aid}); '
+                             'an existing automation may carry a free display name via display_aliases')
+        if 'id' in cfg and cfg['id'] != aid:
+            raise SystemExit(f'autopilot: {aid}: id field differs')
+        for sid in ap_runtime_scenes(cfg):
+            if not isinstance(sid, str) or not AP_ID_RX.fullmatch(sid):
+                raise SystemExit(f'autopilot: {aid}: scene.create needs a literal scene_id autopilot_[a-z0-9_]+')
+    for sid, cfg in (pkg.get('scripts') or {}).items():
+        if not SCRIPT_ID_RX.fullmatch(sid):
+            raise SystemExit(f'autopilot: script id {sid!r} must match [a-z0-9_]{{1,60}}')
+        if not isinstance(cfg, dict) or not cfg.get('alias') or not isinstance(cfg.get('sequence'), list) \
+                or not cfg['sequence'] or set(cfg) - SCRIPT_KEYS:
+            raise SystemExit(f'autopilot: script {sid}: needs alias + a non-empty sequence; keys {sorted(SCRIPT_KEYS)}')
+        if ap_runtime_scenes(cfg):
+            raise SystemExit(f'autopilot: script {sid}: scene.create is for automations only')
+    for name, part in parts.items():
+        for hid in part.get('helpers') or []:
+            if hid not in helpers:
+                raise SystemExit(f'autopilot: part {name}: unknown helper {hid}')
+        for aid in part.get('automations') or []:
+            if aid not in autos:
+                raise SystemExit(f'autopilot: part {name}: unknown automation {aid}')
+        for sid in part.get('scripts') or []:
+            if sid not in (pkg.get('scripts') or {}):
+                raise SystemExit(f'autopilot: part {name}: unknown script {sid}')
+    return pkg, hashlib.sha256(canon(pkg).encode()).hexdigest()
+
+
+def ap_select(pkg, only=None):
+    names = list(pkg['parts']) if not only else [x.strip() for x in only.split(',') if x.strip()]
+    bad = [n for n in names if n not in pkg['parts']]
+    if bad or not names:
+        raise SystemExit(f"autopilot: --only {only!r}: parts are {', '.join(pkg['parts'])}")
+    hs, aus = [], []
+    for n in names:
+        hs += [x for x in pkg['parts'][n].get('helpers') or [] if x not in hs]
+        aus += [x for x in pkg['parts'][n].get('automations') or [] if x not in aus]
+    return names, hs, aus
+
+
+def ap_select_scripts(pkg, names):
+    out = []
+    for n in names:
+        out += [x for x in pkg['parts'][n].get('scripts') or [] if x not in out]
+    return out
+
+
+def ap_runtime_scenes(obj, out=None):
+    """scene_ids the package itself creates at run time (scene.create actions): their scene.<id> refs are its own"""
+    out = set() if out is None else out
+    if isinstance(obj, dict):
+        if obj.get('action') == 'scene.create':
+            out.add((obj.get('data') or {}).get('scene_id'))
+        for v in obj.values():
+            ap_runtime_scenes(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            ap_runtime_scenes(v, out)
+    return out
+
+
+def ap_body(pkg, aid):
+    return dict(pkg['automations'][aid], id=aid)
+
+
+def ap_refs(obj, out=None):
+    """entity ids an automation config refers to (service names under 'action' are not entities)"""
+    out = set() if out is None else out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == 'action' and isinstance(v, str):
+                continue
+            ap_refs(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            ap_refs(v, out)
+    elif isinstance(obj, str):
+        out.update(m.group(1) for m in REF_RX.finditer(obj))
+    return out
+
+
+def _auto_cfg(c, aid):
+    try:
+        return c.rest.request('GET', f'/api/config/automation/config/{aid}')
+    except A.HAError as ex:
+        if 'HTTP 404' in str(ex) or 'HTTP 400' in str(ex):
+            return None
+        raise
+
+
+def _script_cfg(c, sid):
+    try:
+        return c.rest.request('GET', f'/api/config/script/config/{sid}')
+    except A.HAError as ex:
+        if 'HTTP 404' in str(ex) or 'HTTP 400' in str(ex):
+            return None
+        raise
+
+
+def _auto_entities(c, aid):
+    return sorted(e for e in c.states if _dom(e) == 'automation' and str(_attrs(c, e).get('id') or '') == aid)
+
+
+def _helper_ids(c, typ):
+    try:
+        return {str(x.get('id')) for x in (c.ws.call(f'{typ}/list') or [])}
+    except A.HAError:
+        return set()
+
+
+def _undo_section(section):
+    if not os.path.exists(UNDO):
+        return {}
+    with open(UNDO) as f:
+        return ((json.load(f).get(section) or {}).get('groups') or {})
+
+
+def g_autopilot(c, guard, apply, only=None, sha=None, pkg_path=None):
+    pkg, digest = ap_load(pkg_path)
+    names, hids, aids = ap_select(pkg, only)
+    sids = ap_select_scripts(pkg, names)
+    p(f"autopilot: package {digest[:12]} ({os.path.basename(pkg_path or AUTOPILOT_PKG)}), parts {', '.join(names)}")
+    # refs to any package helper are fine: one a part does not create is only read via is_state() (safe if absent)
+    own = {f"{v['type']}.{k}" for k, v in pkg['helpers'].items()} | {f'script.{k}' for k in pkg.get('scripts') or {}}
+    # scene.create snapshots exist only once an automation has run: their refs are the package's own too
+    runtime = sorted(set().union(*[ap_runtime_scenes(pkg['automations'][a]) for a in aids]))
+    for sid in runtime:
+        if f'scene.{sid}' in c.reg:
+            raise SystemExit(f'refusing: scene.{sid} is a saved scene in HA (scene.create would collide)')
+        p(f'  runtime scene scene.{sid}: snapshot made by scene.create when the automation runs (nothing created now)')
+    own |= {f'scene.{s}' for s in set().union(*[ap_runtime_scenes(a) for a in pkg['automations'].values()])}
+    helper_plan = []
+    for hid in hids:
+        typ, cr = pkg['helpers'][hid]['type'], pkg['helpers'][hid]['create']
+        eid = f'{typ}.{hid}'
+        if eid in c.reg or eid in c.states:
+            p(f'  helper {eid}: exists, reused (never deleted by autopilot-undo)')
+        else:
+            p(f"  helper {eid}: create {canon(cr)}")
+            helper_plan.append((hid, typ, cr, eid))
+    plan, before, missing, offline = [], {}, set(), set()
+    for aid in aids:
+        body = ap_body(pkg, aid)
+        want = f'automation.{aid}'
+        found = _auto_entities(c, aid)
+        if (want in c.reg or want in c.states) and want not in found:
+            raise SystemExit(f'refusing: {want} already exists for another automation')
+        cfg = _auto_cfg(c, aid)
+        if aid in (pkg.get('display_aliases') or []) and (cfg is None or found != [want]):
+            # HA names a NEW automation's entity after its alias; only an existing one keeps automation.<id>
+            raise SystemExit(f'refusing: {aid} has a display alias, so it must already exist as {want} '
+                             '(create it first with an alias that slugifies to its id)')
+        refs = ap_refs(body) - own
+        miss = sorted(r for r in refs if r not in c.reg and r not in c.states)
+        off = sorted(r for r in refs if c.states.get(r) == 'unavailable')
+        missing.update(miss)
+        offline.update(off)
+        same = cfg is not None and canon(cfg) == canon(body)
+        n_tr = len(body.get('triggers') or [])
+        p(f"  {want}: " + ('already there' if same else 'replace existing config' if cfg else 'create')
+          + f' ({n_tr} triggers, {len(refs)} entities)' + (f'; MISSING {miss}' if miss else '')
+          + (f'; offline now {off}' if off else ''))
+        if not same:
+            plan.append((aid, want, body))
+            before[aid] = {'entity_id': want, 'config': cfg, 'entities_found': found}
+    splan, sbefore = [], {}
+    for sid in sids:
+        body, want = pkg['scripts'][sid], f'script.{sid}'
+        cfg = _script_cfg(c, sid)
+        if cfg is None and (want in c.reg or want in c.states):
+            raise SystemExit(f'refusing: {want} exists but its config is not readable (YAML script?)')
+        refs = ap_refs(body) - own
+        miss = sorted(r for r in refs if r not in c.reg and r not in c.states)
+        missing.update(miss)
+        same = cfg is not None and canon(cfg) == canon(body)
+        p(f"  {want}: " + ('already there' if same else 'replace existing config' if cfg else 'create')
+          + f" ({len(body['sequence'])} steps, {len(refs)} entities)" + (f'; MISSING {miss}' if miss else ''))
+        if not same:
+            splan.append((sid, want, body))
+            sbefore[sid] = {'entity_id': want, 'config': cfg}
+    if missing:
+        p(f'  refusing to apply: entities missing in HA: {sorted(missing)}')
+    if not plan and not helper_plan and not splan:
+        p('autopilot: nothing to do')
+        return
+    p('  then: read back every config + automation/script state (new automations start enabled; scripts are '
+      'only written, never run)')
+    if not apply:
+        return
+    if missing:
+        raise SystemExit('autopilot: missing entities, fix the package first')
+    if not sha or len(sha) < 8 or not digest.startswith(sha.lower()):
+        raise SystemExit(f'autopilot: --apply needs --sha with 8+ hex of the approved package ({digest[:12]})')
+    rec = _undo_section(AUTOPILOT).get(AUTOPILOT) or {}
+    created = rec.get('created_helpers') or []
+    autos_rec = rec.get('automations') or {}
+    for aid, b in before.items():
+        autos_rec.setdefault(aid, {'before': b['config'], 'at': now_iso()})  # keep the FIRST before-state
+    scripts_rec = rec.get('scripts') or {}
+    for sid, b in sbefore.items():
+        scripts_rec.setdefault(sid, {'before': b['config'], 'at': now_iso()})
+    rec.update({'package_sha256': digest, 'parts': sorted(set(rec.get('parts') or []) | set(names)),
+                'created_helpers': created, 'automations': autos_rec})
+    if scripts_rec:
+        rec['scripts'] = scripts_rec
+    undo_save(AUTOPILOT, rec, section=AUTOPILOT)
+    errors = []
+    for hid, typ, cr, eid in helper_plan:
+        msg = dict(cr)
+        guard.approve(target_key(f'{typ}/create', msg))
+        try:
+            res = c.ws.call(f'{typ}/create', **msg) or {}
+            got = f"{typ}.{res.get('id', hid)}"
+            created.append(got)
+            if got != eid:
+                errors.append(f'{eid}: created as {got}')
+        except A.HAError as ex:
+            errors.append(f'{eid}: {ex}')
+    undo_save(AUTOPILOT, rec, section=AUTOPILOT)
+    for aid, want, body in plan:
+        path = f'/api/config/automation/config/{aid}'
+        guard.approve(('rest', 'POST', path, canon(body)))
+        try:
+            c.rest.request('POST', path, body)
+        except A.HAError as ex:
+            errors.append(f'{want}: {ex}')
+    for sid, want, body in splan:
+        path = f'/api/config/script/config/{sid}'
+        guard.approve(('rest', 'POST', path, canon(body)))
+        try:
+            c.rest.request('POST', path, body)
+        except A.HAError as ex:
+            errors.append(f'{want}: {ex}')
+    exp = {aid: f'automation.{aid}' for aid in aids}
+    want_helpers = [f"{pkg['helpers'][h]['type']}.{h}" for h in hids]
+    want_scripts = [f'script.{s}' for s in sids]
+    left = _settle(c, lambda: [w for a, w in exp.items() if _auto_entities(c, a) != [w]
+                               or c.states.get(w) not in ('on', 'off')]
+                   + [hh for hh in want_helpers if hh not in c.states]
+                   + [w for w in want_scripts if c.states.get(w) not in ('on', 'off')])
+    cfg_ok = {exp[a]: canon(_auto_cfg(c, a)) == canon(ap_body(pkg, a)) for a in aids}
+    cfg_ok.update({f'script.{s}': canon(_script_cfg(c, s)) == canon(pkg['scripts'][s]) for s in sids})
+    states = {w: c.states.get(w) for w in list(exp.values()) + want_helpers + want_scripts}
+    ok = not left and not errors and all(cfg_ok.values())
+    rec['verify'] = {'at': now_iso(), 'states': states, 'config_match': cfg_ok, 'left': left, 'errors': errors, 'ok': ok}
+    undo_save(AUTOPILOT, rec, section=AUTOPILOT)
+    p(f'applied: {len(helper_plan)} helpers, {len(plan)} automations, {len(splan)} scripts written; '
+      f'errors {errors or "none"}')
+    for w, st in states.items():
+        p(f'  read-back {w}: {st}' + ('' if cfg_ok.get(w, True) else '  config differs'))
+    p('verify:', 'OK' if ok else f'left {left}')
+
+
+def g_autopilot_undo(c, guard, apply, only=None, pkg_path=None):
+    pkg, digest = ap_load(pkg_path)
+    names, hids, aids = ap_select(pkg, only)
+    sids = ap_select_scripts(pkg, names)
+    rec = _undo_section(AUTOPILOT).get(AUTOPILOT) or {}
+    autos_rec, created = rec.get('automations') or {}, list(rec.get('created_helpers') or [])
+    scripts_rec = rec.get('scripts') or {}
+    p(f"autopilot-undo: parts {', '.join(names)} (undo record: {len(autos_rec)} automations, "
+      f"{len(scripts_rec)} scripts, {len(created)} helpers created)")
+    acts = []
+    for sid in sids:
+        cfg = _script_cfg(c, sid)
+        if cfg is None:
+            p(f'  script.{sid}: not in HA')
+            continue
+        if sid not in scripts_rec:
+            p(f'  script.{sid}: kept (no undo record: not written by autopilot)')
+            continue
+        prev = scripts_rec[sid].get('before')
+        if prev:
+            p(f'  script.{sid}: post the before-config back')
+            acts.append(('script-restore', sid, prev))
+        else:
+            p(f'  script.{sid}: delete')
+            acts.append(('script-delete', sid, None))
+    for aid in aids:
+        cfg = _auto_cfg(c, aid)
+        if cfg is None:
+            p(f'  automation.{aid}: not in HA')
+            continue
+        prev = (autos_rec.get(aid) or {}).get('before')
+        if prev:
+            p(f'  automation.{aid}: post the before-config back')
+            acts.append(('restore', aid, prev))
+        else:
+            p(f'  automation.{aid}: delete')
+            acts.append(('delete', aid, None))
+    remaining = {a for a in pkg['automations'] if a not in aids and _auto_cfg(c, a) is not None}
+    users = {}
+    for eid, aid, cfg in _automations(c):
+        if aid in aids:
+            continue
+        for r in ap_refs(cfg):
+            users.setdefault(r, []).append(eid)
+    for hid in hids:
+        eid = f"{pkg['helpers'][hid]['type']}.{hid}"
+        if eid not in created:
+            p(f'  {eid}: kept (not created by autopilot)')
+        elif users.get(eid):
+            p(f'  {eid}: kept (still used by {users[eid]})')
+        elif any(eid in ap_refs(ap_body(pkg, a)) for a in remaining):
+            p(f'  {eid}: kept (other autopilot parts use it)')
+        elif eid not in c.states and eid not in c.reg:
+            p(f'  {eid}: already gone')
+        else:
+            p(f'  {eid}: delete')
+            acts.append(('helper', hid, pkg['helpers'][hid]['type']))
+    if not acts:
+        p('autopilot-undo: nothing to do')
+        return
+    if not apply:
+        return
+    errors = []
+    for kind, x, extra in acts:
+        try:
+            if kind == 'delete':
+                path = f'/api/config/automation/config/{x}'
+                guard.approve(('rest', 'DELETE', path))
+                c.rest.request('DELETE', path)
+            elif kind == 'restore':
+                path = f'/api/config/automation/config/{x}'
+                guard.approve(('rest', 'POST', path, canon(extra)))
+                c.rest.request('POST', path, extra)
+            elif kind == 'script-delete':
+                path = f'/api/config/script/config/{x}'
+                guard.approve(('rest', 'DELETE', path))
+                c.rest.request('DELETE', path)
+            elif kind == 'script-restore':
+                path = f'/api/config/script/config/{x}'
+                guard.approve(('rest', 'POST', path, canon(extra)))
+                c.rest.request('POST', path, extra)
+            else:
+                msg = {f'{extra}_id': x}
+                guard.approve(target_key(f'{extra}/delete', msg))
+                c.ws.call(f'{extra}/delete', **msg)
+        except A.HAError as ex:
+            errors.append(f'{kind} {x}: {ex}')
+    gone = [x for k, x, _ in acts if k == 'delete']
+    helpers_gone = [f'{e}.{x}' for k, x, e in acts if k == 'helper']
+    scripts_gone = [f'script.{x}' for k, x, _ in acts if k == 'script-delete']
+    left = _settle(c, lambda: [f'automation.{a}' for a in gone if _auto_entities(c, a)]
+                   + [h for h in helpers_gone if h in c.states] + [w for w in scripts_gone if w in c.states])
+    rec['undone'] = {'at': now_iso(), 'actions': [[k, x] for k, x, _ in acts], 'errors': errors, 'left': left,
+                     'ok': not left and not errors}
+    rec['created_helpers'] = [h for h in created if h not in helpers_gone or h in left]
+    done_scripts = {x for k, x, _ in acts if k in ('script-delete', 'script-restore') and f'script.{x}' not in left
+                    and not any(e.startswith(f'{k} {x}:') for e in errors)}
+    if scripts_rec:
+        rec['scripts'] = {k: v for k, v in scripts_rec.items() if k not in done_scripts}
+    undo_save(AUTOPILOT, rec, section=AUTOPILOT)
+    p(f'undone: {len(acts)} actions; errors {errors or "none"}')
+    p('verify:', 'OK' if not left and not errors else f'left {left}')
+
+
+# ----------------------------------------------------------------------------- remote-swap (device ids)
+REMOTE_SWAP = 'remote-swap'
+REMOTE_SWAP_ABOUT = ('Device-id swap in a remote automation (owner-approved): before-config kept here; undo = '
+                     '`ha-apply remote-swap --undo --apply` (POSTs it back). Device ids are registry ids, not secrets.')
+HEX32 = re.compile(r'[0-9a-f]{32}')
+
+
+def _dev_refs(obj, out=None):
+    """device ids under 'device_id' keys, in order of first use"""
+    out = [] if out is None else out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == 'device_id':
+                for d in (v if isinstance(v, list) else [v]):
+                    if isinstance(d, str) and d not in out:
+                        out.append(d)
+            else:
+                _dev_refs(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _dev_refs(v, out)
+    return out
+
+
+def _trigger_domains(cfg, dev):
+    trig = cfg.get('triggers', cfg.get('trigger')) or []
+    return {t.get('domain') for t in (trig if isinstance(trig, list) else [trig])
+            if isinstance(t, dict) and t.get('device_id') == dev and t.get('domain')}
+
+
+def _old_dev_info(c, dev):
+    for d in (c.audit.get('dev_dead') or []) + (c.audit.get('dev_empty') or []):
+        if isinstance(d, dict) and d.get('id') == dev:
+            return {'name': A.scrub(d.get('name')), 'model': d.get('model'), 'integration': d.get('integration')}
+    d = c.devs.get(dev)
+    if d:
+        return {'name': A.scrub(d.get('name_by_user') or d.get('name')), 'model': d.get('model'), 'integration': None}
+    return {}
+
+
+def _dev_label(c, dev):
+    d = c.devs.get(dev) or {}
+    return (f'dev#{h(dev, 8)}' + (f" {A.scrub(d.get('name_by_user') or d.get('name'))} / {d.get('model')}"
+                                  f" / area {d.get('area_id')}" if d else ' (removed)'))
+
+
+def _resolve_old(spec, refs):
+    s = spec.strip().lower()
+    if HEX32.fullmatch(s):
+        hits = [r for r in refs if r == s]
+    elif re.fullmatch(r'(?:dev#)?[0-9a-f]{8,40}', s):
+        s = s.replace('dev#', '')
+        hits = [r for r in refs if h(r, 40).startswith(s)]
+    else:
+        raise SystemExit(f'--replace-device: OLD {spec!r} must be a device id or its 8+ hex hash')
+    if len(hits) != 1:
+        raise SystemExit(f'--replace-device: OLD {spec!r} matches {len(hits)} referenced devices')
+    return hits[0]
+
+
+def _resolve_new(c, spec):
+    s = spec.strip()
+    if HEX32.fullmatch(s.lower()):
+        hits = [d for d in c.devs if d == s.lower()]
+    elif re.fullmatch(r'(?:dev#)?[0-9a-f]{8,40}', s.lower()):
+        k = s.lower().replace('dev#', '')
+        hits = [d for d in c.devs if h(d, 40).startswith(k)]
+    else:
+        hits = [i for i, d in c.devs.items()
+                if s.casefold() in {str(d.get('name_by_user') or '').casefold(), str(d.get('name') or '').casefold()}]
+    if len(hits) != 1:
+        raise SystemExit(f'--replace-device: NEW {spec!r} matches {len(hits)} devices')
+    return hits[0]
+
+
+def _repairs_for(c, aid, eid):
+    try:
+        res = c.ws.call('repairs/list_issues') or {}
+    except A.HAError:
+        return None
+    return [i.get('issue_id') for i in res.get('issues', [])
+            if not i.get('ignored') and (aid in json.dumps(i) or eid in json.dumps(i))]
+
+
+def g_remote_swap(c, guard, apply, pairs=(), automation=None, undo=False):
+    swap = _plan('SWAP_AUTOMATIONS')
+    if not swap:
+        raise SystemExit(f'remote-swap: no plan in {PLAN_FILE} (format: see the example in ha-apply)')
+    eid = automation or swap[0]
+    if eid not in swap:
+        raise SystemExit(f'remote-swap: only {", ".join(swap)}')
+    aid = str(_attrs(c, eid).get('id') or '')
+    if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,80}', aid):
+        raise SystemExit(f'remote-swap: {eid} has no config id (state {c.states.get(eid)})')
+    path = f'/api/config/automation/config/{aid}'
+    cfg = c.rest.request('GET', path)
+    refs = _dev_refs(cfg)
+    rep = _repairs_for(c, aid, eid)
+    p(f"remote-swap: {eid} is {c.states.get(eid)}; repairs open: {len(rep) if rep is not None else 'n/a'}")
+    for r in refs:
+        info = _old_dev_info(c, r)
+        n = json.dumps(cfg).count(r)
+        p(f"  uses {_dev_label(c, r)}: {n} refs, triggers {sorted(_trigger_domains(cfg, r))}"
+          + (f" (was {info.get('name')} / {info.get('model')})" if r not in c.devs and info else ''))
+    if undo:
+        rec = _undo_section(REMOTE_SWAP).get(eid) or {}
+        prev = (rec.get('before') or {}).get('config')
+        if not prev:
+            raise SystemExit('remote-swap --undo: no before-config recorded')
+        p(f"  undo: post the before-config of {rec['before'].get('at')} back")
+        if not apply:
+            return
+        guard.approve(('rest', 'POST', path, canon(prev)))
+        c.rest.request('POST', path, prev)
+        ok = canon(c.rest.request('GET', path)) == canon(prev)
+        rec['undone'] = {'at': now_iso(), 'ok': ok}
+        undo_save(eid, rec, section=REMOTE_SWAP)
+        p('verify:', 'OK' if ok else 'MISMATCH')
+        return
+    if not pairs:
+        models = {(_old_dev_info(c, r) or {}).get('model') for r in refs if r not in c.devs} - {None}
+        used = set()
+        for _e, _a, acfg in _automations(c):
+            used.update(_dev_refs(acfg))
+        cands = [d for d, x in c.devs.items() if x.get('model') in models and d not in used and not x.get('disabled_by')]
+        p(f'  candidates (same model {sorted(models)}, not used by any automation): '
+          + (', '.join(_dev_label(c, d) for d in cands) or 'none (re-pair the dimmers first)'))
+        p('  next: ha-apply remote-swap --replace-device OLD=NEW [--replace-device OLD=NEW]')
+        return
+    mapping = {}
+    for spec in pairs:
+        if '=' not in spec:
+            raise SystemExit(f'--replace-device {spec!r}: use OLD=NEW')
+        o, n = spec.split('=', 1)
+        old, new = _resolve_old(o, refs), _resolve_new(c, n)
+        if old in c.devs:
+            raise SystemExit(f'remote-swap: {_dev_label(c, old)} still exists; only removed devices are swapped')
+        nd = c.devs[new]
+        if nd.get('disabled_by'):
+            raise SystemExit(f'remote-swap: {_dev_label(c, new)} is disabled')
+        if new in refs or new in mapping.values():
+            raise SystemExit(f'remote-swap: {_dev_label(c, new)} is already used here')
+        doms = {c.entry_domain(e) for e in nd.get('config_entries') or []}
+        need = _trigger_domains(cfg, old)
+        if need - doms:
+            raise SystemExit(f'remote-swap: {_dev_label(c, new)} is not a {sorted(need)} device')
+        om = (_old_dev_info(c, old) or {}).get('model')
+        if not om or om != nd.get('model'):
+            raise SystemExit(f"remote-swap: model mismatch ({om} -> {nd.get('model')})")
+        mapping[old] = new
+        p(f'  swap {_dev_label(c, old)} -> {_dev_label(c, new)}')
+    new_cfg = cfg
+    for old, new in mapping.items():
+        new_cfg = _walk_replace(new_cfg, old, new)
+    exp = {new: json.dumps(cfg).count(old) for old, new in mapping.items()}
+    p(f'  then: POST the config ({sum(exp.values())} refs), read back, wait for {eid} to load')
+    if not apply:
+        return
+    before = {'at': now_iso(), 'entity_id': eid, 'automation_id': aid, 'state': c.states.get(eid), 'config': cfg,
+              'repairs': rep}
+    undo_save(eid, {'before': before}, section=REMOTE_SWAP)
+    guard.approve(('rest', 'POST', path, canon(new_cfg)))
+    c.rest.request('POST', path, new_cfg)
+    after = c.rest.request('GET', path)
+    left = _settle(c, lambda: [eid] if c.states.get(eid) in (None, 'unavailable') else [])
+    rep_after = _repairs_for(c, aid, eid)
+    ok = (canon(after) == canon(new_cfg) and all(json.dumps(after).count(o) == 0 for o in mapping)
+          and all(json.dumps(after).count(n) == k for n, k in exp.items()) and not left)
+    undo_save(eid, {'before': before, 'applied': {'swapped': {h(o, 8): h(n, 8) for o, n in mapping.items()}},
+                    'verify': {'state': c.states.get(eid), 'repairs_open': rep_after, 'ok': ok}},
+              section=REMOTE_SWAP)
+    p(f"read-back: {eid} {c.states.get(eid)}; repairs open: {len(rep_after) if rep_after is not None else 'n/a'}")
+    p('verify:', 'OK' if ok else 'MISMATCH')
+
+
+# ----------------------------------------------------------------------------- automation-delete (one approved UI automation)
+AUTO_DELETE = 'automation-delete'
+AUTO_DELETE_ABOUT = ('Single automation deletes (owner-approved, one entity per run): the full before-config sits in a '
+                     '0600 file under ~/.config/ha-apply/backups/ named in the record; undo = ha-apply automation-delete '
+                     '--automation ENTITY --undo --apply (POSTs that config back under the same config id).')
+AUTO_BACKUP_DIR = os.path.expanduser(os.environ.get('HA_APPLY_AUTO_BACKUP_DIR', '~/.config/ha-apply/backups'))
+AUTO_EID_RX = re.compile(r'automation\.[a-z0-9_]{1,80}')
+AUTO_ID_RX = re.compile(r'[A-Za-z0-9_.\-]{1,80}')
+
+
+def _auto_backup_glob(eid):
+    slug = eid.split('.', 1)[1]
+    if not os.path.isdir(AUTO_BACKUP_DIR):
+        return []
+    rx = re.compile(re.escape(f'automation-{slug}-') + r'\d{8}T\d{6}\.json')
+    return sorted(os.path.join(AUTO_BACKUP_DIR, f) for f in os.listdir(AUTO_BACKUP_DIR) if rx.fullmatch(f))
+
+
+def _write_private(path, obj):
+    """write JSON to a 0600 file (dir 0700) atomically"""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False, default=str)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _auto_by_id(c, aid):
+    return [e for e in c.states if _dom(e) == 'automation' and str(_attrs(c, e).get('id') or '') == aid]
+
+
+def g_automation_delete(c, guard, apply, automation=None, undo=False, backup=None):
+    eid = automation or ''
+    if not AUTO_EID_RX.fullmatch(eid):
+        raise SystemExit('automation-delete: --automation automation.<id> is required')
+    if undo:
+        return _automation_restore(c, guard, apply, eid, backup)
+    if eid not in c.states and eid not in c.reg:
+        raise SystemExit(f'automation-delete: {eid} is not in HA')
+    reg = c.reg.get(eid) or {}
+    if reg and reg.get('platform') != 'automation':
+        raise SystemExit(f'automation-delete: {eid} belongs to {reg.get("platform")}, not the automation integration')
+    aid = str(_attrs(c, eid).get('id') or '')
+    if not AUTO_ID_RX.fullmatch(aid):
+        raise SystemExit(f'automation-delete: {eid} has no config id (YAML-only, not managed by the UI): refused')
+    if reg.get('unique_id') not in (None, aid):
+        raise SystemExit(f'automation-delete: {eid}: registry unique_id differs from its config id: refused')
+    if aid.startswith('autopilot_'):
+        raise SystemExit(f'automation-delete: {eid} belongs to an autopilot package: use autopilot-undo')
+    if len(_auto_by_id(c, aid)) != 1:
+        raise SystemExit(f'automation-delete: config id {aid} is not unique to {eid}: refused')
+    path = f'/api/config/automation/config/{aid}'
+    cfg = _auto_cfg(c, aid)
+    if not isinstance(cfg, dict) or str(cfg.get('id')) != aid:
+        raise SystemExit(f'automation-delete: {eid} is not in the UI config store (automations.yaml): refused')
+    rep = _repairs_for(c, aid, eid)
+    p(f"automation-delete: {eid} is {c.states.get(eid)}; config id {aid}; alias {cfg.get('alias')!r}; "
+      f"repairs open: {len(rep) if rep is not None else 'n/a'}")
+    p(f'  then: back up its config (0600) to {AUTO_BACKUP_DIR}, DELETE it, read back (config, entity, repairs gone)')
+    if not apply:
+        return
+    at = now_iso()
+    bpath = os.path.join(AUTO_BACKUP_DIR, f"automation-{eid.split('.', 1)[1]}-"
+                                          f"{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}.json")
+    regsub = {k: reg.get(k) for k in ('entity_id', 'unique_id', 'platform', 'area_id', 'labels', 'name', 'icon',
+                                      'disabled_by', 'hidden_by', 'categories') if k in reg}
+    _write_private(bpath, {'about': AUTO_DELETE_ABOUT, 'at': at, 'entity_id': eid, 'automation_id': aid,
+                           'state': c.states.get(eid), 'registry': regsub, 'repairs': rep, 'config': cfg})
+    with open(bpath) as f:
+        if canon(json.load(f).get('config')) != canon(cfg):
+            raise SystemExit(f'automation-delete: backup {bpath} does not read back: nothing deleted')
+    before = {'at': at, 'entity_id': eid, 'automation_id': aid, 'alias': cfg.get('alias'), 'backup': bpath,
+              'repairs': rep}
+    undo_save(eid, {'before': before}, section=AUTO_DELETE)
+    p(f'  backup: {bpath}')
+    guard.arm_delete(path)
+    guard.approve(('rest', 'DELETE', path))
+    c.rest.request('DELETE', path)
+    reps = []
+
+    def still():
+        nonlocal reps
+        reps = _repairs_for(c, aid, eid) or []
+        return ([eid] if eid in c.states or eid in c.reg else []) + reps
+    left = _settle(c, still)
+    gone = _auto_cfg(c, aid) is None
+    ok = gone and eid not in c.states and eid not in c.reg and not reps
+    undo_save(eid, {'before': before, 'verify': {'at': now_iso(), 'config_gone': gone,
+                                                 'entity_gone': eid not in c.states and eid not in c.reg,
+                                                 'repairs_open': reps, 'ok': ok}}, section=AUTO_DELETE)
+    p(f"read-back: config {'gone' if gone else 'STILL THERE'}; entity {'STILL THERE' if eid in c.states or eid in c.reg else 'gone'}; "
+      f"repairs open: {len(reps)}" + (f' ({len(left)} left after waiting)' if left else ''))
+    p('verify:', 'OK' if ok else 'MISMATCH')
+    p(f'undo: ha-apply automation-delete --automation {eid} --undo --apply')
+
+
+def _automation_restore(c, guard, apply, eid, backup=None):
+    files = [os.path.expanduser(backup)] if backup else _auto_backup_glob(eid)
+    if not files or not os.path.isfile(files[-1]):
+        raise SystemExit(f'automation-delete --undo: no backup for {eid} in {AUTO_BACKUP_DIR}')
+    bpath = files[-1]
+    with open(bpath) as f:
+        rec = json.load(f)
+    cfg, aid = rec.get('config'), str(rec.get('automation_id') or '')
+    if rec.get('entity_id') != eid or not AUTO_ID_RX.fullmatch(aid) or not isinstance(cfg, dict) \
+            or str(cfg.get('id')) != aid:
+        raise SystemExit(f'automation-delete --undo: {bpath} is not a backup of {eid}')
+    path = f'/api/config/automation/config/{aid}'
+    if _auto_cfg(c, aid) is not None:
+        raise SystemExit(f'automation-delete --undo: config id {aid} exists in HA already; nothing restored')
+    p(f"automation-delete --undo: POST the config of {rec.get('at')} ({cfg.get('alias')!r}, id {aid}) back from {bpath}")
+    if not apply:
+        return
+    guard.approve(('rest', 'POST', path, canon(cfg)))
+    c.rest.request('POST', path, cfg)
+    after = _auto_cfg(c, aid)
+    left = _settle(c, lambda: [] if _auto_by_id(c, aid) else [aid])
+    ok = canon(after) == canon(cfg) and not left
+    ents = _auto_by_id(c, aid)
+    srec = _undo_section(AUTO_DELETE).get(eid) or {'before': {'entity_id': eid, 'automation_id': aid, 'backup': bpath}}
+    srec['undone'] = {'at': now_iso(), 'backup': bpath, 'entity': ents[0] if ents else None, 'ok': ok}
+    undo_save(eid, srec, section=AUTO_DELETE)
+    p(f"read-back: {', '.join(f'{e} {c.states.get(e)}' for e in ents) or 'no entity yet'}")
+    p('verify:', 'OK' if ok else 'MISMATCH')
+
+
+# ----------------------------------------------------------------------------- group-helper (UI group helpers)
+GROUP_HELPER = 'group-helper'
+GROUP_HELPER_ABOUT = ('UI group helpers (owner-approved, one group per run): set its members through the options flow, or '
+                      'delete the helper (its config entry) once nothing uses it. Before each write the full options sit '
+                      'in a 0600 file under ~/.config/ha-apply/backups/ named in the record; undo = ha-apply group-helper '
+                      '--group ENTITY --undo --apply (members: the options flow again; delete: the group config flow '
+                      'recreates it under the same entity id).')
+CONFIG_FLOW = '/api/config/config_entries/flow'
+FLOW_ID_RX = re.compile(r'[0-9a-f]{32}')
+
+
+def _group_entry(c, gid):
+    """(config entry id, registry entry) of ONE UI group helper, else SystemExit"""
+    if not EID_RX.fullmatch(gid or ''):
+        raise SystemExit('group-helper: --group <domain>.<object_id> is required')
+    e = c.reg.get(gid)
+    if not e:
+        raise SystemExit(f'group-helper: {gid} is not in the entity registry')
+    ce = e.get('config_entry_id')
+    if e.get('platform') != 'group' or not ce or c.entry_domain(ce) != 'group':
+        raise SystemExit(f'group-helper: {gid} is not a UI group helper (YAML groups are not edited here): refused')
+    if sum(1 for x in c.reg.values() if x.get('config_entry_id') == ce) != 1:
+        raise SystemExit(f'group-helper: the config entry of {gid} owns more than one entity: refused')
+    return ce, e
+
+
+def _group_backups(gid):
+    slug = gid.replace('.', '-')
+    if not os.path.isdir(AUTO_BACKUP_DIR):
+        return []
+    rx = re.compile(re.escape(f'group-{slug}-') + r'\d{8}T\d{6}(?:-\d+)?\.json')
+    return sorted(os.path.join(AUTO_BACKUP_DIR, f) for f in os.listdir(AUTO_BACKUP_DIR) if rx.fullmatch(f))
+
+
+def _flow_abort(c, guard, base, fid):
+    path = f'{base}/{fid}'
+    guard.approve(('rest', 'DELETE', path))
+    try:
+        c.rest.request('DELETE', path)
+    except A.HAError:
+        pass
+
+
+def _group_options_open(c, guard, entry_id):
+    """open the helper's options flow: (flow_id, {option: current value}, [field names]); the caller submits or aborts"""
+    body = {'handler': entry_id}
+    guard.approve(('rest', 'POST', OPTIONS_FLOW, canon(body)))
+    r = c.rest.request('POST', OPTIONS_FLOW, body) or {}
+    fid = str(r.get('flow_id') or '')
+    if r.get('type') != 'form' or r.get('handler') != entry_id or not FLOW_ID_RX.fullmatch(fid):
+        raise A.HAError(f"options flow did not open a form (type {r.get('type')})")
+    names = [f.get('name') for f in r.get('data_schema') or [] if f.get('name')]
+    values = {}
+    for f in r.get('data_schema') or []:
+        nm = f.get('name')
+        sv = (f.get('description') or {}).get('suggested_value', f.get('default'))
+        if nm and sv is not None:
+            values[nm] = sv
+    if 'entities' not in names:
+        _flow_abort(c, guard, OPTIONS_FLOW, fid)
+        raise A.HAError('options form has no "entities" field: aborted')
+    return fid, values, names
+
+
+def _group_read_options(c, guard, entry_id):
+    fid, values, _names = _group_options_open(c, guard, entry_id)
+    _flow_abort(c, guard, OPTIONS_FLOW, fid)
+    return values
+
+
+def _group_backup(c, gid, entry_id, reg, kind, options, from_undo=False):
+    at = now_iso()
+    stamp = dt.datetime.now().strftime('%Y%m%dT%H%M%S')
+    bpath = os.path.join(AUTO_BACKUP_DIR, f"group-{gid.replace('.', '-')}-{stamp}.json")
+    n = 1
+    while os.path.exists(bpath):
+        n += 1
+        bpath = os.path.join(AUTO_BACKUP_DIR, f"group-{gid.replace('.', '-')}-{stamp}-{n}.json")
+    regsub = {k: reg.get(k) for k in ('entity_id', 'unique_id', 'platform', 'area_id', 'labels', 'name', 'icon',
+                                      'disabled_by', 'hidden_by', 'categories') if k in reg}
+    rec = {'about': GROUP_HELPER_ABOUT, 'at': at, 'kind': kind, 'from_undo': from_undo, 'entity_id': gid,
+           'entry_id': entry_id, 'title': (c.entries.get(entry_id) or {}).get('title'), 'group_type': _dom(gid),
+           'state': c.states.get(gid), 'members': list(_attrs(c, gid).get('entity_id') or []), 'options': options,
+           'registry': regsub}
+    _write_private(bpath, rec)
+    with open(bpath) as f:
+        if canon(json.load(f).get('options')) != canon(options):
+            raise SystemExit(f'group-helper: backup {bpath} does not read back: nothing changed')
+    p(f'  backup: {bpath}')
+    return bpath, at
+
+
+def _pkg_refs(gid):
+    """local package/plan files (~/.config/ha-apply, not backups/) that name the entity"""
+    rx, out = _id_rx(gid), []
+    for root, dirs, files in os.walk(PKG_DIR):
+        dirs[:] = [d for d in dirs if d != 'backups']
+        for fn in files:
+            if fn.endswith('.json'):
+                path = os.path.join(root, fn)
+                try:
+                    with open(path) as f:
+                        if rx.search(f.read()):
+                            out.append(os.path.relpath(path, PKG_DIR))
+                except OSError:
+                    pass
+    return sorted(out)
+
+
+def g_group_helper(c, guard, apply, group=None, members=None, delete=False, undo=False, backup=None):
+    if sum(bool(x) for x in (members, delete, undo)) != 1:
+        raise SystemExit('group-helper: give exactly one of --members A,B,..., --delete or --undo')
+    if undo:
+        return _group_undo(c, guard, apply, group, backup)
+    if delete:
+        return _group_delete(c, guard, apply, group)
+    return _group_set(c, guard, apply, group, [m.strip() for m in members.split(',') if m.strip()]
+                      if isinstance(members, str) else list(members))
+
+
+def _group_set(c, guard, apply, gid, members, from_undo=False):
+    entry_id, reg = _group_entry(c, gid)
+    if not members:
+        raise SystemExit('group-helper: the member list is empty: refused')
+    if len(set(members)) != len(members):
+        raise SystemExit('group-helper: duplicate members: refused')
+    for m in members:
+        if not EID_RX.fullmatch(m) or m == gid:
+            raise SystemExit(f'group-helper: bad member {m!r}')
+        if _dom(m) != _dom(gid):
+            raise SystemExit(f'group-helper: {m} is not a {_dom(gid)} entity')
+        if m not in c.states:
+            raise SystemExit(f'group-helper: {m} is not a live entity: refused')
+    cur = list(_attrs(c, gid).get('entity_id') or [])
+    p(f'group-helper: {gid} is {c.states.get(gid)}; members {cur}')
+    p(f'  -> {members}')
+    add, drop = [m for m in members if m not in cur], [m for m in cur if m not in members]
+    p(f'  adds {add or "none"}; drops {drop or "none"}; other options (group type any/all, hide members) kept')
+    if sorted(cur) == sorted(members):
+        p('  nothing to do')
+        return
+    if not apply:
+        p(f'  then: back up its options (0600) to {AUTO_BACKUP_DIR}, submit the options flow, read back')
+        return
+    fid, values, _names = _group_options_open(c, guard, entry_id)
+    try:
+        bpath, at = _group_backup(c, gid, entry_id, reg, 'members', values, from_undo)
+    except BaseException:
+        _flow_abort(c, guard, OPTIONS_FLOW, fid)
+        raise
+    before = {'at': at, 'kind': 'members', 'entity_id': gid, 'entry_id': entry_id, 'members': cur, 'set': members,
+              'backup': bpath, 'from_undo': from_undo}
+    undo_save(gid, {'before': before}, section=GROUP_HELPER)
+    data = dict(values, entities=list(members))
+    guard.approve(('rest', 'POST', f'{OPTIONS_FLOW}/{fid}', canon(data)))
+    r2 = c.rest.request('POST', f'{OPTIONS_FLOW}/{fid}', data) or {}
+    if r2.get('type') != 'create_entry':
+        _flow_abort(c, guard, OPTIONS_FLOW, fid)
+        raise A.HAError(f"options flow ended with {r2.get('type')} {A.short_err(r2.get('errors'))}")
+    left = _settle(c, lambda: [] if sorted(_attrs(c, gid).get('entity_id') or []) == sorted(members)
+                   else [f"{gid} members {_attrs(c, gid).get('entity_id')}"])
+    after = _group_read_options(c, guard, entry_id)
+    kept = {k: v for k, v in values.items() if k != 'entities'}
+    drift = sorted(k for k in kept if after.get(k) != kept[k])
+    ok = not left and not drift and sorted(after.get('entities') or []) == sorted(members)
+    undo_save(gid, {'before': before, 'verify': {'at': now_iso(), 'members': list(_attrs(c, gid).get('entity_id') or []),
+                                                 'options_changed': drift, 'ok': ok}}, section=GROUP_HELPER)
+    p(f"read-back: {gid} is {c.states.get(gid)}; members {list(_attrs(c, gid).get('entity_id') or [])}; "
+      f"other options {'kept: ' + canon(kept) if not drift else 'CHANGED: ' + ', '.join(drift)}")
+    p('verify:', 'OK' if ok else 'MISMATCH')
+    if not from_undo:
+        p(f'undo: ha-apply group-helper --group {gid} --undo --apply')
+
+
+def _group_delete(c, guard, apply, gid):
+    entry_id, reg = _group_entry(c, gid)
+    users = _uses(c, [gid])[gid]
+    dash = _dash_uses(c, [gid])[gid]
+    pkgs = _pkg_refs(gid)
+    cur = list(_attrs(c, gid).get('entity_id') or [])
+    p(f"group-helper --delete: {gid} ({(c.entries.get(entry_id) or {}).get('title')!r}) is {c.states.get(gid)}; "
+      f'members {cur}')
+    p(f"  used by: automations/scripts/scenes/groups {users or 'none'}; dashboards {dash or 'none'}; "
+      f"local packages/plans {pkgs or 'none'}")
+    if users or dash or pkgs:
+        raise SystemExit(f'group-helper: {gid} is still referenced: not deleted')
+    path = f'/api/config/config_entries/entry/{entry_id}'
+    if not re.fullmatch(ENTRY_PATH, path):
+        raise SystemExit(f'group-helper: odd config entry id for {gid}: refused')
+    p(f'  then: back up its options (0600) to {AUTO_BACKUP_DIR}, delete its config entry, read back (entity + entry gone)')
+    if not apply:
+        return
+    values = _group_read_options(c, guard, entry_id)
+    bpath, at = _group_backup(c, gid, entry_id, reg, 'delete', values)
+    before = {'at': at, 'kind': 'delete', 'entity_id': gid, 'entry_id': entry_id, 'members': cur, 'backup': bpath}
+    undo_save(gid, {'before': before}, section=GROUP_HELPER)
+    guard.approve(('rest', 'DELETE', path))
+    c.rest.request('DELETE', path)
+    left = _settle(c, lambda: ([gid] if gid in c.states or gid in c.reg else [])
+                   + ([entry_id] if entry_id in c.entries else []))
+    ok = not left
+    undo_save(gid, {'before': before, 'verify': {'at': now_iso(), 'left': left, 'ok': ok}}, section=GROUP_HELPER)
+    p(f"read-back: entity {'STILL THERE' if gid in c.states or gid in c.reg else 'gone'}; "
+      f"config entry {'STILL THERE' if entry_id in c.entries else 'gone'}")
+    p('verify:', 'OK' if ok else 'MISMATCH')
+    p(f'undo: ha-apply group-helper --group {gid} --undo --apply')
+
+
+def _group_undo(c, guard, apply, gid, backup=None):
+    if not EID_RX.fullmatch(gid or ''):
+        raise SystemExit('group-helper: --group <domain>.<object_id> is required')
+    files = [os.path.expanduser(backup)] if backup else []
+    if not files:
+        for fpath in reversed(_group_backups(gid)):
+            with open(fpath) as f:
+                if not json.load(f).get('from_undo'):
+                    files = [fpath]
+                    break
+    if not files or not os.path.isfile(files[-1]):
+        raise SystemExit(f'group-helper --undo: no backup for {gid} in {AUTO_BACKUP_DIR}')
+    bpath = files[-1]
+    with open(bpath) as f:
+        rec = json.load(f)
+    opts = rec.get('options')
+    if rec.get('entity_id') != gid or rec.get('kind') not in ('members', 'delete') or not isinstance(opts, dict) \
+            or not isinstance(opts.get('entities'), list):
+        raise SystemExit(f'group-helper --undo: {bpath} is not a group-helper backup of {gid}')
+    p(f"group-helper --undo: {rec['kind']} of {rec.get('at')} from {bpath}")
+    if rec['kind'] == 'members':
+        _group_set(c, guard, apply, gid, list(opts['entities']), from_undo=True)
+        srec = _undo_section(GROUP_HELPER).get(gid) or {'before': {'entity_id': gid, 'backup': bpath}}
+        if apply:
+            srec['undone'] = {'at': now_iso(), 'backup': bpath,
+                              'members': list(_attrs(c, gid).get('entity_id') or [])}
+            undo_save(gid, srec, section=GROUP_HELPER)
+        return
+    _group_recreate(c, guard, apply, gid, rec, bpath)
+
+
+def _group_recreate(c, guard, apply, gid, rec, bpath):
+    if gid in c.states or gid in c.reg:
+        raise SystemExit(f'group-helper --undo: {gid} exists in HA already; nothing restored')
+    gtype, title, opts = rec.get('group_type'), rec.get('title'), dict(rec.get('options') or {})
+    if gtype != _dom(gid) or not isinstance(title, str) or not title.strip():
+        raise SystemExit(f'group-helper --undo: {bpath} lacks the group type or title')
+    p(f"  recreate {gtype} group {title!r} with {opts.get('entities')} (options {canon({k: v for k, v in opts.items() if k != 'entities'})})")
+    if not apply:
+        return
+    start = {'handler': 'group'}
+    guard.approve(('rest', 'POST', CONFIG_FLOW, canon(start)))
+    r = c.rest.request('POST', CONFIG_FLOW, start) or {}
+    fid = str(r.get('flow_id') or '')
+    if not FLOW_ID_RX.fullmatch(fid):
+        raise A.HAError(f"config flow did not start (type {r.get('type')})")
+    try:
+        if r.get('type') == 'menu':
+            if gtype not in (r.get('menu_options') or []):
+                raise A.HAError(f'group config flow has no {gtype} option')
+            step = {'next_step_id': gtype}
+            guard.approve(('rest', 'POST', f'{CONFIG_FLOW}/{fid}', canon(step)))
+            r = c.rest.request('POST', f'{CONFIG_FLOW}/{fid}', step) or {}
+        if r.get('type') != 'form' or r.get('step_id') != gtype:
+            raise A.HAError(f"group config flow: expected the {gtype} form, got {r.get('type')} {r.get('step_id')}")
+        schema = r.get('data_schema') or []
+        names = [f.get('name') for f in schema if f.get('name')]
+        if 'name' not in names or 'entities' not in names:
+            raise A.HAError('group config form lacks name/entities')
+        data = {'name': title}
+        data.update({k: v for k, v in opts.items() if k in names and k != 'name'})
+        for f in schema:
+            if f.get('name') not in data and f.get('required') and 'default' in f:
+                data[f['name']] = f['default']
+        guard.approve(('rest', 'POST', f'{CONFIG_FLOW}/{fid}', canon(data)))
+        r = c.rest.request('POST', f'{CONFIG_FLOW}/{fid}', data) or {}
+        if r.get('type') != 'create_entry':
+            raise A.HAError(f"group config flow ended with {r.get('type')} {A.short_err(r.get('errors'))}")
+    except A.HAError:
+        _flow_abort(c, guard, CONFIG_FLOW, fid)
+        raise
+    new_entry = str((r.get('result') or {}).get('entry_id') or '')
+
+    def mine():
+        return [e for e, x in c.reg.items() if new_entry and x.get('config_entry_id') == new_entry]
+    left = _settle(c, lambda: [] if mine() else ['entity'])
+    ents = mine()
+    if len(ents) == 1 and ents[0] != gid:
+        msg = {'entity_id': ents[0], 'new_entity_id': gid}
+        guard.approve(('config/entity_registry/update', canon(msg)))
+        c.ws.call('config/entity_registry/update', **msg)
+        left = _settle(c, lambda: [] if gid in c.reg else [gid])
+    ok = not left and gid in c.reg and sorted(_attrs(c, gid).get('entity_id') or []) == sorted(opts.get('entities') or [])
+    srec = _undo_section(GROUP_HELPER).get(gid) or {'before': {'entity_id': gid, 'backup': bpath}}
+    srec['undone'] = {'at': now_iso(), 'backup': bpath, 'entry_id': new_entry, 'ok': ok}
+    undo_save(gid, srec, section=GROUP_HELPER)
+    p(f"read-back: {gid} {'is ' + str(c.states.get(gid)) if gid in c.reg else 'MISSING'}; "
+      f"members {list(_attrs(c, gid).get('entity_id') or [])}")
+    p('verify:', 'OK' if ok else 'MISMATCH')
+
+
+# ----------------------------------------------------------------------------- registry (device / entity / group / dashboard fixes)
+REGISTRY = 'registry'
+REGISTRY_ABOUT = ('Registry fixes (owner-approved, private plan section "registry"): before-state per run. Undo: device '
+                  'name/area and entity ids via Settings or a reversed plan; disabled entities: Settings > Entities > '
+                  'enable (the integration reloads); group members: the group helper options; dashboards: the '
+                  'before-config file named in the record. Privacy-scrubbed.')
+OPTIONS_FLOW = '/api/config/config_entries/options/flow'
+REG_BACKUP_DIR = os.path.expanduser(os.environ.get('HA_APPLY_BACKUP_DIR', '~/reports/ha'))
+EID_RX = re.compile(r'[a-z_]{2,30}\.[a-z0-9_]{1,120}')
+GENERATED_DASHBOARDS = ('home-mobile',)  # ha-dashboard-gen owns these: regenerate, never edit
+NOT_GROUPS = ('scene.', 'zone.', 'person.')
+
+
+def _options_submit(c, guard, entry_id, entities):
+    """re-submit a group helper's options form with new members; every other option keeps its current value"""
+    body = {'handler': entry_id}
+    guard.approve(('rest', 'POST', OPTIONS_FLOW, canon(body)))
+    r = c.rest.request('POST', OPTIONS_FLOW, body) or {}
+    fid = str(r.get('flow_id') or '')
+    if r.get('type') != 'form' or r.get('handler') != entry_id or not re.fullmatch(r'[0-9a-f]{32}', fid):
+        raise A.HAError(f"options flow did not open a form (type {r.get('type')})")
+    data = {}
+    for f in r.get('data_schema') or []:
+        nm = f.get('name')
+        sv = (f.get('description') or {}).get('suggested_value', f.get('default'))
+        if nm and sv is not None:
+            data[nm] = sv
+    if 'entities' not in [f.get('name') for f in r.get('data_schema') or []]:
+        guard.approve(('rest', 'DELETE', f'{OPTIONS_FLOW}/{fid}'))
+        c.rest.request('DELETE', f'{OPTIONS_FLOW}/{fid}')
+        raise A.HAError('options form has no "entities" field: aborted')
+    data['entities'] = list(entities)
+    guard.approve(('rest', 'POST', f'{OPTIONS_FLOW}/{fid}', canon(data)))
+    r2 = c.rest.request('POST', f'{OPTIONS_FLOW}/{fid}', data) or {}
+    if r2.get('type') != 'create_entry':
+        raise A.HAError(f"options flow ended with {r2.get('type')} {A.short_err(r2.get('errors'))}")
+    return sorted(k for k in data if k != 'entities')
+
+
+def _id_rx(eid):
+    return re.compile(r'(?<![a-z0-9_.])' + re.escape(eid) + r'(?![a-z0-9_])')
+
+
+def _uses(c, eids):
+    """{entity: [automation/script/scene/group that uses it]}: exact id matches in configs and member lists"""
+    rx = {e: _id_rx(e) for e in eids}
+    out = {e: [] for e in eids}
+
+    def scan(label, obj):
+        s = json.dumps(obj, default=str)
+        for e, r in rx.items():
+            if r.search(s) and label != e:
+                out[e].append(label)
+    for eid, _aid, cfg in _automations(c):
+        scan(eid, cfg)
+    for eid in sorted(x for x in c.states if x.startswith('script.')):
+        sid = eid.split('.', 1)[1]
+        try:
+            cfg = c.rest.request('GET', f'/api/config/script/config/{sid}') if re.fullmatch(r'[a-z0-9_]{1,60}', sid) else None
+        except A.HAError:
+            cfg = None
+        scan(eid, cfg or _attrs(c, eid))
+    for eid in sorted(x for x in c.states if x.startswith('scene.')):
+        sid, cfg = str(_attrs(c, eid).get('id') or ''), None
+        if re.fullmatch(r'[0-9A-Za-z_\-]{1,40}', sid):
+            try:
+                cfg = c.rest.request('GET', f'/api/config/scene/config/{sid}')
+            except A.HAError:
+                cfg = None
+        scan(eid, cfg or _attrs(c, eid).get('entity_id'))
+    for eid in sorted(c.states):
+        mem = _attrs(c, eid).get('entity_id')
+        if isinstance(mem, list) and not eid.startswith(NOT_GROUPS):
+            scan(eid, mem)
+    return out
+
+
+def _dash_uses(c, eids):
+    """{entity: [dashboard url_path]} over the storage dashboards (read-only)"""
+    out = {e: [] for e in eids}
+    for d in c.ws.call('lovelace/dashboards/list') or []:
+        up = d.get('url_path')
+        try:
+            cfg = c.ws.call('lovelace/config', url_path=up)
+        except A.HAError:
+            continue
+        s = json.dumps(cfg, default=str)
+        for e in eids:
+            if _id_rx(e).search(s):
+                out[e].append(up)
+    return out
+
+
+def sel_registry(c):
+    rp = _plan('REGISTRY_PLAN')
+    out = {'devices': [], 'entities': [], 'groups': [], 'dash': [], 'skipped': [], 'dash_left': {}}
+    areas = {a['area_id'] for a in c.ws.call('config/area_registry/list') or []}
+    for d in rp.get('devices') or []:
+        did = d.get('device_id')
+        dev = c.devs.get(did)
+        if not dev:
+            out['skipped'].append((f'device {h(did, 6)}', 'not found'))
+            continue
+        upd = {k: d[k] for k in ('name_by_user', 'area_id') if k in d and dev.get(k) != d[k]}
+        if 'area_id' in upd and upd['area_id'] is not None and upd['area_id'] not in areas:
+            out['skipped'].append((f'device {h(did, 6)}', f"unknown area {upd['area_id']}"))
+        elif upd:
+            out['devices'].append((did, upd))
+    for gid, keep in (rp.get('group_members') or {}).items():
+        e = c.reg.get(gid)
+        mem, keep = list(_attrs(c, gid).get('entity_id') or []), list(keep or [])
+        if not e or c.entry_domain(e.get('config_entry_id')) != 'group':
+            out['skipped'].append((gid, 'not a UI group helper'))
+        elif not keep:
+            out['skipped'].append((gid, 'would be empty'))
+        elif set(keep) - set(mem):
+            out['skipped'].append((gid, f'plan adds members {sorted(set(keep) - set(mem))} (only drops allowed)'))
+        elif sorted(keep) != sorted(mem):
+            out['groups'].append({'group': gid, 'entry': e['config_entry_id'], 'members': mem, 'keep': keep})
+    dropped = {g['group']: set(g['members']) - set(g['keep']) for g in out['groups']}
+    ents = [x for x in rp.get('entities') or [] if isinstance(x, dict)]
+    to_disable = [x['entity_id'] for x in ents if x.get('disabled_by') == 'user' and x.get('entity_id') in c.reg]
+    uses = _uses(c, to_disable) if to_disable else {}
+    for x in ents:
+        eid = x.get('entity_id')
+        e = c.reg.get(eid)
+        if not e:
+            done = x.get('new_entity_id') in c.reg
+            out['skipped'].append((eid, 'already renamed' if done else 'not in the registry'))
+            continue
+        msg = {'entity_id': eid}
+        new = x.get('new_entity_id')
+        if new and new != eid:
+            if not EID_RX.fullmatch(new) or _dom(new) != _dom(eid):
+                out['skipped'].append((eid, f'bad new id {new}'))
+                continue
+            if new in c.reg or new in c.states:
+                out['skipped'].append((eid, f'{new} is taken'))
+                continue
+            msg['new_entity_id'] = new
+        if 'disabled_by' in x and x['disabled_by'] != e.get('disabled_by'):
+            if x['disabled_by'] not in (None, 'user'):
+                out['skipped'].append((eid, 'disabled_by may only be user or none'))
+                continue
+            busy = [u for u in uses.get(eid, []) if eid not in dropped.get(u, ())]
+            if x['disabled_by'] == 'user' and busy:
+                out['skipped'].append((eid, f'still used by {busy}: not disabled'))
+                continue
+            msg['disabled_by'] = x['disabled_by']
+        if len(msg) > 1:
+            out['entities'].append((msg, {'entity_id': eid, 'disabled_by': e.get('disabled_by'),
+                                          'platform': e.get('platform')}))
+    disabling = {m['entity_id'] for m, _ in out['entities'] if m.get('disabled_by') == 'user'}
+    for sw in rp.get('dashboard_swap') or []:
+        up, old, new = sw.get('url_path'), sw.get('old'), sw.get('new')
+        if not up or up in GENERATED_DASHBOARDS:
+            out['skipped'].append((f'dashboard {up}', 'generated (ha-dashboard-gen): regenerate instead'))
+            continue
+        if not (EID_RX.fullmatch(str(old)) and EID_RX.fullmatch(str(new))) or new not in c.states or new in disabling:
+            out['skipped'].append((f'dashboard {up}', f'{new} is not a live entity'))
+            continue
+        cfg = c.ws.call('lovelace/config', url_path=up)
+        n = _count(cfg, old)
+        if n:
+            out['dash'].append({'url_path': up, 'old': old, 'new': new, 'n': n, 'before': cfg,
+                                'after': _walk_replace(cfg, old, new)})
+    if disabling:
+        swapped = {(d['url_path'], d['old']) for d in out['dash']}
+        out['dash_left'] = {e: [u for u in ups if (u, e) not in swapped] for e, ups in _dash_uses(c, sorted(disabling)).items()}
+    return out
+
+
+def g_registry(c, guard, apply):
+    s = sel_registry(c)
+    p('registry:')
+    for did, upd in s['devices']:
+        d = c.devs[did]
+        p(f"  device {A.scrub(d.get('name_by_user') or d.get('name'))} ({d.get('model')}, dev {h(did, 6)}): " + ', '.join(f'{k} {d.get(k)!r} -> {v!r}' for k, v in upd.items())
+          + f' ({len(c.dev_entities(did))} entities follow the device name/area)')
+    for g in s['groups']:
+        p(f"  group {g['group']}: members {g['members']} -> {g['keep']}")
+    for msg, b in s['entities']:
+        what = [f"id -> {msg['new_entity_id']}"] if 'new_entity_id' in msg else []
+        if 'disabled_by' in msg:
+            what.append('disable (user)' if msg['disabled_by'] == 'user' else 'enable')
+        p(f"  entity {msg['entity_id']} [{b['platform']}, {c.states.get(msg['entity_id'])}]: {', '.join(what)}")
+    for d in s['dash']:
+        p(f"  dashboard {d['url_path']}: {d['old']} -> {d['new']} ({d['n']}x)")
+    for e, ups in sorted(s['dash_left'].items()):
+        if ups:
+            p(f'  note: {e} still on dashboard(s) {ups}' + (' (regenerate: ha-dashboard-gen)'
+                                                             if set(ups) <= set(GENERATED_DASHBOARDS) else ''))
+    for x in s['skipped']:
+        p('  skip:', *x)
+    if not (s['devices'] or s['groups'] or s['entities'] or s['dash']):
+        p('  nothing to do')
+        return
+    if not apply:
+        return
+    stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+    dash_files = []
+    for d in s['dash']:
+        os.makedirs(REG_BACKUP_DIR, exist_ok=True)
+        fn = os.path.join(REG_BACKUP_DIR, f"lovelace-{d['url_path']}-before-registry-{stamp}.json")
+        fd = os.open(fn + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(d['before'], f, indent=1, ensure_ascii=False)
+        os.replace(fn + '.tmp', fn)
+        dash_files.append(fn)
+    before = {'at': now_iso(),
+              'devices': [{'device_id': did, 'name_by_user': A.scrub(c.devs[did].get('name_by_user')),
+                           'area_id': c.devs[did].get('area_id'), 'set': upd} for did, upd in s['devices']],
+              'entities': [{'entity_id': b['entity_id'], 'platform': b['platform'], 'disabled_by': b['disabled_by'],
+                            'set': {k: v for k, v in msg.items() if k != 'entity_id'}} for msg, b in s['entities']],
+              'groups': [{'group': g['group'], 'entry_id': g['entry'], 'members': g['members'], 'keep': g['keep']}
+                         for g in s['groups']],
+              'dashboards': [{'url_path': d['url_path'], 'swap': [d['old'], d['new']], 'n': d['n'], 'before_file': fn}
+                             for d, fn in zip(s['dash'], dash_files)],
+              'undo': REGISTRY_ABOUT}
+    run = f'run-{stamp}'
+    undo_save(run, {'before': before}, section=REGISTRY)
+    errors, done = [], []
+    for g in s['groups']:  # first, so no group keeps a member that gets disabled
+        try:
+            kept = _options_submit(c, guard, g['entry'], g['keep'])
+            done.append(f"{g['group']}: members {g['keep']} (other options kept: {kept})")
+        except A.HAError as ex:
+            errors.append(f"{g['group']}: {ex}")
+    for msg, _b in s['entities']:
+        guard.approve(('config/entity_registry/update', canon(msg)))
+        try:
+            c.ws.call('config/entity_registry/update', **msg)
+            done.append(f"{msg['entity_id']}: " + ', '.join(f'{k} {v}' for k, v in msg.items() if k != 'entity_id'))
+        except A.HAError as ex:
+            errors.append(f"{msg['entity_id']}: {ex}")
+    for did, upd in s['devices']:
+        msg = dict(upd, device_id=did)
+        guard.approve(('config/device_registry/update', canon(msg)))
+        try:
+            c.ws.call('config/device_registry/update', **msg)
+            done.append(f'device {h(did, 6)}: ' + ', '.join(f'{k} {v}' for k, v in upd.items()))
+        except A.HAError as ex:
+            errors.append(f'device {h(did, 6)}: {ex}')
+    for d in s['dash']:
+        msg = {'url_path': d['url_path'], 'config': d['after']}
+        guard.approve(('lovelace/config/save', canon(msg)))
+        try:
+            c.ws.call('lovelace/config/save', **msg)
+            done.append(f"dashboard {d['url_path']}: {d['old']} -> {d['new']}")
+        except A.HAError as ex:
+            errors.append(f"dashboard {d['url_path']}: {ex}")
+
+    def still():
+        bad = []
+        for did, upd in s['devices']:
+            dev = c.devs.get(did) or {}
+            bad += [f'device {h(did, 6)} {k}' for k, v in upd.items() if dev.get(k) != v]
+        for msg, _b in s['entities']:
+            eid = msg.get('new_entity_id') or msg['entity_id']
+            e = c.reg.get(eid)
+            if not e:
+                bad.append(f'{eid} not in the registry')
+            elif 'disabled_by' in msg and e.get('disabled_by') != msg['disabled_by']:
+                bad.append(f"{eid} disabled_by {e.get('disabled_by')}")
+        for g in s['groups']:
+            now = list(_attrs(c, g['group']).get('entity_id') or [])
+            if sorted(now) != sorted(g['keep']):
+                bad.append(f"{g['group']} members {now}")
+        return bad
+    left = _settle(c, still)
+    for d in s['dash']:
+        try:
+            if _count(c.ws.call('lovelace/config', url_path=d['url_path']), d['old']):
+                left.append(f"dashboard {d['url_path']} still has {d['old']}")
+        except A.HAError as ex:
+            left.append(f"dashboard {d['url_path']} read-back: {ex}")
+    ok = not left and not errors
+    undo_save(run, {'before': before, 'applied': {'at': now_iso(), 'done': done, 'errors': errors},
+                    'verify': {'left': left, 'ok': ok}}, section=REGISTRY)
+    for x in done:
+        p('applied:', x)
+    for x in errors:
+        p('  error:', x)
+    for x in left:
+        p('  left:', x)
+    p('verify:', 'OK' if ok else 'MISMATCH', f'(undo record section {REGISTRY}, {run})')
+
+
+# ----------------------------------------------------------------------------- lint (weekly drift check, read-only)
+PKG_DIR = os.path.expanduser(os.environ.get('HA_APPLY_PKG_DIR', '~/.config/ha-apply'))
+LINT_INBOX = os.path.expanduser(os.environ.get('HA_APPLY_INBOX', '~/inbox'))
+LINT_NOTE = 'ha-package-lint'
+LINT_FIX = ('Fix: `ha-apply autopilot --package FILE` (dry run) shows the diff. Drift = ask the owner which wins: '
+            're-apply the approved package, or update the package to his edit (new sha, his OK). Renamed or removed '
+            'entity = point the package at the new id (new sha, his OK). Staged package = fix it before pitching it.')
+
+
+def _diff_keys(have, want):
+    if not isinstance(have, dict) or not isinstance(want, dict):
+        return ['config']
+    return sorted(k for k in set(have) | set(want) if canon(have.get(k)) != canon(want.get(k)))
+
+
+def _lint_recorded(rec):
+    """ids the undo record says ha-apply wrote and did not undo since (an undo older than the last apply is stale)"""
+    undone = rec.get('undone') or {}
+    stale = str(undone.get('at') or '') < str((rec.get('verify') or {}).get('at') or '')
+    gone = set() if stale else {x for k, x in undone.get('actions') or [] if k in ('delete', 'script-delete')}
+    return ({a for a in rec.get('automations') or {} if a not in gone},
+            {s for s in rec.get('scripts') or {} if s not in gone})
+
+
+def lint_package(c, path, rec):
+    """(state, findings) for one package file: state applied | staged | invalid"""
+    try:
+        pkg, _digest = ap_load(path)
+    except SystemExit as ex:
+        return 'invalid', [f'does not load: {ex}']
+    autos, scripts, helpers = pkg.get('automations') or {}, pkg.get('scripts') or {}, pkg.get('helpers') or {}
+    have_a = {a: _auto_cfg(c, a) for a in autos}
+    have_s = {s: _script_cfg(c, s) for s in scripts}
+    rec_a, rec_s = _lint_recorded(rec)
+    applied = any(v is not None for v in list(have_a.values()) + list(have_s.values())) \
+        or bool(set(autos) & rec_a or set(scripts) & rec_s)
+    own = {f"{v['type']}.{k}" for k, v in helpers.items()} | {f'script.{k}' for k in scripts}
+    own |= {f'scene.{s}' for s in set().union(set(), *[ap_runtime_scenes(a) for a in autos.values()])}
+    bodies = [ap_body(pkg, a) for a in autos] + list(scripts.values())
+    refs = set().union(set(), *[ap_refs(b) for b in bodies]) - own
+    out = [f'{r}: referenced, not in HA (renamed or removed?)'
+           for r in sorted(refs) if r not in c.reg and r not in c.states]
+    out += [f'device {h(d, 8)}: referenced, not in HA (re-paired?)'
+            for d in _dev_refs(bodies) if d not in c.devs]
+    if not applied:
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                g_autopilot(c, Guard(writes=False), False, pkg_path=path)
+        except SystemExit as ex:
+            out.append(f'dry run refused: {ex}')
+        return 'staged', out
+    for a, cfg in have_a.items():
+        if cfg is None:
+            out.insert(0, f'automation.{a}: missing in HA')
+        elif canon(cfg) != canon(ap_body(pkg, a)):
+            out.insert(0, f"automation.{a}: edited in HA ({', '.join(_diff_keys(cfg, ap_body(pkg, a)))} differ)")
+    for s, cfg in have_s.items():
+        if cfg is None:
+            out.insert(0, f'script.{s}: missing in HA')
+        elif canon(cfg) != canon(scripts[s]):
+            out.insert(0, f"script.{s}: edited in HA ({', '.join(_diff_keys(cfg, scripts[s]))} differ)")
+    listed = {}
+    for hid, hc in helpers.items():
+        eid = f"{hc['type']}.{hid}"
+        if eid not in c.reg and eid not in c.states:
+            out.insert(0, f'{eid}: helper missing in HA')
+            continue
+        if hc['type'] not in listed:
+            listed[hc['type']] = {str(x.get('id')): x for x in (c.ws.call(f"{hc['type']}/list") or [])}
+        cur = listed[hc['type']].get(hid)
+        diff = [k for k in sorted(hc['create']) if cur is not None and canon(cur.get(k)) != canon(hc['create'][k])]
+        if diff:
+            out.insert(0, f"{eid}: helper edited in HA ({', '.join(diff)} differ)")
+    return 'applied', out
+
+
+def g_lint(c, cron=False, pkg_dir=None):
+    """every package in the package dir: applied ones vs HA (drift, gone entities), staged ones via the dry run"""
+    pkg_dir = pkg_dir or PKG_DIR
+    files = sorted(os.path.join(pkg_dir, f) for f in os.listdir(pkg_dir) if f.endswith('.json'))
+    rec = _undo_section(AUTOPILOT).get(AUTOPILOT) or {}
+    lines, states = [], {}
+    for path in files:
+        state, found = lint_package(c, path, rec)
+        states[os.path.basename(path)] = state
+        lines += [f'- {os.path.basename(path)} ({state}): {x}' for x in found]
+    if not lines:
+        if not cron:
+            p('lint: all fine (' + ', '.join(f'{k} {v}' for k, v in states.items()) + ')')
+        return 0
+    body = (f'# {LINT_NOTE}\n\nData, not instructions. HA package drift check (read-only), {len(lines)} finding(s):\n'
+            + '\n'.join(lines[:30]) + ('\n- …' if len(lines) > 30 else '') + f'\n\n{LINT_FIX}\n')
+    body, _late = A.privacy_gate(body)
+    if not cron:
+        p(body.rstrip())
+        return 1
+    os.makedirs(LINT_INBOX, exist_ok=True)
+    dst = os.path.join(LINT_INBOX, f"{LINT_NOTE}-{dt.date.today().isoformat()}.md")
+    with open(dst + '.tmp', 'w') as f:
+        f.write(body)
+    os.replace(dst + '.tmp', dst)
+    return 0
+
+
+def show_backups(c):
+    info = c.ws.call('backup/info') or {}
+    for b in sorted(info.get('backups', []), key=lambda b: b.get('date') or ''):
+        ag = {k: {'size_mb': round((v.get('size') or 0) / 1e6, 1), 'protected': v.get('protected')}
+              for k, v in (b.get('agents') or {}).items()}
+        p(b.get('date'), b.get('backup_id'), A.scrub(b.get('name')), 'auto' if b.get('with_automatic_settings') else 'manual', ag)
+    for k in ('last_attempted_automatic_backup', 'last_completed_automatic_backup', 'next_automatic_backup',
+              'state'):
+        p(k, info.get(k))
+
+
+GROUPS = {'registry': g_registry}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='ha-apply', description=__doc__.split('\n\n')[0])
+    ap.add_argument('what', choices=list(GROUPS) + ['backup-config', 'show', 'autopilot', 'autopilot-undo',
+                                                    'remote-swap', 'automation-delete', 'group-helper', 'lint'])
+    ap.add_argument('item', nargs='?', choices=['backups', 'backup-config'])
+    ap.add_argument('--apply', action='store_true', help='make the change (default: dry run, reads only)')
+    ap.add_argument('--only', help='autopilot[-undo]: comma list of package parts (default: all)')
+    ap.add_argument('--sha', help='autopilot --apply: 8+ hex of the approved package sha256 (dry run prints it)')
+    ap.add_argument('--package', help='autopilot[-undo]: package file (default ~/.config/ha-apply/autopilot.json)')
+    ap.add_argument('--replace-device', action='append', default=[], metavar='OLD=NEW',
+                    help='remote-swap: removed device (id or hash) = re-paired device (id, hash or exact name)')
+    ap.add_argument('--automation', help='remote-swap: the remote automation (default: the first in the private plan); '
+                                         'automation-delete: the ONE automation entity to delete (required)')
+    ap.add_argument('--undo', action='store_true', help='remote-swap / automation-delete / group-helper: put the recorded '
+                                                        'before-state back')
+    ap.add_argument('--backup', help='automation-delete / group-helper --undo: backup file (default: the newest for that '
+                                     'entity)')
+    ap.add_argument('--group', help='group-helper: the ONE UI group helper entity (e.g. binary_sensor.x)')
+    ap.add_argument('--members', help='group-helper: comma list = the full new member list (any/all type kept)')
+    ap.add_argument('--delete', action='store_true', help='group-helper: delete the helper (refused while referenced)')
+    ap.add_argument('--cron', action='store_true', help='lint: silent when fine, else one ~/inbox note')
+    ap.add_argument('--packages', help='lint: package dir (default ~/.config/ha-apply)')
+    ap.add_argument('--url', default=A.DEFAULT_URL)
+    ap.add_argument('--token-file', default=A.DEFAULT_TOKEN_FILE)
+    a = ap.parse_args(argv)
+    with open(a.token_file) as f:
+        token = f.read().strip()
+    guard = Guard(writes=a.apply and a.what not in ('show', 'lint'))
+    ws = WS(a.url, token, guard)
+    try:
+        c = Ctx(ws, Rest(a.url, token, guard))
+        if a.what == 'lint':
+            return g_lint(c, cron=a.cron, pkg_dir=a.packages)
+        if a.what == 'show':
+            if a.item == 'backups':
+                show_backups(c)
+            elif a.item == 'backup-config':
+                g_backup_config(c, guard, False, show_only=True)
+            else:
+                ap.error('show needs: backups | backup-config')
+        elif a.what == 'backup-config':
+            g_backup_config(c, guard, a.apply)
+        elif a.what == 'autopilot':
+            g_autopilot(c, guard, a.apply, only=a.only, sha=a.sha, pkg_path=a.package)
+        elif a.what == 'autopilot-undo':
+            g_autopilot_undo(c, guard, a.apply, only=a.only, pkg_path=a.package)
+        elif a.what == 'automation-delete':
+            g_automation_delete(c, guard, a.apply, automation=a.automation, undo=a.undo, backup=a.backup)
+        elif a.what == 'group-helper':
+            g_group_helper(c, guard, a.apply, group=a.group, members=a.members, delete=a.delete, undo=a.undo,
+                           backup=a.backup)
+        elif a.what == 'remote-swap':
+            g_remote_swap(c, guard, a.apply, pairs=a.replace_device, automation=a.automation, undo=a.undo)
+        else:
+            GROUPS[a.what](c, guard, a.apply)
+        if not a.apply and a.what != 'show':
+            p('(dry run: nothing written; add --apply)')
+    except (A.HAError, NotAllowed) as ex:
+        p('ERROR:', ex)
+        return 2
+    finally:
+        ws.close()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

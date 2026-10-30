@@ -1,0 +1,127 @@
+#!/bin/sh
+# Send the owner a Telegram voice note (Bot API sendVoice), from the session or scripts:
+#   tg-voice FILE.ogg [CAPTION] [--silent] [--reply-to MESSAGE_ID]
+# FILE = OGG/Opus (what `tts` writes); it shows as a playable voice message. The session's reply tool sends
+# .ogg files as documents (sendDocument), so voice notes go through here. CAPTION is plain text, cut to 1000
+# characters. Prints the new message_id. Exit 0 = sent; 2 = bad arguments or not OGG/Opus (nothing sent);
+# 1 = not sent (network, Telegram; Telegram's reason on stderr). If his privacy settings refuse voice messages
+# (VOICE_MESSAGES_FORBIDDEN), it is re-sent once as an audio file (sendAudio), with a note on stderr.
+# The bot token never reaches argv or output: the sender (python urllib via core.http in ~/bin/lib, no curl) reads
+# the URL from stdin, and its errors are redacted.
+# One sender: while the hub's tg-adapter drains the hub outbox (tg-outbox's gate decides), the note goes into that
+# outbox (`tg-outbox send tg-voice --file …`, urgent: never held) and the adapter sends it (sendVoice, sendAudio
+# when refused; caption and
+# duration kept) without this script reading the token; it prints the id the adapter got. Otherwise, or when the outbox
+# can't take it, the Bot API directly as below. Switch: ~/.config/tg-adapter/direct-tg-voice (or direct-all).
+# Tests: TG_VOICE_ENV (bot token file), TG_VOICE_ACCESS (access.json), TG_VOICE_API (Bot API base URL); with any of
+# them set the outbox is never used. TG_OUTBOX_BIN, TG_ADAPTER_STATE_DIR (the outbox path); ~/opt/tts-tests/run.sh.
+set -eu
+envf=${TG_VOICE_ENV:-$HOME/.claude/channels/telegram/.env}
+acc=${TG_VOICE_ACCESS:-$HOME/.claude/channels/telegram/access.json}
+api=${TG_VOICE_API:-https://api.telegram.org}
+usage() { echo 'usage: tg-voice FILE.ogg [CAPTION] [--silent] [--reply-to MESSAGE_ID]' >&2; exit 2; }
+
+file= caption= silent= reply_to=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --silent) silent=1 ;;
+    --reply-to) [ $# -ge 2 ] || usage; reply_to=$2; shift ;;
+    --reply-to=*) reply_to=${1#--reply-to=} ;;
+    -h|--help) usage ;;
+    *) if [ -z "$file" ]; then file=$1; elif [ -z "$caption" ]; then caption=$1; else usage; fi ;;
+  esac
+  shift
+done
+[ -n "$file" ] || usage
+[ -f "$file" ] && [ -r "$file" ] && [ -s "$file" ] || { echo "tg-voice: no such file: $file" >&2; exit 2; }
+case $file in *\;*|*\"*|*,*) echo 'tg-voice: file name must not contain ; " or ,' >&2; exit 2 ;; esac
+case $reply_to in ''|*[!0-9]*) [ -z "$reply_to" ] || { echo 'tg-voice: --reply-to takes a message id' >&2; exit 2; } ;; esac
+duration=
+if command -v ffprobe >/dev/null 2>&1; then
+  codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$file" 2>/dev/null || true)
+  fmt=$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$file" 2>/dev/null || true)
+  [ "$codec" = opus ] && [ "$fmt" = ogg ] || {
+    echo "tg-voice: $file is not OGG/Opus (codec ${codec:-?}, container ${fmt:-?}); make it with tts" >&2; exit 2; }
+  duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$file" 2>/dev/null | awk '{printf "%d", $1 + 0.5}')
+fi
+if [ -n "$caption" ]; then
+  caption=$(printf '%s' "$caption" | jq -Rrs 'if length > 1000 then .[:999] + "…" else . end')
+fi
+
+ob=${TG_OUTBOX_BIN:-$(dirname "$0")/tg-outbox}
+if [ -z "${TG_VOICE_ENV:-}${TG_VOICE_ACCESS:-}${TG_VOICE_API:-}" ] && [ -x "$ob" ] &&
+   { [ -s "${TG_ADAPTER_STATE_DIR:-$HOME/.local/state/tg-adapter}/live/adapter.pid" ] || [ -n "${HUB_URL:-}" ] ||
+     [ -e "${HUB_TOKEN_FILE:-$HOME/.secrets/hub-token}" ]; }; then
+  set -- --file "$file"
+  [ -z "$caption" ] || set -- "$@" --caption "$caption"
+  [ -z "$duration" ] || [ "$duration" = 0 ] || set -- "$@" --duration "$duration"
+  [ -z "$silent" ] || set -- "$@" --silent
+  [ -z "$reply_to" ] || set -- "$@" --reply-to "$reply_to"
+  rc=0
+  "$ob" send tg-voice "$@" </dev/null || rc=$?
+  [ "$rc" -eq 75 ] || exit "$rc"
+fi
+. "$envf"
+[ -n "${TELEGRAM_BOT_TOKEN:-}" ] || { echo 'tg-voice: no bot token in the token file' >&2; exit 1; }
+owner=$(jq -r '.allowFrom[0] // empty' "$acc")
+[ -n "$owner" ] || { echo 'tg-voice: no owner chat id in access.json' >&2; exit 1; }
+
+# send METHOD FIELD: prints the response body, then the HTTP code on its own last line (000 = no response). One
+# multipart POST (60 s) through core.http (python urllib: the CI image has no curl); the URL comes in on stdin.
+send_py='
+import os, sys, urllib.error, uuid
+sys.path.insert(0, sys.argv[1])
+from core import http
+url = sys.stdin.readline().strip()
+path, field = sys.argv[2], sys.argv[3]
+b = uuid.uuid4().hex
+parts = []
+for kv in sys.argv[4:]:
+    k, _, v = kv.partition("=")
+    parts.append(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n".encode() + v.encode() + b"\r\n")
+with open(path, "rb") as fh:
+    data = fh.read()
+name = os.path.basename(path).replace("\"", "")
+head = f"--{b}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\nContent-Type: audio/ogg\r\n\r\n"
+body = b"".join(parts) + head.encode() + data + f"\r\n--{b}--\r\n".encode()
+try:
+    with http.open(url, body, headers={"Content-Type": "multipart/form-data; boundary=" + b}, timeout=60) as r:
+        code, out = r.status, r.read()
+except urllib.error.HTTPError as e:
+    code, out = e.code, e.read()
+except Exception as e:  # no response: the reason on the body line, as curl --stderr - gave it
+    code, out = 0, (type(e).__name__ + ": " + str(getattr(e, "reason", e))).encode()
+sys.stdout.write(out.decode("utf-8", "replace") + f"\n{code:03d}\n")
+'
+send() {
+  set -- "$1" "$2" "chat_id=$owner"
+  [ -z "$caption" ] || set -- "$@" "caption=$caption"
+  [ -z "$duration" ] || set -- "$@" "duration=$duration"
+  [ -z "$silent" ] || set -- "$@" "disable_notification=true"
+  [ -z "$reply_to" ] || set -- "$@" "reply_parameters={\"message_id\":$reply_to,\"allow_sending_without_reply\":true}"
+  method=$1; shift
+  printf '%s/bot%s/%s\n' "$api" "$TELEGRAM_BOT_TOKEN" "$method" |
+    python3 -I -c "$send_py" "$(dirname "$0")/lib" "$file" "$@" 2>&1 || printf '\n000\n'
+}
+redact() { sed -E 's/bot[0-9]+:[A-Za-z0-9_-]+/bot<token>/g'; }
+
+out=$(send sendVoice voice)
+code=$(printf '%s\n' "$out" | tail -n 1)
+body=$(printf '%s\n' "$out" | sed '$d')
+if [ "$code" != 200 ] && printf '%s' "$body" | grep -q 'VOICE_MESSAGES_FORBIDDEN'; then
+  echo 'tg-voice: his privacy settings refuse voice messages; sent as an audio file instead' >&2
+  out=$(send sendAudio audio)
+  code=$(printf '%s\n' "$out" | tail -n 1)
+  body=$(printf '%s\n' "$out" | sed '$d')
+fi
+if [ "$code" = 200 ] && id=$(printf '%s' "$body" | jq -er 'select(.ok == true) | .result.message_id' 2>/dev/null); then
+  printf '%s\n' "$id"
+  exit 0
+fi
+if [ "$code" = 000 ]; then
+  echo "tg-voice: not sent (no response): $(printf '%s' "$body" | tail -n 1 | redact)" >&2
+else
+  why=$(printf '%s' "$body" | jq -r '.description // empty' 2>/dev/null || true)
+  echo "tg-voice: not sent (HTTP $code): $(printf '%s' "${why:-unexpected response}" | redact)" >&2
+fi
+exit 1

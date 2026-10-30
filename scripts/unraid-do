@@ -1,0 +1,238 @@
+#!/bin/bash
+# unraid-do: the owner's narrow rights on his Unraid server (dispatcher verbs, claude-bot-cmd v3.6), with an
+# owner-OK gate. Sends one verb through `unraid-ssh run` (same modes: verbs | emulate).
+#
+# Usage: unraid-do [--owner-ok "his words" | --approval NONCE] [--file F] [--dry-run] VERB [ARG...]
+#   docker-list | docker-restart NAME | docker-update NAME*
+#   vm-list | vm-info NAME | vm-start NAME | vm-stop NAME [--force*] (Home Assistant / Pi-Hole: *)
+#   vm-create* NAME VCPUS RAM_GB DISK_GB ISO|none | vm-autostart NAME on|off* (off only)
+#   vm-detach-iso NAME: ejects the ISO-folder media from its cdrom drive(s) in the VM's definition (disks never;
+#     the ISO stays; a running VM keeps it until stopped and started); no OK needed
+#   userscript-list | userscript-run* NAME
+#   appdata-get CONTAINER PATH | appdata-put* CONTAINER PATH (new content on stdin or --file F)
+#   appdata-backups CONTAINER | appdata-restore* CONTAINER ID
+#   plugin-list | plugin-update* NAME | rights-log [N]
+#   hub-restart NAME | hub-recreate* NAME: the hub's own containers only (claude-hub, claude-hub-<part>; dispatcher 3.6)
+#   kit-install* [KIT]: installs the brain's rendered main hub kit (default: the kit id in kit.json). The server
+#     snapshots and hashes the kit itself, refuses one that widens the hub (that stays a paste), and his tap covers
+#     exactly that sha256; output: result, steps, the hub's containers (ps lines)
+#   iso-list | iso-fetch URL SHA256 | iso-fetch-status
+#     URL = https://HOST/PATH/NAME.iso from the dispatcher's host list (official installer hosts); downloads in the
+#     background into the ISO folder, sha256-checked, never overwrites; no OK needed (a new file in the ISO folder
+#     only, at most 12 GB, nothing runs; logged in the rights log). There is no delete.
+# * = needs his tap (dispatcher 3.5, S1): ask him on Telegram first, then
+#   1. unraid-do VERB ARG... --owner-ok "his words": the server's owner-ok-review gives the exact action and summary,
+#      a hub approval is minted for them (`approvals new`), nothing runs; prints JSON (request, summary, approval,
+#      send = the card row for the reply tool, next) and exits 4. Send the card; his ✅ decides.
+#   2. unraid-do VERB ARG... --approval NONCE (or ap:NONCE:y): sends the request with ap-NONCE; the server checks and
+#      consumes his approval in the hub's database (hub-kit-runner.sh owner-ok). appdata-put: the approval covers the
+#      new content's sha256, so send the same content.
+#   His words stay here (~/.local/state/unraid-do/owner-ok.jsonl, 0600) with the reference ok-<12 hex>. A server
+#   older than 3.5 (no owner-ok-review verb) still gets the words' reference (ok-<12 hex>) at once.
+# VM names may contain spaces (pass them as one quoted argument or as words). PATH is the file's path inside
+# /mnt/user/appdata/CONTAINER/ (a/b/c.conf); it is sent as words. Media deletions are not here (~/bin/media).
+# --dry-run prints the request instead of sending it (nothing logged).
+# Env (tests): UNRAID_DO_SSH (default ~/bin/unraid-ssh), UNRAID_DO_STATE (default ~/.local/state/unraid-do),
+#   UNRAID_DO_APPROVALS (default ~/bin/approvals).
+set -u
+case "${1:-}" in
+  -h|--help|help) ;;
+  *) pg="$(dirname "$(readlink -f "$0")")/profile-get"   # feature switch: features.unraid in the profile
+     if [ -x "$pg" ] && [ "$("$pg" --feature unraid 2>/dev/null)" = off ]; then
+       echo "unraid-do: feature unraid is off (features.unraid in the profile)" >&2; exit 3
+     fi ;;
+esac
+SSH_CLIENT_BIN=${UNRAID_DO_SSH:-$HOME/bin/unraid-ssh}
+STATE=${UNRAID_DO_STATE:-$HOME/.local/state/unraid-do}
+APPROVALS_BIN=${UNRAID_DO_APPROVALS:-$HOME/bin/approvals}
+CRITICAL_VM_RE='home[ ._-]?assistant|hass|haos|pi[ ._-]?hole'   # same as the dispatcher
+LOGGED=' docker-restart docker-update vm-start vm-stop vm-create vm-autostart vm-detach-iso userscript-run appdata-get appdata-put appdata-restore plugin-update iso-fetch hub-restart hub-recreate kit-install '
+KIT_JSON=${UNRAID_DO_KITJSON:-$HOME/.local/share/claude-hub/kit/kit.json}
+KNOWN=" docker-list vm-list vm-info userscript-list appdata-backups plugin-list iso-list iso-fetch-status rights-log$LOGGED"
+
+die() { echo "unraid-do: $*" >&2; exit 2; }
+usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; }
+
+words= file= dry=0 force=0 args=() nonce=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --owner-ok) [ $# -ge 2 ] || die "--owner-ok needs his words"; words=$2; shift 2 ;;
+    --owner-ok=*) words=${1#*=}; shift ;;
+    --approval) [ $# -ge 2 ] || die "--approval needs the nonce"; nonce=$2; shift 2 ;;
+    --approval=*) nonce=${1#*=}; shift ;;
+    --file) [ $# -ge 2 ] || die "--file needs a path"; file=$2; shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    --force) force=1; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    --confirm) die "--confirm is added for Home Assistant / Pi-Hole when --owner-ok is given" ;;
+    -*) die "unknown option '$1'" ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+[ "${#args[@]}" -ge 1 ] || { usage >&2; exit 2; }
+verb=${args[0]}
+rest=("${args[@]:1}")
+case $KNOWN in *" $verb "*) ;; *) die "unknown verb '$verb' (unraid-do --help; read-only verbs: unraid-ssh run)" ;; esac
+words=$(printf '%s' "$words" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+if [ -n "$nonce" ]; then
+  [[ ${nonce,,} =~ ^(ap:)?([0-9a-f]{32})(:y)?$ ]] || die "--approval: the 32-hex nonce of his approval (ap:<nonce>:y works too)"
+  nonce=${BASH_REMATCH[2]}
+fi
+
+# --- the request words, per verb
+req=("$verb")
+gate=no
+case $verb in
+  vm-autostart)                              # NAME on|off: off needs his OK; Home Assistant / Pi-Hole also get --confirm
+    n=${#rest[@]}
+    [ "$n" -ge 2 ] || die "vm-autostart takes NAME on|off"
+    mode=${rest[n-1]} name="${rest[*]:0:n-1}"
+    case $mode in on|off) ;; *) die "vm-autostart takes NAME on|off (last word '$mode')" ;; esac
+    read -r -a nw <<< "$name"
+    req+=("${nw[@]}" "$mode")
+    if [ "$mode" = off ]; then
+      gate="yes (autostart off)"
+      shopt -s nocasematch
+      if [[ $name =~ $CRITICAL_VM_RE ]]; then gate="yes (critical VM)"; req+=(--confirm); fi
+      shopt -u nocasematch
+    fi ;;
+  vm-start|vm-stop|vm-info|vm-detach-iso)
+    name="${rest[*]}"                          # spaces in a VM name: one quoted argument or several words
+    [ -n "$name" ] || die "$verb needs the VM's name (unraid-do vm-list)"
+    read -r -a nw <<< "$name"
+    req+=("${nw[@]}")
+    if [ "$verb" = vm-stop ]; then
+      shopt -s nocasematch
+      if [[ $name =~ $CRITICAL_VM_RE ]]; then gate="yes (critical VM)"; req+=(--confirm); fi
+      shopt -u nocasematch
+      if [ "$force" = 1 ]; then gate="yes (hard power-off)"; req+=(--force); fi
+    elif [ "$force" = 1 ]; then die "vm-start takes no --force"
+    fi ;;
+  appdata-get|appdata-put)
+    [ "${#rest[@]}" = 2 ] || die "$verb takes CONTAINER PATH (PATH like config/app.conf)"
+    case ${rest[1]} in /*|*//*|*/) die "PATH is relative to the container's appdata folder (no leading /)" ;; esac
+    IFS=/ read -r -a parts <<< "${rest[1]}"
+    req+=("${rest[0]}" "${parts[@]}")
+    [ "$verb" = appdata-put ] && gate=yes ;;
+  iso-fetch)                                 # the URL goes as words (HOST PART... NAME.iso): ':' and '/' never reach the server
+    [ "${#rest[@]}" = 2 ] || die "iso-fetch takes URL SHA256 (https://HOST/PATH/NAME.iso and its sha256)"
+    url=${rest[0]} sum=${rest[1],,}
+    [[ $url =~ ^https://([A-Za-z0-9.-]+)/([A-Za-z0-9._/-]+)$ ]] ||
+      die "iso-fetch: URL must be https://HOST/PATH/NAME.iso (no http, port, user@, query or %-escapes)"
+    host=${BASH_REMATCH[1],,} path=${BASH_REMATCH[2]}
+    case /$path/ in *//*|*/../*|*/./*) die "iso-fetch: the path has empty, '.' or '..' parts" ;; esac
+    case $path in *.iso) ;; *) die "iso-fetch: the URL must end in .iso" ;; esac
+    [[ $sum =~ ^[0-9a-f]{64}$ ]] || die "iso-fetch: SHA256 must be 64 hex characters"
+    IFS=/ read -r -a parts <<< "$path"
+    req+=("$host" "${parts[@]}" "$sum") ;;
+  docker-update|vm-create|userscript-run|appdata-restore|plugin-update)
+    req+=("${rest[@]}"); gate=yes ;;
+  hub-restart|hub-recreate)
+    [ "${#rest[@]}" = 1 ] && [[ ${rest[0]} =~ ^claude-hub(-[a-z0-9]{1,20})?$ ]] ||
+      die "$verb takes one hub container: claude-hub or claude-hub-<part> (never the vault or the assistant)"
+    req+=("${rest[0]}")
+    [ "$verb" = hub-restart ] || gate=yes ;;
+  kit-install)                               # default: the kit the brain rendered last
+    kit=${rest[0]-}
+    [ "${#rest[@]}" -le 1 ] || die "kit-install takes one kit id"
+    [ -n "$kit" ] || kit=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["kit"])' "$KIT_JSON" 2>/dev/null) ||
+      die "kit-install: no kit id given and none in $KIT_JSON"
+    [[ $kit =~ ^[0-9a-f]{12}$ ]] || die "kit-install: KIT is the 12-hex kit id (kit.json \"kit\")"
+    req+=("$kit"); gate=yes ;;
+  *) req+=("${rest[@]}") ;;
+esac
+[ "$force" = 0 ] || [ "$verb" = vm-stop ] || die "--force is only for vm-stop"
+[ -z "$file" ] || [ "$verb" = appdata-put ] || die "--file is only for appdata-put"
+
+if [ "$gate" != no ]; then
+  [ "${#words}" -ge 2 ] || [ -n "$nonce" ] ||
+    die "$verb ${rest[*]} needs the owner's OK ($gate): ask him first, then --owner-ok \"his words\" (mints his card), then --approval NONCE"
+else
+  [ -z "$nonce" ] || die "--approval is only for the verbs that need his OK"
+fi
+send_ref=no
+case $LOGGED in *" $verb "*) [ -z "$words" ] || send_ref=yes ;; esac
+
+for w in "${req[@]}"; do
+  case $w in ''|*[!A-Za-z0-9._-]*) die "'$w' has characters the server refuses (only A-Za-z0-9._- per word)" ;; esac
+done
+send=("${req[@]}") ts= ref=
+if [ -n "$nonce" ]; then send+=("ap-$nonce"); send_ref=no; fi
+if [ "$send_ref" = yes ]; then
+  ts=$(date +%Y-%m-%dT%H:%M:%S%z)
+  ref=ok-$(printf '%s\n%s\n%s\n' "$ts" "${req[*]}" "$words" | sha256sum | cut -c1-12)
+  send+=("$ref")
+fi
+text="${send[*]}"
+[ "${#text}" -le 200 ] || die "request longer than 200 characters"
+# local inputs before anything is logged or sent: a refused or failed call never leaves an OK entry
+if [ "$verb" = appdata-put ]; then
+  if [ -n "$file" ]; then
+    [ -f "$file" ] || die "no file $file; nothing sent"
+    { [ -r "$file" ] && exec 0< "$file"; } 2>/dev/null || die "cannot read $file; nothing sent"
+  else
+    [ ! -t 0 ] || die "appdata-put reads the new content from stdin or --file F; nothing sent"
+  fi
+fi
+if [ "$dry" = 1 ]; then echo "would send: $text"; [ "$gate" = no ] || echo "owner's OK ($gate): ${words:-approval $nonce}"; exit 0; fi
+
+if [ "$gate" != no ] && [ -z "$nonce" ]; then   # 3.5: his tap. The server says what it will check; mint that approval
+  csha=() tmpc=
+  mkdir -p "$STATE" && chmod 700 "$STATE" || die "cannot write $STATE"
+  if [ "$verb" = appdata-put ]; then           # the approval covers the content: hash it, keep it for an old server
+    tmpc=$(mktemp "$STATE/content.XXXXXX") || die "no temp file"
+    head -c 262145 > "$tmpc"; csha=("c-$(sha256sum < "$tmpc" | cut -c1-64)")
+  fi
+  terr=$(mktemp "$STATE/review.XXXXXX") || die "no temp file"
+  rv=$("$SSH_CLIENT_BIN" run owner-ok-review "${req[@]}" "${csha[@]}" < /dev/null 2> "$terr"); rrc=$?
+  rerr=$(head -c 2000 -- "$terr"); rm -f -- "$terr"
+  act=$(printf '%s\n' "$rv" | sed -n 's/^action\t//p' | head -n 1)
+  sum=$(printf '%s\n' "$rv" | sed -n 's/^summary\t//p' | head -n 1)
+  if [ "$rrc" != 0 ] && [[ $rerr == *"unknown verb 'owner-ok-review'"* ]]; then
+    mint=no                                      # the server is older than 3.5: the words' reference
+    if [ -n "$tmpc" ]; then exec 0< "$tmpc"; fi
+  elif [ "$rrc" = 0 ] && [[ $act == '{"action":"unraid.do",'* ]] && [ -n "$sum" ]; then
+    mint=yes
+  else
+    [ -z "$tmpc" ] || rm -f -- "$tmpc"
+    why=$(printf '%s\n' "$rv" | sed -n 's/^why\t//p' | head -n 5 | tr '\n' ';')
+    echo "unraid-do: the server's owner-ok-review failed (exit $rrc): ${why:-${rerr:-no action}}" >&2; exit 3
+  fi
+  [ -z "$tmpc" ] || rm -f -- "$tmpc"             # (an old server's stdin is already open on it)
+  if [ "$mint" = yes ]; then
+    mkdir -p "$STATE" && chmod 700 "$STATE" || die "cannot write $STATE"
+    ts=$(date +%Y-%m-%dT%H:%M:%S%z)
+    ref=ok-$(printf '%s\n%s\n%s\n' "$ts" "${req[*]}" "$words" | sha256sum | cut -c1-12)
+    python3 -I -c 'import json, sys; print(json.dumps({"ts": sys.argv[1], "ref": sys.argv[2], "request": sys.argv[3], "owner_ok": sys.argv[4], "card": True}, ensure_ascii=False))' \
+      "$ts" "$ref" "${req[*]}" "$words" >> "$STATE/owner-ok.jsonl" || die "cannot log the owner's OK; nothing minted"
+    chmod 600 "$STATE/owner-ok.jsonl"
+    ap=$(printf '%s' "$act" | "$APPROVALS_BIN" new --action - --summary "$sum" --ttl 900 --ref "unraid-do:$verb:$ref" \
+         --yes "✅ Run" --no "❌ Cancel" --json) || { echo "unraid-do: approvals new failed; nothing runs" >&2; exit 3; }
+    python3 -I -c '
+import json, sys
+ap, req, summ, verb, rv = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+n = str(ap.get("nonce", ""))
+if len(n) != 32 or ap.get("summary") not in (None, summ):
+    sys.exit("unraid-do: the hub minted no usable approval (nonce or summary differs); nothing runs")
+review = {k: v for k, _, v in (ln.partition("\t") for ln in rv.splitlines()) if k in ("kit", "kitsum", "sha", "changes")}
+card = "🖥️ Unraid: " + summ.removeprefix("Unraid ") + "\nRuns once, only this exact request (the server checks your tap)."
+if verb == "kit-install":
+    card = ("🖥️ Hub kit " + review.get("kit", req.split()[-1]) + ": install (" + review.get("changes", "?") + ")\n"
+            "Exactly this kit: the server re-checks its sha256 " + review.get("kitsum", "?") + "… and your tap, runs once.")
+out = {"request": req, "summary": summ, "approval": {"nonce": n, "expires": ap.get("expires")},
+       "send": {"text": card, "approval": {"nonce": n}},
+       "next": f"after his ✅: unraid-do {verb} ... --approval {n}" + (" (same content)" if verb == "appdata-put" else "")}
+if review:
+    out["review"] = review
+print(json.dumps(out, ensure_ascii=False))' "$ap" "${req[*]}" "$sum" "$verb" "$rv" || exit 3
+    exit 4
+  fi
+fi
+
+if [ -n "$ref" ]; then
+  mkdir -p "$STATE" && chmod 700 "$STATE" || die "cannot write $STATE"
+  python3 -I -c 'import json, sys; print(json.dumps({"ts": sys.argv[1], "ref": sys.argv[2], "request": sys.argv[3], "owner_ok": sys.argv[4]}, ensure_ascii=False))' \
+    "$ts" "$ref" "${req[*]}" "$words" >> "$STATE/owner-ok.jsonl" || die "cannot log the owner's OK; nothing sent"
+  chmod 600 "$STATE/owner-ok.jsonl"
+fi
+exec "$SSH_CLIENT_BIN" run "${send[@]}"   # appdata-put: stdin is the new content (--file is already on it)

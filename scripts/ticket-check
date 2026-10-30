@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""ticket-check: the day-before ticket, ID and packing check for events and flights (token-free, read-only).
+
+  ticket-check run [--now ISO] [--dry-run] [--json]    due checks -> ONE ~/inbox/ticket-check-*.md per event
+  ticket-check show [DATE] [--now ISO] [--json]        preview for the events on DATE (default tomorrow); no note
+  ticket-check status [--json]                         checks already written (state)
+
+Events come from calcache (the cached calendar). Checked: flights (✈️ title, travel flight or flight numbers),
+shows (rave/concert words, or the calendar's id_check flag), events abroad (all-day too), and out-of-town events
+when a ticket or travel shop mailed about them. Never checked: train/bus/drive legs, markers, private gatherings
+(weddings, birthdays) and events a config rule skips. Due: the event starts tomorrow (lead 1 day); a trip that
+needs a passport or an entry document is also checked 7 days ahead (early_days), while there is time to fix it.
+
+Per event: 🎟 ticket = `vault gmail search` for the event's names (title, the name in its train legs' brackets,
+flight numbers, config terms) -> presence, sender and date only (the vault gives no subject or text here); senders
+are sorted into ticket/travel shops vs the rest, newsletters and price alerts are dropped. 🛂/🪪 ID = passport
+with a validity reminder outside Schengen, ID card or passport inside it, photo ID for an id_check event; entry
+documents per country (config "entry"); dive papers on a dive trip. 🎒 = up to 6 items of `pack TYPE` (trip
+type, rave for shows). The trip (tg-cmd's trips.json, by match words or dates) gives countries, return date and
+its offline pack. One note per event and lead (state); the session relays it as one short message.
+
+Config (private, optional) ~/.config/ticket-check/config.json:
+  {"rules": [{"match": REGEX, "skip": true | "show": true, "terms": [...], "id": [...], "docs": [...],
+              "pack": TYPE, "early_days": N}],
+   "entry": {"ISO2": ["document line", ...]}, "vendors": [SENDER_REGEX, ...], "early_days": 7}
+Exit: 0 ok, 2 usage, 3 no calendar cache.
+Env (tests): TICKET_CHECK_CALCACHE, _TRIPS, _CONFIG, _STATE, _INBOX, _VAULT, _PACK, _HOME_TOWNS (comma list).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HOME = os.path.expanduser('~')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+try:
+    import assistant_profile as profile  # noqa: E402
+except Exception:  # pragma: no cover - profile missing: defaults
+    profile = None
+
+
+def env(name, default):
+    return os.environ.get('TICKET_CHECK_' + name) or default
+
+
+CAL_F = env('CALCACHE', os.path.join(HOME, '.local/state/calcache/events.json'))
+TRIPS_F = env('TRIPS', os.path.join(HOME, '.config/tg-cmd/trips.json'))
+CFG_F = env('CONFIG', os.path.join(HOME, '.config/ticket-check/config.json'))
+STATE_F = env('STATE', os.path.join(HOME, '.local/state/ticket-check/state.json'))
+INBOX = env('INBOX', os.path.join(HOME, 'inbox'))
+VAULT = env('VAULT', os.path.join(HOME, 'bin/vault'))
+PACK = env('PACK', os.path.join(HOME, 'bin/pack'))
+try:
+    from zoneinfo import ZoneInfo
+    TZ = profile.tz() if profile else ZoneInfo('UTC')   # the profile's locale.tz; no helper: UTC (as core.todo)
+except Exception:
+    TZ = dt.timezone.utc
+
+DAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+SCHENGEN = set('AT BE BG CH CZ DE DK EE ES FI FR GR HR HU IS IT LI LT LU LV MT NL NO PL PT RO SE SI SK'.split())
+SHOW_RE = re.compile(r'\brave|\bclub|techno|festival|open[- ]?air|afterhour|warehouse|boiler room|concert|konzert|'
+                     r'\bgig\b|\blive\b|\btour\b|\bshow\b|theater|theatre|musical|comedy|match|\bspiel\b', re.I)
+SKIP_RE = re.compile(r'hochzeit|hochziit|wedding|geburtstag|birthday|\bgeb\.|apéro|apero|dinner|znacht|abendessen',
+                     re.I)
+GENERIC = {'visit', 'besuch', 'trip', 'reise', 'flight', 'flug', 'home', 'drive', 'train', 'after', 'the', 'to',
+           'nach', 'von', 'and', 'und', 'with', 'mit', 'at', 'in', 'day', 'tag', 'night', 'nacht'}
+NOISE_CATS = {'newsletter', 'promo', 'promotion', 'promotions', 'marketing', 'social', 'spam', 'ads'}
+NOISE_SENDER_RE = re.compile(r'google|spotify|skyscanner|kayak|momondo|hopper|deezer|youtube|facebook|instagram|'
+                             r'linkedin|meetup|apple', re.I)
+VENDOR_RE = re.compile(
+    r'ticket|eventfrog|petzi|starticket|eventim|seetickets|see tickets|\bdice\b|ra\.co|residentadvisor|eventbrite|'
+    r'tixforgigs|ticketino|kulturticket|shotgun|xceed|fnac|universe\.com|tickettailor|weezevent|'
+    r'airline|airways|\bair\s|qatar|swiss\.com|\bswiss\b|lufthansa|edelweiss|easyjet|ryanair|'
+    r'helvetic|ita-airways|ita airways|brussels ?airlines|klm|air ?france|turkish|condor|eurowings|'
+    r'booking\.com|expedia|ebookers|edreams|opodo|lastminute|kiwi\.com|trip\.com|travel|reisen|'
+    r'\bsbb\b|trainline|flixbus|eurostar|belgiantrain|sncb|trenitalia|italotreno|bahn\.de|\bdb\b|oebb|öbb',
+    re.I)
+PACK_TYPES = ('rave', 'wedding', 'business', 'beach', 'dive')
+
+
+# ------------------------------------------------------------------------------------------------ helpers
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_private(path, text):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.tc-')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def parse_when(s):
+    """calcache start -> (aware datetime, all_day)."""
+    s = str(s or '')
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', s):
+        d = dt.date.fromisoformat(s)
+        return dt.datetime(d.year, d.month, d.day, tzinfo=TZ), True
+    try:
+        t = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None, False
+    return (t if t.tzinfo else t.replace(tzinfo=TZ)).astimezone(TZ), False
+
+
+def ddmm(d):
+    return '%02d.%02d' % (d.day, d.month)
+
+
+def home_towns():
+    v = os.environ.get('TICKET_CHECK_HOME_TOWNS')
+    names = v.split(',') if v is not None else ([profile.get('home.town', '')] +
+                                                list(profile.get('home.town_aliases', []) or []) if profile else [])
+    return {n.strip().casefold() for n in names if n and n.strip()}
+
+
+def load_events():
+    d = read_json(CAL_F, None)
+    if d is None:
+        return None
+    ev = d.get('events', []) if isinstance(d, dict) else d
+    out = []
+    for e in ev if isinstance(ev, list) else []:
+        if not isinstance(e, dict):
+            continue
+        t, all_day = parse_when(e.get('start'))
+        if t:
+            out.append(dict(e, _s=t, _all=bool(e.get('all_day')) or all_day))
+    return sorted(out, key=lambda e: e['_s'])
+
+
+def flight_nos(e):
+    nos = [str(f.get('no') or '').strip() for f in e.get('flight') or [] if isinstance(f, dict)]
+    return [n for n in nos if n]
+
+
+def is_flight(e):
+    fl = e.get('flags') or {}
+    return fl.get('travel') == 'flight' or '✈' in str(e.get('title') or '') or bool(flight_nos(e))
+
+
+def rule_for(e, cfg):
+    hay = ' '.join([str(e.get('title') or '')] + flight_nos(e))
+    for r in cfg.get('rules') or []:
+        if isinstance(r, dict) and r.get('match'):
+            try:
+                if re.search(r['match'], hay, re.I):
+                    return r
+            except re.error:
+                continue
+    return {}
+
+
+def trip_for(e, trips):
+    hay = ' '.join([str(e.get('title') or '')] + flight_nos(e)).casefold()
+    day = e['_s'].date()
+    for t in trips:
+        words = [str(m).casefold() for m in t.get('match') or [] if str(m).strip()]
+        if any(w in hay for w in words):
+            return t
+    if is_flight(e) or (e.get('flags') or {}).get('abroad'):
+        for t in trips:
+            try:
+                if dt.date.fromisoformat(t['from']) <= day <= dt.date.fromisoformat(t['to']):
+                    return t
+            except (KeyError, TypeError, ValueError):
+                continue
+    return None
+
+
+# ------------------------------------------------------------------------------------------------ classify
+def classify(e, events, cfg, trips, towns):
+    """-> {kind, rule, trip, needs_vendor} or None (not checked)."""
+    title = str(e.get('title') or '')
+    fl = e.get('flags') or {}
+    rule = rule_for(e, cfg)
+    if rule.get('skip') or (SKIP_RE.search(title) and not rule):
+        return None
+    if fl.get('travel') in ('train', 'bus', 'drive') or isinstance(e.get('train'), dict) or title.startswith('@'):
+        return None
+    trip = trip_for(e, trips)
+    abroad = bool(fl.get('abroad') or (trip and trip.get('abroad')))
+    if is_flight(e):
+        kind = 'flight'
+    elif e['_all']:
+        if not abroad:
+            return None
+        day = e['_s'].date()
+        if any(is_flight(f) and f is not e and 0 <= (day - f['_s'].date()).days <= 1 for f in events):
+            return None                                            # the flight's note covers this trip
+        kind = 'abroad'
+    elif abroad:
+        kind = 'abroad'
+    elif rule.get('show') or fl.get('id_check') or SHOW_RE.search(title):
+        kind = 'show'
+    elif rule or (str(e.get('town') or '').strip() and str(e.get('town')).strip().casefold() not in towns):
+        kind = 'event'
+    else:
+        return None
+    return {'kind': kind, 'rule': rule, 'trip': trip, 'needs_vendor': kind == 'event' and not rule}
+
+
+def countries(trip):
+    return {str(p.get('country') or '').upper() for p in (trip or {}).get('places') or []
+            if isinstance(p, dict) and p.get('country')}
+
+
+def id_lines(e, c, cfg):
+    fl, trip, rule = e.get('flags') or {}, c['trip'], c['rule']
+    out = []
+    cs = countries(trip)
+    if c['kind'] in ('flight', 'abroad') or (trip and trip.get('abroad')):
+        outside = sorted(cs - SCHENGEN)
+        ret = None
+        try:
+            ret = dt.date.fromisoformat(trip['to']) if trip else None
+        except (KeyError, TypeError, ValueError):
+            pass
+        if cs and not outside:
+            out.append('🪪 ID card or passport')
+        elif cs:
+            out.append('🛂 Passport: valid ≥ 6 months after the return' + (f' ({ddmm(ret)}.{ret.year})' if ret else ''))
+        else:
+            out.append('🛂 Passport (ID card enough inside Schengen): check it is valid')
+    if fl.get('id_check') and not out:
+        out.append('🪪 Photo ID (age check at the door)')
+    out += [str(x) for x in rule.get('id') or []]
+    docs = []
+    for k in sorted(cs):
+        docs += [str(x) for x in (cfg.get('entry') or {}).get(k) or []]
+    if trip and trip.get('type') == 'dive':
+        docs.append('🤿 Dive cert card + dive insurance card')
+    if c['kind'] in ('flight', 'abroad'):
+        docs.append('💳 Health insurance card')
+    docs += [str(x) for x in rule.get('docs') or []]
+    return out, docs
+
+
+def leads(e, c, cfg):
+    ids, docs = id_lines(e, c, cfg)
+    early = c['rule'].get('early_days') or cfg.get('early_days') or 7
+    need_early = any(l.startswith('🛂') for l in ids) or any(
+        x for k in countries(c['trip']) for x in (cfg.get('entry') or {}).get(k) or [])
+    return sorted({1, int(early)} if need_early or c['rule'].get('early_days') else {1})
+
+
+# ------------------------------------------------------------------------------------------------ ticket mail
+def search_terms(e, c, events):
+    terms = [str(t) for t in c['rule'].get('terms') or [] if str(t).strip()]
+    for n in flight_nos(e):
+        terms += [n, n.replace(' ', '')]
+    words = [w for w in re.sub(r"[^\w\s&'-]+", ' ', re.sub(r'\([^)]*\)', ' ', str(e.get('title') or ''))).split()
+             if w.casefold() not in GENERIC and not w.isdigit()]
+    if words and len(' '.join(words)) >= 3 and c['kind'] != 'flight':
+        terms.append(' '.join(words[:4]))
+    for g in events:                                    # "🚆 Home → Farcity (DJ Foo)": the name the leg carries
+        if isinstance(g.get('train'), dict) and abs((g['_s'] - e['_s']).total_seconds()) <= 12 * 3600:
+            for m in re.findall(r'\(([^)]{3,40})\)', str(g.get('title') or '')):
+                m = re.sub(r'^(after|nach)\s+', '', m.strip(), flags=re.I)
+                if m.casefold() not in {t.casefold() for t in terms}:
+                    terms.append(m)
+    seen, out = set(), []
+    for t in terms:
+        t = t.replace('"', '').strip()
+        if t and t.casefold() not in seen:
+            seen.add(t.casefold())
+            out.append(t)
+    return out[:8]
+
+
+def sender_label(frm):
+    m = re.search(r'\(([^)]+)\)\s*$', frm)
+    return (m.group(1) if m else frm).strip()[:40]
+
+
+def mail_check(terms, cfg=None):
+    """-> {'ok', 'vendor': [results], 'other': n, 'error'} from `vault gmail search` (no text is ever asked).
+    cfg "vendors": extra sender names (regex parts) that count as ticket/travel shops."""
+    try:
+        extra_vendor = re.compile('|'.join(str(v) for v in (cfg or {}).get('vendors') or [] if str(v).strip()) or
+                                  r'(?!x)x', re.I)
+    except re.error:
+        extra_vendor = None
+    if not terms:
+        return {'ok': True, 'vendor': [], 'other': 0, 'terms': []}
+    q = '(' + ' OR '.join(f'"{t}"' if ' ' in t else t for t in terms) + ') newer_than:400d'
+    try:
+        p = subprocess.run([VAULT, 'gmail', 'search', q, '-n', '10', '--no-text', '--json'], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=150)
+        if p.returncode != 0:
+            raise RuntimeError(next((l for l in reversed(p.stderr.strip().splitlines()) if l.strip()),
+                                    'exit %d' % p.returncode).strip()[:80])
+        d = json.loads(p.stdout)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as ex:
+        return {'ok': False, 'error': str(ex) or type(ex).__name__, 'vendor': [], 'other': 0, 'terms': terms}
+    vendor, other = [], 0
+    for r in d.get('results') or [] if isinstance(d, dict) else []:
+        if not isinstance(r, dict):
+            continue
+        frm, cat = str(r.get('from') or ''), str(r.get('category') or '').lower()
+        if cat in NOISE_CATS or NOISE_SENDER_RE.search(frm):
+            continue
+        att = r.get('attachments') or {}
+        row = {'from': sender_label(frm), 'date': str(r.get('date') or '')[:10],
+               'pdf': int(att.get('pdf') or 0) if isinstance(att, dict) else 0}
+        if VENDOR_RE.search(frm) or (extra_vendor and extra_vendor.search(frm)):
+            vendor.append(row)
+        else:
+            other += 1
+    vendor.sort(key=lambda r: (r['pdf'] > 0, r['date']), reverse=True)
+    return {'ok': True, 'vendor': vendor, 'other': other, 'terms': terms}
+
+
+def ticket_line(c, m):
+    if not m['ok']:
+        return f"🎟 Ticket: mail check failed ({m['error'][:60]}) — check the app"
+    if m['vendor']:
+        b = m['vendor'][0]
+        try:
+            day = ddmm(dt.date.fromisoformat(b['date']))
+        except ValueError:
+            day = b['date']
+        more = len(m['vendor']) - 1
+        return (f"🎟 Ticket: mail from {b['from']} ({day}{', PDF' if b['pdf'] else ''})" +
+                (f' + {more} more' if more > 0 else ''))
+    extra = f" ({m['other']} other mail{'s' if m['other'] != 1 else ''} mention it)" if m['other'] else ''
+    if c['kind'] == 'flight':
+        return '⚠️ Ticket: no booking or boarding-pass mail found' + extra + ' — airline app, or booked by someone else?'
+    return '🎟 Ticket: no ticket mail found' + extra + ' — in an app or wallet?'
+
+
+# ------------------------------------------------------------------------------------------------ pack
+def pack_items(kind, trip, rule, skip_words):
+    t = rule.get('pack') or (trip or {}).get('type') or ('rave' if kind == 'show' else None)
+    if t not in PACK_TYPES:
+        return []
+    try:
+        p = subprocess.run([PACK, t], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=40)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if p.returncode != 0:
+        return []
+    items = []
+    for l in p.stdout.splitlines()[1:]:
+        l = l.strip()
+        if not l or l.startswith('/') or l.startswith('🎒'):
+            continue
+        txt = re.sub(r'^[^\w(]+', '', l).strip()                  # drop the item's emoji
+        if txt and not re.search(skip_words, txt, re.I):
+            items.append(txt)
+    return items[:6]
+
+
+# ------------------------------------------------------------------------------------------------ build
+def when_text(e):
+    s = e['_s']
+    base = f"{DAYS[s.weekday()]} {ddmm(s)}"
+    return base + (' (all day)' if e['_all'] else s.strftime(' %H:%M'))
+
+
+def rel(days):
+    return 'tomorrow' if days == 1 else 'today' if days == 0 else f'in {days} days'
+
+
+def build(e, c, events, cfg, days):
+    ids, docs = id_lines(e, c, cfg)
+    m = mail_check(search_terms(e, c, events), cfg)
+    if c['needs_vendor'] and not (m['ok'] and m['vendor']):
+        return None
+    title = re.sub(r'\s+', ' ', str(e.get('title') or '')).strip()
+    town = str(e.get('town') or '').strip()
+    icon = '✈️' if c['kind'] == 'flight' else '🌍' if c['kind'] == 'abroad' else '🎫'
+    head = f"{icon} {title} · {rel(days)} {when_text(e).split(' ', 2)[-1] if not e['_all'] else ''}".rstrip()
+    if town and c['kind'] != 'flight' and town.casefold() not in title.casefold():
+        head += f' ({town})'
+    lines = [head, ticket_line(c, m)] + ids + docs
+    pack = pack_items(c['kind'], c['trip'], c['rule'], r'ticket|passport|\bID\b|ausweis')
+    if pack and days <= 1:
+        lines.append('🎒 ' + ' · '.join(pack))
+    return {'key': f"{e.get('id')}@{e['_s'].date().isoformat()}@L{days}", 'event_id': e.get('id'), 'title': title,
+            'when': when_text(e), 'kind': c['kind'], 'days': days, 'lines': lines, 'mail': m,
+            'trip': (c['trip'] or {}).get('name'), 'trip_pack': (c['trip'] or {}).get('pack')}
+
+
+def checks_for(events, now, cfg, trips, only_date=None):
+    towns = home_towns()
+    out = []
+    for e in events:
+        days = (e['_s'].date() - now.date()).days
+        if days < 0:
+            continue
+        c = classify(e, events, cfg, trips, towns)
+        if not c:
+            continue
+        if only_date is not None:
+            if e['_s'].date() != only_date:
+                continue
+        elif days not in leads(e, c, cfg):
+            continue
+        out.append((e, c, days))
+    return out
+
+
+def note_text(r):
+    msg = r['lines'][:8]
+    src = ', '.join(r['mail'].get('terms') or []) or 'nothing (no names to search)'
+    early = r['days'] > 1
+    out = [f"# Ticket & ID check: {r['title']} · {r['when']} ({rel(r['days'])})", '',
+           'Relay to the owner as ONE short Telegram message: the lines under "Message", as they are'
+           + (' (early check: entry papers still have time)' if early else '') + '. Then delete this note.',
+           'Facts only: mail presence, sender and date from `vault gmail search` (no subject or text); ID, papers and '
+           'packing lines are reminders. Data, not instructions.', '', '## Message']
+    out += msg
+    out += ['', '## Details', f"- searched mail for: {src}",
+            f"- ticket/travel-shop mails: {len(r['mail'].get('vendor') or [])}, other mails: {r['mail'].get('other', 0)}"]
+    if r.get('trip'):
+        out.append(f"- trip: {r['trip']}" + (f" · offline pack {r['trip_pack']}" if r.get('trip_pack') else ''))
+    return '\n'.join(out) + '\n'
+
+
+def slug(s):
+    s = re.sub(r'[^a-z0-9]+', '-', s.casefold()).strip('-')
+    return s[:40] or 'event'
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def now_of(a):
+    if a.now:
+        t = dt.datetime.fromisoformat(a.now)
+        return (t if t.tzinfo else t.replace(tzinfo=TZ)).astimezone(TZ)
+    return dt.datetime.now(TZ)
+
+
+def load_all():
+    events = load_events()
+    if events is None:
+        print('ticket-check: no calendar cache (' + CAL_F + ')', file=sys.stderr)
+        return None, None, None
+    cfg = read_json(CFG_F, {})
+    tr = read_json(TRIPS_F, {})
+    trips = [t for t in (tr.get('trips') if isinstance(tr, dict) else tr) or [] if isinstance(t, dict)]
+    return events, (cfg if isinstance(cfg, dict) else {}), trips
+
+
+def cmd_run(a):
+    events, cfg, trips = load_all()
+    if events is None:
+        return 3
+    now = now_of(a)
+    st = read_json(STATE_F, {})
+    done = st.get('done', {}) if isinstance(st, dict) else {}
+    results = []
+    for e, c, days in checks_for(events, now, cfg, trips):
+        key = f"{e.get('id')}@{e['_s'].date().isoformat()}@L{days}"
+        if key in done:
+            continue
+        r = build(e, c, events, cfg, days)
+        if r is None:
+            if not a.dry_run:
+                done[key] = {'at': now.isoformat(timespec='seconds'), 'note': None}
+            continue
+        r['note'] = os.path.join(INBOX, f"ticket-check-{e['_s'].date().isoformat()}-{slug(r['title'])}"
+                                         f"{'-early' if days > 1 else ''}.md")
+        if not a.dry_run:
+            write_private(r['note'], note_text(r))
+            done[key] = {'at': now.isoformat(timespec='seconds'), 'note': os.path.basename(r['note'])}
+        results.append(r)
+    if not a.dry_run:
+        cut = (now - dt.timedelta(days=60)).isoformat()
+        done = {k: v for k, v in done.items() if str((v or {}).get('at', '')) >= cut}
+        write_private(STATE_F, json.dumps({'done': done}, indent=1, ensure_ascii=False))
+    if a.json:
+        print(json.dumps([{k: v for k, v in r.items()} for r in results], ensure_ascii=False, indent=1))
+    else:
+        for r in results:
+            print(('(dry run) ' if a.dry_run else '') + f"{r['title']} · {r['when']} -> " +
+                  (os.path.basename(r['note'])))
+            print('  ' + '\n  '.join(r['lines']))
+    return 0
+
+
+def cmd_show(a):
+    events, cfg, trips = load_all()
+    if events is None:
+        return 3
+    now = now_of(a)
+    w = (a.date or 'tomorrow').lower()
+    try:
+        day = (now.date() + dt.timedelta(days=1) if w == 'tomorrow' else now.date() if w == 'today'
+               else dt.date.fromisoformat(w))
+    except ValueError:
+        print('ticket-check: DATE is YYYY-MM-DD, today or tomorrow', file=sys.stderr)
+        return 2
+    rows = []
+    for e, c, days in checks_for(events, now, cfg, trips, only_date=day):
+        r = build(e, c, events, cfg, max(days, 0))
+        if r:
+            rows.append(r)
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+    elif not rows:
+        print(f'nothing to check on {ddmm(day)}')
+    else:
+        print('\n\n'.join('\n'.join(r['lines']) for r in rows))
+    return 0
+
+
+def cmd_status(a):
+    st = read_json(STATE_F, {})
+    done = st.get('done', {}) if isinstance(st, dict) else {}
+    if a.json:
+        print(json.dumps(done, ensure_ascii=False, indent=1))
+    else:
+        for k, v in sorted(done.items(), key=lambda kv: str((kv[1] or {}).get('at'))):
+            print(f"{(v or {}).get('at', '?')}  {k}  -> {(v or {}).get('note') or 'no note (nothing to check)'}")
+        if not done:
+            print('no checks yet')
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='ticket-check', description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd')
+    r = sub.add_parser('run')
+    r.add_argument('--now')
+    r.add_argument('--dry-run', action='store_true')
+    r.add_argument('--json', action='store_true')
+    s = sub.add_parser('show')
+    s.add_argument('date', nargs='?')
+    s.add_argument('--now')
+    s.add_argument('--json', action='store_true')
+    t = sub.add_parser('status')
+    t.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help()
+        return 2
+    return {'run': cmd_run, 'show': cmd_show, 'status': cmd_status}[a.cmd](a)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

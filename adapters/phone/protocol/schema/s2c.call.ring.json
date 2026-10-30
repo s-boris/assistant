@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.call.ring.json",
+  "title": "ring him in the app (M3): CallStyle full-screen incoming call; reason is lock-screen linted (absent = generic)",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "type": "string",
+      "pattern": "^k_[A-Za-z0-9]{8,32}$"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 80
+    },
+    "timeout_s": {
+      "type": "integer",
+      "minimum": 3,
+      "maximum": 120
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "call_id",
+    "timeout_s"
+  ]
+}

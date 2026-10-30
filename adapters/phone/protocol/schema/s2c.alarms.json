@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.alarms.json",
+  "title": "local reminder alarms for the next 48 h (replaces the previous set; an empty set clears them). Titles pass the lock-screen lint or are private; a private item may carry the clipped real `text`, shown only when unlocked. exact: alarm_clock only for wake/departure (remind --call) items. backup=true: fire only if no push for that reminder arrived by due + 2 min (apps that sent cap alarm_backup). push_id + nonce: offline Snooze/Done taps sync back as `action` (arg r:<rid>)",
+  "type": "object",
+  "properties": {
+    "rev": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "items": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "properties": {
+          "rid": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}$"
+          },
+          "at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4102444800
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "exact": {
+            "enum": [
+              "alarm_clock",
+              "exact",
+              "inexact"
+            ]
+          },
+          "snooze": {
+            "type": "boolean"
+          },
+          "backup": {
+            "type": "boolean"
+          },
+          "push_id": {
+            "type": "string",
+            "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "nonce": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}$"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "rid",
+          "at",
+          "title"
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "rev",
+    "items"
+  ]
+}

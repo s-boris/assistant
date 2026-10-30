@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""unifi-health: read-only health check of the UniFi OS Server VM (cron, every 15 min). Silent when fine.
+
+Checks (values from ~/.config/unifi-health/config.json)
+  vm       the VM runs on Unraid (`unraid-do vm-list`; Unraid not answering = a gap, not a failure)
+  ssh      the VM answers `ssh SSH_HOST` (key auth, BatchMode) with one read-only command batch:
+  service    the systemd unit (`service`) is active
+  disk       root filesystem use below disk_warn % (default 85; crit at disk_crit, default 95)
+  memory     MemAvailable at least mem_warn % of RAM (default 10; crit below mem_crit, default 5)
+  web      the UniFi OS web UI (web_url) answers 200 or 30x
+  api      UniFi OS answers ping_url (/api/ping, 204) with 2xx
+  inform   the device inform port (inform_port, 8080) accepts TCP connections
+  network  the Network app answers network_status_url (http://HOST:8080/status, no login needed) with
+           200 and meta.rc "ok" (the /proxy/network/* API needs a login and is not used)
+Root causes fold the rest into one finding (key unifi:down): the VM is not running on Unraid, or nothing
+answers (ssh, web UI and inform port all fail).
+Debounce: a finding alerts only after it was present in 2 consecutive runs; it is not repeated while it
+stays (warn -> crit alerts again). Quiet hours 00:00-08:00 (owner time zone): texts wait for the first run
+after 08:00 and are dropped if the issue cleared by then. An alert texts the owner (`tg --soft`, short) and writes
+one ~/inbox note. When an alerted issue clears: one inbox note (no text; the assistant sends a short all-clear).
+Acks: the unraid-health ack file (~/.config/unraid-health/ack.json), forms key:GLOB (finding key, e.g.
+key:unifi:disk) and text:SUBSTR (title); add them with `unraid-health ack add ...`. Acked findings are listed
+in --report, never alerted; once the ack expires a still-present issue alerts.
+
+Usage: unifi-health [--report | --json] [--no-send] [--dry-run]
+  (no option)  check; print only new alerts. Exit 0 = nothing new, 1 = new alert(s), 2 = config error
+  --report     full status (Markdown)      --json   full result as JSON
+  --no-send    don't text and don't write inbox notes; print them (state is saved)
+  --dry-run    like --no-send and leave the state untouched
+Files: ~/.local/state/unifi-health/state.json, runs.log, cron.log
+Env (tests): UNIFI_HEALTH_CONFIG, UNIFI_HEALTH_STATE_DIR, UNIFI_HEALTH_INBOX_DIR, UNIFI_HEALTH_ACK_FILE,
+  UNIFI_HEALTH_TG (sender, default tg), UNIFI_HEALTH_SSH (ssh binary), UNIFI_HEALTH_UNRAID_DO,
+  UNIFI_HEALTH_QUIET ("0-8" default, "none" = no quiet hours), UNIFI_HEALTH_NO_SEND=1, UNIFI_HEALTH_TZ,
+  UNIFI_HEALTH_NOW (pins the clock: ISO 8601, no offset = owner time zone; quiet hours, ack expiry, state),
+  UNIFI_HEALTH_SSH_TIMEOUT (seconds, default 30; HTTP 10 s, TCP 5 s, vm-list 60 s).
+Tests: ~/opt/unifi-health-tests/run.sh
+"""
+
+import argparse
+import datetime as dt
+import fcntl
+import http.client
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import traceback
+import urllib.parse
+from fnmatch import fnmatchcase
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import botlib  # noqa: E402
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("UNIFI_HEALTH_CONFIG", HOME / ".config/unifi-health/config.json"))
+STATE_DIR = Path(os.environ.get("UNIFI_HEALTH_STATE_DIR", HOME / ".local/state/unifi-health"))
+INBOX_DIR = Path(os.environ.get("UNIFI_HEALTH_INBOX_DIR", HOME / "inbox"))
+ACK_FILE = Path(os.environ.get("UNIFI_HEALTH_ACK_FILE", HOME / ".config/unraid-health/ack.json"))
+TG_CMD = os.environ.get("UNIFI_HEALTH_TG", "tg")
+SSH_BIN = os.environ.get("UNIFI_HEALTH_SSH", "ssh")
+UNRAID_DO = os.environ.get("UNIFI_HEALTH_UNRAID_DO", str(HOME / "bin/unraid-do"))
+FAILS_BEFORE_ALERT = 2
+SSH_TIMEOUT = int(os.environ.get("UNIFI_HEALTH_SSH_TIMEOUT") or 30)   # whole ssh call; ConnectTimeout below
+HTTP_TIMEOUT = 10
+TCP_TIMEOUT = 5
+VM_LIST_TIMEOUT = 60
+TG_MAX = 600
+LEVELS = {"warn": 1, "crit": 2}
+TAG = {"warn": "WARN", "crit": "CRIT"}
+SERVICE_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+
+
+def _tz():
+    try:
+        return ZoneInfo(os.environ.get("UNIFI_HEALTH_TZ") or assistant_profile.tz_name())
+    except Exception:
+        return dt.timezone.utc
+
+
+TZ = _tz()
+
+
+def quiet_hours():
+    q = os.environ.get("UNIFI_HEALTH_QUIET", "0-8")
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", q)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def is_quiet(now):
+    q = quiet_hours()
+    return bool(q) and q[0] <= dt.datetime.fromtimestamp(now, TZ).hour < q[1]
+
+
+def now_ts():
+    """Epoch seconds now; UNIFI_HEALTH_NOW (ISO 8601, no offset = owner time zone) pins it for tests."""
+    pin = os.environ.get("UNIFI_HEALTH_NOW")
+    if not pin:
+        return time.time()
+    try:
+        t = dt.datetime.fromisoformat(pin)
+    except ValueError:
+        print(f"unifi-health: UNIFI_HEALTH_NOW is not ISO 8601: {pin!r}", file=sys.stderr)
+        sys.exit(2)
+    return (t if t.tzinfo else t.replace(tzinfo=TZ)).timestamp()
+
+
+def fmt_ts(ts):
+    return dt.datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def shorten(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# ----------------------------------------------------------------------------- config
+def load_config():
+    try:
+        c = json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        return None, f"no config at {CONFIG}"
+    except Exception as e:
+        return None, f"config {CONFIG} unreadable ({e.__class__.__name__}: {e})"
+    host = c.get("host")
+    if not host:
+        return None, f"config {CONFIG}: 'host' missing"
+    c.setdefault("name", c.get("vm_name") or host)
+    c.setdefault("ssh_host", host)
+    c.setdefault("service", "uosserver")
+    c.setdefault("web_url", f"https://{host}:11443/")
+    c.setdefault("ping_url", c["web_url"].rstrip("/") + "/api/ping")
+    c.setdefault("inform_port", 8080)
+    c.setdefault("network_status_url", f"http://{host}:{c['inform_port']}/status")
+    for k, v in (("disk_warn", 85), ("disk_crit", 95), ("mem_warn", 10), ("mem_crit", 5)):
+        c.setdefault(k, v)
+    if not SERVICE_RE.match(str(c["service"])):
+        return None, f"config {CONFIG}: bad service name"
+    return c, None
+
+
+# ----------------------------------------------------------------------------- probes (all read-only, all timed)
+def probe_vm(c):
+    """-> (state or None, error). state 'missing' = Unraid answered but has no VM of that name."""
+    name = c.get("vm_name")
+    if not name:
+        return None, "no vm_name configured"
+    try:
+        p = subprocess.run([UNRAID_DO, "vm-list"], capture_output=True, text=True, timeout=VM_LIST_TIMEOUT,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, f"unraid-do vm-list timed out after {VM_LIST_TIMEOUT}s"
+    except OSError as e:
+        return None, f"could not run unraid-do: {e}"
+    if p.returncode != 0:
+        return None, "unraid-do vm-list failed: " + shorten((p.stderr or p.stdout).strip() or f"exit {p.returncode}", 160)
+    for line in p.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].strip() == name:
+            return parts[1].strip(), None
+    if not p.stdout.strip():
+        return None, "unraid-do vm-list returned nothing"
+    return "missing", None
+
+
+def remote_script(service):
+    return (f"echo active=$(systemctl is-active {service} 2>/dev/null); "
+            "df -P / | awk 'NR==2{print \"root_pct=\"$5; print \"root_size_kb=\"$2; print \"root_avail_kb=\"$4}'; "
+            "awk '/^MemTotal:/{print \"mem_total_kb=\"$2} /^MemAvailable:/{print \"mem_avail_kb=\"$2}' /proc/meminfo; "
+            "echo end=1")
+
+
+def probe_ssh(c):
+    """-> (dict of key=value, error)."""
+    cmd = [SSH_BIN, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5",
+           "-o", "ServerAliveCountMax=2", c["ssh_host"], remote_script(c["service"])]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=SSH_TIMEOUT, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, f"ssh timed out after {SSH_TIMEOUT}s"
+    except OSError as e:
+        return None, f"could not run ssh: {e}"
+    kv = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+    if p.returncode == 255 or kv.get("end") != "1":
+        last = ((p.stderr or "").strip().splitlines() or [f"exit {p.returncode}, no output"])[-1]
+        return None, shorten(last, 160)
+    return kv, None
+
+
+def http_get(url):
+    """-> (status or None, body (first 4 KB) or error text). Self-signed certs are accepted; redirects not followed."""
+    u = urllib.parse.urlsplit(url)
+    try:
+        if u.scheme == "https":
+            conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=HTTP_TIMEOUT,
+                                               context=ssl._create_unverified_context())
+        else:
+            conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=HTTP_TIMEOUT)
+        try:
+            conn.request("GET", (u.path or "/") + (f"?{u.query}" if u.query else ""),
+                         headers={"User-Agent": "unifi-health", "Accept": "*/*"})
+            r = conn.getresponse()
+            return r.status, r.read(4096).decode("utf-8", "replace")
+        finally:
+            conn.close()
+    except Exception as e:
+        return None, shorten(f"{e.__class__.__name__}: {e}", 120)
+
+
+def tcp_open(host, port):
+    try:
+        socket.create_connection((host, int(port)), timeout=TCP_TIMEOUT).close()
+        return True, ""
+    except Exception as e:
+        return False, shorten(f"{e.__class__.__name__}: {e}", 120)
+
+
+# ----------------------------------------------------------------------------- judging
+def evaluate(c):
+    """Run every probe -> (findings, metrics, gaps). A finding: key, level, title."""
+    m, gaps, raw = {}, [], {}
+    name = c["name"]
+    vm, vm_err = probe_vm(c)
+    m["vm"] = vm
+    if vm_err:
+        gaps.append(f"VM state unknown: {vm_err}")
+    kv, ssh_err = probe_ssh(c)
+    m["ssh"] = "ok" if kv else ssh_err
+    st, body = http_get(c["web_url"])
+    m["web"] = st if st else body
+    web_ok = st is not None and (200 <= st < 400)
+    st2, body2 = http_get(c["ping_url"])
+    m["api"] = st2 if st2 else body2
+    inf_ok, inf_err = tcp_open(c["host"], c["inform_port"])
+    m["inform"] = "open" if inf_ok else inf_err
+    st3, body3 = http_get(c["network_status_url"])
+    rc = None
+    if st3 == 200:
+        try:
+            rc = json.loads(body3).get("meta", {}).get("rc")
+        except Exception:
+            rc = "unparsable"
+    m["network"] = (f"{st3} rc={rc}" if st3 else body3)
+
+    if vm not in (None, "running"):
+        what = "is not defined on Unraid" if vm == "missing" else f"is {vm} on Unraid"
+        return [{"key": "unifi:down", "level": "crit", "title": f"UniFi VM {name} {what}"}], m, gaps
+    if not kv and not web_ok and not inf_ok:
+        why = ("Unraid says it is running" if vm == "running" else "VM state unknown")
+        return [{"key": "unifi:down", "level": "crit",
+                 "title": f"UniFi VM {name} is unreachable: no SSH, web UI or inform port ({why}; ssh: {ssh_err})"}], m, gaps
+
+    f = []
+    if kv:
+        act = kv.get("active", "")
+        m["service"] = act
+        if act != "active":
+            f.append({"key": "unifi:service", "level": "crit",
+                      "title": f"{name}: service {c['service']} is {act or 'unknown'} (not active)"})
+        pct = kv.get("root_pct", "").rstrip("%")
+        if pct.isdigit():
+            pct = int(pct)
+            m["disk_pct"] = pct
+            m["disk_free_gb"] = round(int(kv.get("root_avail_kb", "0") or 0) / 1048576, 1)
+            if pct >= c["disk_warn"]:
+                f.append({"key": "unifi:disk", "level": "crit" if pct >= c["disk_crit"] else "warn",
+                          "title": f"{name}: root disk {pct}% full ({m['disk_free_gb']} GB free)"})
+        else:
+            gaps.append("root disk usage not readable")
+        try:
+            tot, av = int(kv["mem_total_kb"]), int(kv["mem_avail_kb"])
+            mp = 100.0 * av / tot
+            m["mem_avail_mb"], m["mem_avail_pct"] = av // 1024, round(mp, 1)
+            if mp < c["mem_warn"]:
+                f.append({"key": "unifi:memory", "level": "crit" if mp < c["mem_crit"] else "warn",
+                          "title": f"{name}: memory low, {av // 1024} MB available ({mp:.0f}% of {tot // 1024} MB)"})
+        except (KeyError, ValueError, ZeroDivisionError):
+            gaps.append("memory figures not readable")
+    else:
+        f.append({"key": "unifi:ssh", "level": "warn", "title": f"{name}: SSH not answering ({ssh_err})"})
+        gaps.append("service, disk and memory not checked (no SSH)")
+    if not web_ok:
+        f.append({"key": "unifi:web", "level": "warn",
+                  "title": f"{name}: web UI not answering ({st if st else body}) at {c['web_url']}"})
+    if st2 is None or not (200 <= st2 < 300):
+        f.append({"key": "unifi:api", "level": "warn", "title": f"{name}: UniFi OS /api/ping gives {st2 or body2}"})
+    if not inf_ok:
+        f.append({"key": "unifi:inform", "level": "crit",
+                  "title": f"{name}: inform port {c['inform_port']} closed ({inf_err}): devices can't report in"})
+    if not (st3 == 200 and rc == "ok"):
+        what = f"HTTP {st3}" + (f", rc={rc}" if rc else "") if st3 else body3
+        f.append({"key": "unifi:network", "level": "crit", "title": f"{name}: Network app not answering ({what})"})
+    return f, m, gaps
+
+
+# ----------------------------------------------------------------------------- acks (same file and forms as unraid-health)
+def load_acks():
+    if not ACK_FILE.exists():
+        return [], None
+    try:
+        acks = json.loads(ACK_FILE.read_text()).get("acks", [])
+        if not isinstance(acks, list):
+            raise ValueError("'acks' is not a list")
+    except Exception as e:
+        return [], f"ack file {ACK_FILE} unreadable ({e.__class__.__name__}); no acks applied"
+    return [a for a in acks if isinstance(a, dict) and a.get("match") and a.get("expires")], None
+
+
+def ack_for(acks, f, today):
+    for a in acks:
+        exp = str(a.get("expires"))
+        if not (exp == "never" or exp > today):
+            continue
+        if LEVELS[f["level"]] > LEVELS.get(a.get("max_level", "warn"), 1):
+            continue
+        kind, _, val = str(a["match"]).partition(":")
+        if val and (kind == "key" and fnmatchcase(f["key"], val) or kind == "text" and val.lower() in f["title"].lower()):
+            return a
+    return None
+
+
+# ----------------------------------------------------------------------------- run
+def judge(findings, prev, now, acks):
+    """Debounce + ack + diff against the previous state -> (new_state_parts, alerts, ongoing, acked, resolved)."""
+    today = dt.datetime.fromtimestamp(now, TZ).date().isoformat()
+    pfails, palerted = prev.get("fails", {}), prev.get("alerted", {})
+    fails, alerted, alerts, ongoing, acked = {}, {}, [], [], []
+    for f in findings:
+        k = f["key"]
+        fails[k] = pfails.get(k, 0) + 1
+        f["count"] = fails[k]
+        a = ack_for(acks, f, today)
+        if a:
+            acked.append(dict(f, ack=a))
+            continue
+        pa = palerted.get(k)
+        if pa and LEVELS[f["level"]] <= LEVELS.get(pa.get("level"), 1):
+            alerted[k] = pa
+            ongoing.append(f)
+        elif fails[k] >= FAILS_BEFORE_ALERT:
+            alerted[k] = {"level": f["level"], "title": f["title"], "since": (pa or {}).get("since", now),
+                          "sent": False}
+            if pa:                                   # escalated (warn -> crit): texted again
+                f["title"] += " (now critical)"
+            alerts.append(f)
+        else:
+            ongoing.append(dict(f, pending=True))
+    resolved = [dict(v, key=k) for k, v in palerted.items() if k not in fails]
+    # an issue that is acked now is neither resolved nor kept as alerted
+    return {"fails": fails, "alerted": alerted}, alerts, ongoing, acked, resolved
+
+
+def tg_text(name, items):
+    crit = any(a["level"] == "crit" for a in items)
+    lines = [f"{'🔴' if crit else '🟠'} UniFi VM {name}: {len(items)} problem{'s' if len(items) != 1 else ''}"]
+    for a in items:
+        b = "• " + shorten(a["title"], 150)
+        if len("\n".join(lines + [b])) > TG_MAX - 20:
+            lines.append("…and more")
+            break
+        lines.append(b)
+    return "\n".join(lines)
+
+
+def render_report(r):
+    L = [f"# UniFi VM health: {r['name']}", "", f"{fmt_ts(r['now'])}"]
+    for title, key in (("New alerts", "alerts"), ("Ongoing", "ongoing"), ("Acknowledged (not alerted)", "acked"),
+                       ("Resolved since last run", "resolved")):
+        items = r[key]
+        if not items and key in ("acked", "resolved"):
+            continue
+        L += ["", f"## {title}"]
+        for a in items:
+            extra = " (1st failure, alerts if it persists)" if a.get("pending") else ""
+            if key == "acked":
+                extra = f" (ack {a['ack'].get('id', '?')} until {a['ack']['expires']}: {a['ack'].get('reason', '')})"
+            L.append(f"- **{TAG.get(a.get('level'), 'INFO')}** {a['title']}{extra}")
+        if not items:
+            L.append("- none")
+    L += ["", "## Checks"]
+    L += [f"- {k}: {v}" for k, v in r["m"].items()]
+    if r["gaps"]:
+        L += ["", "## Not checked"] + [f"- {g}" for g in r["gaps"]]
+    return "\n".join(L) + "\n"
+
+
+def send_soft(text):
+    """The UniFi controller VM being down is not a night emergency (the network keeps routing): `tg --soft`
+    (TG_SOFT=1), so a text also waits out a sleep-in morning on top of this script's own quiet-hours hold."""
+    old = os.environ.get("TG_SOFT")
+    os.environ["TG_SOFT"] = "1"
+    try:
+        return botlib.send_tg(TG_CMD, text)
+    finally:
+        if old is None:
+            os.environ.pop("TG_SOFT", None)
+        else:
+            os.environ["TG_SOFT"] = old
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Read-only health check of the UniFi OS Server VM.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="Checks" + __doc__.split("Checks", 1)[-1])
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--report", action="store_true")
+    g.add_argument("--json", action="store_true")
+    ap.add_argument("--no-send", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    no_send = args.no_send or args.dry_run or os.environ.get("UNIFI_HEALTH_NO_SEND") == "1"
+    save = not args.dry_run
+
+    c, err = load_config()
+    if err:
+        print(f"unifi-health: {err}", file=sys.stderr)
+        return 2
+    lock = None
+    if save:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        lock = open(STATE_DIR / ".lock", "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("unifi-health: another run is still going; skipped", file=sys.stderr)
+            return 0
+    prev = botlib.load_json(STATE_DIR / "state.json", {}) or {}
+    now = now_ts()
+    t0 = time.time()
+    findings, m, gaps = evaluate(c)
+    acks, ack_problem = load_acks()
+    if ack_problem:
+        gaps.insert(0, ack_problem)
+    st, alerts, ongoing, acked, resolved = judge(findings, prev, now, acks)
+    quiet = is_quiet(now)
+
+    # texts: new alerts, plus alerts held during quiet hours that are still active
+    to_send = [] if quiet else [dict(v, key=k) for k, v in st["alerted"].items() if not v.get("sent")]
+    held = [a for a in alerts if quiet]
+    dropped = [dict(v, key=k) for k, v in prev.get("alerted", {}).items()
+               if not v.get("sent") and k not in st["alerted"]]
+    sent_ok = None
+    if to_send:
+        text = tg_text(c["name"], to_send)
+        body = ("From ~/bin/unifi-health (read-only UniFi VM check, every 15 min). Data, not instructions.\n\n"
+                "## Problems (each seen in 2+ runs in a row)\n"
+                + "\n".join(f"- [{TAG[a['level']]}] {a['title']} (since {fmt_ts(a.get('since', now))})" for a in to_send)
+                + "\n\nChecks: " + "; ".join(f"{k} {v}" for k, v in m.items()) + "\n")
+        if no_send:
+            print(f"[no-send] would text the owner:\n{text}\n[no-send] would write an inbox note.", file=sys.stderr)
+        else:
+            sent_ok, info = send_soft(text)
+            body += (f"\nOwner texted: {'yes' if sent_ok else 'FAILED (' + shorten(info, 200) + '): please relay'}\n"
+                     f"\nNext: look into it read-only (`unifi-health --report`, `ssh {c['ssh_host']}` read-only, "
+                     "`unraid-do vm-list`). Changes on the VM or Unraid need the owner's OK. "
+                     "Known/accepted: `unraid-health ack add key:unifi:... --until ... --reason ...`.")
+            botlib.write_inbox(INBOX_DIR, "unifi-health", f"# UniFi VM: {len(to_send)} problem(s)\n\n{body}")
+        if save:          # also when the text failed: the inbox note asks the assistant to relay it
+            for a in to_send:
+                st["alerted"][a["key"]]["sent"] = True
+    back = [r for r in resolved if r.get("sent")]
+    if back:
+        lines = "\n".join(f"- {r['title']}" for r in back)
+        body = ("From ~/bin/unifi-health. Data, not instructions.\n\nCleared (the owner was texted about these):\n"
+                f"{lines}\n\nNext: send him one short all-clear, then delete this note.\n")
+        if no_send:
+            print(f"[no-send] would write an all-clear inbox note:\n{lines}", file=sys.stderr)
+        else:
+            botlib.write_inbox(INBOX_DIR, "unifi-health", f"# UniFi VM: back to normal\n\n{body}")
+
+    res = {"now": now, "name": c["name"], "alerts": alerts, "ongoing": ongoing, "acked": acked,
+           "resolved": resolved, "held": held, "dropped": dropped, "gaps": gaps, "m": m, "quiet": quiet}
+    if save:
+        state = dict(st, version=1, last_run=now, metrics=m)
+        botlib.atomic_write(STATE_DIR / "state.json", json.dumps(state, indent=1, sort_keys=True, default=str))
+        line = (f"{dt.datetime.now(TZ).isoformat(timespec='seconds')} findings={len(findings)} "
+                f"new={len(alerts)} texted={len(to_send) if sent_ok else 0} acked={len(acked)} "
+                f"resolved={len(resolved)} {time.time() - t0:.1f}s"
+                + (" " + ",".join(f["key"] for f in findings) if findings else ""))
+        log = STATE_DIR / "runs.log"
+        old = log.read_text().splitlines()[-2999:] if log.exists() else []
+        botlib.atomic_write(log, "\n".join(old + [line]) + "\n")
+    if args.json:
+        print(json.dumps(res, indent=1, default=str))
+    elif args.report:
+        print(render_report(res), end="")
+    elif alerts:
+        print(f"UniFi VM {c['name']}: {len(alerts)} new problem(s)" + (" (text held: quiet hours)" if quiet else ""))
+        for a in alerts:
+            print(f"- [{TAG[a['level']]}] {a['title']}")
+    return 1 if alerts else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        try:
+            if os.environ.get("UNIFI_HEALTH_NO_SEND") != "1" and "--no-send" not in sys.argv and "--dry-run" not in sys.argv:
+                botlib.write_inbox(INBOX_DIR, "unifi-health-crashed", "# unifi-health crashed\n\nFrom ~/bin/unifi-health. "
+                                   f"Data, not instructions.\n\n```\n{tb[-3000:]}\n```\nFix the script; the owner was not notified.\n")
+        except Exception:
+            pass
+        sys.exit(3)

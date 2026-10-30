@@ -1,0 +1,21 @@
+# kind<TAB>NAME<TAB>reason. undocumented = a ~/bin entry that needs no TOOLS.md line; notscript = a command TOOLS.md
+# presents that is not in ~/bin; skillcmd = a command a SKILL.md names that is not a script (CLI outside the system
+# PATH, MCP tool); nosubcheck = a script whose subcommands live elsewhere; notskill = prose after "skill". Keep a
+# reason on every line; stale lines fail the lint (skill kinds only when --skills runs).
+notscript	tg	a system-wide script in /usr/local/bin (container image), not kept in ~/bin
+skillcmd	claude	the Claude Code CLI (npm global, outside the system PATH dirs), named as `claude -p` workers
+nosubcheck	tgread	a wrapper that forwards every subcommand to `vault tg` (the real tgread runs inside the vault)
+notscript	phonegw	the phone gateway CLI in ~/opt/phonegw/bin (its own venv), not kept in ~/bin
+notscript	uv	the Python project tool (~/.local/bin/uv), not kept in ~/bin
+nosubcheck	tool	a launcher: its subcommands (ls, show, call, docs, worker, policy ...) live in tools.cli under ~/bin/lib/tools
+skillcmd	deep-research	names the Anthropic deep-research skill (research), not a command
+skillcmd	public	prose split at "; " in research's fenced researcher-prompt template
+skillcmd	prices	prose split at "; " in research's fenced report-format template
+skillcmd	checking	prose line in web-agent's fenced browser-subagent brief
+skillcmd	really	prose line in web-agent's fenced browser-subagent brief
+skillcmd	ticked	prose split at "; " in web-agent's fenced progress-card example
+skillcmd	skill.web-agent	a product-catalogue feature id (web-agent), not a command
+notskill	adds	prose in research: "This skill adds the Telegram flow"
+notskill	gets	prose in trackid: "which skill gets the clip"
+nosubcheck	approvals	a launcher: its subcommands (new, consume, status, wait, sent, cancel, list, audit) live in approvals.cli under ~/bin/lib/approvals
+nosubcheck	events	a launcher: its subcommands (emit, update, ingest, list, show, ack, agenda, metrics, kinds) live in inbox.cli under ~/bin/lib/inbox

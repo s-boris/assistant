@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.open.json",
+  "title": "phone actions: open something on the phone now (Maps navigation, an https link, an SBB Mobile connection, an installed app). Sent directly (never queued, ack false) only while the phone is connected. The app opens it at once when direct is true, until has not passed and Android lets it start an activity (Display over other apps, or the app on screen); otherwise it posts a tap-to-open notification. It always answers with c2s open.result. url follows the push link rule (https without userinfo, geo:, google.navigation:); app = an installed launcher app's name or package, never anything else.",
+  "type": "object",
+  "properties": {
+    "open_id": {
+      "type": "string",
+      "pattern": "^o_[A-Za-z0-9]{1,40}$"
+    },
+    "kind": {
+      "enum": [
+        "nav",
+        "url",
+        "sbb",
+        "app"
+      ]
+    },
+    "url": {
+      "type": "string",
+      "minLength": 6,
+      "maxLength": 2048,
+      "pattern": "^(https://[A-Za-z0-9.-]+(:[0-9]{1,5})?([/?#][^\\s\\x00-\\x1f\\x7f]*)?|geo:[^\\s\\x00-\\x1f\\x7f]+|google\\.navigation:[^\\s\\x00-\\x1f\\x7f]+)$"
+    },
+    "app": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 60,
+      "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "direct": {
+      "type": "boolean"
+    },
+    "until": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_:.-]{0,47}$"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "open_id",
+    "kind",
+    "label",
+    "until"
+  ],
+  "if": {
+    "properties": {
+      "kind": {
+        "const": "app"
+      }
+    }
+  },
+  "then": {
+    "required": [
+      "app"
+    ],
+    "not": {
+      "required": [
+        "url"
+      ]
+    }
+  },
+  "else": {
+    "required": [
+      "url"
+    ],
+    "not": {
+      "required": [
+        "app"
+      ]
+    }
+  }
+}

@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+"""cputemp-log: read-only CPU heat logger for the Unraid server (fix 0 "Measure first" of
+~/reports/unraid/cpu-heat-2026-10-16.md). No tokens, no writes on the server.
+
+One persistent SSH session (the dispatcher's read-only `cputemp` verb) runs a tiny bash loop that only READS /sys (coretemp hwmon, RAPL energy,
+cpufreq, thermal_throttle counters). This side drives the cadence: it writes one line to the loop's stdin per
+sample and gets one line back, so the server keeps no clock, files or state; when this side dies, stdin closes
+and the remote loop ends. Cadence: every 10 s during the vault job windows (00:55-06:35, 11:55-20:05,
+owner time zone), otherwise every 60 s, aligned to the wall clock.
+
+Rows: ~/.local/state/cputemp/YYYY-MM-DD.csv (kept 14 days), columns
+  ts            local time of the sample
+  dt_s          seconds since the previous row (blank on the first row after a (re)connect)
+  pkg_c         package temp (coretemp "Package id 0")      core_max_c   hottest core temp
+  pkg_w         package power from the RAPL energy delta    pcore_mhz    mean scaling_cur_freq of the P-cores
+  pkg_thr_n/ms  package throttle events / ms in the interval (thermal_throttle counters, cpu0)
+  core_thr_n    core throttle events, summed over physical cores
+  core_thr_ms_max  throttled ms of the worst core in the interval
+  win           night | day | other
+
+Usage:
+  cputemp-log ensure          (cron, every 5 min) start the logger loop unless it runs or was stopped on purpose;
+                              restarts it when it holds the lock but has written nothing for 10 min
+  cputemp-log run             the loop itself (foreground; holds ~/.local/state/cputemp/run.lock)
+  cputemp-log stop | start    stop on purpose (ensure then leaves it alone) | clear that and start
+  cputemp-log status          running?, last row, rows today, last error
+  cputemp-log summary [SPAN] [--json]
+                              per window: rows, max/p95 temp (hottest of pkg/core), seconds throttled
+                              (package, and the worst core), mean power, mean P-core MHz. SPAN = a DAY
+                              (YYYY-MM-DD, today (default), yesterday) or START..END; --json adds logged
+                              hours and throttled seconds per hour (unraid-health reads its last 24 h this way)
+  cputemp-log compare BEFORE AFTER [--json]
+  cputemp-log compare --before SPAN --after SPAN [--json]
+  cputemp-log compare --at TIME [--hours N] [--json]
+                              before/after table per window (night, day, other, all): rows, logged hours,
+                              max/p95 °C, package throttled s and s per hour, mean W, P-core MHz, and the
+                              change. --at = the N hours (default 24) before and after a change at TIME
+  cputemp-log tail [N]        the last N rows of today's CSV (default 10)
+  START, END, TIME: "YYYY-MM-DD HH:MM[:SS]" (or with T), a DAY (as an END: the end of that day), or now;
+  END may be just HH:MM (START's day), e.g. "YYYY-MM-DD 06:35..09:15".
+Env (tests): CPUTEMP_STATE, CPUTEMP_SSH (ssh binary), CPUTEMP_HOST, CPUTEMP_WINDOWS ("00:55-06:35,11:55-20:05"),
+  CPUTEMP_INTERVALS ("10,60" = in-window,outside), CPUTEMP_MAX_SAMPLES (run exits after N rows),
+  CPUTEMP_NOW (summary/compare/rotation: fake "YYYY-MM-DD" or "YYYY-MM-DD HH:MM[:SS]"), UNRAID_SSH_BIN.
+Under the owner's SSH lockdown (`unraid-ssh mode` = verbs; emulate too) raw commands are refused, so the loop
+runs server-side as the dispatcher's read-only `cputemp` verb (`unraid-ssh run cputemp`: one line in, one
+line out, the /sys root fixed by the dispatcher, no arguments). A dispatcher without that verb (an older
+install) is recorded in status ("refused the cputemp verb") and retried every 10 min. Root mode: the raw loop.
+"""
+import csv
+import datetime as dt
+import fcntl
+import json
+import os
+import selectors
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+os.environ.setdefault("TZ", assistant_profile.tz_name())
+time.tzset()
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("CPUTEMP_STATE") or os.path.join(HOME, ".local/state/cputemp")
+SSH = os.environ.get("CPUTEMP_SSH", "ssh")
+HOST = os.environ.get("CPUTEMP_HOST", "unraid")
+UNRAID_SSH = os.environ.get("UNRAID_SSH_BIN") or os.path.join(HOME, "bin/unraid-ssh")
+KEEP_DAYS = 14
+STALE_S = 600
+COLS = ["ts", "dt_s", "pkg_c", "core_max_c", "pkg_w", "pcore_mhz", "pkg_thr_n", "pkg_thr_ms",
+        "core_thr_n", "core_thr_ms_max", "win"]
+LOCK = os.path.join(STATE, "run.lock")
+STATUS = os.path.join(STATE, "status.json")
+OFF = os.path.join(STATE, "disabled")
+LOG = os.path.join(STATE, "run.log")
+
+# STRICTLY READ-ONLY remote loop: only `read` from /sys and `echo` to stdout. No forks per sample (bash builtins).
+REMOTE = r'''set -u
+R=${CPUTEMP_SYSROOT:-/sys}; C=$R/devices/system/cpu; RA=$R/class/powercap/intel-rapl:0
+rd() { V=; [ -r "$1" ] && read -r V < "$1"; V=${V:-}; }
+expand() { local IFS=, p i; L=; for p in $1; do if [[ $p == *-* ]]; then for ((i=${p%-*}; i<=${p#*-}; i++)); do L+=" $i"; done; else L+=" $p"; fi; done; }
+hw=; for d in "$R"/class/hwmon/hwmon*; do rd "$d/name"; [ "$V" = coretemp ] && { hw=$d; break; }; done
+pk=; cores=()
+if [ -n "$hw" ]; then for f in "$hw"/temp*_label; do rd "$f"; case $V in Package*) pk=${f%_label}_input;; Core*) cores+=("${f%_label}_input");; esac; done; fi
+rd "$RA/max_energy_range_uj"; emax=$V
+all=; for d in "$C"/cpu[0-9]*; do all+=" ${d##*/cpu}"; done
+rd "$R/devices/cpu_core/cpus"; if [ -n "$V" ]; then expand "$V"; pc=$L; else pc=$all; fi
+topo=; for n in $all; do rd "$C/cpu$n/topology/core_id"; c=$V; rd "$C/cpu$n/topology/physical_package_id"; topo+=",$n:${V:-0}.$c"; done
+pcl=; for n in $pc; do pcl+=",$n"; done
+echo "T emax=$emax pcpus=${pcl#,} topo=${topo#,}"
+while read -r _; do
+  ts=${EPOCHREALTIME/,/.}
+  rd "$pk"; p=$V
+  m=; for f in "${cores[@]}"; do rd "$f"; [ -n "$V" ] && { [ -z "$m" ] || [ "$V" -gt "$m" ]; } && m=$V; done
+  rd "$RA/energy_uj"; e=$V
+  fs=0; fn=0; for n in $pc; do rd "$C/cpu$n/cpufreq/scaling_cur_freq"; [ -n "$V" ] && { fs=$((fs+V)); fn=$((fn+1)); }; done
+  rd "$C/cpu0/thermal_throttle/package_throttle_count"; a=$V; rd "$C/cpu0/thermal_throttle/package_throttle_total_time_ms"; b=$V
+  ct=; for n in $all; do rd "$C/cpu$n/thermal_throttle/core_throttle_count"; x=$V; rd "$C/cpu$n/thermal_throttle/core_throttle_total_time_ms"; ct+=",$n:$x:$V"; done
+  echo "S ts=$ts pkg=$p core=$m e=$e fs=$fs fn=$fn pthr=$a pthrms=$b ct=${ct#,}"
+done
+'''
+
+
+def now():
+    return dt.datetime.now()
+
+
+def today():
+    return (os.environ.get("CPUTEMP_NOW") or now().strftime("%Y-%m-%d"))[:10]
+
+
+def span_now():
+    """'now' for spans: CPUTEMP_NOW when it has a time of day, else the clock."""
+    fake = os.environ.get("CPUTEMP_NOW") or ""
+    return dt.datetime.fromisoformat(fake) if len(fake) > 10 else now().replace(microsecond=0)
+
+
+def windows():
+    out = []
+    for part in os.environ.get("CPUTEMP_WINDOWS", "00:55-06:35,11:55-20:05").split(","):
+        a, b = part.split("-")
+        ha, ma = map(int, a.split(":"))
+        hb, mb = map(int, b.split(":"))
+        out.append((ha * 60 + ma, hb * 60 + mb))
+    return out
+
+
+def window_of(t):
+    """'night' / 'day' for the 1st / 2nd job window, 'other' outside."""
+    m = t.hour * 60 + t.minute
+    for i, (a, b) in enumerate(windows()):
+        if a <= m < b:
+            return ("night", "day")[i] if i < 2 else "win%d" % (i + 1)
+    return "other"
+
+
+def intervals():
+    a, b = os.environ.get("CPUTEMP_INTERVALS", "10,60").split(",")
+    return float(a), float(b)
+
+
+def interval_at(t):
+    inside, outside = intervals()
+    return inside if window_of(t) != "other" else outside
+
+
+def kv(line):
+    d = {}
+    for tok in line.split()[1:]:
+        k, _, v = tok.partition("=")
+        d[k] = v
+    return d
+
+
+def num(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+
+def parse_topo(line):
+    """T line -> {"emax": int|None, "cores": {cpu: core_key}}"""
+    d = kv(line)
+    cores = {}
+    for tok in filter(None, d.get("topo", "").split(",")):
+        cpu, _, key = tok.partition(":")
+        cores[cpu] = key
+    return {"emax": num(d.get("emax")), "cores": cores}
+
+
+def parse_sample(line, topo):
+    d = kv(line)
+    s = {k: num(d.get(k)) for k in ("ts", "pkg", "core", "e", "fs", "fn", "pthr", "pthrms")}
+    per_core = {}   # core key -> (count, ms); HT siblings share the core's counters, take the first
+    for tok in filter(None, d.get("ct", "").split(",")):
+        cpu, cnt, ms = (tok.split(":") + ["", ""])[:3]
+        key = topo["cores"].get(cpu, cpu)
+        if key not in per_core:
+            per_core[key] = (num(cnt), num(ms))
+    s["cores"] = per_core
+    return s
+
+
+def delta(a, b):
+    if a is None or b is None:
+        return None
+    d = b - a
+    return d if d >= 0 else None     # counters reset (reboot) -> unknown
+
+
+def make_row(prev, cur, topo, t):
+    r = {c: "" for c in COLS}
+    r["ts"] = t.strftime("%Y-%m-%d %H:%M:%S")
+    r["win"] = window_of(t)
+    if cur["pkg"] is not None:
+        r["pkg_c"] = "%.1f" % (cur["pkg"] / 1000)
+    if cur["core"] is not None:
+        r["core_max_c"] = "%.1f" % (cur["core"] / 1000)
+    if cur["fn"]:
+        r["pcore_mhz"] = "%d" % round(cur["fs"] / cur["fn"] / 1000)
+    if prev is None or cur["ts"] is None or prev["ts"] is None or cur["ts"] <= prev["ts"]:
+        return r
+    secs = cur["ts"] - prev["ts"]
+    r["dt_s"] = "%.1f" % secs
+    if cur["e"] is not None and prev["e"] is not None:
+        de = cur["e"] - prev["e"]
+        if de < 0 and topo.get("emax"):
+            de += topo["emax"] + 1        # RAPL energy counter wrapped
+        if de >= 0:
+            r["pkg_w"] = "%.1f" % (de / 1e6 / secs)
+    for col, key in (("pkg_thr_n", "pthr"), ("pkg_thr_ms", "pthrms")):
+        v = delta(prev[key], cur[key])
+        if v is not None:
+            r[col] = str(v)
+    n, ms = [], []
+    for key, (cnt, t_ms) in cur["cores"].items():
+        p = prev["cores"].get(key)
+        if p is None:
+            continue
+        dn, dm = delta(p[0], cnt), delta(p[1], t_ms)
+        if dn is not None:
+            n.append(dn)
+        if dm is not None:
+            ms.append(dm)
+    if n:
+        r["core_thr_n"] = str(sum(n))
+    if ms:
+        r["core_thr_ms_max"] = str(max(ms))
+    return r
+
+
+def csv_path(day):
+    return os.path.join(STATE, "%s.csv" % day)
+
+
+def append_row(r):
+    p = csv_path(r["ts"][:10])
+    new = not os.path.exists(p)
+    with open(p, "a", newline="") as f:
+        w = csv.DictWriter(f, COLS)
+        if new:
+            w.writeheader()
+        w.writerow(r)
+
+
+def rotate():
+    cutoff = (dt.date.fromisoformat(today()) - dt.timedelta(days=KEEP_DAYS - 1)).isoformat()
+    for name in os.listdir(STATE):
+        if name.endswith(".csv") and len(name) == 14 and name[:10] < cutoff:
+            os.remove(os.path.join(STATE, name))
+
+
+def read_status():
+    try:
+        with open(STATUS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_status(st):
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATUS)
+
+
+def log(msg):
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
+            os.replace(LOG, LOG + ".1")
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+class Remote:
+    def __init__(self, via_verb=False):
+        if via_verb:   # lockdown: the dispatcher runs this same REMOTE loop (copied in by its build)
+            cmd = [UNRAID_SSH, "--host", HOST, "run", "cputemp"]
+        else:
+            cmd = [SSH, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30",
+                   "-o", "ServerAliveCountMax=3", HOST, "bash -c " + shlex.quote(REMOTE)]
+        errf = os.path.join(STATE, "ssh.err")
+        self.err_start = os.path.getsize(errf) if os.path.exists(errf) else 0
+        self.err = open(errf, "ab")
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, bufsize=0)
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.p.stdout, selectors.EVENT_READ)
+        self.buf = b""
+
+    def readline(self, timeout):
+        end = time.monotonic() + timeout
+        while b"\n" not in self.buf:
+            left = end - time.monotonic()
+            if left <= 0 or not self.sel.select(left):
+                raise TimeoutError("no answer from the server in %ds" % timeout)
+            chunk = os.read(self.p.stdout.fileno(), 65536)
+            if not chunk:
+                raise EOFError("ssh session ended (exit %s)" % self.p.poll())
+            self.buf += chunk
+        line, _, self.buf = self.buf.partition(b"\n")
+        return line.decode("utf-8", "replace")
+
+    def ask(self, timeout=20):
+        self.p.stdin.write(b"s\n")
+        line = self.readline(timeout)
+        while not line.startswith("S "):
+            line = self.readline(timeout)
+        return line
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.p.wait(3)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+        self.err.close()
+
+    def refused(self):
+        """True when the dispatcher rejected the request (e.g. no cputemp verb yet). Call after close()."""
+        try:
+            with open(self.err.name, "rb") as f:
+                f.seek(self.err_start)
+                return b"claude-bot-cmd: rejected" in f.read(65536)
+        except OSError:
+            return False
+
+
+def lockdown_mode():
+    try:
+        out = subprocess.run([UNRAID_SSH, "mode"], capture_output=True, text=True, timeout=60).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return "root"
+    return out or "root"
+
+
+def sleep_until_next():
+    iv = interval_at(now())
+    epoch = time.time()
+    nxt = (int(epoch / iv) + 1) * iv if iv >= 1 else epoch + iv
+    time.sleep(max(0.0, nxt - time.time()))
+
+
+STOP = False
+
+
+def _term(*_):
+    global STOP
+    STOP = True
+    raise KeyboardInterrupt
+
+
+def cmd_run():
+    os.makedirs(STATE, exist_ok=True)
+    lockf = open(LOCK, "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("cputemp-log: already running", file=sys.stderr)
+        return 0
+    signal.signal(signal.SIGTERM, _term)
+    st = {"pid": os.getpid(), "started": stamp(), "connects": 0,
+          "last_row": None, "last_connect": None, "last_error": None, "rows": 0}
+    write_status(st)
+    max_rows = int(os.environ.get("CPUTEMP_MAX_SAMPLES", "0"))
+    backoff = 30
+    rotate()
+    day = today()
+    log("start pid %d" % os.getpid())
+    try:
+        while not STOP:
+            if os.path.exists(OFF):
+                log("disabled flag set, exiting")
+                break
+            via_verb = lockdown_mode() in ("verbs", "emulate")
+            refused = False
+            st["connects"] += 1
+            st["last_connect"] = stamp()
+            write_status(st)
+            r = Remote(via_verb)
+            try:
+                topo = parse_topo(r.readline(30))
+                prev = None
+                while not STOP:
+                    sleep_until_next()
+                    line = r.ask()
+                    t = now()
+                    cur = parse_sample(line, topo)
+                    append_row(make_row(prev, cur, topo, t))
+                    prev = cur
+                    backoff = 30
+                    st["rows"] += 1
+                    st["last_row"] = stamp(t)
+                    st["last_error"] = None
+                    write_status(st)
+                    if today() != day:
+                        day = today()
+                        rotate()
+                    if max_rows and st["rows"] >= max_rows:
+                        return 0
+                    if os.path.exists(OFF):
+                        break
+            except (TimeoutError, EOFError, BrokenPipeError, OSError, ValueError) as e:
+                r.close()
+                refused = via_verb and r.refused()
+                if refused:
+                    st["last_error"] = ("SSH lockdown verbs mode: the server's dispatcher refused the cputemp verb "
+                                        "(owner's reinstall pending); retry every 10 min")
+                    log(st["last_error"])
+                else:
+                    st["last_error"] = "%s: %s" % (now().strftime("%H:%M:%S"), e)
+                    log("session lost: %s (retry in %ds)" % (e, backoff))
+                write_status(st)
+            finally:
+                r.close()
+            if STOP or os.path.exists(OFF):
+                break
+            time.sleep(600 if refused else backoff)
+            if not refused:
+                backoff = min(backoff * 2, 300)
+    except KeyboardInterrupt:
+        pass
+    log("stop pid %d" % os.getpid())
+    return 0
+
+
+def running_pid():
+    """pid of the loop if one holds the lock, else None."""
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOCK, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return None
+        except OSError:
+            return read_status().get("pid") or -1
+
+
+def stamp(t=None):
+    """A status time with its UTC offset, so ages stay right across DST (fold-aware for the repeated hour)."""
+    return (t or now()).astimezone().isoformat(timespec="seconds")
+
+
+def age_s(iso, now_s=None):
+    """Seconds since iso in real time (epoch maths; an offset-less iso is local time)."""
+    if not iso:
+        return None
+    return (time.time() if now_s is None else now_s) - dt.datetime.fromisoformat(iso).timestamp()
+
+
+def spawn():
+    me = os.path.abspath(sys.argv[0])
+    with open(os.devnull, "rb") as dn, open(LOG, "ab") as lg:
+        subprocess.Popen([sys.executable, me, "run"], stdin=dn, stdout=lg, stderr=lg, start_new_session=True,
+                         close_fds=True)
+
+
+def cmd_ensure():
+    if os.path.exists(OFF):
+        return 0
+    pid = running_pid()
+    if pid:
+        st = read_status()
+        ages = [age_s(st.get(k)) for k in ("last_row", "last_connect", "started")]
+        last = min([a for a in ages if a is not None] or [1e9])
+        verbs = "verbs mode" in (st.get("last_error") or "")
+        if last < STALE_S or verbs or pid < 0:
+            return 0
+        log("ensure: pid %s wrote nothing for %ds, restarting" % (pid, last))
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(20):
+            if not running_pid():
+                break
+            time.sleep(0.5)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            time.sleep(1)
+    spawn()
+    return 0
+
+
+def cmd_stop():
+    os.makedirs(STATE, exist_ok=True)
+    open(OFF, "w").close()
+    pid = running_pid()
+    if pid and pid > 0:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(20):
+            if not running_pid():
+                break
+            time.sleep(0.5)
+    print("stopped (cputemp-log start resumes)")
+    return 0
+
+
+def cmd_start():
+    try:
+        os.remove(OFF)
+    except FileNotFoundError:
+        pass
+    return cmd_ensure()
+
+
+def load_rows(day):
+    p = csv_path(day)
+    if not os.path.exists(p):
+        return []
+    with open(p, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def resolve_day(arg):
+    if arg in (None, "today"):
+        return today()
+    if arg == "yesterday":
+        return (dt.date.fromisoformat(today()) - dt.timedelta(days=1)).isoformat()
+    dt.date.fromisoformat(arg)
+    return arg
+
+
+def parse_when(s, end=False):
+    """A moment: 'YYYY-MM-DD HH:MM[:SS]' (or with T), now, or a DAY (its start; as an END: its end)."""
+    s = s.strip()
+    if s == "now":
+        return span_now()
+    if s in ("today", "yesterday") or len(s) == 10:
+        t = dt.datetime.combine(dt.date.fromisoformat(resolve_day(s)), dt.time())
+        return t + dt.timedelta(days=1) if end else t
+    return dt.datetime.fromisoformat(s.replace(" ", "T", 1)).replace(tzinfo=None, microsecond=0)
+
+
+def resolve_span(arg):
+    """DAY or START..END -> (start, end, label); end is exclusive. ValueError on nonsense."""
+    if arg and ".." in arg:
+        a, b = arg.split("..", 1)
+        start = parse_when(a)
+        if len(b.strip()) in (5, 8) and b.count(":") in (1, 2):      # END = HH:MM[:SS] on START's day
+            b = "%s %s" % (start.date().isoformat(), b.strip())
+        end = parse_when(b, end=True)
+        label = "%s..%s" % (start.strftime("%Y-%m-%d %H:%M"),
+                            end.strftime("%H:%M" if end.date() == start.date() else "%Y-%m-%d %H:%M"))
+    else:
+        day = resolve_day(arg)
+        start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time())
+        end, label = start + dt.timedelta(days=1), day
+    if end <= start:
+        raise ValueError("empty span")
+    return start, end, label
+
+
+def load_span(start, end):
+    """Rows with start <= ts < end, from every daily CSV the span touches."""
+    a, b = start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+    out, d = [], start.date()
+    while d <= (end - dt.timedelta(seconds=1)).date():
+        out += [r for r in load_rows(d.isoformat()) if a <= r["ts"] < b]
+        d += dt.timedelta(days=1)
+    return out
+
+
+def p95(vals):
+    v = sorted(vals)
+    if not v:
+        return None
+    k = max(0, -(-95 * len(v) // 100) - 1)       # nearest rank
+    return v[k]
+
+
+def stats(rows):
+    temps = []
+    w_sum = w_dt = logged = 0.0
+    mhz = []
+    pkg_ms = core_ms = 0
+    for r in rows:
+        t = [num(r["pkg_c"]), num(r["core_max_c"])]
+        t = [x for x in t if x is not None]
+        if t:
+            temps.append(max(t))
+        d, w = num(r["dt_s"]), num(r["pkg_w"])
+        logged += d or 0
+        if d and w is not None:
+            w_sum += w * d
+            w_dt += d
+        if num(r["pcore_mhz"]) is not None:
+            mhz.append(num(r["pcore_mhz"]))
+        pkg_ms += num(r["pkg_thr_ms"]) or 0
+        core_ms += num(r["core_thr_ms_max"]) or 0
+    hours = logged / 3600
+    return {"rows": len(rows), "max": max(temps) if temps else None, "p95": p95(temps),
+            "thr_s": pkg_ms / 1000, "core_thr_s": core_ms / 1000,
+            "mean_w": w_sum / w_dt if w_dt else None, "mhz": sum(mhz) / len(mhz) if mhz else None,
+            "hours": round(hours, 3), "thr_s_per_h": pkg_ms / 1000 / hours if hours else None}
+
+
+def fmt(v, f):
+    return "-" if v is None else f % v
+
+
+def window_names():
+    w = windows()
+    span = lambda i: "%02d:%02d-%02d:%02d" % (w[i][0] // 60, w[i][0] % 60, w[i][1] // 60, w[i][1] % 60)
+    return [("night", span(0)), ("day", span(1) if len(w) > 1 else ""), ("other", ""), ("all", "")]
+
+
+def span_stats(arg):
+    """{label, start, end, first, last, windows: {night|day|other|all: stats + span}} for a DAY or START..END."""
+    start, end, label = resolve_span(arg)
+    rows = load_span(start, end)
+    out = {"label": label, "start": start.strftime("%Y-%m-%d %H:%M:%S"), "end": end.strftime("%Y-%m-%d %H:%M:%S"),
+           "first": rows[0]["ts"] if rows else None, "last": rows[-1]["ts"] if rows else None, "windows": {}}
+    for name, span in window_names():
+        s = stats(rows if name == "all" else [r for r in rows if r["win"] == name])
+        out["windows"][name] = dict(s, span=span)
+    return out
+
+
+def cmd_summary(arg, as_json=False):
+    st = span_stats(arg)
+    if as_json:
+        print(json.dumps(st, sort_keys=True))
+        return 0 if st["first"] else 1
+    if not st["first"]:
+        print("cputemp %s: no samples" % st["label"])
+        return 1
+    print("cputemp %s  (%s .. %s)" % (st["label"], st["first"][11:], st["last"][11:]))
+    print("%-19s %5s %6s %6s %7s %8s %7s %6s" % ("window", "rows", "max°C", "p95°C", "thr s", "core thr", "mean W",
+                                                  "P MHz"))
+    for name, span in window_names():
+        s = st["windows"][name]
+        if not s["rows"] and name != "all":
+            continue
+        print("%-19s %5d %6s %6s %7s %8s %7s %6s" % (
+            (name + " " + span).strip(), s["rows"], fmt(s["max"], "%.0f"), fmt(s["p95"], "%.0f"),
+            fmt(s["thr_s"], "%.1f"), fmt(s["core_thr_s"], "%.1f"), fmt(s["mean_w"], "%.1f"), fmt(s["mhz"], "%.0f")))
+    print("max/p95 = hottest of package/core temp per sample; thr s = package throttled seconds;"
+          " core thr = worst core's throttled seconds; mean W time-weighted")
+    return 0
+
+
+def compare_args(args):
+    """compare's arguments -> (before SPAN, after SPAN, json?). ValueError on a bad call."""
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    opts, pos, i = {}, [], 0
+    while i < len(args):
+        if args[i] in ("--before", "--after", "--at", "--hours"):
+            if i + 1 >= len(args):
+                raise ValueError("%s needs a value" % args[i])
+            opts[args[i]] = args[i + 1]
+            i += 2
+        else:
+            pos.append(args[i])
+            i += 1
+    if "--at" in opts:
+        if pos or "--before" in opts or "--after" in opts:
+            raise ValueError("--at takes no other spans")
+        at, h = parse_when(opts["--at"]), dt.timedelta(hours=float(opts.get("--hours", 24)))
+        if h <= dt.timedelta(0):
+            raise ValueError("--hours must be > 0")
+        f = lambda t: t.strftime("%Y-%m-%d %H:%M:%S")
+        return "%s..%s" % (f(at - h), f(at)), "%s..%s" % (f(at), f(at + h)), as_json
+    if "--hours" in opts:
+        raise ValueError("--hours goes with --at")
+    before, after = opts.get("--before"), opts.get("--after")
+    for a in pos:
+        if before is None:
+            before = a
+        elif after is None:
+            after = a
+        else:
+            raise ValueError("too many spans")
+    if before is None or after is None:
+        raise ValueError("need two spans")
+    return before, after, as_json
+
+
+def cmd_compare(args):
+    before, after = (span_stats(a) for a in compare_args(args)[:2])
+    if "--json" in args:
+        print(json.dumps({"before": before, "after": after}, sort_keys=True))
+        return 0 if before["first"] or after["first"] else 1
+    for name, st in (("before", before), ("after", after)):
+        got = "%s .. %s" % (st["first"], st["last"]) if st["first"] else "no samples"
+        print("%-6s %s  (%s)" % (name, st["label"], got))
+    if not (before["first"] or after["first"]):
+        return 1
+    hdr = "%-19s %-6s %5s %6s %6s %6s %7s %7s %7s %6s"
+    print(hdr % ("window", "", "rows", "hours", "max°C", "p95°C", "thr s", "thr s/h", "mean W", "P MHz"))
+    for name, span in window_names():
+        b, a = before["windows"][name], after["windows"][name]
+        if not (b["rows"] or a["rows"]) and name != "all":
+            continue
+        label = (name + " " + span).strip()
+        for set_name, s in (("before", b), ("after", a)):
+            print(hdr % (label, set_name, s["rows"], fmt(s["hours"] if s["rows"] else None, "%.1f"),
+                         fmt(s["max"], "%.0f"), fmt(s["p95"], "%.0f"), fmt(s["thr_s"] if s["rows"] else None, "%.1f"),
+                         fmt(s["thr_s_per_h"], "%.1f"), fmt(s["mean_w"], "%.1f"), fmt(s["mhz"], "%.0f")))
+            label = ""
+        d = lambda k, f: "" if a[k] is None or b[k] is None else f % (a[k] - b[k])
+        if b["rows"] and a["rows"]:
+            print(hdr % ("", "change", "", "", d("max", "%+.0f"), d("p95", "%+.0f"), "", d("thr_s_per_h", "%+.1f"),
+                         d("mean_w", "%+.1f"), d("mhz", "%+.0f")))
+    print("thr s = package throttled seconds; thr s/h = per logged hour (spans differ in length);"
+          " max/p95 = hottest of package/core temp per sample; mean W time-weighted")
+    return 0
+
+
+def cmd_status():
+    pid = running_pid()
+    st = read_status()
+    off = os.path.exists(OFF)
+    rows = load_rows(today())
+    state = "running (pid %s)" % pid if pid else ("stopped on purpose" if off else "not running")
+    print("cputemp-log: %s; last row %s; rows today %d; connects %s%s" % (
+        state, st.get("last_row") or "-", len(rows), st.get("connects", 0),
+        "; last error: %s" % st["last_error"] if st.get("last_error") else ""))
+    return 0 if pid else 1
+
+
+def cmd_tail(n):
+    rows = load_rows(today())
+    print(",".join(COLS))
+    for r in rows[-n:]:
+        print(",".join(r[c] for c in COLS))
+    return 0
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd == "run":
+        return cmd_run()
+    os.makedirs(STATE, exist_ok=True)
+    if cmd == "ensure":
+        return cmd_ensure()
+    if cmd == "stop":
+        return cmd_stop()
+    if cmd == "start":
+        return cmd_start()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "summary":
+        rest = argv[2:]
+        try:
+            spans = [a for a in rest if a != "--json"]
+            if len(spans) > 1:
+                raise ValueError("one span")
+            return cmd_summary(spans[0] if spans else None, "--json" in rest)
+        except ValueError:
+            print("usage: cputemp-log summary [YYYY-MM-DD|today|yesterday|START..END] [--json]", file=sys.stderr)
+            return 2
+    if cmd == "compare":
+        try:
+            compare_args(argv[2:])
+            return cmd_compare(argv[2:])
+        except ValueError as e:
+            print("cputemp-log compare: %s\nusage: cputemp-log compare BEFORE AFTER | --before SPAN --after SPAN"
+                  " | --at TIME [--hours N]  [--json]; SPAN = DAY or START..END" % e, file=sys.stderr)
+            return 2
+    if cmd == "tail":
+        return cmd_tail(int(argv[2]) if len(argv) > 2 else 10)
+    print(__doc__.split("Usage:")[1].split("Env (tests)")[0].rstrip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

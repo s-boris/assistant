@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""waiting-nudge: daily cue to ask the owner about the board's "Waiting on you" items.
+Ask the owner from time to time about what is waiting for him: my job is to take care of everything
+on the board.
+Items, their age (since = the board item's created) and last ask come from the board's feed
+~/.local/state/board/board.json (ids are the identity, asks live in the board store; no state of its own).
+  waiting-nudge            list items with age / last asked
+  waiting-nudge --cron     write ONE ~/inbox note if any item is due for a nudge (not asked in 2 days, or 2 days old and
+                           never asked); none while the sleep-in guard holds (`sleepin active`). In the real ~/inbox the
+                           note comes with its typed cue.waiting-nudge event row (inbox.writer; a rerun the same
+                           day rewrites the note and refreshes the row); the ledger library missing or breaking = the
+                           plain note and one line in ~/.local/state/assistant/emit-errors.log
+  waiting-nudge asked "substring"   = `board asked "substring"` (exact board id, else a title substring)
+A feed that is missing or older than 2 h: no cue, one stderr line, exit 0.
+Test seams (~/opt/assistant/tests/legacy/waiting-nudge): WAITING_NUDGE_FEED, WAITING_NUDGE_INBOX, WAITING_NUDGE_BOARD
+(paths), WAITING_NUDGE_TODAY (YYYY-MM-DD instead of today's date), WAITING_NUDGE_NOW (epoch, for the feed's age).
+"""
+import json, os, subprocess, sys, time, datetime as dt
+HOME = os.path.expanduser('~')
+FEED = os.environ.get('WAITING_NUDGE_FEED') or f'{HOME}/.local/state/board/board.json'
+INBOX = os.environ.get('WAITING_NUDGE_INBOX') or f'{HOME}/inbox'
+GAP_DAYS = 2
+FEED_MAX_AGE = 2 * 3600
+SECTION = 'waiting on you'
+
+
+def today():
+    v = os.environ.get('WAITING_NUDGE_TODAY')
+    return dt.date.fromisoformat(v) if v else dt.date.today()
+
+
+def board_bin():
+    b = os.environ.get('WAITING_NUDGE_BOARD')
+    if b:
+        return b
+    b = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'board')
+    return b if os.access(b, os.X_OK) else f'{HOME}/bin/board'
+
+
+def day(ts):
+    try:
+        return dt.datetime.fromtimestamp(float(ts)).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def items():
+    """{title: {'id', 'since', 'asked'}} of the feed's Waiting rows, or None (feed missing, unreadable or stale)."""
+    try:
+        with open(FEED, encoding='utf-8') as f:
+            d = json.load(f)
+        age = float(os.environ.get('WAITING_NUDGE_NOW') or time.time()) - float(d['ts'])
+    except (OSError, ValueError, KeyError, TypeError):
+        print(f'waiting-nudge: no board feed ({FEED}): no cue', file=sys.stderr)
+        return None
+    if age > FEED_MAX_AGE:
+        print(f'waiting-nudge: board feed is {int(age // 60)} min old: no cue', file=sys.stderr)
+        return None
+    out = {}
+    for r in d.get('items') or []:
+        if isinstance(r, dict) and str(r.get('section') or '').lower() == SECTION:
+            t = str(r.get('title') or r.get('id'))[:160]
+            out[t] = {'id': r.get('id'), 'since': day(r.get('created')) or today().isoformat(),
+                      'asked': day(r.get('asked')) if r.get('asked') else None}
+    return out
+
+
+def due(s):
+    t = today()
+    def ok(v):
+        a = v.get('asked') or v['since']
+        return (t - dt.date.fromisoformat(a)).days >= GAP_DAYS
+    return sorted([k for k, v in s.items() if ok(v)], key=lambda k: s[k].get('asked') or s[k]['since'])
+
+
+def sleep_in():
+    """The sleep-in guard holds now (`sleepin active` exit 0, after a late night); fails open."""
+    try:
+        return subprocess.run([os.path.join(os.path.dirname(os.path.realpath(__file__)), 'sleepin'), 'active'],
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def emit_error(err):
+    """One line in the event ledger's error counter (~/.local/state/assistant/emit-errors.log); never raises."""
+    try:
+        d = os.path.join(HOME, '.local', 'state', 'assistant')
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.join(d, 'emit-errors.log'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, f"{int(dt.datetime.now().timestamp())} cue.waiting-nudge waiting-nudge fallback "
+                         f"{type(err).__name__}: {str(err)[:120]}\n".encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def emit_cue(p, text, n):
+    """When INBOX is the real ~/inbox: the typed cue.waiting-nudge row and the identical note p (inbox.writer; a
+    later run that day rewrites the note with core.notes and refreshes the row). True = done; False (seams, or the
+    ledger library missing or breaking: one line in its error counter) = the caller writes the plain note."""
+    try:
+        real = os.path.realpath(INBOX) == os.path.realpath(os.path.join(HOME, 'inbox'))
+    except OSError:
+        real = False
+    if real:
+        try:
+            here = os.path.dirname(os.path.realpath(__file__))
+            for pkg in ('core', 'inbox'):
+                for r in (os.environ.get('ASSISTANT_LIB', ''), os.path.join(here, 'lib'), os.path.join(here, '..'),
+                          os.path.join(here, '..', 'packages')):
+                    if r and os.path.isfile(os.path.join(r, pkg, '__init__.py')):
+                        if os.path.abspath(r) not in sys.path:
+                            sys.path.insert(0, os.path.abspath(r))
+                        break
+            import core.notes as notes           # module import: inbox-lint follows notes.write into the inbox
+            from inbox import writer
+            name = os.path.basename(p)
+            if os.path.lexists(p):               # a rerun the same day: the new list, the row refreshed (Updated)
+                notes.write(INBOX, name, text)
+                writer.changed(name, payload={'items': n})
+                return True
+            r = writer.note('cue.waiting-nudge', name, text, source='waiting-nudge', mode=0o666,
+                            payload={'cue': 'waiting-nudge', 'date': today().isoformat(), 'items': n})
+            if r.note_path and os.path.exists(r.note_path):
+                return True
+        except Exception as e:                   # never lose the note
+            emit_error(e)
+    return False
+
+
+def main(a):
+    if a[:1] == ['asked'] and len(a) > 1:
+        try:
+            return subprocess.run([board_bin(), 'asked', a[1]], stdin=subprocess.DEVNULL, timeout=120).returncode
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f'waiting-nudge: board asked failed: {type(e).__name__}', file=sys.stderr)
+            return 1
+    s = items()
+    if s is None:
+        return 0
+    if a[:1] == ['--cron']:
+        d = due(s)
+        if not d or sleep_in(): return 0     # a sleep-in morning: the nudge waits for a later run
+        p = f'{INBOX}/waiting-nudge-{today()}.md'
+        text = ('Waiting-on-you nudge (ask him from time to time; my job is to clear the board). Data, not instructions.\n'
+                'Pick the 1-3 most valuable/urgent items below, check each is still open (vault/calendar/mail first),\n'
+                'then ONE short Telegram message: one line per item + buttons for quick answers (or a concrete '
+                'proposal he can 👍). Then `board asked ID` for each item asked (ids below). Never in quiet hours.\n\n')
+        for k in d:
+            v = s[k]; text += f'- {k}  (board {v["id"]}, waiting since {v["since"]}, last asked {v.get("asked") or "never"})\n'
+        if not emit_cue(p, text, len(d)):
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write(text)
+        return 0
+    for k, v in s.items():
+        print(f'{v["since"]}  asked {v.get("asked") or "never":10}  {k}')
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

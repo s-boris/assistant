@@ -1,0 +1,42 @@
+{
+  "source": "~/plugins/telegram-plus",
+  "commit": "974bed5",
+  "version": "0.1.22",
+  "verbatim": {
+    "src/fold.ts": "c4358b7432b12651461ddd7bed1e94446adcd3c19506d8eaee5620932a79c15d",
+    "src/buttons.ts": "80b97720958e9a0ac4ad3be183e94226589dfd750c7ff9160e54763c60cab14d",
+    "src/quiet.ts": "2947498a8355806f56cf4b1c53259b35318375ab1b2e8babf8c4ea867b881b77",
+    "LICENSE": "dfd016a63459229ceb791be757c3bede084fb22303c36b61342db1b8f58cc450",
+    "src/photo.ts": "9eff9e654c35580bd9d8b002be1f608ea23f191b1c2bd97cbe580095d83bfd1f",
+    "src/scan.ts": "1f168f5a38bcac01868ff8b6e7ba5e46eec9b02eab8eacda1730030d89fc892d",
+    "src/picture.ts": "50537614e9c20c5084821d63aaf73b44824c149a387cc31b72679d38613d8cb3",
+    "test/images.ts": "882331db043e0919b5e190c9e01a087ee307145d18471937a92f1ea439aee080",
+    "src/callbacks.ts": "c13d7a35fec254f6d3cf83a091356194a45709cf6fc39bdfe1c001d991c0d32f"
+  },
+  "tests_import_path_only": [
+    "test/fold.test.ts",
+    "test/buttons.test.ts",
+    "test/quiet.test.ts",
+    "test/photo.test.ts",
+    "test/scan.test.ts",
+    "test/picture.test.ts",
+    "test/callbacks.test.ts"
+  ],
+  "adapted_from_server_ts": {
+    "src/format.ts": "lines 570-623, 632-904, 957-967 (chunk, formats, keyboards, sendFormatted, editWithFold, reaction whitelist)",
+    "src/access.ts": "lines 312-332, 351-395, 397-415, 442-548 (access file, gate without pairing, senderAllowed, outbound gate, isMentioned)",
+    "src/inbound.ts": "lines 3809-3888, 3936-4021, 4022-4159, 4161-4258 (callback, reaction, poll answer, message handlers, handleInbound meta)",
+    "src/outbox.ts": "lines 2562-2810 (reply, react, edit_message, send_poll tool bodies)",
+    "src/adapter.ts": "lines 913-935 + 3864-3881 (on_press mark after a press), 1788-1792 (cleanErr), 4290 (ALLOWED_UPDATES); the poll loop is new",
+    "test/mockbot.ts": "test/offline.ts lines 1-150 (mock Bot API)",
+    "test/clock.test.ts": "test/clock.test.ts lines 53-62 (buttons TTL)",
+    "src/files.ts": "lines 337-349 (assertSendable, widened), 2502-2560 (sendFile, sendAlbum), 2082-2097 (downloadToInbox); sendVoice/sendAudio is tg-voice's",
+    "src/typing.ts": "lines 975-1212 (typing: board, evaluateTyping, withSend) as one class",
+    "src/draft.ts": "lines 1191-1347 (streams: flush, update, end; one 1.2 s gap for both modes)",
+    "src/prep.ts": "lines 1411-1419, 1873-2192, 4026-4046, 4165-4268 (photo download, transcription, private scans; pending rows replace the per-chat delivery queue)",
+    "src/compat.ts": "lines 1794-1850 (runLocal), 3176-3330 (inbound journal shape and cap)",
+    "src/outbox.ts (P2 ops)": "lines 2562-2680 (reply files), 2731-2760 (draft, chat_action), 2810-2875 (send_location, pin, delete, set_commands)",
+    "src/instant.ts": "lines 1430-1433, 1452-1567, 1759-1786 (instant commands: parse, argv split, /status entry, command match; P3)",
+    "src/bind.ts": "lines 1567-1758 + 3809-3888 (instant command and callback runs: wording, toasts, busy guard, picture answers, note/forward; P3, rebuilt on bindings rows and the tools registry)"
+  }
+}

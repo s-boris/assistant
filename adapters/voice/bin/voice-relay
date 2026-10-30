@@ -1,0 +1,31 @@
+#!/bin/sh
+# voice-relay: live voice front end for the assistant. serve [--fake] [--tg-calls] | init | link | passwd | reply ID TEXT | status | health (call account session, via the relay) | canary [--no-live] (Gemini key/model/billing) |
+#   call [--reason TEXT] [--say WORDS] (ring the owner; say = spoken-friendly why) |
+#   calls [--last N] [--out] [--json] (the hub relay's call log, metadata only: answered or not per outgoing call) |
+#   files [--last N] [--json] (big files he sent to the call account) | stats [--days 14] [--json] (call quality: counts + timings, no text)
+#   greet [--refresh] [--json] (the cached pick-up line for his calls: show / generate now)
+#   The relay runs in claude-hub-voice: call | reply | status go through the hub gateway: ~/bin/voice-hub (same
+#   arguments, output and exit codes); everything else runs here (calls | stats fetch the hub relay's log through
+#   voice-hub calls = voice.calls: the log stays in claude-hub-voice).
+#   Where the rest runs: in a checkout (voice_relay/ or requirements.lock next to bin/: this repo's adapters/voice)
+#   that copy, with its .venv, else VOICE_RELAY_PYTHON, else python3. Deployed as ~/bin/voice-relay (managed)
+#   it runs the hub's current release copy: RELEASES/<CURRENT>/voice/run.py
+#   (voice/app + its pinned wheels, the code claude-hub-voice runs), RELEASES = VOICE_RELAY_RELEASES or
+#   ~/.local/share/claude-hub/releases. No release with voice = exit 2.
+case "${1:-}" in
+  call|reply|status)
+    VH="${VOICE_HUB_BIN:-$HOME/bin/voice-hub}"
+    [ -x "$VH" ] || { echo "voice-relay not reachable: the relay runs in the hub, but $VH is missing" >&2; exit 2; }
+    exec "$VH" "$@" ;;
+esac
+D="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+if [ -d "$D/voice_relay" ] || [ -f "$D/requirements.lock" ]; then
+  cd "$D" || exit 2
+  PY="$D/.venv/bin/python"; [ -x "$PY" ] || PY="${VOICE_RELAY_PYTHON:-python3}"  # the monorepo copy has no venv of its own
+  exec "$PY" -E -s -m voice_relay.server "$@"
+fi
+REL="${VOICE_RELAY_RELEASES:-$HOME/.local/share/claude-hub/releases}"
+ID=$(awk 'NR == 1 { print $1 }' "$REL/CURRENT" 2>/dev/null)
+RUN="$REL/$ID/voice/run.py"
+[ -n "$ID" ] && [ -f "$RUN" ] || { echo "voice-relay: no relay code (no voice in the hub release, $REL/CURRENT)" >&2; exit 2; }
+exec "${VOICE_RELAY_PYTHON:-python3}" -I -B "$RUN" "$@"

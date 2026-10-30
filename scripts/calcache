@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+"""calcache: token-free cache of the owner's next 21 days of Google Calendar, for scripts.
+
+A script can't reach the claude.ai calendar tools; the session saves a list_events result and imports it here.
+
+  calcache import FILE|- [FILE ...] [--days N] [--consume] [--allow-empty]
+                     saved list_events JSON (the MCP result: one page object with its events under "events" or
+                     "items" (the Google API shape), a list of such pages, or a list of events) -> normalized cache
+                     of today 00:00 + N days (default 21); prints counts only; --consume deletes the input files
+                     after a successful import. An import that yields 0 events while the current cache holds events
+                     in the new window is refused (exit 2, cache and input files unchanged) unless --allow-empty
+  calcache show [--days N] [--json]          events from today on (default 7 days)
+  calcache busy DATE [--days N] [--json]     busy windows per day (timed events, merged, clipped to the day),
+                                             evening busy (18-23), away the night after, all-day count
+  calcache towns DATE [--days N] [--json]    towns of the day's events (+ train destinations), in order
+  calcache age [--max-hours H] [--quiet] [--json]
+                     cache age; exit 1 when missing or (with --max-hours) older than H hours
+DATE: YYYY-MM-DD, today, tomorrow or +N (days from today).
+
+Cache: ~/.local/state/calcache/events.json (0600): {version, fetched, tz, window {start, end}, events}; per event
+id, start, end (local ISO; all-day: YYYY-MM-DD, end exclusive), all_day, title, town, free (marked free),
+flags {travel: train|bus|flight|drive|null, busy_evening, away_overnight, abroad, id_check}, and for timed 🚆/🚌 legs
+train {from, to, lines} (SBB-link stops, "home" for a Home end of the title; planned lines) for
+`train-watch sync --from-cache`; for timed ✈️ events flight [{no, from, to, dep, arr}] (flight-number lines of the
+description, lib/flights.py; local airport times) for `flight-watch sync --from-cache`.
+Descriptions and locations are never stored: the location is reduced to its town
+(postcode town, stop town, a lone place name; never a street). Cancelled and declined events are skipped.
+Busy = any timed event, also one marked free (concerts and the like are often marked free); all-day events are
+markers and never busy. away_overnight: a timed event that ends after 04:00 on a later day, or an all-day event of
+2+ days, away from the home town; an all-day event abroad; a ✈️ or 🏨 title. abroad: a foreign country in the
+location or a foreign flag emoji in the title. id_check: the title or description asks for ID or an age limit
+("18+", "ID", "Ausweis", "photo ID"); only the flag is kept, never the text.
+Exit: 0 ok, 1 age: missing/stale, 2 usage or bad input (import: not a list_events result, or 0 events over a
+cache that has some; the cache and the input files stay as they were), 3 no cache, 4 DATE outside the cached window.
+Env (tests): CALCACHE_DIR, CALCACHE_NOW (ISO), ASSISTANT_PROFILE.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.parse
+
+for _lib in (os.path.expanduser('~/bin/lib'), os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib')):
+    sys.path.insert(0, _lib)
+import assistant_profile as profile  # noqa: E402
+import home_place  # noqa: E402
+import flights  # noqa: E402
+
+DIR = os.environ.get('CALCACHE_DIR') or os.path.expanduser('~/.local/state/calcache')
+CACHE_F = os.path.join(DIR, 'events.json')
+DEFAULT_DAYS = 21
+STALE_H = 36
+EVENING = (18, 23)
+NIGHT_END_H = 4
+ICONS = (('\U0001F686', 'train'), ('\U0001F68C', 'bus'), ('\u2708', 'flight'), ('\U0001F6EB', 'flight'), ('\U0001F6EC', 'flight'), ('\U0001F697', 'drive'))
+AWAY_ICONS = ('\u2708', '\U0001F6EB', '\U0001F6EC', '\U0001F3E8')  # ✈️ 🛫 🛬 🏨
+LINK_RE = re.compile(r'https://app\.sbbmobile\.ch/timetable\?[^\s)>\]]+')
+# same pattern as train-watch's LINE_RE (tests check that `sync --from-cache` equals `sync FILE`)
+LINE_RE = re.compile(r'(?i:\b(?:bus|tram)\s+[A-Z]?\d+[A-Z]?\b)|\b(?:SN|S|ICN|ICE|IC|IR|RE|R|EC|EN|NJ|TGV|RJX|RJ|PE)\d{1,4}\b')
+POSTCODE_RE = re.compile(r'^(?:[A-Z]{1,2}-)?\d{4,5}\s+(\D.*)$')
+STREET_RE = re.compile(r'\d|(?i:(?:strasse|straße|str\.|gasse|weg|platz|allee|quai|graben|steig|halde|ring|road|street|'
+                       r'avenue|lane|boulevard|drive|heerweg|straat|laan)\b)|(?i:^(?:rue|chemin|via|viale|piazza|corso|'
+                       r'avenue|route|place)\b)|(?i:\b(?:st|rd|ave|blvd)\.?$)')
+COUNTRIES = {'switzerland', 'schweiz', 'suisse', 'svizzera', 'ch', 'germany', 'deutschland', 'austria', 'österreich',
+             'france', 'italy', 'italia', 'belgium', 'belgië', 'belgique', 'netherlands', 'nederland', 'spain',
+             'españa', 'portugal', 'united kingdom', 'uk', 'england', 'ireland', 'usa', 'united states',
+             'croatia', 'greece', 'czechia', 'poland', 'hungary', 'denmark', 'sweden', 'norway', 'finland',
+             'liechtenstein', 'luxembourg', 'turkey', 'serbia'}
+HOME_COUNTRY = {'switzerland', 'schweiz', 'suisse', 'svizzera', 'ch'}
+FLAG_RE = re.compile('([\U0001F1E6-\U0001F1FF]{2})')            # a regional-indicator pair = a country flag
+ID_RE = re.compile(r'(?<![\d+])(?:18|16|21)\s*\+|\bID\b|(?i:\b(?:ab|ü|over|age|from)\s*(?:18|16|21)\b|ausweis|'
+                   r'photo[- ]?id\b|identity card|identit[äa]tskarte|pi[eè]ce d.identit|passport (?:required|needed))')
+STATION_RE = re.compile(r'^(?:bahnhof|station|gare)\s+|\s+(?:hb|hbf|bahnhof|sbb|bf)$|,?\s*(?:gleis|pl|platform|kante)\s*\S*$',
+                        re.I)
+
+
+class Usage(Exception):
+    pass
+
+
+def die(msg, code=2):
+    print(f'calcache: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------------------------ time
+def tz():
+    return profile.tz()
+
+
+def iso(s):
+    try:
+        t = dt.datetime.fromisoformat(str(s).strip().replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=tz())).astimezone(tz())
+
+
+def now():
+    s = os.environ.get('CALCACHE_NOW')
+    t = iso(s) if s else dt.datetime.now(tz()).replace(microsecond=0)
+    if not t:
+        die(f'bad CALCACHE_NOW {s!r}')
+    return t
+
+
+def midnight(d):
+    return dt.datetime.combine(d, dt.time(), tz())
+
+
+def parse_date(s, today):
+    s = str(s).strip().lower()
+    if s == 'today':
+        return today
+    if s == 'tomorrow':
+        return today + dt.timedelta(days=1)
+    if re.fullmatch(r'\+\d{1,3}', s):
+        return today + dt.timedelta(days=int(s[1:]))
+    try:
+        return dt.date.fromisoformat(s)
+    except ValueError:
+        raise Usage(f'bad DATE {s!r} (YYYY-MM-DD, today, tomorrow or +N)')
+
+
+def day_label(d):
+    return f"{d.strftime('%a')} {d.day:02d}.{d.month:02d}"
+
+
+# ------------------------------------------------------------------------------------------------ normalizing
+def norm_town(t):
+    t = ' '.join(re.sub(r'\([^)]*\)', ' ', str(t or '')).split()).strip(' ,-')
+    if not t or len(t) > 40 or len(t.split()) > 4 or STREET_RE.search(t):
+        return None
+    for name in [profile.get('home.town', '') or ''] + list(profile.get('home.town_aliases', []) or []):
+        if name and t.casefold() == str(name).casefold():
+            return profile.get('home.town', '') or t
+    return t
+
+
+def stop_town(stop):
+    """Town of an SBB stop: 'Bern, Guisanplatz Expo' -> Bern; 'Bahnhof Zürich HB' -> Zürich; the home town's stops
+    (its first word or an alias) -> the home town."""
+    s = str(stop or '').split(',')[0].strip()
+    for _ in range(3):
+        s = STATION_RE.sub('', s).strip()
+    if not s:
+        return None
+    if s.casefold() == 'home' or home_place.is_home(s):
+        return profile.get('home.town', '') or None
+    first = s.split()[0].casefold()
+    for name in [profile.get('home.town', '') or '', profile.get('work.town', '') or ''] + \
+            list(profile.get('home.town_aliases', []) or []):
+        if name and str(name).split()[0].casefold() == first:
+            return profile.get('home.town', '') if name != profile.get('work.town', '') else name
+    return norm_town(s)
+
+
+def place(location, title, travel):
+    """(town or None, abroad) from a location string; never returns a street. Title '@Town' (a working-location
+    marker) names the town when there is no location."""
+    loc = str(location or '').strip()
+    if not loc:
+        m = re.fullmatch(r'@\s*([^\W\d][\w .\'-]{1,38})', str(title or '').strip())
+        return (norm_town(m.group(1)) if m else None), False
+    parts = [p.strip() for p in loc.split(',') if p.strip()]
+    country = parts[-1].casefold() if parts and parts[-1].casefold() in COUNTRIES else None
+    abroad = bool(country and country not in HOME_COUNTRY)
+    if country:
+        parts = parts[:-1]
+    for p in reversed(parts):
+        m = POSTCODE_RE.match(p)
+        if m:
+            return norm_town(m.group(1)), abroad
+    if travel in ('train', 'bus') and parts:
+        return stop_town(loc), abroad
+    if not parts:
+        return (norm_town(loc) if country else None), abroad
+    return norm_town(parts[-1]), abroad
+
+
+def parse_lines(text):
+    first = (str(text or '').strip().splitlines() or [''])[0]
+    out = []
+    for part in first.split('›'):
+        m = LINE_RE.search(part)
+        if m:
+            w = m.group(0).split()
+            out.append(f'{w[0].capitalize()} {w[1]}' if len(w) == 2 else w[0])
+    return out
+
+
+def train_fields(summary, desc):
+    src = dst = None
+    m = LINK_RE.search(str(desc or ''))
+    if m:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(m.group(0)).query)
+        src, dst = (q.get('from') or [None])[0], (q.get('to') or [None])[0]
+    body = re.sub(r'\s*\([^)]*\)\s*$', '', summary.replace('\U0001F686', '').replace('\U0001F68C', '')).strip()
+    if src and dst and '→' in body:
+        ta, tb = (x.strip() for x in body.split('→', 1))
+        src = 'home' if home_place.is_home(ta) else src
+        dst = 'home' if home_place.is_home(tb) else dst
+    return {'from': src if src and dst else None, 'to': dst if src and dst else None, 'lines': parse_lines(desc)}
+
+
+def declined(e):
+    return any(isinstance(a, dict) and a.get('self') and a.get('responseStatus') == 'declined'
+               for a in e.get('attendees') or [])
+
+
+def when(e, key):
+    """('YYYY-MM-DD', True) for an all-day boundary, (aware datetime, False) for a timed one, (None, None)."""
+    b = e.get(key) or {}
+    if isinstance(b, str):                                 # a bare ISO string instead of {dateTime|date}
+        b = {'date': b} if re.fullmatch(r'\d{4}-\d{2}-\d{2}', b) else {'dateTime': b}
+    if not isinstance(b, dict):
+        return None, None
+    if b.get('dateTime'):
+        return iso(b['dateTime']), False
+    if b.get('date') and re.match(r'\d{4}-\d{2}-\d{2}', str(b['date'])):
+        return dt.date.fromisoformat(str(b['date'])[:10]), True
+    return None, None
+
+
+def normalize(e):
+    if not isinstance(e, dict) or e.get('status') == 'cancelled' or declined(e):
+        return None
+    start, all_day = when(e, 'start')
+    end, _ = when(e, 'end')
+    if start is None:
+        return None
+    if all_day:
+        end = end if isinstance(end, dt.date) and end > start else start + dt.timedelta(days=1)
+    elif not isinstance(end, dt.datetime) or end < start:
+        end = start
+    title = ' '.join(str(e.get('summary') or '').split()) or '(no title)'
+    travel = next((name for icon, name in ICONS if icon in title), None)
+    town, abroad = place(e.get('location'), title, travel)
+    home = profile.get('home.town', '') or None
+    away_from_home = bool(town and home and town != home) or abroad
+    if all_day:
+        busy_evening = False
+        away = (away_from_home and ((end - start).days >= 2 or abroad))
+    else:
+        busy_evening = any(max(start, midnight(d) + dt.timedelta(hours=EVENING[0]))
+                           < min(end, midnight(d) + dt.timedelta(hours=EVENING[1]))
+                           for d in days_between(start.date(), end.date()))
+        away = away_from_home and end > midnight(start.date() + dt.timedelta(days=1)) + dt.timedelta(hours=NIGHT_END_H)
+    away = bool(away or any(i in title for i in AWAY_ICONS))
+    flag = next((f for f in FLAG_RE.findall(title)
+                 if ''.join(chr(ord(c) - 0x1F1E6 + 97) for c in f) not in HOME_COUNTRY), None)
+    id_check = bool(ID_RE.search(title) or ID_RE.search(str(e.get('description') or '')))
+    free = e.get('transparency') == 'transparent' or e.get('availability') == 'AVAILABILITY_FREE'
+    ev = {'id': str(e.get('id') or ''), 'start': start.isoformat(), 'end': end.isoformat(), 'all_day': bool(all_day),
+          'title': title, 'town': town, 'free': bool(free),
+          'flags': {'travel': travel, 'busy_evening': bool(busy_evening), 'away_overnight': away,
+                    'abroad': bool(abroad or flag), 'id_check': id_check}}
+    if travel in ('train', 'bus') and not all_day:
+        ev['train'] = train_fields(title, e.get('description'))
+    if travel == 'flight' and not all_day:
+        legs = flights.parse_event(title, e.get('description'), start, end)
+        if legs:
+            ev['flight'] = legs
+    return ev
+
+
+def days_between(a, b):
+    out, d = [], a
+    while d <= b:
+        out.append(d)
+        d += dt.timedelta(days=1)
+    return out
+
+
+def bounds(ev):
+    """Aware (start, end) of a cached event; all-day ones span their dates."""
+    if ev['all_day']:
+        return midnight(dt.date.fromisoformat(ev['start'])), midnight(dt.date.fromisoformat(ev['end']))
+    return iso(ev['start']), iso(ev['end'])
+
+
+def in_window(ev, w0, w1):
+    """The event overlaps [w0, w1) (an event ending exactly at w0 is out)."""
+    try:
+        s, en = bounds(ev)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return not (en <= w0 and s < w0 or s >= w1)
+
+
+# ------------------------------------------------------------------------------------------------ cache io
+def load_cache(required=True):
+    try:
+        with open(CACHE_F, encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get('events'), list):
+            return data
+    except (OSError, ValueError):
+        pass
+    if required:
+        die(f'no calendar cache at {CACHE_F} (calcache import first)', 3)
+    return None
+
+
+def save_cache(data):
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=DIR, prefix='.events-', suffix='.tmp')
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.write('\n')
+        os.replace(tmp, CACHE_F)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def warn_stale(data, t):
+    f = iso(data.get('fetched'))
+    if f and (t - f).total_seconds() > STALE_H * 3600:
+        print(f'calcache: cache is {(t - f).total_seconds() / 3600:.0f} h old', file=sys.stderr)
+
+
+PAGE_KEYS = ('events', 'items')                            # claude.ai tool result / Google API events.list
+
+
+def read_events(paths):
+    """Raw events of saved list_events results. A page is an object with a list under "events" or "items" (its own
+    "summary" is the calendar's name, not an event); an event is an object with a "start"."""
+    events = []
+    for p in paths:
+        try:
+            data = json.load(sys.stdin) if p == '-' else json.load(open(p, encoding='utf-8'))
+        except OSError as e:
+            raise Usage(f'{p}: {e.strerror}')
+        except ValueError as e:
+            raise Usage(f'{p}: not JSON ({e})')
+        items = data if isinstance(data, list) else [data]
+        ok = False
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            lists = [it[k] for k in PAGE_KEYS if isinstance(it.get(k), list)]
+            if lists:
+                for lst in lists:
+                    events += lst
+                ok = True
+            elif it.get('start'):
+                events.append(it)
+                ok = True
+        if not ok and items:
+            raise Usage(f'{p}: no list_events result (expected an object with "events" or "items", '
+                        'or a list of events); cache unchanged')
+    return events
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def cmd_import(a, t):
+    if not 1 <= a.days <= 90:
+        raise Usage('--days must be 1..90')
+    raw = read_events(a.files)
+    w0 = midnight(t.date())
+    w1 = midnight(t.date() + dt.timedelta(days=a.days))
+    seen, events, skipped = set(), [], 0
+    for e in raw:
+        ev = normalize(e)
+        if not ev:
+            skipped += 1
+            continue
+        if not in_window(ev, w0, w1):
+            continue
+        key = ev['id'] or f"{ev['title']}|{ev['start']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        events.append(ev)
+    events.sort(key=lambda ev: (bounds(ev)[0], not ev['all_day'], ev['title']))
+    if not events and not a.allow_empty:
+        old = load_cache(required=False)
+        held = [ev for ev in (old or {}).get('events', []) if isinstance(ev, dict) and in_window(ev, w0, w1)]
+        if held:
+            raise Usage(f'0 events from {len(raw)} raw entries, but the cache holds {len(held)} in '
+                        f'{w0.date()} → {w1.date()}; cache unchanged (a wrong file? re-save it; '
+                        'really empty: --allow-empty)')
+    save_cache({'version': 1, 'fetched': t.isoformat(), 'tz': profile.tz_name(),
+                'window': {'start': w0.isoformat(), 'end': w1.isoformat()}, 'events': events})
+    if a.consume:
+        for p in a.files:
+            if p != '-' and os.path.isfile(p):
+                os.unlink(p)
+    n_travel = sum(1 for ev in events if ev['flags']['travel'])
+    print(f'cached {len(events)} events ({n_travel} travel, {skipped} cancelled/declined/skipped), '
+          f'{w0.date()} → {w1.date()} -> {CACHE_F}')
+    return 0
+
+
+def window(data):
+    return iso(data['window']['start']), iso(data['window']['end'])
+
+
+def on_day(data, d):
+    a, b = midnight(d), midnight(d + dt.timedelta(days=1))
+    return [ev for ev in data['events'] if bounds(ev)[0] < b and (bounds(ev)[1] > a or bounds(ev)[0] >= a)]
+
+
+def date_range(a, t, data, default_days=1):
+    first = parse_date(a.date, t.date()) if getattr(a, 'date', None) else t.date()
+    n = a.days or default_days
+    if not 1 <= n <= 90:
+        raise Usage('--days must be 1..90')
+    w0, w1 = window(data)
+    dates = [first + dt.timedelta(days=i) for i in range(n)]
+    covered = {d: w0.date() <= d < w1.date() for d in dates}
+    return dates, covered
+
+
+def hm(x, d):
+    return '24:00' if x.date() > d else x.strftime('%H:%M')
+
+
+def busy_day(data, d):
+    a, b = midnight(d), midnight(d + dt.timedelta(days=1))
+    evs = on_day(data, d)
+    spans = sorted((max(s, a), min(e, b)) for s, e in (bounds(ev) for ev in evs if not ev['all_day'])
+                   if min(e, b) > max(s, a) or s == e)
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    eve0, eve1 = a + dt.timedelta(hours=EVENING[0]), a + dt.timedelta(hours=EVENING[1])
+    # the night after this day: a timed away event across its midnight, or an all-day away event covering the day
+    away = [ev for ev in evs if ev['flags']['away_overnight']
+            and (ev['all_day'] or bounds(ev)[0] < b < bounds(ev)[1])]
+    return {'date': d.isoformat(), 'busy': [[hm(s, d), hm(e, d)] for s, e in merged],
+            'evening_busy': any(not ev['all_day'] and bounds(ev)[0] < eve1 and bounds(ev)[1] > eve0 for ev in evs),
+            'away_overnight': bool(away),
+            'all_day': sum(1 for ev in evs if ev['all_day']),
+            'travel': sorted({ev['flags']['travel'] for ev in evs if ev['flags']['travel']})}
+
+
+def towns_day(data, d):
+    out = []
+    for ev in on_day(data, d):
+        for tn in (ev.get('town'), stop_town((ev.get('train') or {}).get('to'))):
+            if tn and tn not in out:
+                out.append(tn)
+    return out
+
+
+def emit_days(a, rows, covered, text_fn):
+    if a.json:
+        out = [dict(r, covered=covered[dt.date.fromisoformat(r['date'])]) for r in rows]
+        print(json.dumps(out[0] if len(out) == 1 and not a.days else out, ensure_ascii=False))
+    else:
+        for r in rows:
+            d = dt.date.fromisoformat(r['date'])
+            print(f"{r['date']} {d.strftime('%a')}: " + (text_fn(r) if covered[d] else 'not cached'))
+    if len(rows) == 1 and not covered[dt.date.fromisoformat(rows[0]['date'])]:
+        return 4
+    return 0
+
+
+def busy_text(r):
+    parts = [('busy ' + ', '.join(f'{s}–{e}' for s, e in r['busy'])) if r['busy'] else 'free']
+    if r['evening_busy']:
+        parts.append('evening busy')
+    if r['away_overnight']:
+        parts.append('away overnight')
+    if r['all_day']:
+        parts.append(f"{r['all_day']} all-day")
+    return ' · '.join(parts)
+
+
+def cmd_busy(a, t):
+    data = load_cache()
+    warn_stale(data, t)
+    dates, covered = date_range(a, t, data)
+    rows = [busy_day(data, d) if covered[d] else {'date': d.isoformat(), 'busy': [], 'evening_busy': False,
+                                                    'away_overnight': False, 'all_day': 0, 'travel': []}
+            for d in dates]
+    return emit_days(a, rows, covered, busy_text)
+
+
+def cmd_towns(a, t):
+    data = load_cache()
+    warn_stale(data, t)
+    dates, covered = date_range(a, t, data)
+    rows = [{'date': d.isoformat(), 'towns': towns_day(data, d) if covered[d] else []} for d in dates]
+    return emit_days(a, rows, covered, lambda r: ', '.join(r['towns']) or '-')
+
+
+def cmd_show(a, t):
+    data = load_cache()
+    warn_stale(data, t)
+    n = a.days or 7
+    a0, a1 = midnight(t.date()), midnight(t.date() + dt.timedelta(days=n))
+    evs = [ev for ev in data['events'] if bounds(ev)[0] < a1 and bounds(ev)[1] > a0]
+    if a.json:
+        print(json.dumps(evs, ensure_ascii=False, indent=1))
+        return 0
+    if not evs:
+        print(f'no events in the next {n} days')
+    for ev in evs:
+        s, e = bounds(ev)
+        if ev['all_day']:
+            last = e.date() - dt.timedelta(days=1)
+            span = day_label(s.date()) + (f'–{day_label(last)}' if last > s.date() else '') + ' all day'
+        else:
+            span = f"{day_label(s.date())} {s.strftime('%H:%M')}–{e.strftime('%H:%M')}"
+        marks = [m for m, on in (('evening', ev['flags']['busy_evening']), ('overnight', ev['flags']['away_overnight']),
+                                 ('free', ev['free'])) if on]
+        print(f"{span} {ev['title']}" + (f" · {ev['town']}" if ev.get('town') else '')
+              + (f" [{', '.join(marks)}]" if marks else ''))
+    return 0
+
+
+def cmd_age(a, t):
+    data = load_cache(required=False)
+    f = iso(data.get('fetched')) if data else None
+    if not f:
+        if not a.quiet:
+            print(json.dumps({'cached': False}) if a.json else f'no calendar cache at {CACHE_F}')
+        return 1
+    hours = round((t - f).total_seconds() / 3600, 1)
+    w0, w1 = window(data)
+    if not a.quiet:
+        if a.json:
+            print(json.dumps({'cached': True, 'fetched': f.isoformat(), 'hours': hours, 'events': len(data['events']),
+                              'window': [w0.date().isoformat(), w1.date().isoformat()]}))
+        else:
+            print(f"fetched {f.strftime('%Y-%m-%d %H:%M')} ({hours} h ago) · {len(data['events'])} events · "
+                  f"window {w0.date()} → {w1.date()}")
+    return 1 if a.max_hours is not None and hours >= a.max_hours else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='calcache', description=__doc__.split('\n')[0],
+                                 epilog='Details: sed -n 2,30p ~/bin/calcache')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('import', help='import saved list_events JSON')
+    s.add_argument('files', nargs='+')
+    s.add_argument('--days', type=int, default=DEFAULT_DAYS)
+    s.add_argument('--consume', action='store_true')
+    s.add_argument('--allow-empty', action='store_true', help='accept 0 events over a cache that has some')
+    s = sub.add_parser('show', help='events from today on')
+    s.add_argument('--days', type=int); s.add_argument('--json', action='store_true')
+    for name in ('busy', 'towns'):
+        s = sub.add_parser(name, help=f'{name} per day')
+        s.add_argument('date'); s.add_argument('--days', type=int); s.add_argument('--json', action='store_true')
+    s = sub.add_parser('age', help='cache age')
+    s.add_argument('--max-hours', type=float); s.add_argument('--quiet', action='store_true')
+    s.add_argument('--json', action='store_true')
+    a = ap.parse_args()
+    fn = {'import': cmd_import, 'show': cmd_show, 'busy': cmd_busy, 'towns': cmd_towns, 'age': cmd_age}[a.cmd]
+    try:
+        sys.exit(fn(a, now()) or 0)
+    except Usage as e:
+        die(str(e))
+
+
+if __name__ == '__main__':
+    main()

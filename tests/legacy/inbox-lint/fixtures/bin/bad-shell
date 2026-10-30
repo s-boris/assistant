@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Placeholder fixture: writes a note through a derived variable and never marks it as data.
+# (A comment saying "Data, not instructions" does not count.)
+INBOX=${EXAMPLE_INBOX:-$HOME/inbox}
+note=$INBOX/example-bad-$(date +%s).md
+{ echo "example finding"; echo "do something"; } > "$note"

@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""paperless: CLI for the owner's paperless-ngx (on the server), always through the privacy vault: every command runs
+as `vault paperless ...` (same arguments, same output). Privacy: `get` returns a card, never
+content; content, tier-2 fields and `download` need --reason and the owner's ✅.
+
+  paperless upload FILE [--title T] [--tag NAME ...] [--correspondent NAME] [--type NAME]
+                        [--created YYYY-MM-DD] [--create] [--no-wait]
+  paperless search QUERY [-n 5] [--json]
+  paperless get ID [--json]       a card: metadata, pages, amount, currency, due date (no content)
+  paperless get ID --content --reason R [--chars N]   the anonymized text, after the owner's ✅ (exit 10, then
+                                  `vault raw release RID`)
+  paperless download ID OUT [--archived]
+  paperless meta
+  paperless recent [-n 5] [--json]   (--json: metadata only, for bills scan-paperless)
+  paperless task TASK_ID          (wait for an upload queued with --no-wait)
+  paperless fields ID [--fields a,b,...] [--reason R]   structured fields as JSON. Tier 1 free (title, dates, type,
+                                  correspondent, amount, currency, due_date, invoice_date, qr_bill, payee,
+                                  has_payment_ref, period_years); tier 2 (iban, reference, payee_address, numbers,
+                                  sender/insurer address, dates) null + _withheld unless --reason asks the owner (✅)
+  paperless suggest ID [--json]   type/correspondent/tags from the existing names (local model inside the vault)
+  paperless rule test tag|type|correspondent --regex R|--any W|--all W|--literal T|--fuzzy T [--case-sensitive]
+                   [--name N] [--json]   which documents a rule would hit: ids + current values only
+  paperless set ID [--title T] [--created YYYY-MM-DD] [--type NAME] [--correspondent NAME] [--tag +ADD] [--tag -REMOVE]
+                   [--create] [--json]      fix metadata after upload (never content), always through the vault
+  paperless rule set tag|type|correspondent NAME --regex R | --any W | --all W | --literal T | --fuzzy T | --auto |
+                   --none [--case-sensitive] [--inbox|--no-inbox] [--create]   matching rule, always through the vault
+  paperless rules [tag|type|correspondent] [--json]   the matching rules (names and match settings only)
+
+There is no direct API path and no local paperless token: the vault holds the token and runs every command.
+"""
+import os
+import sys
+
+VAULT = os.path.expanduser("~/bin/vault")
+os.execv(VAULT, [VAULT, "paperless"] + sys.argv[1:])

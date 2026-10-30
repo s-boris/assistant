@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""webagent - web tasks in my headed Chrome that stop before any committing action and wait for his approval.
+
+Protocol and card handling: ~/.claude/skills/web-agent/SKILL.md. Logic: ~/bin/lib/webagent.py. Tests: ~/opt/webagent-tests.
+
+  webagent start "TITLE" [--url U] [--kind K] [--dry] [--agent REF] [--data yes|no|auto] [--minutes N]
+                [--retry-of auto|ID|none]
+                                        new task (prints the id; --json for all). --retry-of auto (default): an
+                                        unfinished earlier attempt with the same title + site (24 h) is a retry of the
+                                        same job: a running or stale one is aborted (reason retry) and linked; exit 6
+                                        while it has an open card, an approved/executing step or a revivable fill
+                                        session (the message says which: stop again, revive, or --retry-of ID|none).
+                                        --data (auto = kinds booking + form):
+                                        ask the vault now for the task's fill session (one ✅ in the vault bot for
+                                        his details on this site, --minutes 1-60, default 30); else the first
+                                        `securefill fill` asks. done/abort/sweep end it; the vault bot reports.
+  webagent step ID "what I did" [--kind navigate|fill|select|click|read|note] [--url U] [--shot PNG] [--side-effect S]
+  webagent check "LABEL"                exit 3 = committing (stop first), 0 = not; prints the classification
+  webagent stop ID --label "BUTTON TEXT" --what "WHAT HAPPENS" --shot PNG [--target SELECTOR] [--url U]
+                [--category C] [--verify "WHAT SUCCESS LOOKS LIKE"] [--card] [--amount "CHF 127.00"]
+                [--summary "WHAT IS BOOKED/ORDERED"] [--declined "EXTRAS DECLINED"] [--tick "EXACT BOX LABEL"]...
+                                        -> pending + the approval card (JSON); --card: `securefill commit` runs it.
+                                        On a pending task it replaces the unanswered card (send + `sent` the new one;
+                                        taps on the old card no longer count).
+                                        booking/order: soft steps (Continue, Confirm, Submit details) run without a
+                                        stop; the one final card (pay/book/order) needs --summary + --amount.
+                                        --tick (repeatable): required T&C boxes; his ✅ covers exactly those and
+                                        securefill ticks them (commit, or `securefill tick ID` without --card)
+  webagent card ID [--link auto|off|URL]   the approval card again (live: `browser link` adds 🖥)
+  webagent sent ID --msg MESSAGE_ID     record the card's Telegram message id (links his tap / 👍)
+  webagent approve ID [--typed MSG_ID | --button CALLBACK] [--simulate]   after his ✅: the card's approval
+                                        (ap:<nonce>, consumed once; tg-adapter or the Telegram journal), else the
+                                        journal's other proofs (👍 on the card, --typed his yes, --button = another
+                                        flow's yes button, e.g. shop:buy:galaxus); 5 = no proof or he declined
+  webagent resume ID                    for the executing agent: JSON; exit 0 go, 4 expired, 5 not approved, 6 closed
+  webagent revive ID                    a stale task back to running (logged): only within 2 h of going stale, only
+                                        one that went stale while running, only while its fill session is still live
+                                        (pending or active); exit 4 too late, 6 not revivable (start a new task)
+  webagent done ID [--fail] [--shot PNG] [--note TEXT] [--continue]   result (+ the result card JSON)
+  webagent abort ID [--reason owner|error|agent|retry] [--typed MSG_ID]  -> back-out JSON (tab to close, side
+                                        effects, stopped_by); owner without his ❌/👎/--typed no = stopped_by session
+                                        (not counted as his stop);
+                                        also a stale task (ends the fill session sweep keeps for `revive`)
+  webagent status [ID] [--all] [--json] | sweep | stats [--days N] [--dry] [--by-cause] [--json]
+                                        stats: per task and per job (a task + its retries); --by-cause: one row per
+                                        unfinished task (cause, site, last step kind, stop tier/category, who
+                                        stopped it, retried as) and per guard deny (caller, tier, dry); no text
+Stale = running or executing without a step for 45 min. A running task whose fill session waits for his ✅ in the
+vault bot (`securefill fill` / `session start` exit 10) does not go stale before that request's deadline (status:
+"waiting for his vault ✅ until HH:MM"); the 45 min count from there.
+  webagent guard                        PreToolUse hook entry (JSON on stdin)
+ID may also be the card's callback data ap:<nonce>:y|n (the task whose card carries that approval).
+Typed form values are never accepted; free text is redacted (cards, IBANs, CVCs, secrets, tokens).
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ.get("WEBAGENT_LIB") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import webagent as W  # noqa: E402
+
+
+def out(obj, as_json=True):
+    print(json.dumps(obj, ensure_ascii=False, indent=1) if as_json else obj)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="webagent", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("start")
+    s.add_argument("title")
+    s.add_argument("--url")
+    s.add_argument("--kind", default="other", choices=W.KINDS)
+    s.add_argument("--dry", action="store_true")
+    s.add_argument("--agent")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--data", default="auto", choices=("yes", "no", "auto"))
+    s.add_argument("--minutes", type=int, choices=range(1, 61), metavar="1-60")
+    s.add_argument("--retry-of", default="auto", metavar="auto|ID|none")
+    s = sub.add_parser("step")
+    s.add_argument("id")
+    s.add_argument("desc")
+    s.add_argument("--kind", default="note", choices=("navigate", "fill", "select", "click", "read", "note"))
+    s.add_argument("--url")
+    s.add_argument("--shot")
+    s.add_argument("--side-effect")
+    s = sub.add_parser("check")
+    s.add_argument("label")
+    s = sub.add_parser("stop")
+    s.add_argument("id")
+    s.add_argument("--label", required=True)
+    s.add_argument("--what", required=True)
+    s.add_argument("--shot", required=True)
+    s.add_argument("--target")
+    s.add_argument("--url")
+    s.add_argument("--category", choices=list(W.CATEGORY_TITLE))
+    s.add_argument("--verify")
+    s.add_argument("--card", action="store_true", help="the step pays with his card: securefill commit fills it")
+    s.add_argument("--amount", help="the exact total, e.g. 'CHF 127.00' (with --card shown on both ✅ cards)")
+    s.add_argument("--tick", action="append", default=[], help="exact visible label of a required checkbox (repeat)")
+    s.add_argument("--summary", help="what is booked/ordered (required on the final booking/order card)")
+    s.add_argument("--declined", help="extras declined (insurance, seats, bags, ...)")
+    s.add_argument("--link", default="auto")
+    s = sub.add_parser("card")
+    s.add_argument("id")
+    s.add_argument("--link", default="auto")
+    s = sub.add_parser("sent")
+    s.add_argument("id")
+    s.add_argument("--msg", required=True)
+    s = sub.add_parser("approve")
+    s.add_argument("id")
+    s.add_argument("--typed")
+    s.add_argument("--button")
+    s.add_argument("--simulate", action="store_true")
+    s = sub.add_parser("resume")
+    s.add_argument("id")
+    s = sub.add_parser("revive")
+    s.add_argument("id")
+    s = sub.add_parser("done")
+    s.add_argument("id")
+    s.add_argument("--fail", action="store_true")
+    s.add_argument("--ok", action="store_true", help="default")
+    s.add_argument("--shot")
+    s.add_argument("--note")
+    s.add_argument("--continue", dest="cont", action="store_true")
+    s = sub.add_parser("abort")
+    s.add_argument("id")
+    s.add_argument("--reason", default="owner", choices=("owner", "error", "agent", "retry"))
+    s.add_argument("--typed")
+    s = sub.add_parser("status")
+    s.add_argument("id", nargs="?")
+    s.add_argument("--all", action="store_true")
+    s.add_argument("--json", action="store_true")
+    sub.add_parser("sweep")
+    s = sub.add_parser("stats")
+    s.add_argument("--days", type=int, default=30)
+    s.add_argument("--dry", action="store_true")
+    s.add_argument("--by-cause", action="store_true")
+    s.add_argument("--json", action="store_true")
+    sub.add_parser("guard")
+    a = ap.parse_args(argv)
+    if getattr(a, "id", None):
+        a.id = W.resolve(a.id)                       # ap:<nonce>:y|n -> the task whose card carries it
+
+    if a.cmd == "start":
+        t = W.start(a.title, a.url, a.kind, a.dry, a.agent, a.data, a.minutes, a.retry_of)
+        out(W.public(t)) if a.json else print(t["id"])
+        fs = t.get("fill_session") or {}
+        if fs.get("note") and not a.json:
+            print(f"fill session: {fs.get('state')}: {fs['note']}", file=sys.stderr)
+    elif a.cmd == "step":
+        W.step(a.id, a.desc, a.url, a.shot, a.kind, a.side_effect)
+    elif a.cmd == "check":
+        c = W.classify(a.label)
+        out(c)
+        return 3 if c["commit"] else 0
+    elif a.cmd == "stop":
+        t = W.stop(a.id, a.label, a.what, a.shot, a.target, a.url, a.category, a.verify, a.card, a.amount,
+                   a.tick, a.summary, a.declined)
+        out({"id": t["id"], "state": t["state"], "expires": W.fmt_local(t["expires"]), "card": W.card(t, a.link)})
+    elif a.cmd == "card":
+        t = W.load(a.id) or W.die(f"no task {a.id}", 2)
+        if W.effective(t) != "pending":
+            W.die(f"task {a.id} is {W.effective(t)}, no card to send", 4 if W.effective(t) == "expired" else 6)
+        out(W.card(t, a.link))
+    elif a.cmd == "sent":
+        W.sent(a.id, a.msg)
+    elif a.cmd == "approve":
+        t = W.approve(a.id, a.simulate, a.typed, a.button)
+        out({"id": t["id"], "state": t["state"], "via": t["approval"]["via"],
+             "until": W.fmt_local(t["approval"]["until"]), "label": t["pending"]["label"]})
+    elif a.cmd == "resume":
+        o, code = W.resume(a.id)
+        out(o)
+        return code
+    elif a.cmd == "revive":
+        t = W.revive(a.id)
+        rv = t["revived"][-1]
+        out({"id": t["id"], "state": t["state"], "fill_session": rv["fill_session"],
+             "stale_min": rv["stale_s"] // 60, "tab_url": t.get("tab_url"),
+             "next": f"resume the agent (`webagent resume {t['id']}`, then its abx window: `abx list --task "
+                     f"{t['id']}`; exit 4 = closed meanwhile: `abx start --task {t['id']} <tab_url>` and check the "
+                     "page); the next committing step needs its own card and his ✅"})
+    elif a.cmd == "done":
+        t = W.done(a.id, not a.fail, a.shot, a.note, a.cont)
+        out({"id": t["id"], "state": t["state"], "result": t["result"], "card": W.result_card(t)})
+    elif a.cmd == "abort":
+        _, o = W.abort(a.id, a.reason, a.typed)
+        out(o)
+    elif a.cmd == "status":
+        if a.id:
+            t = W.load(a.id) or W.die(f"no task {a.id}", 2)
+            out(W.public(t))
+            return 0
+        ts = [W.public(t) for t in W.all_tasks()]
+        ts = ts if a.all else [t for t in ts if t["state"] in W.OPEN or t.get("revive_until")]
+        if a.json:
+            out(ts)
+        elif not ts:
+            print("no open web tasks" if not a.all else "no web tasks")
+        else:
+            for t in ts:
+                extra = f" · {t['pending']['category']} “{t['pending']['label']}” until {t['expires']}" \
+                    if t["state"] == "pending" and t["pending"] else ""
+                if t.get("waiting"):
+                    extra += f" · waiting for his vault ✅ until {t['waiting']['until']}"
+                if t.get("revive_until"):
+                    extra += f" · revivable until {t['revive_until']} if its fill session is live"
+                print(f"{t['id']} {t['state']:<9} {t['mode']:<4} {t['title'][:60]} · {t['steps']} steps{extra}")
+    elif a.cmd == "sweep":
+        out(W.sweep())
+    elif a.cmd == "stats":
+        st = W.stats(a.days, a.dry, a.by_cause)
+        if a.json:
+            out(st)
+        else:
+            ab = "–" if st["abandon_rate"] is None else f"{st['abandon_rate']:.0%}"
+            print(f"web tasks {st['days']} d: {st['tasks']} started · {st['completed']} completed "
+                  f"({st['committed']} committed) · {st['reached_card']} reached a card · {st['approvals']} approved · "
+                  f"{st['owner_stops']} stopped · {st['expired']} expired · abandon {ab} · "
+                  f"median approval {st['median_approval_s'] if st['median_approval_s'] is not None else '–'} s · "
+                  f"{st['guard_blocks']} guard blocks (+{st['guard_blocks_dry']} in dry runs)")
+            jr = "–" if st["job_completion_rate"] is None else f"{st['job_completion_rate']:.0%}"
+            print(f"jobs (a task + its retries): {st['jobs']} · {st['jobs_completed']} completed ({jr}) · "
+                  f"{st['retried']} attempts retried · cards ended by the session, not by him: {st['session_stops']}")
+            if a.by_cause:
+                print("causes: " + (", ".join(f"{k} {v}" for k, v in sorted(st["causes"].items(), key=lambda x: -x[1]))
+                                    or "none"))
+                for r in st["unfinished"]:
+                    print(f"  {r['id']} {r['kind']:<8} {r['site'] or '-':<18} {r['cause']:<17} last {r['last_step'] or '-'}"
+                          f" (+{r['idle_min'] if r['idle_min'] is not None else '-'} min) stop {r['stop'] or '-'}"
+                          f" by {r['stopped_by'] or '-'} · job {r['job']}{' done' if r['job_done'] else ''}"
+                          f"{' → ' + r['retried_as'] if r['retried_as'] else ''}")
+                for g in st["guard"]:
+                    print(f"  deny {g['t']} {g['caller']:<5} {g['tool']} {g['tier']}/{g['cat']}{' (dry)' if g['dry'] else ''}")
+    elif a.cmd == "guard":
+        try:
+            ev = json.load(sys.stdin)
+        except ValueError:
+            return 0
+        r = W.guard_hook(ev)
+        if r:
+            print(json.dumps(r, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

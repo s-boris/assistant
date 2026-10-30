@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# browser: his real, headed Google Chrome for pages WebFetch can't handle (JS-heavy, bot-protected, owner-approved
+# logins), driven by the Playwright MCP ("browser" MCP server) over CDP. Chrome runs in claude-hub-browser; every
+# command goes to browser-hub, which talks to the container's control API and its browsersvc CDP gate.
+#
+#   browser status [--json]            the container (Chrome, version, service, view) and the clients' CDP route
+#   browser ensure                     exit 0 when the container answers with Chrome up (cron every 5 min)
+#   browser start|restart              restart Chrome in the container (clean close first)
+#   browser stop                       refused: the container keeps Chrome up
+#   browser screenshot [F]             PNG of the whole display (default ~/reports/browser/screen-<time>.png)
+#   browser url                        open tabs (title + URL)
+#   browser open URL                   open URL in a new tab
+#   browser view on [MIN]|off|status   owner view: noVNC through the phone front on :6080 (VNC password asked by noVNC)
+#   browser link [--json] [--min N]    view on (30 min default) + his one-tap URL for the phone, checked to load
+#   browser update                     Chrome is pinned in the container image: says how to bump it
+#   browser-hub --help                 the rest (prep, mcp, audit)
+set -uo pipefail
+hubcli="$(dirname "$(readlink -f "$0")")/browser-hub"
+case "${1:-}" in
+  -h|--help|help) grep -v '^# managed: ' "$0" | sed -n '2,16p' | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+pg="$(dirname "$(readlink -f "$0")")/profile-get"
+if [ -x "$pg" ] && [ "$("$pg" --feature browser 2>/dev/null)" = off ]; then
+  echo "browser: feature browser is off (features.browser in the profile)" >&2; exit 3
+fi
+[ -x "$hubcli" ] || { echo "browser: browser-hub is missing ($hubcli)" >&2; exit 1; }
+exec "$hubcli" "$@"

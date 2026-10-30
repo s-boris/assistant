@@ -1,0 +1,120 @@
+#!/usr/local/bin/python3.13 -I
+"""tool: launcher for the typed tool registry (packages/tools): runs `tools.cli` in its own venv.
+
+The venv holds the pinned runtime (FastMCP, Pydantic) from requirements.lock beside the package (deployed:
+~/bin/lib/tools/requirements.lock). It lives in ~/.local/share/assistant/venvs/tools-<lock hash> and is built on
+first use with uv under a lock (the deploy smoke does that); the last 3 are kept. Everything else: `tool --help`.
+Env: ASSISTANT_LIB (a dir holding core/ and tools/) · TOOLS_VENV (use this venv as is) · TOOLS_UV (uv binary).
+Stdlib only.
+"""
+
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_cands = [os.environ.get("ASSISTANT_LIB") or "", os.path.join(_here, "lib")]
+_repo = os.path.dirname(_here)
+LIB = next((c for c in _cands if c and os.path.isfile(os.path.join(c, "tools", "cli.py"))), "")
+if LIB:
+    SYSPATH = [LIB]
+elif os.path.isfile(os.path.join(_repo, "packages", "tools", "cli.py")):  # a repo checkout: scripts/tool
+    SYSPATH = [_repo, os.path.join(_repo, "packages")]
+    LIB = os.path.join(_repo, "packages")
+else:
+    sys.exit("tool: the tools package is missing (deploy with `assistant land`)")
+sys.path[:0] = SYSPATH
+from core import locks  # noqa: E402  (the harness core next to the package)
+
+LOCKFILE = os.path.join(LIB, "tools", "requirements.lock")
+HOME = os.path.expanduser("~")
+VENVS = os.path.join(HOME, ".local", "share", "assistant", "venvs")
+BOOT = (
+    "import os,sys; sys.path[:0]=os.environ['TOOLS_SYSPATH'].split(os.pathsep); "
+    "from tools.cli import main; sys.exit(main(sys.argv[1:]))"
+)
+
+
+def uv() -> str:
+    u = os.environ.get("TOOLS_UV") or shutil.which("uv") or os.path.join(HOME, ".local", "bin", "uv")
+    if not os.path.isfile(u):
+        sys.exit("tool: uv is missing (~/.local/bin/uv) and the venv isn't built yet")
+    return u
+
+
+def build(dest: str) -> None:
+    env = dict(os.environ, UV_NO_PROGRESS="1")
+    env.setdefault("UV_CACHE_DIR", os.path.join(HOME, ".cache", "uv"))
+    env.setdefault("UV_PYTHON_INSTALL_DIR", os.path.join(HOME, ".local", "share", "uv", "python"))
+    tmp = f"{dest}.tmp{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        for py in ("3.13", "/usr/bin/python3"):
+            r = subprocess.run(
+                [uv(), "venv", "--quiet", "--python", py, "--no-python-downloads", tmp],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            if r.returncode == 0:
+                break
+        else:
+            sys.exit(f"tool: uv venv failed: {r.stderr.strip()[-300:]}")
+        r = subprocess.run(
+            [
+                uv(),
+                "pip",
+                "sync",
+                "--quiet",
+                "--require-hashes",
+                "--python",
+                os.path.join(tmp, "bin", "python"),
+                LOCKFILE,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            sys.exit(f"tool: installing {LOCKFILE} failed: {r.stderr.strip()[-300:]}")
+        os.replace(tmp, dest)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    olds = sorted(
+        (os.path.join(VENVS, n) for n in os.listdir(VENVS) if n.startswith("tools-") and ".tmp" not in n),
+        key=os.path.getmtime,
+    )
+    for old in [o for o in olds if o != dest][:-2]:  # keep the 2 before this one
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def venv_python() -> str:
+    if os.environ.get("TOOLS_VENV"):
+        return os.path.join(os.environ["TOOLS_VENV"], "bin", "python")
+    with open(LOCKFILE, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()[:12]
+    dest = os.path.join(VENVS, f"tools-{digest}")
+    py = os.path.join(dest, "bin", "python")
+    if not os.path.exists(py):
+        os.makedirs(VENVS, mode=0o700, exist_ok=True)
+        with locks.hold(os.path.join(VENVS, ".tools.lock"), wait=300) as fd:
+            if fd is None:
+                sys.exit("tool: another run is still building the venv (lock busy > 300 s)")
+            if not os.path.exists(py):
+                t0 = time.monotonic()
+                build(dest)
+                print(f"tool: built {dest} in {time.monotonic() - t0:.1f} s", file=sys.stderr)
+    return py
+
+
+def main() -> None:
+    py = venv_python()
+    env = dict(os.environ, TOOLS_SYSPATH=os.pathsep.join(SYSPATH))
+    os.execve(py, [py, "-I", "-c", BOOT, *sys.argv[1:]], env)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# llm-server-ctl start|stop|restart|status|ensure|idle-check|info|install
+# Local LLM for private data (~/bin/llm-local): llama.cpp llama-server, bound to 127.0.0.1 only (port 8179),
+# nice 19 with a thread cap so it never starves the box. No web UI, no outbound network (built without OpenSSL).
+#   ensure  (boot.sh at start, cron every 5 min) starts it unless I stopped it on purpose (`stop` sets a flag).
+#   start   (llm-local on demand) always starts it and clears that flag.
+#   idle-check (cron, every 5 min) stops it (and sets the flag, like `stop`) once it has served no request for
+#           LLM_LOCAL_IDLE_MIN minutes (default 30): last activity = server.log mtime (every completion logs
+#           there; /health polls don't) or the start, and no open TCP connection on the port.
+#   install (boot.sh, idempotent) rebuilds llama.cpp at the pinned tag only if the binary is missing or broken
+#           (e.g. after an image change), and downloads the default model (sha256-checked) only if it's missing.
+# Settings: env vars below, or ~/.config/llm-local/server.env (same names). Log: ~/.cache/llm-local/server.log
+set -uo pipefail
+CONF=${LLM_LOCAL_CONF:-$HOME/.config/llm-local/server.env}
+[ -f "$CONF" ] && . "$CONF"
+PORT=${LLM_LOCAL_PORT:-8179}
+SRC=${LLM_LOCAL_SRC:-$HOME/opt/llama.cpp}
+BIN=${LLM_LOCAL_BIN:-$SRC/build/bin/llama-server}
+M=$HOME/opt/llm-models
+MODEL=${LLM_LOCAL_MODEL:-$M/Qwen3.5-9B-MTP-Q4_K_M.gguf}
+SPEC=${LLM_LOCAL_SPEC:-draft-mtp}          # "none" to disable MTP speculative decoding
+DRAFT=${LLM_LOCAL_DRAFT:-}                  # separate MTP drafter gguf (Gemma 4); empty = MTP layers inside the model
+DRAFT_MAX=${LLM_LOCAL_DRAFT_MAX:-3}
+CTX=${LLM_LOCAL_CTX:-32768}
+THREADS=${LLM_LOCAL_THREADS:-8}            # generation is memory-bound: 4 threads ≈ 16 threads here
+THREADS_BATCH=${LLM_LOCAL_THREADS_BATCH:-8} # prompt processing: 8 measured faster than 12 (E-cores drag)
+IDLE_MIN=${LLM_LOCAL_IDLE_MIN:-30}           # idle-check: stop after this many minutes without a request
+MIN_FREE_MB=${LLM_LOCAL_MIN_FREE_MB:-9000} # refuse to start if MemAvailable is below this (model + KV + headroom)
+# Pinned build + default model (bump deliberately; the model file name is what MODEL points at).
+LLAMA_TAG=b11541
+MODEL_URL=https://huggingface.co/unsloth/Qwen3.5-9B-MTP-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf
+MODEL_FILE=$M/Qwen3.5-9B-MTP-Q4_K_M.gguf
+MODEL_SHA256=e8dd94817e95d6c0939102049d068418269978377b13616c4726235e232841fe
+DIR=$HOME/.cache/llm-local; PIDF=$DIR/server.pid; OFF=$DIR/disabled
+mkdir -p "$DIR"
+
+healthy() { curl -sf --noproxy '*' --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"ok"'; }
+pid() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null && cat "$PIDF"; }
+
+start() {
+  rm -f "$OFF"
+  healthy && return 0
+  if [ -n "$(pid)" ]; then   # still loading, or wedged
+    for _ in $(seq 60); do healthy && return 0; [ -n "$(pid)" ] || break; sleep 1; done
+    stop; rm -f "$OFF"
+  fi
+  for f in "$BIN" "$MODEL"; do [ -e "$f" ] || { echo "llm-server-ctl: missing $f" >&2; return 1; }; done
+  local avail; avail=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+  [ "$avail" -ge "$MIN_FREE_MB" ] || { echo "llm-server-ctl: only ${avail} MB RAM available (need $MIN_FREE_MB), not starting" >&2; return 1; }
+  local spec=(); [ "$SPEC" != none ] && spec=(--spec-type "$SPEC" --spec-draft-n-max "$DRAFT_MAX")
+  [ "$SPEC" != none ] && [ -n "$DRAFT" ] && spec+=(-md "$DRAFT")
+  setsid nohup nice -n 19 "$BIN" --host 127.0.0.1 --port "$PORT" -m "$MODEL" -c "$CTX" -np 1 \
+    -t "$THREADS" -tb "$THREADS_BATCH" --no-webui --no-slots --reasoning off --cache-ram 1024 "${spec[@]}" \
+    >"$DIR/server.log" 2>&1 </dev/null &
+  echo $! >"$PIDF"
+  for _ in $(seq 120); do healthy && return 0; [ -n "$(pid)" ] || break; sleep 0.5; done
+  echo "llm-server-ctl: server did not become healthy (see $DIR/server.log)" >&2; return 1
+}
+stop() { local p; p=$(pid) && { kill "$p"; for _ in 1 2 3 4 5; do kill -0 "$p" 2>/dev/null || break; sleep 1; done; kill -9 "$p" 2>/dev/null; }; rm -f "$PIDF"; true; }
+
+busy() {   # an established TCP connection on our port (a request in flight)
+  local hex; hex=$(printf ':%04X' "$PORT")
+  awk -v h="$hex" 'FNR > 1 && $4 == "01" && substr($2, length($2) - 4) == h { f = 1 } END { exit !f }' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+idle_check() {
+  local p last started age
+  p=$(pid) || return 0
+  last=$(stat -c %Y "$DIR/server.log" 2>/dev/null || echo 0)
+  started=$(stat -c %Y "$PIDF" 2>/dev/null || echo 0)
+  [ "$started" -gt "$last" ] && last=$started
+  age=$(( ($(date +%s) - last) / 60 ))
+  [ "$age" -ge "$IDLE_MIN" ] || return 0
+  busy && return 0
+  echo "$(date -Is) idle ${age} min (no request since $(date -d "@$last" +%H:%M)), stopping pid $p" >>"$DIR/idle.log"
+  stop; touch "$OFF"
+}
+
+install() {
+  local log=$DIR/install.log missing= p
+  for p in libgomp1; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
+  if ! { [ -x "$BIN" ] && "$BIN" --version >/dev/null 2>&1; }; then
+    for p in build-essential cmake git; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
+  fi
+  [ -z "$missing" ] || { sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing; } >>"$log" 2>&1
+  if ! { [ -x "$BIN" ] && "$BIN" --version >/dev/null 2>&1; }; then
+    echo "$(date -Is) building llama.cpp $LLAMA_TAG" >>"$log"
+    if [ "$(git -C "$SRC" describe --tags --exact-match 2>/dev/null)" != "$LLAMA_TAG" ]; then
+      rm -rf "$SRC" && git clone -q --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp.git "$SRC" >>"$log" 2>&1 || return 1
+    fi
+    rm -rf "$SRC/build"
+    ( cd "$SRC" && nice -n 10 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DLLAMA_OPENSSL=OFF \
+        -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF && nice -n 10 cmake --build build -j 16 --target llama-server llama-bench ) >>"$log" 2>&1 \
+      || { echo "llm-server-ctl: llama.cpp build failed (see $log)" >&2; return 1; }
+  fi
+  if [ ! -f "$MODEL_FILE" ]; then
+    echo "$(date -Is) downloading $(basename "$MODEL_FILE")" >>"$log"
+    mkdir -p "$M"
+    curl -fsSL --retry 3 -C - -o "$MODEL_FILE.part" "$MODEL_URL" >>"$log" 2>&1 \
+      && echo "$MODEL_SHA256  $MODEL_FILE.part" | sha256sum -c --quiet >>"$log" 2>&1 \
+      && mv "$MODEL_FILE.part" "$MODEL_FILE" \
+      || { echo "llm-server-ctl: model download/verification failed (see $log)" >&2; rm -f "$MODEL_FILE.part"; return 1; }
+  fi
+}
+
+case "${1:-}" in
+  start) start ;;
+  ensure) [ -f "$OFF" ] && exit 0; start ;;
+  stop) stop; touch "$OFF" ;;
+  idle-check) idle_check ;;
+  restart) stop; start ;;
+  status) if healthy; then
+            p=$(pid); rss=$(awk '/VmRSS/{print int($2/1024)}' "/proc/$p/status" 2>/dev/null)
+            running=$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -A1 -x -- -m | tail -1)
+            echo "up (pid ${p:-?}, 127.0.0.1:$PORT, $(basename "${running:-$MODEL}"), RSS ${rss:-?} MB)"
+          else echo "down$([ -f "$OFF" ] && echo ' (stopped on purpose; `llm-server-ctl start` or llm-local starts it)')"; exit 1; fi ;;
+  install) install ;;
+  info) echo "model=$MODEL spec=$SPEC draft=${DRAFT:-builtin}/$DRAFT_MAX ctx=$CTX threads=$THREADS/$THREADS_BATCH port=$PORT" ;;
+  *) echo "usage: llm-server-ctl start|stop|restart|status|ensure|idle-check|info|install" >&2; exit 2 ;;
+esac

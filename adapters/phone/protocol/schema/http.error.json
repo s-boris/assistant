@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.error.json",
+  "title": "any 4xx/5xx JSON body",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_:.-]{0,31}$"
+    },
+    "msg": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "retry_s": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "problems": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 200
+      },
+      "maxItems": 20
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "error"
+  ]
+}

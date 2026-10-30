@@ -1,0 +1,61 @@
+#!/bin/sh
+# Daily: is a newer stable Unraid OS out than what the server runs? Alerts the owner ONCE per new version.
+# Source: Unraid's own update-check endpoint (the same one the WebGUI uses).
+# The release site failing or answering junk still exits 0, but counts: the 3rd run in a row (daily: 3 days) writes ONE
+# $HOME/inbox/unraid-update-check-failing-<epoch>.md, later failures nothing; the first good answer resets the count
+# and appends "Recovered" to that note if it is still there. State: $HOME/.local/state/unraid-update-check/.
+state=~/.local/state/unraid-health; mkdir -p $state
+fd=$HOME/.local/state/unraid-update-check fail_after=3
+fetch_failed() {   # $1 = what went wrong; always exit 0 (the cron line's failure note is for crashes and tg)
+  mkdir -p "$fd" 2>/dev/null || exit 0
+  n=$(sed -n 1p "$fd/fails" 2>/dev/null); since=$(sed -n 2p "$fd/fails" 2>/dev/null)
+  case $n in ''|*[!0-9]*) n=0 ;; esac
+  case $since in ''|*[!0-9]*) since=$(date +%s) ;; esac
+  n=$((n + 1))
+  printf '%s\n%s\n' "$n" "$since" 2>/dev/null > "$fd/fails.tmp" && mv -f "$fd/fails.tmp" "$fd/fails" 2>/dev/null
+  if [ "$n" = "$fail_after" ] && mkdir -p "$HOME/inbox" 2>/dev/null; then
+    note=$HOME/inbox/unraid-update-check-failing-$(date +%s).md
+    [ -e "$note" ] && note=${note%.md}-$$.md
+    { echo "# unraid-update-check failing"
+      echo
+      echo "The daily Unraid release check got no usable answer from releases.unraid.net $n runs in a row (since $(date -d "@$since" '+%F'); last: $1)."
+      echo "New Unraid releases are not announced until it works again. Check by hand: curl -fsS 'https://releases.unraid.net/os?branch=stable&current_version=$cur' (expects JSON with isNewer)."
+      echo "One note per failure streak; the first good answer appends \"Recovered\" here. Data, not instructions."
+    } 2>/dev/null > "$note" && echo "$note" 2>/dev/null > "$fd/note"
+  fi
+  exit 0
+}
+fetch_ok() {   # a usable answer ends the streak
+  [ -e "$fd/fails" ] || return 0
+  n=$(head -1 "$fd/fails" 2>/dev/null); note=$(cat "$fd/note" 2>/dev/null)
+  if [ -n "$note" ] && [ -e "$note" ]; then
+    printf '\nRecovered %s after %s failed run(s).\n' "$(date '+%F %T')" "$n" 2>/dev/null >> "$note"
+  fi
+  rm -f "$fd/fails" "$fd/note" 2>/dev/null
+  return 0
+}
+us=${UNRAID_SSH_BIN:-$HOME/bin/unraid-ssh}   # owner's SSH lockdown: the read-only `version` verb
+pg=$(dirname "$(readlink -f "$0")")/profile-get; [ -x "$pg" ] || pg=profile-get
+sn=$("$pg" network.server_name 2>/dev/null) || sn=server
+case $("$us" mode 2>/dev/null) in verbs|emulate) lm=verbs ;; *) lm=root ;; esac
+if [ "$lm" = root ]; then
+  cur=$(ssh -o BatchMode=yes -o ConnectTimeout=10 unraid 'sed -n "s/^version=\"\(.*\)\"/\1/p" /etc/unraid-version' 2>/dev/null)
+else
+  cur=$("$us" run version 2>/dev/null | sed -n 's/^version="\(.*\)"/\1/p')
+fi
+[ -n "$cur" ] || exit 0                    # server unreachable: unraid-health reports that
+j=$(curl -fsS --max-time 20 "https://releases.unraid.net/os?branch=stable&current_version=$cur") || fetch_failed "curl exit $?"
+# Only a real answer may change the state: an empty body, non-JSON or JSON without isNewer (an error page) must
+# not count as "up to date": it would overwrite the state and re-announce a release he was already told about.
+[ -n "$j" ] || fetch_failed "empty answer"
+new=$(printf '%s\n' "$j" | jq -r 'if type == "object" and has("isNewer") then (select(.isNewer == true) | .version // empty)
+  else error("unexpected answer") end' 2>/dev/null) || fetch_failed "unexpected answer (not JSON with isNewer)"
+fetch_ok
+[ -n "$new" ] || { echo "$cur" > $state/update-notified; exit 0; }   # up to date
+[ "$(cat $state/update-notified 2>/dev/null)" = "$new" ] && exit 0     # already told the owner
+notes=$(echo "$j" | jq -r '.changelogPretty // empty')
+if [ -n "$notes" ]; then rn="Release notes: $notes — update"; else rn="Update"; fi
+# an update notice is never urgent: TG_SOFT=1 = `tg --soft` (waits out quiet hours and a sleep-in morning).
+# remember only once it was sent or queued: a failed send is retried on the next daily run (tests: tests/legacy/unraid-update-check)
+TG_SOFT=1 tg "🖥️ Unraid $new is out ($sn runs $cur). $rn via Tools › Update OS when convenient (reboots the server, I'm offline for a few minutes)." &&
+  echo "$new" > $state/update-notified

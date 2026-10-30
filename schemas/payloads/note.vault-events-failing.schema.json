@@ -1,0 +1,48 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.vault-events-failing.schema.json",
+ "title": "vault-events: the event feed failed N runs in a row while the vault was up; recovered/failed_runs once the first good run appended Recovered",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "runs",
+  "since",
+  "error"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.vault-events-failing"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "runs": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "since": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "error": {
+   "type": "string"
+  },
+  "recovered": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "failed_runs": {
+   "type": "integer",
+   "minimum": 0
+  }
+ }
+}

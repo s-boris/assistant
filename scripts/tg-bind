@@ -1,0 +1,31 @@
+#!/usr/local/bin/python3.13 -I
+"""tg-bind: the brain's Telegram bindings: commands and buttons bound to a tool of the tools registry,
+answered by tg-adapter without a brain turn; `tg-bind --help`, `tg-bind tools`, `tg-bind table`.
+Source: ~/opt/assistant (packages/tgadapter/bind.py, schemas/tools.toml, adapters/tg/src/bind.ts).
+
+Finds its libraries next to itself: deployed, ~/bin/lib/{core,tgadapter}; in the repo, ../core and
+../packages/tgadapter. $ASSISTANT_LIB (a directory holding core/ and tgadapter/) overrides both. Stdlib only.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [
+    os.environ.get("ASSISTANT_LIB", ""),
+    os.path.join(_here, "lib"),
+    os.path.join(_here, ".."),
+    os.path.join(_here, "..", "packages"),
+]
+for _pkg in ("core", "tgadapter"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+if __name__ == "__main__":
+    from tgadapter import bind
+
+    sys.exit(bind.main(sys.argv[1:]))

@@ -1,0 +1,44 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/schedule.changed.schema.json",
+ "title": "workflow.schedule / hub wf watches: one row per schedule change, with its why",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "job",
+  "state",
+  "why"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "schedule.changed"
+  },
+  "v": {
+   "const": 1
+  },
+  "job": {
+   "type": "string",
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+  },
+  "state": {
+   "enum": [
+    "shadow",
+    "live",
+    "edit",
+    "paused",
+    "active",
+    "absent",
+    "off"
+   ]
+  },
+  "why": {
+   "type": "string",
+   "maxLength": 200
+  },
+  "cron": {
+   "type": "string"
+  }
+ }
+}

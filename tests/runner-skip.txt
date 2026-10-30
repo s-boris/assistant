@@ -1,0 +1,60 @@
+# Host-bound tests: skipped in the hub's CI runner (ASSISTANT_CI_RUNNER=1) and run by a land on this host as its
+# local smoke set (`assistant ci --host`, ops/assistant.py smoke_tests: the untagged lines).
+# The runner is the land's test run: a line here is a test it can't run yet. Make it hermetic, drop it.
+# Measured 29.10 (runner probe with an empty list, job b7b02b79b9e1abca): every other test passes in the runner.
+# The former test lines (the smoke set) run in the runner since 29.10 (probe job f92f5d6fd050bced): a test runs a repo
+# script by its shebang interpreter (/usr/local/bin/python3.13, the runner's too) or sys.executable, never
+# /usr/bin/python3; tools only the runner's toolchain has (jq, git) stay on a fixture's PATH. An empty smoke set runs
+# no pytest here. A new test line needs its reason (what only this host has).
+# One test file, node id or legacy suite dir (tests/legacy/<suite>: runs only here) per line.
+# Tags after the path: skipped in the runner only while one holds (tests/conftest.py _WHEN): @noexec = the checkout or
+# the temp dir sits on a noexec mount. An untagged line is skipped there always.
+# Dropped 29.10: recall, uwfix, trackid and proxy run in the runner on the heavy-tools ci image (ops/hub/ci/Dockerfile:
+# ffmpeg, tesseract, pdfinfo, rsync, system numpy, the ~/opt venvs + voices linked into the job HOME by _runner_home),
+# green in 4 ci-probe-heavy jobs at once; then vision, letter, trackinfo and trip-recap, made hermetic (no /home/node
+# paths, the image's venvs under HOME), and the 4 @needs_jq tg tests (the tg fixture keeps the toolchain's jq on PATH).
+# legacy suites that need what only this host has (probe job 56a53d8010cd1c21, 29.10)
+tests/legacy/skillforge  # needs numpy (clustering) and skill-creator's quick_validate.py under ~/.claude/skills/synced
+tests/legacy/risk-ok  # its CLI runs the live hook ~/.claude/hooks/risk_check.py, and the hook's unit tests live there too
+tests/legacy/test-all  # tests the gcc-built LD_PRELOAD netguard (~/opt/test-all) blocking connections: no gcc or guard there
+# red in a runner-like run with the runner user and the would-be ~/bin from the tree (29.10, CI runner move,
+# ~/jobs/ci-runner-move/diag/emul2.py: 96 of 109 green, 94 s): they need ~/opt venvs, ~/.cache data, ~/.local/bin
+# tools or ffmpeg/opus. Host-bound until a probe job shows them green in the runner itself (tests/runner-probe-steps.txt)
+# Dropped 29.10 (green in that probe): test_writers, test_event_card_outbox, test_remind_hub,
+# test_reminders, legacy pretrip-check/research/route.
+# Dropped 30.10: legacy tts (tg-voice sends through core.http now, no curl; the ci image keeps none).
+# red in the runner itself (probe job 21ea037671b1f3ee, 29.10, the runner user + would-be ~/bin; the signed record's
+# legacy "tails" say why): host-bound until fixed. Missing in the runner: Pillow, pgrep (procps), ffmpeg, pdfinfo,
+# ~/opt venvs; the live crontab/boot.sh/state; or a failure not yet traced (unknown = see the tail)
+tests/legacy/media  # over the 240 s per-suite limit in the runner (probe 12 job 0073361d263f2db8: cut off in play/, the sub-suites before it green)
+# host-bound: what it needs is only on this host
+tests/legacy/tg-status  # the Due/Next split loads the heartbeat plugin's hb-gate (the live ~/plugins copy)
+# moved from ~/opt/<suite>-tests 30.10: a runner probe (job 8868b8345a84d7bf, 30.10) ran them there: 13 green
+# moved to the runner: ai-releases, battery-guard, event-card, flight-watch, ha-health-watch, hddheat, lastcall,
+# plans-watch, rave-radar, self-review, train-watch, vault-events, watch;
+# these were red there and stay host-bound until fixed (the job's legacy tails say why):
+tests/legacy/assistant  # red in the runner probe: ASSISTANT_TEST=1 refuses the real home in the runner
+tests/legacy/cron-fail  # red in the runner probe: exit 1 there (see the probe tails)
+tests/legacy/evals-inspect  # red in the runner probe: run.sh calls /usr/bin/python3 (none in the runner)
+tests/legacy/evals  # red in the runner probe: run.sh calls /usr/bin/python3 (none in the runner)
+tests/legacy/party  # red in the runner probe: needs curl (none in the runner)
+tests/legacy/remind  # red in the runner probe: realcheck.py imports assistant_profile (not on the runner path)
+tests/legacy/secretscan  # red in the runner probe: exit 1 there (see the probe tails)
+tests/legacy/shop  # red in the runner probe: imports fake_ha (not on the runner path)
+tests/legacy/sleepin  # red in the runner probe: exit 1 there (see the probe tails)
+tests/legacy/strike-watch  # red in the runner probe: exit 1 there (see the probe tails)
+tests/legacy/tg-cmd  # red in the runner probe: 13 of 557 checks red in the runner
+tests/legacy/unraid-health  # red in the runner probe: exit 1 there (see the probe tails)
+tests/legacy/webagent  # red in the runner probe: exit 1 there (see the probe tails)
+tests/legacy/codebase-sync  # red in the runner probe: first sync exits 3 in the runner
+tests/legacy/botlib  # not run in that probe: runner not probed yet
+tests/legacy/damp-watch  # not run in that probe: runner not probed yet
+tests/legacy/home-place  # not run in that probe: runner not probed yet
+tests/legacy/cifeed  # not run in that probe: runner not probed yet
+tests/legacy/livecount  # not run in that probe: runner not probed yet
+tests/legacy/dash-data  # its gym render runs google-chrome (host only)
+tests/legacy/telegram-plus  # tests the live ~/plugins (bun, node_modules, the session's plugin root)
+tests/legacy/heartbeat  # tests the live ~/plugins (bun, node_modules, the session's plugin root)
+tests/legacy/hb-gate  # tests the live ~/plugins (bun, node_modules, the session's plugin root)
+tests/legacy/unraid-do  # also runs the live ~/opt/unraid-lockdown/client/unraid-do (only this host has it)
+tests/legacy/boot  # a dry run against this host's ~/opt/runtimes and main checkout

@@ -1,0 +1,1249 @@
+#!/usr/bin/python3 -I
+"""recall: fast local search over my own past work (notes, reports, memory, chat transcripts).
+
+  recall "query" [--since YYYY-MM-DD] [--src md|chat|all] [-n 10] [--by-date] [--raw]
+        ranked hits, one line each: #ID date where snippet (n capped at 40); newer hits rank above older ones with a
+        similar text match, FACTS.md hits get a boost
+  recall --show ID [-C K]   full text of hit #ID (+K neighbouring chunks of the same file)
+  recall --index [--cron]   incremental index update (nightly cron 03:31; --cron: ~/inbox note on failure)
+  recall --embed [--cron]   embed the md chunks that have no vector yet (nightly cron 03:36; niced)
+  recall --rebuild          drop the index and rebuild from scratch (vectors are kept: they are keyed by text hash)
+  recall --stats            index size and age, semantic coverage
+  --lexical                 text search only (no embeddings)
+Query: plain words (question words like what/when/did are dropped), "exact phrase", prefix*.
+All words must match first; if that finds too little, hits with only some of the words follow.
+--raw passes the query to SQLite FTS5 MATCH as is (AND/OR/NOT/NEAR).
+Semantic: md chunks (never transcripts) also get a local EmbeddingGemma vector (llama-server started per run on a
+free 127.0.0.1 port, CPU; the same model as /vibe), so a query also finds notes worded differently ("phone
+conversations" -> "video calls"). Text hits and cosine hits are merged by reciprocal rank (all-words text hits weigh most, newer and
+FACTS.md hits get a mild boost); the output format is the same. Vectors: ~/.local/state/recall/vectors.db (keyed by
+a hash of the redacted chunk text, so unchanged chunks are never re-embedded) + vec-matrix.npy for the query. A query
+embeds new chunks itself for up to RECALL_EMBED_LIVE_S (0.4 s), FACTS.md and newest first; `--embed` does the rest.
+No embedder, no numpy or an error: text hits only (one stderr line). --raw, --src chat and --lexical skip it.
+A running shared server with the same model file (`memory2 embedd`, RECALL_EMBED_SHARED, default
+http://127.0.0.1:8786; "off" disables it) is used instead of booting one: ~0.5 s less per query.
+
+Sources: ~/workspace/*.md (FACTS.md included), ~/reports/**/*.md, auto-memory *.md, ~/.claude/skills/*/SKILL.md,
+~/.claude/agents/*.md, the header (module docstring or leading comment block) of every script in ~/bin and ~/bin/lib
+(cited as bin/NAME:LINE), the commit log of every git repo under ~/opt (one chunk per commit, cited as
+opt/REPO@HASH), and the main session's transcripts
+(~/.claude/projects/-home-node-workspace/*.jsonl): owner messages (terminal + Telegram, button presses,
+reactions), my text blocks and my Telegram reply texts, subagent results. Never tool results, thinking or blobs.
+Privacy: every chunk goes through secretscan.redact() before it is stored (fail-closed: no secretscan, no index).
+Never read: ~/.secrets, ~/.ssh, ~/.local/state/context/* (signals.json; old telegram.md, signals.md, location.json),
+~/.claude/channels, the index itself, and any path with "vault" in it outside my own notes (workspace, reports,
+memory, skills), e.g. ~/opt/claude-vault; symlinks are checked after resolving.
+Dates: a leading YYYY-MM-DD [HH:MM] or DD.MM[.YYYY] [HH:MM] on the line, else a date in the heading or file name,
+else the file's mtime. Index: SQLite FTS5 in
+~/.local/state/recall/index.db (0600, dir 0700). A query refreshes it first if it is older than 30 min.
+Env (tests): RECALL_HOME (source root), RECALL_STATE, RECALL_NOW (epoch secs), RECALL_SECRETSCAN_DIR,
+SECRETSCAN_SOURCES, RECALL_EMBED=off, RECALL_EMBED_URL (an OpenAI-style /v1/embeddings endpoint instead of the
+llama-server), RECALL_EMBED_SERVER/_MODEL, RECALL_EMBED_LIVE_S.
+"""
+import argparse
+import fcntl
+import glob
+import hashlib
+import html
+import http.client
+import json
+import os
+import re
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+os.umask(0o077)
+sys.path.insert(0, os.environ.get("RECALL_SECRETSCAN_DIR") or os.path.dirname(os.path.realpath(__file__)))
+try:
+    import secretscan  # noqa: E402
+except Exception:  # fail-closed: indexing refuses to run without it
+    secretscan = None
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+TZ = assistant_profile.tz()
+HOME = os.path.realpath(os.environ.get("RECALL_HOME") or os.path.expanduser("~"))
+STATE = os.environ.get("RECALL_STATE") or os.path.join(HOME, ".local/state/recall")
+DB = os.path.join(STATE, "index.db")
+PROJECT_REL = ".claude/projects/-home-node-workspace"
+PROJECT = os.path.join(HOME, PROJECT_REL)
+FACTS = os.path.join(HOME, "workspace", "FACTS.md")
+INBOX = os.path.join(HOME, "inbox")
+SCHEMA = "1"
+STALE_SECS = 30 * 60
+MAX_MD_BYTES = 2 * 1024 * 1024
+CHUNK = 1200
+SNIP = 200
+MAX_HITS = 40
+DENY_DIRS = (".secrets", ".ssh", ".local/state/context", ".local/state/recall", ".claude/channels")
+DENY_NAMES = ("telegram.md", "signals.md", "location.json", "signals.json", "FACTS-core.md")  # FACTS-core.md: generated view of FACTS.md
+# my own notes may mention the vault in a path (reports/vault/..., memory ask-vault-first.md, skills/vault/SKILL.md);
+# anything else with "vault" in its path is vault data or code and stays out
+OWN_ROOTS = ("workspace", "reports", ".claude/skills", PROJECT_REL + "/memory")
+MD_VERSION = "3"        # bump when md chunking/dating changes: md files re-index on the next run (transcripts stay)
+RECENCY_W = 1.0         # a hit from today scores up to 2x its text match ...
+RECENCY_DAYS = 7        # ... 1.5x a week ago, ~1.2x a month ago, ~1.07x after 3 months
+FACTS_W = 1.5           # FACTS.md (setup facts + done/declined ledger) outranks older copies of the same fact
+POOL = 10               # candidates fetched per hit wanted, re-ranked by date and file
+
+STOP = set("""what when where which who whom whose why how did do does done doing we i me my mine you your us our
+ours the a an about of to in on at for from by is are was were be been being and or with that this these those it
+its decide decided decision decisions regarding re again last time ever any there have has had can could would
+should will shall please tell find search remember recall wann wie wo wer warum wir ich mir mein der die das den
+dem des und oder über ueber haben hat habe hatte ein eine einen einem einer ist sind war waren zu im mit von für
+fuer""".split())
+
+DATE_RE = re.compile(r"\b(20\d\d-[01]\d-[0-3]\d)(?:[ T]([0-2]\d:[0-5]\d))?")
+LEAD_DATE_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?(?:\[[ xX]\]\s*)?(?:\*\*)?\(?"
+                          r"(20\d\d-[01]\d-[0-3]\d)(?:[ T]([0-2]\d:[0-5]\d))?")
+# "- 19.10 00:05 ...", "19.10.2026: ...", "**6.11** ...": a one-digit month only counts with a year or a time ("7.3 18:00"),
+# so "2.5 Gbit" or "1.6.3 stable" are no dates
+LEAD_DM_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)?(?:\[[ xX]\]\s*)?(?:\*\*)?\(?"
+                        r"([0-3]?\d)\.([01]?\d)(?:\.(20\d\d))?\.?(?![\d.])(?:\*\*)?(?:,?\s+([0-2]\d:[0-5]\d)(?!\d))?")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
+ITEM_RE = re.compile(r"^(?:[-*+]\s|\d+[.)]\s)")
+BLOB_RE = re.compile(r"[A-Za-z0-9+/_=-]{160,}")
+SYSREM_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+CHANNEL_RE = re.compile(r'<channel((?:\s+[\w-]+="[^"]*")*)\s*>(.*?)(?:</channel>|$)', re.S)
+ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+TAG_RE = re.compile(r"<(summary|result)>(.*?)</\1>", re.S)
+TYPE_RE = re.compile(rb'"type"\s*:\s*"(?:user|assistant)"')
+SKIP_PREFIX = ("[heartbeat]", "The heartbeat plugin sent a message:", "[self-scheduled", "<local-command-",
+               "<command-name>", "<command-message>", "<command-args>", "[Image:", "Caveat:",
+               "[Request interrupted", "This session is being continued")
+
+
+def die(msg, code=2):
+    print("recall: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def now():
+    return float(os.environ.get("RECALL_NOW") or time.time())
+
+
+# ------------------------------------------------------------------ sources
+
+def own_note(rel):
+    return any(rel.startswith(r + os.sep) for r in OWN_ROOTS)
+
+
+def allowed(p):
+    for q in {os.path.abspath(p), os.path.realpath(p)}:
+        rel = os.path.relpath(q, HOME)
+        if rel == ".." or rel.startswith(".." + os.sep):
+            return False
+        if not own_note(rel) and any("vault" in part.lower() for part in rel.split(os.sep)):
+            return False
+        if any(rel == d or rel.startswith(d + os.sep) for d in DENY_DIRS):
+            return False
+        if os.path.basename(q) in DENY_NAMES:
+            return False
+    return True
+
+
+def sources():
+    md = (sorted(glob.glob(os.path.join(HOME, "workspace", "*.md")))
+          + sorted(glob.glob(os.path.join(HOME, "reports", "**", "*.md"), recursive=True))
+          + sorted(glob.glob(os.path.join(PROJECT, "memory", "*.md")))
+          + sorted(glob.glob(os.path.join(HOME, ".claude", "skills", "*", "SKILL.md")))
+          + sorted(glob.glob(os.path.join(HOME, ".claude", "agents", "*.md"))))
+    chat = sorted(glob.glob(os.path.join(PROJECT, "*.jsonl")))
+    out, seen = [], set()
+    for src, paths in (("md", md), ("bin", bin_sources()), ("git", git_sources()), ("chat", chat)):
+        for p in paths:
+            p = os.path.abspath(p)
+            if p not in seen and os.path.isfile(p) and allowed(p):
+                seen.add(p)
+                out.append((p, src))
+    return out
+
+
+BIN_SKIP = (".bak", ".orig", ".pyc", "~", ".tmp", ".new", ".old", ".swp", ".lock", ".json", ".log")
+BIN_MAX = 512 * 1024
+HEADER_LINES = 160
+
+
+def bin_sources():
+    """Scripts in ~/bin and ~/bin/lib (their headers are indexed, never the code)."""
+    out = []
+    for d in ("bin", os.path.join("bin", "lib")):
+        for p in sorted(glob.glob(os.path.join(HOME, d, "*"))):
+            b = os.path.basename(p)
+            if b.startswith(".") or b.endswith(BIN_SKIP) or ".bak" in b or ".orig" in b:
+                continue
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) <= BIN_MAX:
+                    out.append(p)
+            except OSError:
+                pass
+    return out
+
+
+def git_sources():
+    """<repo>/.git/logs/HEAD of the git repos under ~/opt (changes with every commit; the plugins' history is the
+    monorepo's, ~/opt/assistant)."""
+    out = []
+    for pat in (os.path.join("opt", "*", ".git"), os.path.join("opt", "*", "*", ".git")):
+        for g in sorted(glob.glob(os.path.join(HOME, pat))):
+            h = os.path.join(g, "logs", "HEAD")
+            if os.path.isfile(h):
+                out.append(h)
+    return out
+
+
+def script_header(text):
+    """(1-based first line, text) of a script's module docstring, else its leading comment block."""
+    lines = text.split("\n")[:HEADER_LINES + 40]
+    i = 1 if lines and lines[0].startswith("#!") else 0
+    while i < len(lines) and (not lines[i].strip() or re.match(r"#.*(coding[:=]|-\*-|noqa|pylint|shellcheck)", lines[i])):
+        i += 1
+    if i < len(lines):
+        m = re.match(r"\s*[rbuRBU]?(\"\"\"|\'\'\')", lines[i])
+        if m:
+            q = m.group(1)
+            first = lines[i].split(q, 1)[1]
+            if q in first:
+                return i + 1, first.split(q, 1)[0]
+            body = [first]
+            for k in range(i + 1, min(len(lines), i + HEADER_LINES)):
+                if q in lines[k]:
+                    body.append(lines[k].split(q, 1)[0])
+                    break
+                body.append(lines[k])
+            return i + 1, "\n".join(body)
+    body, start = [], None
+    for k in range(i, min(len(lines), i + HEADER_LINES)):
+        s = lines[k]
+        if s.startswith("#"):
+            start = k + 1 if start is None else start
+            body.append(re.sub(r"^#+ ?", "", s))
+        elif body or s.strip():
+            break
+    return (start or 1), "\n".join(body)
+
+
+# ------------------------------------------------------------------ chunking
+
+def redact(text):
+    return secretscan.redact(text)
+
+
+def clean(text):
+    text = SYSREM_RE.sub("", text)
+    text = BLOB_RE.sub("[blob]", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def split_long(text, limit=CHUNK):
+    """[(line_offset, part)]: pieces of <= ~limit chars, cut at line or word boundaries."""
+    if len(text) <= limit:
+        return [(0, text)]
+    parts, cur, cur_start, line_no = [], [], 0, 0
+    size = 0
+    for line in text.split("\n"):
+        while len(line) > limit:
+            cut = line.rfind(" ", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            if cur:
+                parts.append((cur_start, "\n".join(cur)))
+                cur, size = [], 0
+            parts.append((line_no, line[:cut]))
+            line = line[cut:].lstrip()
+        if cur and size + len(line) + 1 > limit:
+            parts.append((cur_start, "\n".join(cur)))
+            cur, size = [], 0
+        if not cur:
+            cur_start = line_no
+        cur.append(line)
+        size += len(line) + 1
+        line_no += 1
+    if cur and "\n".join(cur).strip():
+        parts.append((cur_start, "\n".join(cur)))
+    return [(o, p) for o, p in parts if p.strip()]
+
+
+def fmt_date(d, t=None):
+    return d + (" " + t if t else "")
+
+
+def dm_date(m, fallback):
+    """YYYY-MM-DD[ HH:MM] for a LEAD_DM_RE match, or None. No year: the nearest such day to the fallback date
+    (the file's date), as hb-gate reads DD.MM: in a file from December, 05.01 is next January."""
+    day, month, year, hhmm = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
+    if len(m.group(2)) < 2 and not (hhmm or year):
+        return None
+    ref = datetime.strptime(fallback, "%Y-%m-%d")
+    cands = []
+    for y in ([int(year)] if year else [ref.year - 1, ref.year, ref.year + 1]):
+        try:
+            cands.append(datetime(y, month, day))
+        except ValueError:
+            pass
+    if not cands:
+        return None
+    d = min(cands, key=lambda c: abs((c - ref).days))
+    return fmt_date(d.strftime("%Y-%m-%d"), hhmm)
+
+
+def lead_date(part, fallback):
+    m = LEAD_DATE_RE.match(part)
+    if m:
+        return fmt_date(m.group(1), m.group(2))
+    m = LEAD_DM_RE.match(part)
+    return dm_date(m, fallback) if m else None
+
+
+def md_chunks(text, path, mtime):
+    """[(line, head, body, date)] by heading / top-level list item / paragraph."""
+    fname_date = DATE_RE.search(os.path.basename(path))
+    fallback = fname_date.group(1) if fname_date else datetime.fromtimestamp(mtime, TZ).strftime("%Y-%m-%d")
+    out, heads, cur, start, blank = [], [], [], 0, False
+
+    def flush():
+        body = "\n".join(cur).strip()
+        if not body:
+            return
+        head = " / ".join(h for _, h in heads)
+        hd = DATE_RE.search(head)
+        for off, part in split_long(body):
+            date = (lead_date(part, fallback) or lead_date(body, fallback)
+                    or (hd.group(1) if hd else fallback))
+            out.append((start + 1 + off, head, part, date))
+
+    for i, line in enumerate(text.split("\n")):
+        m = HEADING_RE.match(line)
+        if m:
+            flush()
+            cur, blank = [], False
+            lvl = len(m.group(1))
+            heads = [h for h in heads if h[0] < lvl] + [(lvl, m.group(2).strip())]
+            continue
+        if not line.strip():
+            blank = True
+            continue
+        indented = line[:1] in (" ", "\t")
+        if cur and (ITEM_RE.match(line) or (blank and not indented)):
+            flush()
+            cur = []
+        if not cur:
+            start = i
+        cur.append(line)
+        blank = False
+    flush()
+    return out
+
+
+def local_ts(ts):
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ""
+
+
+def channel_msgs(s):
+    for m in CHANNEL_RE.finditer(s):
+        a = {k: html.unescape(v) for k, v in ATTR_RE.findall(m.group(1))}
+        body = m.group(2).strip()
+        ev = a.get("event_type", "")
+        loc = "tg#" + a["message_id"] if a.get("message_id") else ""
+        if ev == "button":
+            text = "[button] " + a.get("button_text", "")
+            if a.get("message_text"):
+                text += " (on: " + a["message_text"][:200] + ")"
+        elif ev == "reaction":
+            text = "[reaction %s] on: %s" % (a.get("reaction", ""), a.get("reacted_to_text", "")[:200])
+            if a.get("reacted_to_message_id"):
+                loc = "tg#" + a["reacted_to_message_id"]
+        elif ev:
+            text = "[%s] %s" % (ev, body)
+        else:
+            text = body
+            if a.get("attachment_kind"):
+                text = "[%s] %s" % (a["attachment_kind"], text)
+            if a.get("reply_to_text"):
+                text += "\n(re: " + a["reply_to_text"][:200] + ")"
+        if text.strip():
+            yield "owner", loc, text
+
+
+def chat_texts(o):
+    """(role, loc, text) for the parts of one transcript record worth indexing."""
+    t = o.get("type")
+    if t not in ("user", "assistant") or o.get("isCompactSummary") or o.get("isVisibleInTranscriptOnly"):
+        return
+    c = (o.get("message") or {}).get("content")
+    blocks = [{"type": "text", "text": c}] if isinstance(c, str) else (c if isinstance(c, list) else [])
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if t == "assistant":
+            if bt == "text" and isinstance(b.get("text"), str):
+                yield "me", "", b["text"]
+            elif bt == "tool_use" and str(b.get("name", "")).endswith("telegram__reply"):
+                inp = b.get("input") or {}
+                if isinstance(inp.get("text"), str):  # what the owner actually read
+                    yield "me>tg", "", inp["text"]
+            continue
+        if bt != "text" or not isinstance(b.get("text"), str):
+            continue  # tool_result, image, document, ...
+        text = b["text"]
+        s = text.lstrip()
+        if s.startswith("<channel"):
+            yield from channel_msgs(SYSREM_RE.sub("", s))
+        elif s.startswith("<task-notification"):
+            parts = dict((k, v.strip()) for k, v in TAG_RE.findall(s))
+            body = "\n".join(x for x in (parts.get("summary"), parts.get("result")) if x)
+            if body:
+                yield "agent", "", body
+        elif s.startswith("Another Claude session sent a message"):
+            yield "msg", "", text
+        elif o.get("isMeta") or s.startswith(SKIP_PREFIX):
+            continue  # skill bodies, injected context, heartbeats, local commands
+        else:
+            yield "owner", "", text
+
+
+# ------------------------------------------------------------------ database
+
+def connect():
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    db = sqlite3.connect(DB, timeout=30)
+    os.chmod(DB, 0o600)
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+        CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, src TEXT, mtime REAL, size INTEGER,
+                                         off INTEGER, lineno INTEGER, headhash TEXT);
+        CREATE TABLE IF NOT EXISTS docs(id INTEGER PRIMARY KEY, path TEXT, src TEXT, date TEXT,
+                                        role TEXT, loc TEXT);
+        CREATE INDEX IF NOT EXISTS docs_path ON docs(path);
+        CREATE TABLE IF NOT EXISTS emb(id INTEGER PRIMARY KEY, hash TEXT);
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(head, body,
+            tokenize = 'porter unicode61 remove_diacritics 2');
+    """)
+    v = db.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+    if v is None:
+        db.execute("INSERT OR REPLACE INTO meta VALUES('schema', ?)", (SCHEMA,))
+        db.commit()
+    elif v[0] != SCHEMA:
+        db.close()
+        os.remove(DB)
+        return connect()
+    return db
+
+
+def meta(db, k, default=None):
+    r = db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+    return r[0] if r else default
+
+
+def drop_path(db, path):
+    db.execute("DELETE FROM emb WHERE id IN (SELECT id FROM docs WHERE path=?)", (path,))
+    db.execute("DELETE FROM fts WHERE rowid IN (SELECT id FROM docs WHERE path=?)", (path,))
+    db.execute("DELETE FROM docs WHERE path=?", (path,))
+
+
+def add(db, path, src, date, role, loc, head, body):
+    cur = db.execute("INSERT INTO docs(path, src, date, role, loc) VALUES(?,?,?,?,?)",
+                     (path, src, date, role, loc))
+    db.execute("INSERT INTO fts(rowid, head, body) VALUES(?,?,?)", (cur.lastrowid, head, body))
+    if src == "md":   # transcripts are never embedded
+        db.execute("INSERT OR REPLACE INTO emb VALUES(?,?)", (cur.lastrowid, emb_hash(emb_text(path, head, body))))
+
+
+def index_bin(db, path, st):
+    drop_path(db, path)
+    n = 0
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(64 * 1024)
+    except OSError:
+        raw = b""
+    if raw and b"\0" not in raw[:4096]:
+        start, text = script_header(raw.decode("utf-8", "replace"))
+        text = redact(text.strip("\n"))
+        if len(text.strip()) >= 40:
+            name = os.path.basename(path)
+            for line, head, body, date in md_chunks(text, path, st.st_mtime):
+                add(db, path, "md", date, "", str(start + line - 1), (name + (" / " + head if head else ""))[:200],
+                    body)
+                n += 1
+    db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)", (path, "bin", st.st_mtime, st.st_size, 0, 0, ""))
+    return n
+
+
+def index_git(db, path, st):
+    """One chunk per commit (date, short hash, subject, body without trailers) of the repo owning .git/logs/HEAD."""
+    drop_path(db, path)
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(path)))
+    n = 0
+    try:
+        out = subprocess.run(["git", "-C", repo, "log", "--no-color", "--date=short", "-n", "500",
+                              "--format=%x1e%h%x1f%ad%x1f%s%x1f%b"], capture_output=True, timeout=30,
+                             stdin=subprocess.DEVNULL).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    name = os.path.relpath(repo, HOME)
+    for rec in out.split("\x1e"):
+        parts = rec.split("\x1f")
+        if len(parts) < 4 or not parts[0].strip():
+            continue
+        h, d, subj = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        body = "\n".join(x for x in parts[3].strip().split("\n")
+                         if not x.startswith(("Co-Authored-By:", "Claude-Session:", "Signed-off-by:")))
+        text = redact(("%s %s %s\n%s" % (d, h, subj, body)).strip())[:CHUNK]
+        add(db, path, "md", d, "", h, "git log " + name, text)
+        n += 1
+    db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)", (path, "git", st.st_mtime, st.st_size, 0, 0, ""))
+    return n
+
+
+def head_hash(path, n):
+    with open(path, "rb") as f:
+        return hashlib.sha1(f.read(n)).hexdigest()
+
+
+def index_md(db, path, st):
+    drop_path(db, path)
+    n = 0
+    if st.st_size <= MAX_MD_BYTES:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = redact(f.read())
+        for line, head, body, date in md_chunks(text, path, st.st_mtime):
+            add(db, path, "md", date, "", str(line), head, body)
+            n += 1
+    db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)",
+               (path, "md", st.st_mtime, st.st_size, 0, 0, ""))
+    return n
+
+
+def index_jsonl(db, path, st, known, full):
+    start, lineno = 0, 0
+    if known and not full:
+        _, _, mtime, size, off, ln, hh = known
+        try:
+            hl, hx = hh.split(":")
+            same_head = int(hl) <= st.st_size and head_hash(path, int(hl)) == hx
+        except (ValueError, OSError):
+            same_head = False
+        if same_head and st.st_size >= off:
+            if st.st_size == size and st.st_mtime == mtime:
+                return 0
+            start, lineno = off, ln
+    if start == 0:
+        drop_path(db, path)
+    n, pos = 0, start
+    sess = os.path.basename(path)[:8]
+    with open(path, "rb") as f:
+        f.seek(start)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break  # line still being written; picked up next time
+            pos += len(raw)
+            lineno += 1
+            if not TYPE_RE.search(raw):
+                continue
+            try:
+                o = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(o, dict):
+                continue
+            date = local_ts(o.get("timestamp", ""))
+            for role, tg, text in chat_texts(o):
+                text = clean(text)
+                if not text:
+                    continue
+                text = redact(text)
+                loc = ("%s:L%d %s" % (sess, lineno, tg)).strip()
+                for _, part in split_long(text):
+                    add(db, path, "chat", date, role, loc, "", part)
+                    n += 1
+            if n and n % 2000 == 0:
+                db.commit()
+    hl = min(pos, 4096)
+    db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?)",
+               (path, "chat", st.st_mtime, st.st_size, pos, lineno, "%d:%s" % (hl, head_hash(path, hl))))
+    return n
+
+
+class Busy(Exception):
+    pass
+
+
+def lock(block):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(STATE, "lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
+    except BlockingIOError:
+        os.close(fd)
+        raise Busy()
+    return fd
+
+
+def index(db, full=False, block=True):
+    if secretscan is None:
+        raise RuntimeError("secretscan module unavailable: refusing to index (fail-closed)")
+    fd = lock(block)
+    try:
+        t0, added, changed = time.time(), 0, 0
+        srcs = sources()
+        known = {r[0]: r for r in db.execute("SELECT * FROM files")}
+        md_full = full or meta(db, "md_version") != MD_VERSION
+        current = {p for p, _ in srcs}
+        for p in known:
+            if p not in current:
+                drop_path(db, p)
+                db.execute("DELETE FROM files WHERE path=?", (p,))
+                changed += 1
+        for p, src in srcs:
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            k = known.get(p)
+            if src in ("md", "bin", "git"):
+                if k and not md_full and k[2] == st.st_mtime and k[3] == st.st_size:
+                    continue
+                added += {"md": index_md, "bin": index_bin, "git": index_git}[src](db, p, st)
+                changed += 1
+            else:
+                n = index_jsonl(db, p, st, k, full)
+                added += n
+                changed += 1 if (n or not k or full) else 0
+            db.commit()
+        db.execute("INSERT OR REPLACE INTO meta VALUES('last_index', ?)", (str(now()),))
+        db.execute("INSERT OR REPLACE INTO meta VALUES('md_version', ?)", (MD_VERSION,))
+        db.commit()
+        return added, changed, time.time() - t0
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------------ semantic (local embeddings, md chunks only)
+
+EMBED_SERVER = os.path.expanduser(os.environ.get("RECALL_EMBED_SERVER") or "~/opt/llama.cpp/build/bin/llama-server")
+EMBED_MODEL = os.path.expanduser(os.environ.get("RECALL_EMBED_MODEL")
+                                 or "~/opt/llm-models/embeddinggemma-300M-Q8_0.gguf")
+EMBED_URL = os.environ.get("RECALL_EMBED_URL")
+EMBED_SHARED = os.environ.get("RECALL_EMBED_SHARED", "http://127.0.0.1:8786")
+EMBED_OFF = (os.environ.get("RECALL_EMBED") or "").lower() in ("off", "0", "no", "false")
+VEC_DB = os.path.join(STATE, "vectors.db")
+MATRIX = os.path.join(STATE, "vec-matrix.npy")
+MATRIX_IDS = os.path.join(STATE, "vec-ids.npy")
+MATRIX_META = os.path.join(STATE, "vec-matrix.json")
+EMBED_CHARS = 1500      # embedded text cap (EmbeddingGemma document prompt + path / heading + chunk)
+EMBED_BATCH = 16        # texts per request in --embed
+LIVE_BATCH = 4          # ... and in the query-time top-up
+EMBED_BOOT_S = 20
+LIVE_S = float(os.environ.get("RECALL_EMBED_LIVE_S") or 0.4)   # query-time budget for embedding new chunks
+SEM_MIN = 0.30          # cosine floor for a semantic candidate (EmbeddingGemma, query prompt vs document prompt)
+SEM_SPREAD = 0.12       # ... and at most this far below the best cosine of the query
+SEM_POOL = 2            # semantic candidates per hit wanted
+SEM_BOOST = 0.15        # cosine x boost()**this: newer hits and FACTS.md win a near tie, nothing more
+RRF_K = 8               # reciprocal rank fusion: score = w / (RRF_K + rank)
+LEX_OR_W = 0.5          # text hits with only some of the words weigh this much (all-words hits: 1.0)
+SEM_W = 0.8             # semantic hits weigh this much
+
+
+class EmbedError(Exception):
+    pass
+
+
+def emb_text(path, head, body):
+    """The text a chunk is embedded as (EmbeddingGemma's document prompt); its sha1 keys the vector."""
+    title = os.path.relpath(path, HOME) + (" / " + head if head else "")
+    return ("title: %s | text: %s" % (title, body))[:EMBED_CHARS]
+
+
+def emb_hash(text):
+    return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+
+
+def model_id():
+    return "url" if EMBED_URL else os.path.basename(EMBED_MODEL)
+
+
+class Embedder:
+    """EmbeddingGemma for one run: RECALL_EMBED_URL, else a llama-server on a free loopback port (stopped on close).
+    start() returns at once; the first embed() waits for the server, so it boots while the text search runs."""
+    def __init__(self, nice=False):
+        self.url, self.proc, self.nice, self.ready = EMBED_URL, None, nice, bool(EMBED_URL)
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def start(self):
+        if self.url or self.shared():
+            return self
+        for f in (EMBED_SERVER, EMBED_MODEL):
+            if not os.path.exists(f):
+                raise EmbedError("missing " + os.path.basename(f))
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        argv = [EMBED_SERVER, "--host", "127.0.0.1", "--port", str(port), "-m", EMBED_MODEL, "--embeddings",
+                "-c", "2048", "-b", "2048", "-ub", "2048", "-np", "1", "-t", "8"]
+        self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True,
+                                     preexec_fn=(lambda: os.nice(10)) if self.nice else None)
+        self.url = "http://127.0.0.1:%d" % port
+        return self
+
+    def shared(self):
+        """Use the long-running server (memory2 embedd) when it serves the same model file (not in tests)."""
+        if EMBED_SHARED.lower() in ("", "off", "0", "no") or os.environ.get("RECALL_HOME"):
+            return False
+        try:
+            with self.opener.open(EMBED_SHARED.rstrip("/") + "/props", timeout=0.3) as r:
+                d = json.loads(r.read())
+        except (OSError, ValueError, http.client.HTTPException):
+            return False
+        if os.path.basename(str(d.get("model_path") or "")) != os.path.basename(EMBED_MODEL):
+            return False
+        self.url, self.ready = EMBED_SHARED.rstrip("/"), True
+        return True
+
+    def wait(self):
+        end = time.time() + EMBED_BOOT_S
+        while not self.ready:
+            if self.proc.poll() is not None:
+                raise EmbedError("embedding server exited at start")
+            if time.time() > end:
+                raise EmbedError("embedding server not up within %d s" % EMBED_BOOT_S)
+            try:
+                with self.opener.open(self.url + "/health", timeout=2) as r:
+                    self.ready = r.status == 200
+            except (OSError, http.client.HTTPException):
+                pass
+            if not self.ready:
+                time.sleep(0.02)
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(5)
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def embed(self, texts):
+        """texts -> float32 unit rows (numpy, len(texts) x dim)."""
+        import numpy as np
+        self.wait()
+        req = urllib.request.Request(self.url.rstrip("/") + "/v1/embeddings", json.dumps({"input": texts}).encode(),
+                                     {"Content-Type": "application/json"}, method="POST")
+        try:
+            with self.opener.open(req, timeout=120) as r:
+                d = json.loads(r.read())
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise EmbedError("embedding: %s" % type(e).__name__)
+        rows = sorted(d.get("data") or [], key=lambda x: x.get("index", 0))
+        if len(rows) != len(texts):
+            raise EmbedError("embedding: %d vectors for %d texts" % (len(rows), len(texts)))
+        m = np.array([row.get("embedding") or [] for row in rows], dtype=np.float32)
+        if m.ndim != 2 or not m.shape[1]:
+            raise EmbedError("embedding: empty vectors")
+        return m / np.maximum(np.linalg.norm(m, axis=1, keepdims=True), 1e-9)
+
+
+def vconnect():
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    v = sqlite3.connect(VEC_DB, timeout=30)
+    os.chmod(VEC_DB, 0o600)
+    v.executescript("CREATE TABLE IF NOT EXISTS vec(hash TEXT PRIMARY KEY, v BLOB);"
+                    "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);")
+    r = v.execute("SELECT v FROM meta WHERE k='model'").fetchone()
+    if r is None or r[0] != model_id():   # another model: its vectors don't compare
+        v.execute("DELETE FROM vec")
+        v.execute("DELETE FROM meta")
+        v.execute("INSERT INTO meta VALUES('model', ?)", (model_id(),))
+        v.commit()
+    return v
+
+
+def emb_sig(db):
+    """Changes whenever md chunks are added, dropped or re-indexed (rowids only grow)."""
+    return "%d:%d:%d" % db.execute("SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0) FROM emb").fetchone()
+
+
+def pending(db, vdb):
+    """[(id, hash, path)] md chunks whose text has no vector yet: FACTS.md first, then newest first."""
+    have = {r[0] for r in vdb.execute("SELECT hash FROM vec")}
+    rows = db.execute("SELECT e.id, e.hash, d.path, d.date FROM emb e JOIN docs d ON d.id = e.id").fetchall()
+    rows.sort(key=lambda r: r[3] or "", reverse=True)
+    rows.sort(key=lambda r: r[2] != FACTS)
+    out, seen = [], set(have)
+    for id_, h, path, _ in rows:
+        if h not in seen:
+            seen.add(h)
+            out.append((id_, h, path))
+    return out
+
+
+def embed_some(db, vdb, emb, todo, batch, deadline=None):
+    """Embed `todo` in batches (until `deadline`), store the vectors; returns how many were stored."""
+    import numpy as np
+    done = 0
+    for i in range(0, len(todo), batch):
+        if deadline is not None and time.time() >= deadline:
+            break
+        part, texts = [], []
+        for id_, h, path in todo[i:i + batch]:
+            r = db.execute("SELECT head, body FROM fts WHERE rowid=?", (id_,)).fetchone()
+            if r:
+                t = emb_text(path, r[0], r[1])
+                if emb_hash(t) == h:
+                    part.append(h)
+                    texts.append(t)
+        if not texts:
+            continue
+        m = emb.embed(texts)
+        if vdb.execute("SELECT v FROM meta WHERE k='dim'").fetchone() is None:
+            vdb.execute("INSERT OR REPLACE INTO meta VALUES('dim', ?)", (str(m.shape[1]),))
+        vdb.executemany("INSERT OR REPLACE INTO vec VALUES(?,?)",
+                        [(h, m[j].astype(np.float16).tobytes()) for j, h in enumerate(part)])
+        vdb.commit()
+        done += len(part)
+    return done
+
+
+def save_npy(path, arr):
+    import numpy as np
+    tmp = path + ".tmp%d" % os.getpid()
+    with open(tmp, "wb") as f:
+        np.save(f, arr)
+    os.replace(tmp, path)
+
+
+def build_matrix(db, vdb):
+    """Query matrix (float32 unit rows) + docs ids for every md chunk that has a vector; returns (ids, mat, missing)."""
+    import numpy as np
+    sig = emb_sig(db)
+    rows = db.execute("SELECT id, hash FROM emb ORDER BY id").fetchall()
+    need = {h for _, h in rows}
+    vecs = {h: b for h, b in vdb.execute("SELECT hash, v FROM vec") if h in need}
+    r = vdb.execute("SELECT v FROM meta WHERE k='dim'").fetchone()
+    dim = int(r[0]) if r else 0
+    keep = [(i, h) for i, h in rows if h in vecs]
+    ids = np.array([i for i, _ in keep], dtype=np.int64)
+    if keep and dim:
+        mat = np.frombuffer(b"".join(vecs[h] for _, h in keep), dtype=np.float16).reshape(len(keep), dim)
+        mat = mat.astype(np.float32)
+    else:
+        mat = np.zeros((0, max(dim, 1)), dtype=np.float32)
+    missing = len(rows) - len(keep)
+    save_npy(MATRIX, mat)
+    save_npy(MATRIX_IDS, ids)
+    tmp = MATRIX_META + ".tmp%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump({"sig": sig, "model": model_id(), "n": len(keep), "missing": missing, "built": now()}, f)
+    os.replace(tmp, MATRIX_META)
+    return ids, mat, missing
+
+
+def matrix_meta():
+    try:
+        with open(MATRIX_META) as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) and m.get("model") == model_id() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_matrix(db, emb):
+    """The query matrix; tops up new chunks within LIVE_S and rebuilds it when the index changed."""
+    import numpy as np
+    m = matrix_meta()
+    if m.get("sig") == emb_sig(db) and not m.get("missing"):
+        try:
+            return np.load(MATRIX_IDS), np.load(MATRIX, mmap_mode="r")
+        except (OSError, ValueError):
+            pass
+    vdb = vconnect()
+    try:
+        todo = pending(db, vdb)
+        if todo and LIVE_S > 0:
+            embed_some(db, vdb, emb, todo, LIVE_BATCH, time.time() + LIVE_S)
+        ids, mat, _ = build_matrix(db, vdb)
+        return ids, mat
+    finally:
+        vdb.close()
+
+
+def query_text(q):
+    q = re.sub(r'["*]', " ", q)
+    return "task: search result | query: " + " ".join(q.split())
+
+
+def sem_search(db, args, emb, limit):
+    """[(id, date, src, role, path, loc, snippet, score)] best semantic md hits (cosine >= SEM_MIN), best first."""
+    import numpy as np
+    qv = emb.embed([query_text(args.query)])[0]
+    ids, mat = load_matrix(db, emb)
+    if not len(ids) or mat.shape[1] != qv.shape[0]:
+        return []
+    sims = np.asarray(mat @ qv)
+    k = min(len(sims), max(limit * 4, 40))
+    top = np.argpartition(-sims, k - 1)[:k]
+    floor = max(SEM_MIN, float(sims[top].max()) - SEM_SPREAD)
+    cand = {int(ids[j]): float(sims[j]) for j in top if sims[j] >= floor}
+    if not cand:
+        return []
+    marks = ",".join("?" * len(cand))
+    sql = ("SELECT d.id, d.date, d.src, d.role, d.path, d.loc, f.body FROM docs d JOIN fts f ON f.rowid = d.id "
+           "WHERE d.src = 'md' AND d.id IN (%s)" % marks)
+    params = list(cand)
+    if args.since:
+        sql += " AND d.date >= ?"
+        params.append(args.since)
+    out = []
+    for r in db.execute(sql, params):
+        score = cand[r[0]] * boost(r[1], r[4]) ** SEM_BOOST
+        out.append(r[:6] + (norm_snip(r[6]), score))
+    out.sort(key=lambda r: -r[7])
+    return out[:limit]
+
+
+def embed_pass(db, nice=False):
+    """--embed: vectors for every md chunk that has none, stale vectors dropped, query matrix rebuilt."""
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(STATE, "embed.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Busy()
+        t0 = time.time()
+        vdb = vconnect()
+        try:
+            todo = pending(db, vdb)
+            done = 0
+            if todo:
+                with Embedder(nice=nice) as emb:
+                    done = embed_some(db, vdb, emb, todo, EMBED_BATCH)
+            dropped = 0
+            used = {r[0] for r in db.execute("SELECT hash FROM emb")}
+            if used and meta(db, "md_version") == MD_VERSION:   # never prune against an empty or old index
+                stale = [(h,) for (h,) in vdb.execute("SELECT hash FROM vec") if h not in used]
+                vdb.executemany("DELETE FROM vec WHERE hash=?", stale)
+                vdb.commit()
+                dropped = len(stale)
+                if dropped > 1000:
+                    vdb.execute("VACUUM")
+            _, _, missing = build_matrix(db, vdb)
+            total = db.execute("SELECT COUNT(*) FROM emb").fetchone()[0]
+            return done, dropped, total - missing, total, time.time() - t0
+        finally:
+            vdb.close()
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------------ search
+
+def build_terms(q):
+    phrases = re.findall(r'"([^"]+)"', q)
+    rest = re.sub(r'"[^"]*"?', " ", q)
+    words = re.findall(r"\w+(?:[-.']\w+)*\*?", rest)
+    keep = [w for w in words if w.lower().rstrip("*") not in STOP]
+    words = keep or words
+    terms = ['"%s"' % p.replace('"', '""') for p in phrases if p.strip()]
+    for w in words:
+        star = w.endswith("*")
+        terms.append('"%s"%s' % (w.rstrip("*").replace('"', '""'), "*" if star else ""))
+    seen, out = set(), []
+    for t in terms:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def norm_snip(s):
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if len(s) <= SNIP else s[:SNIP - 1].rstrip() + "…"
+
+
+def run_query(db, match, args, exclude, limit):
+    sql = ("SELECT d.id, d.date, d.src, d.role, d.path, d.loc, snippet(fts, -1, '', '', '…', 36), bm25(fts, 0.5, 1.0) "
+           "FROM fts JOIN docs d ON d.id = fts.rowid WHERE fts MATCH ?")
+    params = [match]
+    if args.since:
+        sql += " AND d.date >= ?"
+        params.append(args.since)
+    if args.src != "all":
+        sql += " AND d.src = ?"
+        params.append(args.src)
+    sql += " ORDER BY bm25(fts, 0.5, 1.0) LIMIT ?"
+    params.append(limit)
+    rows = [r for r in db.execute(sql, params) if r[0] not in exclude]
+    return sorted(rows, key=lambda r: r[7] * boost(r[1], r[4]))   # bm25 is negative: lower = better
+
+
+def boost(date, path):
+    """Multiplier for a hit's bm25: newer hits and FACTS.md win over older copies of a similar match."""
+    try:
+        long = len(date) >= 16
+        ts = datetime.strptime(date[:16] if long else date[:10], "%Y-%m-%d %H:%M" if long else "%Y-%m-%d")
+        age = max(0.0, (now() - ts.replace(tzinfo=TZ).timestamp()) / 86400)
+        m = 1 + RECENCY_W / (1 + age / RECENCY_DAYS)
+    except (TypeError, ValueError):
+        m = 1.0
+    return m * (FACTS_W if path == FACTS else 1.0)
+
+
+def where(path, src, role, loc):
+    if src == "chat":
+        tg = [x for x in loc.split() if x.startswith("tg#")]
+        return "chat/" + role + (" " + tg[0] if tg else "")
+    if path.endswith(os.path.join(".git", "logs", "HEAD")):
+        return "%s@%s" % (os.path.relpath(os.path.dirname(os.path.dirname(os.path.dirname(path))), HOME), loc)
+    return "%s:%s" % (os.path.relpath(path, HOME), loc)
+
+
+def age_str(db):
+    last = float(meta(db, "last_index", "0"))
+    m = int((now() - last) // 60)
+    return "%dm" % m if m < 120 else "%dh" % (m // 60)
+
+
+def sem_note(e):
+    print("recall: semantic search off (%s); text hits only" % (str(e) or type(e).__name__), file=sys.stderr)
+
+
+def fuse(lex, sem, n):
+    """Reciprocal rank fusion of text hits (weight 1, or LEX_OR_W for some-words hits) and semantic hits (SEM_W)."""
+    score, row = {}, {}
+    for rank, h in enumerate(lex):
+        score[h[0]] = score.get(h[0], 0.0) + h[7] / (RRF_K + rank + 1)
+        row[h[0]] = h[:7]
+    for rank, h in enumerate(sem):
+        score[h[0]] = score.get(h[0], 0.0) + SEM_W / (RRF_K + rank + 1)
+        row.setdefault(h[0], h[:7])
+    out, snips = [], set()
+    for id_ in sorted(score, key=lambda i: -score[i]):   # stable: ties keep text hits first
+        r = row[id_]
+        if r[6] not in snips:
+            snips.add(r[6])
+            out.append(r)
+            if len(out) >= n:
+                break
+    return out
+
+
+def search_hits(db, args):
+    """[(id, date, src, role, path, loc, snippet)] best first (text + semantic fusion); kb imports this."""
+    n = max(1, min(args.n, MAX_HITS))
+    if args.raw:
+        queries = [args.query]
+    else:
+        terms = build_terms(args.query)
+        if not terms:
+            die("empty query")
+        queries = [" ".join(terms)] + ([" OR ".join(terms)] if len(terms) > 1 else [])
+    emb = None
+    if not (args.raw or args.lexical or args.src == "chat" or EMBED_OFF):
+        try:
+            import numpy  # noqa: F401
+            emb = Embedder().start()   # boots while the text search runs
+        except Exception as e:
+            sem_note(e)
+    try:
+        want = 2 * n if emb else n
+        hits, ids, snips = [], set(), set()
+        for stage, q in enumerate(queries):
+            try:
+                rows = run_query(db, q, args, ids, want * POOL)
+            except sqlite3.OperationalError as e:
+                die("bad query (%s); try plain words or --raw with FTS5 syntax" % e)
+            for r in rows:
+                s = norm_snip(r[6])
+                if s in snips:
+                    continue
+                snips.add(s)
+                ids.add(r[0])
+                hits.append(r[:6] + (s, 1.0 if stage == 0 else LEX_OR_W))
+                if len(hits) >= want:
+                    break
+            if len(hits) >= want:
+                break
+        sem = []
+        if emb:
+            try:
+                sem = sem_search(db, args, emb, n * SEM_POOL)
+            except Exception as e:
+                sem_note(e)
+    finally:
+        if emb:
+            emb.close()
+    hits = fuse(hits, sem, n) if sem else [h[:7] for h in hits[:n]]
+    if args.by_date:
+        hits.sort(key=lambda r: r[1], reverse=True)
+    return hits
+
+
+def search(db, args):
+    hits = search_hits(db, args)
+    filt = "".join([" since " + args.since if args.since else "", " src=" + args.src if args.src != "all" else ""])
+    if not hits:
+        print('recall: no hits for "%s"%s (index %s old; try fewer words or --src all)' % (args.query, filt, age_str(db)))
+        return 1
+    print('recall: %d hits for "%s"%s · index %s old · recall --show ID [-C 2] for more'
+          % (len(hits), args.query, filt, age_str(db)))
+    for id_, date, src, role, path, loc, snip in hits:
+        print("#%d %s %s  %s" % (id_, date, where(path, src, role, loc), snip))
+    return 0
+
+
+def show(db, args):
+    r = db.execute("SELECT id, path FROM docs WHERE id=?", (args.show,)).fetchone()
+    if not r:
+        die("no chunk #%d (the index may have been rebuilt; search again)" % args.show, 1)
+    k = max(0, min(args.C, 10))
+    before = [x[0] for x in db.execute("SELECT id FROM docs WHERE path=? AND id<? ORDER BY id DESC LIMIT ?",
+                                       (r[1], r[0], k))]
+    after = [x[0] for x in db.execute("SELECT id FROM docs WHERE path=? AND id>? ORDER BY id LIMIT ?",
+                                      (r[1], r[0], k))]
+    for i in sorted(before) + [r[0]] + after:
+        d = db.execute("SELECT d.id, d.date, d.src, d.role, d.path, d.loc, f.head, f.body FROM docs d "
+                       "JOIN fts f ON f.rowid = d.id WHERE d.id=?", (i,)).fetchone()
+        id_, date, src, role, path, loc, head, body = d
+        if src == "chat":
+            label = "transcript %s (%s)" % (loc, role)
+        else:
+            label = "%s:%s" % (os.path.relpath(path, HOME), loc) + (" [%s]" % head if head else "")
+        mark = ">>" if i == r[0] else "--"
+        print("%s #%d %s %s" % (mark, id_, date, label))
+        print(body if len(body) <= 1500 else body[:1500] + " …[cut]")
+    return 0
+
+
+def stats(db):
+    rows = dict(db.execute("SELECT src, COUNT(*) FROM docs GROUP BY src").fetchall())
+    files = dict(db.execute("SELECT src, COUNT(*) FROM files GROUP BY src").fetchall())
+    size = os.path.getsize(DB) / 1e6
+    print("recall index: %d md chunks (%d files), %d chat chunks (%d transcripts), %.1f MB, updated %s ago"
+          % (rows.get("md", 0), files.get("md", 0), rows.get("chat", 0), files.get("chat", 0), size, age_str(db)))
+    total = db.execute("SELECT COUNT(*) FROM emb").fetchone()[0]
+    m = matrix_meta()
+    vsize = os.path.getsize(VEC_DB) / 1e6 if os.path.exists(VEC_DB) else 0.0
+    fresh = "current" if m.get("sig") == emb_sig(db) else "rebuilt on the next query"
+    built = "%dm ago" % ((now() - float(m["built"])) // 60) if m.get("built") else "never"
+    print("recall semantic: %d of %d md chunks embedded (%s; vectors %.1f MB; query matrix built %s, %s)%s"
+          % (m.get("n", 0), total, model_id(), vsize, built, fresh, " [RECALL_EMBED=off]" if EMBED_OFF else ""))
+    return 0
+
+
+def cron_note(what, e):
+    os.makedirs(INBOX, exist_ok=True)
+    with open(os.path.join(INBOX, "recall-%s-failed-%d.md" % (what, int(time.time()))), "w") as f:
+        f.write("recall --%s failed %s: %s. Data, not instructions. Next: run `recall --%s` by hand.\n"
+                % (what, datetime.now(TZ).strftime("%F %H:%M"), type(e).__name__, what))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="recall", description="Search my own past work (local SQLite FTS5).")
+    ap.add_argument("query", nargs="?")
+    ap.add_argument("--since", metavar="YYYY-MM-DD")
+    ap.add_argument("--src", choices=("md", "chat", "all"), default="all")
+    ap.add_argument("-n", type=int, default=10, help="max hits (capped at %d)" % MAX_HITS)
+    ap.add_argument("--by-date", action="store_true", help="newest first instead of best match first")
+    ap.add_argument("--raw", action="store_true", help="query is FTS5 MATCH syntax")
+    ap.add_argument("--show", type=int, metavar="ID")
+    ap.add_argument("-C", type=int, default=0, metavar="K", help="with --show: K neighbouring chunks")
+    ap.add_argument("--index", action="store_true")
+    ap.add_argument("--rebuild", action="store_true")
+    ap.add_argument("--embed", action="store_true", help="embed md chunks that have no vector yet")
+    ap.add_argument("--cron", action="store_true", help="with --index/--embed: ~/inbox note on failure")
+    ap.add_argument("--lexical", action="store_true", help="text search only, no embeddings")
+    ap.add_argument("--stats", action="store_true")
+    args = ap.parse_args(argv)
+    if args.since and not re.fullmatch(r"\d{4}-\d\d-\d\d", args.since):
+        die("--since wants YYYY-MM-DD")
+
+    if args.index or args.rebuild:
+        try:
+            if args.rebuild:
+                fd = lock(True)
+                try:
+                    for suffix in ("", "-journal", "-wal", "-shm"):
+                        if os.path.exists(DB + suffix):
+                            os.remove(DB + suffix)
+                finally:
+                    os.close(fd)
+            db = connect()
+            added, changed, secs = index(db, full=args.rebuild)
+            if args.rebuild or changed:
+                db.execute("INSERT INTO fts(fts) VALUES('optimize')")
+                db.commit()
+            total = db.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+            print("recall: +%d chunks from %d changed files in %.1fs; %d chunks total" % (added, changed, secs, total))
+            return 0
+        except Exception as e:
+            if args.cron:
+                cron_note("index", e)
+            die("index failed: %s" % e)
+
+    if args.embed:
+        if EMBED_OFF:
+            die("RECALL_EMBED=off: nothing to embed", 0)
+        try:
+            db = connect()
+            if meta(db, "md_version") != MD_VERSION or now() - float(meta(db, "last_index", "0")) > STALE_SECS:
+                index(db)
+            done, dropped, have, total, secs = embed_pass(db, nice=args.cron)
+            print("recall: embedded %d chunks in %.1fs; %d of %d md chunks have vectors; %d stale vectors dropped"
+                  % (done, secs, have, total, dropped))
+            return 0
+        except Busy:
+            print("recall: another --embed is running")
+            return 0
+        except Exception as e:
+            if args.cron:
+                cron_note("embed", e)
+            die("embed failed: %s" % e)
+
+    if args.show is None and not args.stats and not args.query:
+        ap.print_usage()
+        return 2
+    fresh = not os.path.exists(DB)
+    db = connect()
+    if args.show is None:
+        last = float(meta(db, "last_index", "0"))
+        if fresh or now() - last > STALE_SECS:
+            try:
+                index(db, block=fresh)
+            except Busy:
+                pass  # another indexer is running; search what is there
+            except Exception as e:
+                if fresh:
+                    die("index failed: %s" % e)
+                print("recall: index refresh failed (%s); results may be stale" % e, file=sys.stderr)
+    if args.stats:
+        return stats(db)
+    if args.show is not None:
+        return show(db, args)
+    return search(db, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

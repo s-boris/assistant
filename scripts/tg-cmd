@@ -1,0 +1,3141 @@
+#!/usr/bin/env python3
+"""tg-cmd: short, Telegram-friendly answers for the bot's instant commands (tg-bind rows run by tg-adapter).
+
+  tg-cmd bills        open bills, overdue first (~/bin/bills)
+  tg-cmd queue        Sonarr/Radarr download queue (~/bin/media queue)
+  tg-cmd space        Unraid array/pool usage + fill-up forecast (unraid-capacity, one read-only ssh;
+                      falls back to the last daily sample)
+  tg-cmd reminders    the owner's next 10 reminders (~/bin/remind list, owner ones only)
+  tg-cmd home         Home Assistant at a glance: lights on per room, room temperatures, vacuum, media
+                      playing, low batteries (one `ha list --json` read, privacy-gated) + open problems of
+                      the latest ha-health-watch snapshot (new vs known-offline). Read-only; never reads
+                      person/device_tracker/zone/proximity/geo_location entities.
+  tg-cmd list         the lists: HA's shopping list first (`shop list`, which syncs with HA), then the local
+                      ones (`lists show`; its own "shopping" list is replaced by HA's, its open items counted)
+  tg-cmd shop         the shopping plan card (`shop card`, text only) after a best-effort `shop sync`
+  tg-cmd parcels [picked]  parcels card (`parcels`, cache only: pickups, on the way, carrier notices); `picked`
+                     = he picked up what waits at the station (`parcels picked station`); /shop adds `parcels line`
+  tg-cmd gym [WORD]   the next gym session (`gym plan next`: local data as of the last sync, no API call);
+                      WORD (one argument, text_arg): recap (last) = `gym recap`
+  tg-cmd train        the next 4 planned 🚆 legs (`train-watch list`), each with a one-line live verdict from
+                      `train-watch status ID --json` (parallel, 10 s each): on time / +N min / cancelled → alt …;
+                      home ends are door to door (the leave-home time)
+  tg-cmd gohome [STOP]  the way home (`gohome [STOP]`): the next 3 connections door to door + the last one
+                      tonight, each with its SBB app link; from STOP, else a calendar event under way (or
+                      ended <= 3 h ago), else the phone's town (`vault ha now`); "You're home 🏠" at home
+  tg-cmd rave         upcoming shows and lineups of his artists (`rave-radar list --json`, muted ones out) plus the
+                      events named in 🚆 leg titles ("A → B (Artist)", "(after X)"): 🎟 going = a train leg on that
+                      date to that town/artist; ✈️ = falls inside a trip
+  tg-cmd trip [WORDS|list]  the next trip (trip-conditions' trips.json, pretrip-check's trip.json, optional
+                      ~/.config/tg-cmd/trips.json, merged by name): dates + countdown, legs, its 🚆 legs, open to-dos
+                      (the trip's own "todo", TODO.md "Waiting on you" and owner reminders that name the trip), link,
+                      and "📦 Offline pack" with its path when the trip's "pack" file (trip-pack) exists: tg-adapter
+                      sends text only, so the session sends the file when he asks; WORDS (one argument,
+                      text_arg) pick an upcoming trip by name or match word ("/trip belgium"), list = all upcoming trips
+  tg-cmd warranty [WORDS] shop invoices/receipts still under the 2-year warranty (`contracts warranty --max 7`:
+                      paperless cards only, live metadata; cached amounts, missing cards fetched for ≤ 6 s), plus
+                      "📝 Logged by you": open items of the `lists` warranty list (voice-plan's warranty action,
+                      "product · shop · bought D · warranty to D"; ≤ 4 shown, then paperless gets --max 7 minus
+                      their lines, at least 3); WORDS (one argument: the registry tool's text_arg) filter
+                      titles/shops/entries and list expired matches too ("/warranty tv")
+  tg-cmd back [N]     catch-up card after time away, ≤ 10 lines, each only when non-empty: owner reminders fired in
+                      the window (remind's recent.json; open = not snoozed/done) and due in the next 48 h, bills due
+                      ≤ 7 d, new on Emby (`media recent` imports: count + 2 titles), new warnings of the latest
+                      unraid-health report, birthdays in 7 days (`gift-radar list`, first names), the next calendar
+                      event (calcache). Window: N days (1-30), else the whole absence from remind's place-state.json
+                      (away now, or home again within 72 h), else 2 days. A failed source → "⚠️ Not checked: …"
+  tg-cmd week         the week ahead (today + 6 days), one line per day: calcache events (timed ones still ahead;
+                      multi-day all-day ones once, "(to DD.MM)"), 🚆 legs (calendar travel events + `train-watch list`
+                      legs it lacks), @<work town> markers = 🏢 office (other @Town = 📍), the DST switch, home weather
+                      (open-meteo daily, 3 h cache in TG_CMD_STATE/week-weather.json; when it fails a cached forecast
+                      ≤ 72 h old, else none, silently), 🌙 late nights + 😴 sleep-in mornings (`sleepin status --json`),
+                      birthdays (`gift-radar list`, first names), bills due (`bills list --open`, counts only; overdue on
+                      today). All sources in parallel; a failed one → "⚠️ Not checked: …", a broken calcache → exit 3
+  tg-cmd pack [TYPE|WORDS|list]  packing list (≤ 10 lines) for the next event within 10 days (calcache + the trip
+                      files): the type's private template (~/.config/tg-cmd/pack-templates.json; type from title
+                      words, rave-radar's artists, abroad/trip length) plus photo ID (calcache id_check), passport
+                      + EUR (abroad), toothbrush + charger (a night away), earplugs + powerbank (a train home
+                      00:00-06:59). TYPE forces a template, WORDS picks an event, list shows the types. Copy into
+                      HA: `pack --todo` (~/bin/pack)
+  tg-cmd vibe [TEXT]  4 library movies for a mood or a film (`media vibe --json TEXT`: its plain "text" with ▶ Emby
+                      links; "/vibe cozy rainy sunday", "/vibe like Arrival", "short" / "90min" caps); a series word
+                      ("/vibe a dark crime series", "a show", "Serie") or a series title = 4 library series; bare = a hint
+  tg-cmd finish       shows he started and paused 14+ days, closest to the end first (`media finish --json`: its
+                      plain "text", "Hijack · 3 of 8 left · ★7.4" + the next episode and a ▶ Emby link)
+  tg-cmd doctor [TITLE] open Seerr requests that haven't reached Emby, stuck ones first, each with its verdict
+                      (`media doctor --json --no-probe`: its plain "text"); TITLE (one argument, text_arg) = that
+                      request + a German and an English line to forward ("/doctor dune"). Routine fixes run as in the
+                      session (searches throttled); no indexer search here, cached results count
+  tg-cmd party [off|status]  WRITES lights: `party on|off|status` (WLEDs follow the playing track's BPM; off
+                      restores the snapshot); party's own text, also when it exits 1; other words = a hint
+  tg-cmd crate        WRITES the crate list: `crate-now` (the track playing on Spotify via HA -> lists add crate;
+                      dedupes like rave-radar; "nothing playing" is a normal answer)
+  tg-cmd sleep        his sleep & energy card (~/bin/lib/healthlib.py over the private health store; Health
+                      Connect days from the phone app): last night, 7-day debt vs his usual, bedtime drift, late nights
+                      and gym days vs ordinary nights, steps trend; picture = 14-night bar chart. Never logs values
+  tg-cmd cat          the cat's week (cat-corner's daily history.jsonl, local file only): litter visits per day,
+                      weight, feeder grams, drawer level
+  tg-cmd --list       names and descriptions
+
+Instant commands are tg-bind rows (the events store's `bindings` table), run by tg-adapter, not the plugin: a
+registry tool in packages/tools/domains/bindings.py (argv, effect, picture output, text argument, menu line) →
+`tool gen` (schemas/tools.toml) → `tg-bind add command NAME TOOL --why "…"` or `tg-bind import FILE`. When the
+owner sends /<name>, tg-adapter runs the tool's argv (`tg-cmd <name>`) and sends the output itself, without a Claude
+turn. Every data source runs with a timeout (whole answer < ~15 s; the registry's default allows 20 s). Exit 0 =
+answer printed. Exit 3 = the data source failed: a short "⚠️ …" fallback is printed; tg-adapter sends it and tells
+the session. Exit 2 = usage.
+Output is plain text (no Markdown), at most ~3500 characters, and goes through secretscan's redact()
+as a safety net.
+Picture cards (TG_CMD_PICTURES=1; the registry's argv sets it for tools with output "picture"): /space, /gym, /cat, /finish, /vibe, /week, /train, /sleep
+and /trip print
+one JSON line {"photo": PATH, "caption": …, "text": …} instead; tg-adapter sends PATH (a 1080x1350 PNG from
+~/bin/lib/cardimg.py in ~/.local/state/cardimg, CARDIMG_DIR overrides) with the caption, and the plain text card is
+the fallback. A picture that fails to render prints the text card. Poster cards: /finish (6 shows, 3x2) and /vibe
+(4 picks, 2x2) as a collage of Emby posters (`media poster --json IDS`: cached Primary images; a missing one = a
+placeholder tile) with a number badge, ★ rating, short reason and progress; the caption carries the numbered ▶ links
+(≤ 1024 chars: links of the last items dropped first). /week: one panel per day (weekday, drawn
+weather glyph + max/min + rain ≥ 30 %, pills for office/clock change/sleep-in/late night/birthday/bills, timed events
+and legs; busy days end in "+ N more" so 7 days fit), caption = the text card with shorter titles (≤ 1024). /train: a departure
+board of the next 6 legs (time + day, destination, line pills, arr/from, platform sign, status in its colour: on time green,
+delay amber, cancelled/tight change red, no status grey, plus a note with the alternative), caption = the text card for
+those 6 (without the flag /train stays at 4). /trip: countdown (days, then hours, to the first flight, else the start;
+"Day N of M · place" during it), flight-watch's journeys not yet landed (stops in local time, flight numbers), the
+place strip from trip-conditions' config (legs, hop days, today marker), hop lines, one tile per place with today's dive
+estimate (`trip-conditions KEY --json --days 1 --no-advisory`; the clearly best one starred), open to-dos; caption = the
+text card. A trip without places draws its own leg lines. Bare /vibe, no picks, no train legs and the trip
+list stay text. Instant answers carry no buttons (the session's mt:play buttons stay with `media`).
+Nothing here writes anywhere, except shop's own HA sync (/list, /shop: the same two-way sync
+its cron runs every 10 min, so the list matches HA) and /week's weather cache.
+Testing env: TG_CMD_BIN (dir with bills/media/remind/unraid-capacity/ha/lists/shop/gym/train-watch/gohome/rave-radar/contracts/
+gift-radar/calcache/sleepin/flight-watch/trip-conditions;
+default ~/bin), TG_CMD_TRIP_CONDITIONS / TG_CMD_PRETRIP / TG_CMD_TRIPS (the three trip files), TG_CMD_TODO (TODO.md), TG_CMD_PACK_TEMPLATES,
+TG_CMD_NOW ("YYYY-MM-DD HH:MM", Zurich), BILLS_STATE_DIR / REMIND_DB pass through to those scripts,
+HA_HEALTH_DIR (ha-health-watch's state dir; default ~/.local/state/ha/health), TG_CMD_UNRAID_REPORTS (unraid-health's
+daily reports; default ~/reports/unraid); /back reads recent.json and place-state.json next to REMIND_DB; /week: TG_CMD_STATE
+(its weather cache dir; default ~/.local/state/tg-cmd), TG_CMD_WEATHER ("off", or a file standing in for open-meteo's answer).
+"""
+import json, os, pwd, re, signal, subprocess, sys, unicodedata
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
+
+sys.dont_write_bytecode = True
+REAL_LIB = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "bin", "lib")   # the real home's, whatever $HOME says
+for _lib in (REAL_LIB, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")):
+    sys.path.insert(0, _lib)       # own lib dir first; the real home's ~/bin/lib for a copy elsewhere (CI's overlay)
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+TZ = assistant_profile.tz()
+BIN = os.path.expanduser(os.environ.get("TG_CMD_BIN") or "~/bin")
+HEALTH_DIR = os.path.expanduser(os.environ.get("HA_HEALTH_DIR") or "~/.local/state/ha/health")
+MAX_CHARS = 3500
+
+
+class Fail(Exception):
+    """A data source failed; str() is the owner-facing reason (short, redacted)."""
+
+
+def now():
+    n = os.environ.get("TG_CMD_NOW")
+    return datetime.strptime(n, "%Y-%m-%d %H:%M") if n else datetime.now(TZ).replace(tzinfo=None)
+
+
+def run(args, timeout, what, full=False):
+    """stdout of BIN/args[0] ...; raises Fail on timeout or non-zero exit. Own process group,
+    killed whole on timeout (ssh children too). full: (exit code, stdout, stderr), any exit code."""
+    env = {**os.environ, "TZ": TZ.key}
+    env.pop("TELEGRAM_BOT_TOKEN", None)
+    try:
+        p = subprocess.Popen([os.path.join(BIN, args[0]), *args[1:]], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             stdin=subprocess.DEVNULL, env=env, start_new_session=True, text=True)
+    except OSError as e:
+        raise Fail(f"{what}: {args[0]} not runnable ({type(e).__name__})")
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.communicate()
+        raise Fail(f"{what}: no answer within {timeout} s")
+    if full:
+        return p.returncode, out, err
+    if p.returncode != 0:
+        last = next((l for l in reversed(err.strip().splitlines()) if l.strip()), "")
+        last = re.sub(r"^[\w-]+: ", "", last.strip())[:120]
+        raise Fail(f"{what}: {last or f'exit {p.returncode}'}")
+    return out
+
+
+# ---------------------------------------------------------------- formatting helpers
+
+def day_txt(d, with_weekday=True):
+    """'today', 'tomorrow', 'Fri 16.10' (year added when it's not this year)."""
+    t = now().date()
+    if d == t:
+        return "today"
+    if d == t + timedelta(days=1):
+        return "tomorrow"
+    s = d.strftime("%d.%m") if d.year == t.year else d.strftime("%d.%m.%Y")
+    return f"{d:%a} {s}" if with_weekday else s
+
+
+def money(cur, amt):
+    try:
+        return f"{cur} {Decimal(str(amt)):,.2f}".replace(",", "'")
+    except InvalidOperation:
+        return f"{cur} {amt}"
+
+
+def size(b):
+    if b >= 1e12:
+        return f"{b / 1e12:.1f} TB"
+    if b >= 1e9:
+        return f"{b / 1e9:.0f} GB"
+    return f"{b / 1e6:.0f} MB"
+
+
+def clip(s, n):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_bills():
+    bills = json.loads(run(["bills", "list", "--open", "--json"], 6, "bill tracker") or "[]")
+    if not bills:
+        return "💳 No open bills."
+    bills.sort(key=lambda b: b["due"])
+    totals = {}
+    for b in bills:
+        try:
+            totals[b["currency"]] = totals.get(b["currency"], Decimal(0)) + Decimal(str(b["amount"]))
+        except InvalidOperation:
+            pass
+    head = f"💳 Open bills: {len(bills)} · " + " + ".join(money(c, a) for c, a in sorted(totals.items()))
+    lines, today = [head], now().date()
+    for b in bills[:12]:
+        due = date.fromisoformat(b["due"])
+        what = f"{clip(b['payee'], 28)} · {money(b['currency'], b['amount'])}"
+        days = (due - today).days
+        if days < 0:
+            lines.append(f"⚠️ {what} · OVERDUE since {day_txt(due)}")
+        elif days == 0:
+            lines.append(f"❗ {what} · due today")
+        else:
+            lines.append(f"• {day_txt(due)} · {what}" + (f" (in {days} d)" if days <= 14 else ""))
+    if len(bills) > 12:
+        lines.append(f"+ {len(bills) - 12} more")
+    return "\n".join(lines)
+
+
+def cmd_queue():
+    out = run(["media", "queue"], 12, "Sonarr/Radarr").strip()
+    if not out or out == "nothing downloading":
+        return "📥 Nothing downloading."
+    lines, items = ["📥 Downloads"], 0
+    for l in out.splitlines():
+        if not l.strip():
+            continue
+        if l.startswith("Movies ("):
+            lines.append("🎬 " + l.rstrip(":"))
+        elif l.startswith("TV ("):
+            lines.append("📺 " + l.rstrip(":"))
+        else:
+            items += 1
+            if items <= 20:
+                lines.append("• " + clip(l.strip().replace(" -- ", " · "), 160))
+    if items > 20:
+        lines.append(f"+ {items - 20} more")
+    return "\n".join(lines)
+
+
+def space_data():
+    note = ""
+    try:
+        r = json.loads(run(["unraid-capacity", "forecast", "--live"], 10, "live reading"))
+    except (Fail, ValueError) as e:
+        r = json.loads(run(["unraid-capacity", "forecast"], 5, "capacity history"))
+        note = f"\n⚠️ {e}; showing the last daily sample"
+    if not r.get("ok", True) or "array" not in r:
+        raise Fail("capacity data incomplete")
+    return r, note
+
+
+def cmd_space(data=None):
+    r, note = data or space_data()
+    a = r["array"]
+    age = "" if r.get("sample_age_h", 0) < 1 else f" (sample {r['sample_age_h']:.0f} h old)"
+    lines = [f"💾 Server space · {r.get('as_of_local', '?')[-5:]}{age}", ""]
+    filled = round(a["pct"] / 10)
+    lines += [f"Array {a['pct']:.0f}% full", "▓" * filled + "░" * (10 - filled),
+              f"{size(a['free'])} free of {size(a['size'])}"]
+    eta, rate = a.get("eta") or {}, (r.get("model") or {}).get("rate")
+    alerts = r.get("alerts") or []
+    array_alert = any(al.get("key") == "array" for al in alerts)
+    if eta.get("date"):
+        d = date.fromisoformat(eta["date"])
+        lines += ["", ("⚠️ " if array_alert else "") + f"Full in ~{eta['days']:.0f} days ({d:%d %b})"]
+        if rate:
+            lines.append(f"Growing ~{size(rate)}/day")
+    elif rate is not None and rate <= 0:
+        lines += ["", "Not growing at the moment"]
+    # owner: array total only, no per-disk fill levels; a disk with a bad status still shows
+    disks = (r.get("disks") or {}).items()
+    bad = [f"{n} {d['status']}" for n, d in disks if d.get("size") and d.get("status") and d["status"] != "DISK_OK"]
+    if bad:
+        lines += ["", "⚠️ Disk status: " + ", ".join(bad)]
+    pools = r.get("pools") or {}
+    if pools:
+        lines += ["", "Pools"] + [f"• {n} {p['pct']:.0f}% · {size(p['free'])} free" for n, p in pools.items()]
+    extra = [al for al in alerts if not (al.get("key") == "array" and eta.get("date"))]
+    if extra:
+        lines.append("")
+        lines += ["⚠️ " + clip(al.get("msg", str(al)), 160) for al in extra]
+    return "\n".join(lines) + note
+
+
+# ---------------------------------------------------------------- picture cards (TG_CMD_PICTURES=1)
+
+def pictures_on():
+    return os.environ.get("TG_CMD_PICTURES") == "1"
+
+
+def cardimg():
+    """~/bin/lib/cardimg.py (next to this script, else ~/bin/lib; TG_CMD_CARDIMG = a file for tests)."""
+    import importlib.util
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib", "cardimg.py")
+    path = os.environ.get("TG_CMD_CARDIMG") or (here if os.path.exists(here) else os.path.join(REAL_LIB, "cardimg.py"))
+    spec = importlib.util.spec_from_file_location("cardimg", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+EMOJI_RE = re.compile("[\U0001F000-\U0001FFFF☀-➿️‍⬀-⯿]")
+
+
+def plain(s):
+    """Text for the image: Pillow can't draw colour emoji, so they go (and the space after them)."""
+    return re.sub(r"\s{2,}", " ", EMOJI_RE.sub("", s)).strip()
+
+
+def jsonl_tail(path, n):
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        return []
+    return rows[-n:]
+
+
+def tb(b):
+    return b / 1e12
+
+
+def space_history(days=90):
+    """{date: used bytes} from unraid-capacity's state files (real samples win over the backfill estimate)."""
+    d = os.path.expanduser(os.environ.get("UNRAID_CAPACITY_STATE_DIR") or "~/.local/state/unraid-capacity")
+    used = {}
+    for name, get in (("backfill.jsonl", lambda x: x.get("used")), ("samples.jsonl", lambda x: (x.get("array") or {}).get("used"))):
+        for x in jsonl_tail(os.path.join(d, name), 400):
+            if x.get("date") and isinstance(get(x), (int, float)):
+                used[x["date"]] = get(x)
+    cut = (now().date() - timedelta(days=days)).isoformat()
+    return {k: v for k, v in sorted(used.items()) if k >= cut}
+
+
+def pic_space():
+    data = space_data()
+    r, note = data
+    text = cmd_space(data)
+    a = r["array"]
+    eta, rate = a.get("eta") or {}, (r.get("model") or {}).get("rate")
+    array_alert = any(al.get("key") == "array" for al in (r.get("alerts") or []))
+    cap = f"💾 Array {a['pct']:.0f}% full · {size(a['free'])} free"
+    if eta.get("date"):
+        cap += f" · full ~{date.fromisoformat(eta['date']):%d.%m.%Y}"
+
+    def render():
+        ci = cardimg()
+        today = now().date()
+        age = "" if r.get("sample_age_h", 0) < 1 else f" · sample {r['sample_age_h']:.0f} h old"
+        try:
+            asof = f"{datetime.strptime(r['as_of_local'], '%Y-%m-%d %H:%M'):%d.%m %H:%M}"
+        except (KeyError, TypeError, ValueError):
+            asof = r.get("as_of_local") or "?"
+        c = ci.Card("Server space", f"{r.get('host') or 'Array'} · {asof}{age}")
+        col = ci.severity(a["pct"])
+        c.big(f"{a['pct']:.0f}%", f"full · {size(a['free'])} free of {size(a['size'])}", color=col)
+        c.progress(a["pct"], color=col)
+        hist = space_history()
+        hist[today.isoformat()] = a["used"]
+        pts = [((date.fromisoformat(k) - today).days, tb(v)) for k, v in sorted(hist.items())]
+        limit = tb(a["used"] + a.get("usable", a["free"]))
+        proj, labels = None, [(pts[0][0], f"{today + timedelta(days=pts[0][0]):%d.%m}"), (0, "today")]
+        if rate and rate > 0:
+            days = min(float(eta.get("days") or 180), 180)
+            proj = [(0, tb(a["used"])), (days, min(limit, tb(a["used"] + rate * days)))]
+            labels.append((days, f"{today + timedelta(days=round(days)):%d.%m.%y}"))
+        c.line_chart(pts, height=540, projection=proj, limit=(limit, "full"), x_labels=labels, y_fmt=lambda v: f"{v:.0f} TB",
+                     note=f"Used, last {-pts[0][0]} days" + (" · dashed = trend" if proj else ""))
+        if eta.get("date"):
+            d = date.fromisoformat(eta["date"])
+            c.d.text((ci.PAD, c.y), f"Full in ~{eta['days']:.0f} days", font=ci.font(52, True), fill=ci.WARN if array_alert else ci.TEXT)
+            c.d.text((c.w - ci.PAD, c.y + 14), f"{d:%d %b %Y}", font=ci.font(36), fill=ci.TEXT2, anchor="ra")
+            c.gap(76)
+        elif rate is not None and rate <= 0:
+            c.lines(["Not growing at the moment"], size=40, color=ci.TEXT)
+        rows = []
+        if rate:
+            rows.append(f"Growing ~{size(rate)}/day (30-day trend)")
+        bad = [f"{n} {d['status']}" for n, d in (r.get("disks") or {}).items() if d.get("size") and d.get("status") and d["status"] != "DISK_OK"]
+        if bad:
+            rows.append(("Disk status: " + ", ".join(bad), ci.BAD))
+        pools = r.get("pools") or {}
+        if pools:
+            rows += [f"Pool {n}: {p['pct']:.0f}% · {size(p['free'])} free" for n, p in pools.items()]
+        for al in r.get("alerts") or []:
+            if not (al.get("key") == "array" and eta.get("date")):
+                rows.append((plain(clip(al.get("msg", str(al)), 120)), ci.WARN))
+        if note:
+            rows.append((plain(note), ci.WARN))
+        c.lines(rows, size=30)
+        return c.save("space")
+    return text, cap, render
+
+
+def gym_bg(args, timeout, what):
+    try:
+        return run(args, timeout, what)
+    except Fail as e:
+        return e
+
+
+GYM_WORDS = {"recap": ["recap"], "last": ["recap"]}
+GYM_HINT = "🏋️ /gym = next session from the plan · /gym recap = last session"
+
+
+def gym_word(arg):
+    # /gym WORD -> the gym argv; None for a bare /gym; [] for an unknown word (the hint)
+    if arg is None or not str(arg).strip():
+        return None
+    return GYM_WORDS.get(str(arg).strip().lower().lstrip("/"), [])
+
+
+def cmd_gym_word(sub):
+    if not sub:
+        return GYM_HINT
+    out = run(["gym"] + sub, 12, "gym " + sub[0]).strip()
+    return out or "🏋️ Gym · nothing logged yet"
+
+
+def pic_gym(arg=None):
+    sub = gym_word(arg)
+    if sub is not None:
+        text = cmd_gym_word(sub)
+        return text, text.splitlines()[0], None
+    from concurrent.futures import ThreadPoolExecutor
+    ci_dir = os.path.expanduser(os.environ.get("CARDIMG_DIR") or "~/.local/state/cardimg")
+    with ThreadPoolExecutor(3) as ex:
+        f_next = ex.submit(gym_bg, ["gym", "plan", "next"], 8, "gym")
+        f_stats = ex.submit(gym_bg, ["gym", "stats", "--json", "--weeks", "8"], 10, "gym stats")
+        f_chart = ex.submit(gym_bg, ["gym", "chart", "--weeks", "8", "--out", os.path.join(ci_dir, "gym-src")], 12, "gym chart")
+        nxt, stats, chart = f_next.result(), f_stats.result(), f_chart.result()
+    if isinstance(nxt, Fail):
+        raise nxt
+    text = nxt.strip() or "🏋️ Gym · nothing logged yet"
+    st = json.loads(stats) if isinstance(stats, str) else {}
+    wk = (st.get("weekly") or [{}])[-1]
+    cons = st.get("consistency") or {}
+    first = text.splitlines()[0]
+    cap = first + (f" · {wk.get('sessions', 0)} this week" if wk else "")
+
+    def render():
+        if not st:
+            raise Fail("no gym stats")
+        ci = cardimg()
+        start = date.fromisoformat(wk["start"]) if wk.get("start") else now().date()
+        c = ci.Card("Gym week", f"Week of {start:%d.%m} · {now():%d.%m %H:%M}")
+        since = cons.get("days_since_last")
+        c.stats([(str(wk.get("sessions", 0)), "sessions", ci.GOOD if wk.get("sessions") else ci.TEXT),
+                 (str(wk.get("hard_sets", 0)), "hard sets"),
+                 (f"{cons.get('streak_weeks', 0)} wk", "streak"),
+                 (f"{since} d" if since is not None else "–", "since last")])
+        png = next((ln.strip() for ln in chart.splitlines() if ln.strip().endswith("sessions.png")), None) if isinstance(chart, str) else None
+        if not (png and c.paste(png, max_height=470)):
+            vals = [w.get("sessions", 0) for w in st.get("weekly") or []]
+            c.bar_chart(vals, [f"{date.fromisoformat(w['start']):%d.%m}" for w in st.get("weekly") or []], height=360,
+                        note="Sessions per week")
+        c.heading(plain(first) or "Next session")
+        c.lines([plain(ln) for ln in text.splitlines()[1:] if ln.strip()], size=28)
+        return c.save("gym")
+    return text, cap, render
+
+
+def cat_history():
+    d = os.path.expanduser(os.environ.get("CAT_CORNER_STATE_DIR") or "~/.local/state/cat-corner")
+    rows = [x for x in jsonl_tail(os.path.join(d, "history.jsonl"), 60) if x.get("date")]
+    byday = {x["date"]: x for x in rows}
+    if not byday:
+        raise Fail("no cat-corner history yet")
+    days = sorted(byday)[-7:]
+    return [byday[k] for k in days]
+
+
+def pet_name(sensor):
+    n = sensor.split(".", 1)[-1]
+    for suf in ("_visits_today", "_visits", "_today"):
+        if n.endswith(suf):
+            n = n[: -len(suf)]
+    return n.replace("_", " ").strip().title() or "Cat"
+
+
+def cat_facts():
+    rows = cat_history()
+    pets = sorted({p for x in rows for p in (x.get("pets") or {})})
+    visits = [sum((v or {}).get("visits") or 0 for v in (x.get("pets") or {}).values()) for x in rows]
+    food = [sum((v or {}).get("food_g") or 0 for v in (x.get("feeders") or {}).values()) for x in rows]
+    weights = [(x["date"], w) for x in rows for v in (x.get("pets") or {}).values() if (w := (v or {}).get("weight_kg"))]
+    full = [v for x, v in zip(rows, visits) if x.get("complete")]
+    last = rows[-1]
+    name = pet_name(pets[0]) if len(pets) == 1 else "Cats"
+    stale = (now().date() - date.fromisoformat(last["date"])).days
+    return dict(rows=rows, visits=visits, food=food, weights=weights, avg=(sum(full) / len(full)) if full else None,
+                name=name, last=last, stale=stale)
+
+
+def cmd_cat():
+    f = cat_facts()
+    rows, v, food, last = f["rows"], f["visits"], f["food"], f["last"]
+    span_ = f"{len(rows)} day{'s' if len(rows) != 1 else ''}"
+    so_far = "" if last.get("complete") else " so far"
+    out = [f"🐾 {f['name']} · last {span_}"]
+    vis = f"Litter visits: {v[-1]} today{so_far}"
+    if len(v) > 1:
+        vis += f" · {v[-2]} yesterday"
+    if f["avg"] is not None:
+        vis += f" · avg {f['avg']:.1f}/day"
+    out.append(vis)
+    if f["weights"]:
+        w0, w1 = f["weights"][0][1], f["weights"][-1][1]
+        out.append(f"Weight {w1:.2f} kg" + (f" ({w1 - w0:+.2f} kg in {len(rows)} d)" if len(f["weights"]) > 1 else ""))
+    if any(x.get("feeders") for x in rows):
+        out.append(f"Feeder: {food[-1]:.0f} g today{so_far}" + (f" · {food[-2]:.0f} g yesterday" if len(food) > 1 else ""))
+    if last.get("drawer_end") is not None:
+        out.append(f"Drawer {last['drawer_end']:.0f}% full")
+    out += cat_runout()
+    if f["stale"] >= 2:
+        out.append(f"⚠️ cat-corner's data is {f['stale']} days old")
+    return "\n".join(out)
+
+
+def cat_runout():
+    """cat-autopilot's "runs out" lines (forecast.json, written by its cron; local file only), when <= 2 days old."""
+    d = os.path.expanduser(os.environ.get("CAT_CORNER_STATE_DIR") or "~/.local/state/cat-corner")
+    try:
+        with open(os.path.join(d, "forecast.json")) as fh:
+            fc = json.load(fh)
+        if (now().date() - date.fromisoformat(fc["today"])).days > 2:
+            return []
+        return [str(x) for x in fc.get("card_lines") or []][:2]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def pic_cat():
+    f = cat_facts()
+    text = cmd_cat()
+    cap = text.splitlines()[0] + " · " + text.splitlines()[1].replace("Litter visits: ", "litter ")
+
+    def render():
+        ci = cardimg()
+        rows, v, food, last = f["rows"], f["visits"], f["food"], f["last"]
+        d0, d1 = date.fromisoformat(rows[0]["date"]), date.fromisoformat(last["date"])
+        c = ci.Card(f"{f['name']}'s week" if f["name"] != "Cats" else "Cat week",
+                    f"{d0:%d.%m}–{d1:%d.%m} · litter box + feeder")
+        w = f["weights"]
+        tiles = [(str(v[-1]), "today" + ("" if last.get("complete") else " so far")),
+                 (f"{f['avg']:.1f}" if f["avg"] is not None else "–", "visits / day")]
+        if w:
+            tiles.append((f"{w[-1][1]:.2f}", "kg" + (f" ({w[-1][1] - w[0][1]:+.2f})" if len(w) > 1 else "")))
+        if last.get("drawer_end") is not None:
+            tiles.append((f"{last['drawer_end']:.0f}%", "drawer", ci.WARN if last["drawer_end"] >= 80 else ci.TEXT))
+        c.stats(tiles)
+        labels = [f"{date.fromisoformat(x['date']):%a %d}" for x in rows]
+        part = [ci.ACCENT if x.get("complete") else ci.FAINT for x in rows]
+        c.bar_chart(v, labels, height=400, colors=part, note="Litter box visits per day (faint = day not over)")
+        if any(x.get("feeders") for x in rows):
+            c.bar_chart([round(g) for g in food], labels, height=330, colors=[ci.GOOD if x.get("complete") else ci.FAINT for x in rows],
+                        value_fmt=lambda g: f"{g}", note="Feeder, grams per day")
+        rest = []
+        if last.get("cycles") is not None:
+            rest.append(f"Cleaning cycles today: {last['cycles']}" + (f" · robot faults: {last['faults']}" if last.get("faults") else ""))
+        rest += [x for x in cat_runout() if not x.startswith("?")]
+        if f["stale"] >= 2:
+            rest.append((f"cat-corner's data is {f['stale']} days old", ci.WARN))
+        c.lines(rest, size=28)
+        return c.save("cat")
+    return text, cap, render
+
+
+POSTER_ID = re.compile(r"[0-9A-Za-z]{1,40}")
+POSTER_W = 480          # px; one cache size for all cards
+CAPTION_MAX = 1024      # Telegram's photo caption limit (the plugin sends a longer one as a separate text)
+NUM = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣"]
+
+
+def posters(ids, timeout=6):
+    """{item id: local poster path} via `media poster --json` (cached Emby Primary images); {} when it fails: the card
+    then draws placeholder tiles."""
+    ids = [i for i in dict.fromkeys(str(x) for x in ids if x) if POSTER_ID.fullmatch(i)][:12]
+    if not ids:
+        return {}
+    try:
+        _, out, _ = run(["media", "poster", "--json", "--width", str(POSTER_W), *ids], timeout, "posters", full=True)
+        got = (json.loads(out) or {}).get("posters") or {}
+        return {k: v for k, v in got.items() if isinstance(v, str) and v}
+    except (Fail, ValueError, AttributeError):
+        return {}
+
+
+def fit_caption(head, entries, limit=CAPTION_MAX):
+    """head + one entry per item, each (line, link): the links of the last items go first, then whole entries, so
+    the caption fits the photo (≤ limit chars)."""
+    links = [bool(lk) for _, lk in entries]
+    keep = len(entries)
+
+    def build():
+        parts = [head]
+        for (ln, lk), on in list(zip(entries, links))[:keep]:
+            parts.append(ln + (f"\n▶ {lk}" if on else ""))
+        if keep < len(entries):
+            parts.append(f"+ {len(entries) - keep} more")
+        return "\n".join(parts)
+    cap = build()
+    i = len(entries) - 1
+    while len(cap) > limit and i >= 0:
+        links[i] = False
+        i -= 1
+        cap = build()
+    while len(cap) > limit and keep > 0:
+        keep -= 1
+        cap = build()
+    return cap[:limit]
+
+
+def caption_clip(s):
+    """A one-line caption: clipped at 1000; a multi-line one keeps its lines, cut at Telegram's 1024."""
+    if "\n" not in s:
+        return clip(s, 1000)
+    s = "\n".join(" ".join(ln.split()) for ln in s.strip().splitlines())
+    return s if len(s) <= CAPTION_MAX else s[: CAPTION_MAX - 1].rstrip() + "…"
+
+
+def emby_links(text):
+    """{item id: ▶ link} from a media text answer (its ▶ lines)."""
+    out = {}
+    for url in re.findall(r"▶ (https?://\S+)", text or ""):
+        m = re.search(r"[?&#]id=([0-9A-Za-z]+)", url)
+        if m:
+            out.setdefault(m.group(1), url)
+    return out
+
+
+def short_day(iso):
+    try:
+        d = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(TZ).date()
+    except (TypeError, ValueError):
+        return ""
+    return f"{d:%d.%m.}" if d.year == now().year else f"{d:%d.%m.%y}"
+
+
+def pic_finish():
+    t0 = now_s()
+    d = finish_data(6, timeout=14)
+    text = d.get("text") or "🏁 Finish next · no answer"
+    items = [x for x in d.get("items") or [] if isinstance(x, dict)][:6]
+    if not items:
+        return text, "", None
+    links = emby_links(text)
+    total = d.get("total") or len(items)
+    head = f"🏁 Finish next · {len(items)} of {total} started" if total > len(items) else "🏁 Finish next"
+    entries = []
+    for i, x in enumerate(items):
+        nxt = x.get("episode") or ""
+        entries.append((f"{NUM[i]} {x.get('title') or '?'}" + (f" · {nxt}" if nxt else "") + f" · {x.get('left', '?')} left",
+                        links.get(str(x.get("id")))))
+    cap = fit_caption(head, entries)
+
+    def render():
+        ci = cardimg()
+        pics = posters([x.get("series_id") or x.get("id") for x in items], timeout=max(2, min(6, 17 - (now_s() - t0))))
+        tiles = []
+        for i, x in enumerate(items):
+            tot, left = x.get("total") or 0, x.get("left") or 0
+            nxt = (x.get("episode") or "") + (f" at {x['pos_min']} min" if x.get("pos_min") else "")
+            day = short_day(x.get("last_played"))
+            tiles.append({"image": pics.get(str(x.get("series_id") or x.get("id"))), "title": x.get("title") or "?",
+                          "badge": str(i + 1), "rating": x.get("rating"),
+                          "lines": [(f"{left} of {tot} left", ci.TEXT), " · ".join(y for y in ("next " + nxt if nxt else "", day) if y)],
+                          "progress": 100.0 * (tot - left) / tot if tot else None})
+        days = d.get("idle_days")
+        c = ci.Card("Finish next", f"Started, paused {days}+ days · closest to the end first" if days else "Started shows, closest to the end first")
+        if total > len(items):
+            c.footer(f"+ {total - len(items)} more started shows · links to play in the caption")
+        else:
+            c.footer("Links to play in the caption")
+        c.poster_grid(tiles, reserve=36)
+        return c.save("finish")
+    return text, cap, render
+
+
+def vibe_reason(why):
+    """The short reason of a vibe pick: its first "·" part (genres, "Sci-Fi like Arrival"), no quotes or emoji."""
+    first = plain(str(why or "").split(" · ")[0])
+    return "" if first.startswith(("“", '"')) else first
+
+
+def pic_vibe(arg=None):
+    words = " ".join((arg or "").split())[:200].split()
+    if not words:
+        return VIBE_HINT, "", None
+    t0 = now_s()
+    d = vibe_data(words)
+    text = d.get("text") or "🎬 Vibe · no answer"
+    picks = [x for x in d.get("picks") or [] if isinstance(x, dict)][:6]
+    if not picks:
+        return text, "", None
+    series = d.get("kind") == "series"
+    label = d.get("label") or " ".join(words)
+    head = f"{'📺' if series else '🎬'} Vibe · {label}"
+    entries = [(f"{NUM[i]} {x.get('title') or '?'}" + (f" ({x['year']})" if x.get("year") else ""), x.get("link"))
+               for i, x in enumerate(picks)]
+    cap = fit_caption(head, entries)
+
+    def render():
+        ci = cardimg()
+        pics = posters([x.get("emby_id") for x in picks], timeout=max(2, min(6, 17 - (now_s() - t0))))
+        tiles = []
+        for i, x in enumerate(picks):
+            size = f"{x['episodes']} eps" if series and x.get("episodes") else f"{x['runtime_min']} min" if x.get("runtime_min") else ""
+            meta = " · ".join(str(y) for y in (x.get("year"), size) if y)
+            eps, seen = x.get("episodes") or 0, x.get("watched") or 0
+            tiles.append({"image": pics.get(str(x.get("emby_id"))), "title": x.get("title") or "?", "badge": str(i + 1),
+                          "rating": x.get("rating"), "lines": [(meta, ci.TEXT), vibe_reason(x.get("why"))],
+                          "progress": 100.0 * seen / eps if series and eps and seen else None, "accent": ci.ACCENT})
+        c = ci.Card("Vibe · series" if series else "Vibe", plain(label))
+        c.footer("Links to play in the caption")
+        c.poster_grid(tiles, reserve=36)
+        return c.save("vibe")
+    return text, cap, render
+
+
+# ---------------------------------------------------------------- /week: the week ahead (today + 6 days)
+
+WEEK_DAYS = 7
+WEEK_STATE = os.path.expanduser(os.environ.get("TG_CMD_STATE") or "~/.local/state/tg-cmd")
+WEEK_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+WEEK_WEATHER_TTL = 3 * 3600         # a forecast this fresh is reused without asking open-meteo
+WEEK_WEATHER_STALE = 72 * 3600      # when open-meteo fails, a cached one this old still fills the days it covers
+WEEK_WEATHER_TIMEOUT = 1.5          # s; the whole card stays under ~2 s
+WX_EMOJI = {"sun": "☀️", "partly": "⛅", "cloud": "☁️", "fog": "🌫", "rain": "🌧", "snow": "🌨", "storm": "⛈"}
+LEG_EMOJI = {"train": "🚆", "bus": "🚌", "flight": "✈️", "drive": "🚗", "boat": "⛴"}
+LEG_WORD = {"train": "Train", "bus": "Bus", "flight": "Flight", "drive": "Drive", "boat": "Ferry"}
+LEAD_EMOJI_RE = re.compile(r"^((?:[\U0001F000-\U0001FFFF☀-➿⬀-⯿]|️|‍)+)\s*")
+
+
+def wmo_kind(code):
+    """open-meteo's WMO weather code → sun / partly / cloud / fog / rain / snow / storm (None when missing)."""
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return None
+    if c <= 1:
+        return "sun"
+    if c == 2:
+        return "partly"
+    if c in (45, 48):
+        return "fog"
+    if 51 <= c <= 67 or 80 <= c <= 82:
+        return "rain"
+    if 71 <= c <= 77 or c in (85, 86):
+        return "snow"
+    if c >= 95:
+        return "storm"
+    return "cloud"
+
+
+def save_json_private(path, obj):
+    """Atomic write, 0600 (dir 0700)."""
+    import tempfile
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".week.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def week_weather():
+    """({iso date: {kind, tmax, tmin, rain}}, age of the forecast in s or None) for home: open-meteo's daily forecast
+    (the home point rounded to 2 decimals, as `context` asks), cached 3 h in TG_CMD_STATE/week-weather.json. When
+    open-meteo fails (503, timeout), a cached forecast up to 72 h old fills the days it covers; else ({}, None) and
+    the card leaves the weather out. TG_CMD_WEATHER: "off", or a file standing in for open-meteo's answer (tests)."""
+    import time
+    src = os.environ.get("TG_CMD_WEATHER") or ""
+    if src == "off":
+        return {}, None
+    path = os.path.join(WEEK_STATE, "week-weather.json")
+    cache = load_json_file(path, {})
+    cache = cache if isinstance(cache, dict) else {}
+    ts = time.time()
+    daily = cache.get("daily") if isinstance(cache.get("daily"), dict) else None
+    age = ts - cache["ts"] if daily and isinstance(cache.get("ts"), (int, float)) else None
+    if age is None or not 0 <= age <= WEEK_WEATHER_TTL:
+        try:
+            if src:
+                with open(src, encoding="utf-8") as fh:
+                    fresh = json.load(fh)
+            else:
+                import urllib.parse
+                from core import http as core_http   # one GET, no retries, as urlopen did
+                q = {"latitude": round(float(assistant_profile.get("home.lat")), 2),
+                     "longitude": round(float(assistant_profile.get("home.lon")), 2),
+                     "timezone": TZ.key, "forecast_days": WEEK_DAYS + 1,
+                     "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"}
+                fresh = core_http.get_json(WEEK_WEATHER_URL + "?" + urllib.parse.urlencode(q),
+                                           headers={"User-Agent": "tg-cmd/1.0 (personal week card, on demand)"},
+                                           timeout=WEEK_WEATHER_TIMEOUT)
+            nd = fresh.get("daily") if isinstance(fresh, dict) else None
+            if not isinstance(nd, dict) or not isinstance(nd.get("time"), list) or not nd["time"]:
+                raise ValueError("no daily forecast")
+            daily, age = nd, 0.0
+            try:
+                save_json_private(path, {"ts": ts, "daily": nd})
+            except OSError:
+                pass
+        except Exception:   # 503, timeout, bad JSON: the cached forecast if it isn't too old, else no weather
+            if age is None or not 0 <= age <= WEEK_WEATHER_STALE:
+                return {}, None
+    out = {}
+    for i, day in enumerate(daily.get("time") or []):
+        def g(k):
+            v = daily.get(k)
+            return v[i] if isinstance(v, list) and i < len(v) and isinstance(v[i], (int, float)) else None
+        kind, hi, lo = wmo_kind(g("weather_code")), g("temperature_2m_max"), g("temperature_2m_min")
+        if kind or hi is not None:
+            out[str(day)] = {"kind": kind, "tmax": hi, "tmin": lo, "rain": g("precipitation_probability_max")}
+    return out, age
+
+
+def week_sources(t):
+    """All sources at once (parallel, each with its own timeout): {name: result or the exception}."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = {
+        "calendar": lambda: run(["calcache", "show", "--days", str(WEEK_DAYS + 1), "--json"], 6, "calendar", full=True),
+        "trains": lambda: run(["train-watch", "list", "--json"], 5, "train watch", full=True),
+        "late nights": lambda: run(["sleepin", "status", "--days", str(WEEK_DAYS), "--json", "--at", f"{t:%Y-%m-%d %H:%M}"],
+                                   5, "sleep-in guard", full=True),
+        "bills": lambda: run(["bills", "list", "--open", "--json"], 6, "bill tracker", full=True),
+        "birthdays": lambda: run(["gift-radar", "list", "--days", str(WEEK_DAYS), "--date", f"{t:%Y-%m-%d}"], 6,
+                                 "birthdays", full=True),
+        "weather": week_weather,
+    }
+    with ThreadPoolExecutor(len(jobs)) as ex:
+        futs = {k: ex.submit(f) for k, f in jobs.items()}
+        res = {}
+        for k, fu in futs.items():
+            try:
+                res[k] = fu.result()
+            except Exception as e:  # noqa: BLE001  (one source must not sink the card)
+                res[k] = e
+    return res
+
+
+def ok_out(r):
+    """stdout of a run(full=True) result that exited 0, else None."""
+    return r[1] if isinstance(r, tuple) and r[0] == 0 else None
+
+
+def week_data():
+    """{"days": [7 x {date, events, tags, late, sleepin, bills, overdue, birthdays, weather}], "missing": [source
+    names that failed], "wx_age": s or None}. Raises Fail only when calcache itself is broken."""
+    t = now()
+    today = t.date()
+    days = [today + timedelta(days=i) for i in range(WEEK_DAYS)]
+    D = {d: {"date": d, "events": [], "tags": [], "late": False, "sleepin": None, "bills": 0, "overdue": 0,
+             "birthdays": [], "weather": None} for d in days}
+    for d in days:                                   # the DST switch: "clocks back/forward 1 h"
+        a, b = (datetime.combine(x, datetime.min.time()).replace(tzinfo=TZ).utcoffset() for x in (d, d + timedelta(days=1)))
+        if a != b:
+            h = round(abs((b - a).total_seconds()) / 3600, 1)
+            D[d]["tags"].append(("clock", f"Clocks {'back' if b < a else 'forward'} {h:g} h"))
+    res = week_sources(t)
+    missing = []
+    cal = res["calendar"]
+    if isinstance(cal, Exception) or cal[0] not in (0, 3):
+        raise Fail("calendar: calcache failed")
+    try:
+        evs = json.loads(cal[1] or "[]") if cal[0] == 0 else []
+    except ValueError:
+        raise Fail("calendar: unreadable calcache answer")
+    if cal[0] == 3:
+        missing.append("calendar (no cache yet)")
+    work = str(assistant_profile.get("work.town", "") or "").strip().lower()
+    midnight = datetime.combine(today, datetime.min.time())
+    legs_at = set()
+    for e in evs if isinstance(evs, list) else []:
+        if not isinstance(e, dict):
+            continue
+        title = " ".join(str(e.get("title") or "").split())
+        flags = e.get("flags") if isinstance(e.get("flags"), dict) else {}
+        try:
+            if e.get("all_day"):
+                s = date.fromisoformat(str(e["start"])[:10])
+                en = date.fromisoformat(str(e["end"])[:10])
+            else:
+                s, en = local_dt(str(e["start"])), local_dt(str(e["end"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e.get("all_day"):
+            en = max(en, s + timedelta(days=1))
+            cover = [d for d in days if s <= d < en]
+            if title.startswith("@"):               # location markers: @<work town> = an office day
+                place = title[1:].strip()
+                tag = ("office", "Office") if place.lower() == work and work else ("place", place)
+                for d in cover:
+                    if place and tag not in D[d]["tags"]:
+                        D[d]["tags"].append(tag)
+                continue
+            n = (en - s).days
+            for d in cover:
+                D[d]["events"].append({"time": None, "title": title, "kind": "allday", "first": d == cover[0],
+                                       "until": en - timedelta(days=1) if n > 1 else None,
+                                       "day": (d - s).days + 1, "of": n})
+            continue
+        if en <= t:
+            continue                                 # over already
+        d = today if s < midnight else s.date()      # under way since before today: on today's row
+        if d not in D:
+            continue
+        kind = str(flags.get("travel") or "event")
+        if kind != "event":
+            legs_at.add(s.replace(second=0, microsecond=0))
+        D[d]["events"].append({"time": s, "end": en, "title": title, "kind": kind, "since": s < midnight})
+    try:                                             # train-watch legs the calendar doesn't have (quietly optional)
+        legs = json.loads(ok_out(res["trains"]) or "[]")
+    except ValueError:
+        legs = []
+    for g in legs if isinstance(legs, list) else []:
+        try:
+            dep = local_dt(str(g["dep"]))
+            arr = local_dt(str(g["arr"])) if g.get("arr") else dep
+        except (KeyError, TypeError, ValueError):
+            continue
+        if dep.replace(second=0, microsecond=0) in legs_at or arr <= t or dep.date() not in D:
+            continue
+        title = str(g.get("title") or f"🚆 {g.get('from') or '?'} → {g.get('to') or '?'}")
+        D[dep.date()]["events"].append({"time": dep, "end": arr, "title": " ".join(title.split()), "kind": "train"})
+    out = ok_out(res["late nights"])
+    try:
+        sl = json.loads(out) if out else None
+    except ValueError:
+        sl = None
+    if not isinstance(sl, dict):
+        missing.append("late nights")
+    else:
+        mornings = [(a.get("date"), None if a.get("off") else a.get("until"))
+                    for a in sl.get("ahead") or [] if isinstance(a, dict) and (a.get("sources") or a.get("until"))]
+        if sl.get("until") and not sl.get("ended") and sl.get("date") == today.isoformat():
+            mornings.append((sl["date"], sl["until"]))
+        for iso, until in mornings:
+            try:
+                md = date.fromisoformat(str(iso))
+            except ValueError:
+                continue
+            if md - timedelta(days=1) in D:
+                D[md - timedelta(days=1)]["late"] = True
+            if md in D and until:
+                D[md]["sleepin"] = str(until)
+    out = ok_out(res["bills"])
+    try:
+        bills = json.loads(out) if out is not None else None
+    except ValueError:
+        bills = None
+    if not isinstance(bills, list):
+        missing.append("bills")
+    else:
+        for b in bills:
+            try:
+                due = date.fromisoformat(str(b["due"])[:10])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if due < today:
+                D[today]["overdue"] += 1
+            elif due in D:
+                D[due]["bills"] += 1
+    out = ok_out(res["birthdays"])
+    if out is None:
+        missing.append("birthdays")
+    else:
+        for line in out.splitlines():
+            m = BDAY_RE.match(line.strip())
+            if m:
+                try:
+                    bd = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+                except ValueError:
+                    continue
+                if bd in D:
+                    D[bd]["birthdays"].append(m.group(5).split()[0])
+    wx = res["weather"]
+    wx_map, wx_age = wx if isinstance(wx, tuple) else ({}, None)
+    for d in days:
+        D[d]["weather"] = wx_map.get(d.isoformat())
+        D[d]["events"].sort(key=lambda ev: (ev["time"] is not None, ev["time"] or midnight, ev["title"]))
+    return {"days": [D[d] for d in days], "missing": missing, "wx_age": wx_age}
+
+
+def split_lead(title, kind):
+    """(emoji, rest) of an event title: its leading emoji, else the travel kind's."""
+    m = LEAD_EMOJI_RE.match(title)
+    if m:
+        return m.group(1), title[m.end():].strip()
+    return LEG_EMOJI.get(kind, "" if kind == "event" else "🚆"), title
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def week_temps(wx):
+    if not wx or wx.get("tmax") is None:
+        return ""
+    s = f"{round(wx['tmax'])}°" + (f"/{round(wx['tmin'])}°" if wx.get("tmin") is not None else "")
+    return s + (f" 💧{round(wx['rain'])}%" if (wx.get("rain") or 0) >= 30 else "")
+
+
+def week_event_txt(ev, w):
+    if ev["kind"] == "allday":
+        return clip(ev["title"], w) + (f" (to {ev['until']:%d.%m})" if ev.get("until") else "")
+    lead, rest = split_lead(ev["title"], ev["kind"])
+    hm = f"till {ev['end']:%H:%M}" if ev.get("since") else f"{ev['time']:%H:%M}"
+    return f"{lead} {hm} {clip(rest, w)}" if lead else f"{hm} {clip(rest, w)}"
+
+
+def week_day_txt(x, w):
+    d, wx = x["date"], x["weather"]
+    head = f"{d:%a %d.%m}"
+    if wx:
+        head += " " + " ".join(y for y in (WX_EMOJI.get(wx.get("kind"), ""), week_temps(wx)) if y)
+    bits = ["🏢 office" if k == "office" else f"🕒 {lbl.lower()}" if k == "clock" else f"📍 {clip(lbl, 20)}"
+            for k, lbl in x["tags"]]
+    if x["sleepin"]:
+        bits.append(f"😴 sleep-in till {x['sleepin']}")
+    bits += [week_event_txt(ev, w) for ev in x["events"]
+             if ev["kind"] != "allday" or ev["first"]]  # a multi-day event once, on its first day in the week
+    if x["late"]:
+        bits.append("🌙 late night")
+    bits += [f"🎂 {n}" for n in x["birthdays"]]
+    if x["overdue"]:
+        bits.append(f"💳 {plural(x['overdue'], 'bill')} overdue")
+    if x["bills"]:
+        bits.append(f"💳 {plural(x['bills'], 'bill')} due")
+    return f"{head}: " + (" · ".join(bits) if bits else "free")
+
+
+def week_text(data, w=40):
+    days = data["days"]
+    lines = [f"🗓 Week · {days[0]['date']:%a %d.%m} – {days[-1]['date']:%a %d.%m}"]
+    lines += [week_day_txt(x, w) for x in days]
+    if data["missing"]:
+        lines.append("⚠️ Not checked: " + ", ".join(data["missing"]))
+    return "\n".join(lines)
+
+
+def week_caption(data):
+    """The text card, titles cut shorter until it fits a photo caption (≤ 1024)."""
+    for w in (40, 30, 22, 16, 12):
+        cap = week_text(data, w)
+        if len(cap) <= CAPTION_MAX:
+            return cap
+    return caption_clip(cap)
+
+
+def cmd_week():
+    return week_text(week_data())
+
+
+WEEK_LATE = (167, 139, 250)
+WEEK_BDAY = (244, 114, 182)
+WX_SUN = (255, 196, 70)
+WX_CLOUD = (200, 206, 216)
+WX_DARK = (140, 149, 163)
+
+
+def wx_icon(c, kind, x, y, s):
+    """A weather glyph in the box (x, y, s) drawn with shapes (the card has no emoji)."""
+    import math
+    d = c.d
+
+    def sun(cx, cy, r):
+        for i in range(8):
+            a = i * math.pi / 4
+            d.line((cx + math.cos(a) * r * 1.4, cy + math.sin(a) * r * 1.4, cx + math.cos(a) * r * 1.85,
+                    cy + math.sin(a) * r * 1.85), fill=WX_SUN, width=max(2, int(r * 0.24)))
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=WX_SUN)
+
+    def cloud(x0, y0, w, h, col):
+        d.rounded_rectangle((x0, y0 + h * 0.42, x0 + w, y0 + h), radius=int(h * 0.29), fill=col)
+        d.ellipse((x0 + w * 0.10, y0 + h * 0.20, x0 + w * 0.50, y0 + h * 0.86), fill=col)
+        d.ellipse((x0 + w * 0.34, y0, x0 + w * 0.86, y0 + h * 0.82), fill=col)
+
+    if kind == "sun":
+        sun(x + s / 2, y + s / 2, s * 0.22)
+    elif kind == "partly":
+        sun(x + s * 0.36, y + s * 0.34, s * 0.16)
+        cloud(x + s * 0.20, y + s * 0.38, s * 0.76, s * 0.46, WX_CLOUD)
+    elif kind == "fog":
+        for i in range(3):
+            o = s * 0.08 * (i % 2)
+            d.rounded_rectangle((x + s * 0.12 + o, y + s * (0.26 + i * 0.2), x + s * 0.88 - s * 0.08 + o,
+                                 y + s * (0.26 + i * 0.2) + s * 0.09), radius=int(s * 0.045), fill=WX_DARK)
+    elif kind:
+        cloud(x + s * 0.06, y + s * 0.10, s * 0.88, s * 0.52, WX_CLOUD if kind == "cloud" else WX_DARK)
+        if kind == "rain":
+            for i in range(3):
+                bx = x + s * (0.28 + i * 0.2)
+                d.line((bx, y + s * 0.70, bx - s * 0.07, y + s * 0.94), fill=(88, 166, 255), width=max(2, int(s * 0.06)))
+        elif kind == "snow":
+            for i in range(3):
+                bx, by, r = x + s * (0.28 + i * 0.2), y + s * (0.78 + 0.08 * (i % 2)), s * 0.05
+                d.ellipse((bx - r, by - r, bx + r, by + r), fill=(240, 244, 250))
+        elif kind == "storm":
+            d.polygon([(x + s * 0.52, y + s * 0.58), (x + s * 0.36, y + s * 0.80), (x + s * 0.48, y + s * 0.80),
+                       (x + s * 0.40, y + s), (x + s * 0.64, y + s * 0.72), (x + s * 0.52, y + s * 0.72),
+                       (x + s * 0.60, y + s * 0.58)], fill=WX_SUN)
+
+
+def card_txt(s):
+    """plain() for the card, with → as › (Noto Sans has no arrows)."""
+    return plain(str(s)).replace("→", "›")
+
+
+def week_rows(x, ci):
+    """(pills, lines) of one day on the card: pills [(text, fill, colour)], lines [(time, text, colour)]."""
+    pills = [("Office", (28, 52, 86), ci.ACCENT) if k == "office" else (lbl, (70, 56, 24), ci.WARN) if k == "clock"
+             else (card_txt(lbl)[:24] or "?", ci.GRID, ci.TEXT) for k, lbl in x["tags"]]
+    if x["sleepin"]:
+        pills.append((f"Sleep in till {x['sleepin']}", (44, 36, 74), WEEK_LATE))
+    if x["late"]:
+        pills.append(("Late night", (52, 40, 90), WEEK_LATE))
+    pills += [(f"Birthday {card_txt(n)}", (78, 32, 58), WEEK_BDAY) for n in x["birthdays"]]
+    if x["overdue"]:
+        pills.append((f"{plural(x['overdue'], 'bill')} overdue", (90, 30, 30), ci.BAD))
+    if x["bills"]:
+        pills.append((f"{plural(x['bills'], 'bill')} due", (82, 58, 20), ci.WARN))
+    lines = []
+    for ev in x["events"]:
+        if ev["kind"] == "allday":
+            if ev["first"]:
+                lines.append(("", card_txt(ev["title"]) + (f" (to {ev['until']:%d.%m})" if ev.get("until") else ""), ci.TEXT))
+            else:
+                lines.append(("", f"{card_txt(ev['title'])} · day {ev['day']} of {ev['of']}", ci.TEXT2))
+            continue
+        rest = card_txt(split_lead(ev["title"], ev["kind"])[1]) or "?"
+        if ev.get("since"):                     # under way since before today
+            lines.append(("", f"{rest} · till {ev['end']:%H:%M}", ci.ACCENT if ev["kind"] != "event" else ci.TEXT))
+            continue
+        if ev["kind"] == "event":
+            lines.append((f"{ev['time']:%H:%M}", rest, ci.TEXT))
+            continue
+        word = LEG_WORD.get(ev["kind"], ev["kind"].capitalize())
+        if not rest.lower().startswith(word.lower()):
+            rest = f"{word} · {rest}"
+        lines.append((f"{ev['time']:%H:%M}", rest, ci.ACCENT))
+    return pills, lines
+
+
+def week_render(data):
+    ci = cardimg()
+    days = data["days"]
+    legs = sum(1 for x in days for ev in x["events"] if ev["kind"] in ("train", "bus"))
+    lates = sum(1 for x in days if x["late"])
+    bdays = sum(len(x["birthdays"]) for x in days)
+    due = sum(x["bills"] + x["overdue"] for x in days)
+    bits = [plural(legs, "train") if legs else "", plural(lates, "late night") if lates else "",
+            plural(bdays, "birthday") if bdays else "", f"{plural(due, 'bill')} due" if due else ""]
+    c = ci.Card("Week ahead", " · ".join([f"{days[0]['date']:%a %d.%m} – {days[-1]['date']:%a %d.%m}"] + [b for b in bits if b]))
+    f_day, f_date, f_time, f_ev = ci.font(40, True), ci.font(26), ci.font(29, True), ci.font(29)
+    f_hi, f_lo, f_rain = ci.font(32, True), ci.font(26), ci.font(22, True)
+    TOP, LH, GAP, MIN_H, PILL, PILL_H = 16, 38, 12, 112, 22, 34
+    x0, x1 = ci.PAD, c.w - ci.PAD
+    mx = x0 + 20 + 128                      # middle column: pills + events
+    rx = x1 - 20 - 150                      # right column: weather
+    mw = rx - 16 - mx
+    tcol = 92                               # time column inside the middle one
+    rows = []
+    for x in days:
+        pills, lines = week_rows(x, ci)
+        prow, cur = [[]], 0                 # pills wrapped into rows of the middle column's width
+        for p in pills:
+            w = int(c.tw(p[0], ci.font(PILL, True)) + PILL * 0.9) + 10
+            if prow[-1] and cur + w > mw:
+                prow.append([])
+                cur = 0
+            prow[-1].append(p)
+            cur += w
+        prow = [r for r in prow if r][:2]
+        rows.append({"x": x, "pills": prow, "lines": lines, "cap": max(1, len(lines))})
+
+    def shown(r):
+        n = len(r["lines"])
+        return max(1, min(n, r["cap"]))
+
+    def height(r):
+        return max(MIN_H, 2 * TOP + len(r["pills"]) * (PILL_H + 8) + shown(r) * LH)
+    avail = c.h - ci.PAD - 40 - c.y
+    while sum(height(r) for r in rows) + GAP * (len(rows) - 1) > avail:
+        cut = [r for r in rows if shown(r) > 1]
+        if not cut:
+            break
+        big = max(cut, key=lambda r: (height(r), rows.index(r)))   # the tallest day first; later days on ties
+        big["cap"] = shown(big) - 1
+    today = now().date()
+    for r in rows:
+        x, h = r["x"], height(r)
+        y = c.y
+        if y + min(h, MIN_H) > c.h - ci.PAD - 40:
+            break
+        is_today = x["date"] == today
+        c.d.rounded_rectangle((x0, y, x1, y + h), radius=22, fill=ci.PANEL,
+                              outline=ci.ACCENT if is_today else None, width=3 if is_today else 0)
+        c.d.text((x0 + 22, y + TOP - 4), f"{x['date']:%a}", font=f_day, fill=ci.ACCENT if is_today else ci.TEXT)
+        c.d.text((x0 + 24, y + TOP + 48), "today" if is_today else f"{x['date']:%d.%m}", font=f_date,
+                 fill=ci.ACCENT if is_today else ci.TEXT2)
+        wx = x["weather"]
+        if wx:
+            wx_icon(c, wx.get("kind"), rx, y + TOP, 58)
+            if wx.get("tmax") is not None:
+                c.d.text((rx + 72, y + TOP - 2), f"{round(wx['tmax'])}°", font=f_hi, fill=ci.TEXT)
+            if wx.get("tmin") is not None:
+                c.d.text((rx + 72, y + TOP + 38), f"{round(wx['tmin'])}°", font=f_lo, fill=ci.TEXT2)
+            if (wx.get("rain") or 0) >= 30:
+                c.d.text((rx + 6, y + TOP + 64), f"{round(wx['rain'])}%", font=f_rain, fill=ci.ACCENT)
+        ty = y + TOP
+        for prow in r["pills"]:
+            px = mx
+            for s, fill, col in prow:
+                if px + 40 > rx - 16:
+                    break
+                s = c.fit(s, ci.font(PILL, True), rx - 16 - px - PILL)
+                px += c.pill(px, ty, s, size=PILL, fill=fill, color=col) + 10
+            ty += PILL_H + 8
+        lines = r["lines"]
+        n = shown(r)
+        if len(lines) > n:
+            lines = lines[: n - 1] + [("", f"+ {len(lines) - n + 1} more", ci.TEXT2)]
+        if not lines and not r["pills"]:
+            lines = [("", "Nothing planned", ci.FAINT)]
+        for tm, s, col in lines:
+            if tm:
+                c.d.text((mx, ty), tm, font=f_time, fill=ci.ACCENT if col == ci.ACCENT else ci.TEXT)
+                c.d.text((mx + tcol, ty), c.fit(s, f_ev, mw - tcol), font=f_ev, fill=col)
+            else:
+                c.d.text((mx, ty), c.fit(s, f_ev, mw), font=f_ev, fill=col)
+            ty += LH
+        c.y = y + h + GAP
+    c.y -= GAP
+    age = data.get("wx_age")
+    foot = ["Weather: open-meteo" + (f", {int(age // 3600)} h old" if age and age > WEEK_WEATHER_TTL else "")
+            if age is not None else "No weather right now"]
+    if data["missing"]:
+        foot.append("Not checked: " + ", ".join(data["missing"]))
+    c.trim(min_height=700, footer=True)
+    c.footer(" · ".join(foot))
+    return c.save("week")
+
+
+def pic_week():
+    data = week_data()
+    return week_text(data), week_caption(data), lambda: week_render(data)
+
+
+def now_s():
+    import time
+    return time.monotonic()
+
+
+PICTURES = {"space": pic_space, "gym": pic_gym, "cat": pic_cat, "finish": pic_finish, "vibe": pic_vibe,
+            "week": pic_week}
+
+
+def picture(name, *args):
+    """Print the picture answer; a render failure prints the text card instead."""
+    text, caption, render = PICTURES[name](*args)
+    if render is None:   # nothing to draw (a hint, no picks, nothing playing): the text card
+        finish(text)
+        return
+    try:
+        path = render()
+    except Exception as e:  # Pillow, fonts, disk: the text card still answers
+        print(f"tg-cmd: /{name} picture failed ({type(e).__name__}: {e}); sent the text card", file=sys.stderr)
+        finish(text)
+        return
+    text = redact(text.strip())
+    if len(text) > MAX_CHARS:
+        text = text[: MAX_CHARS - 2].rstrip() + "\n…"
+    print(json.dumps({"photo": path, "caption": caption_clip(redact(caption)), "text": text}, ensure_ascii=False))
+
+
+REM_RE = re.compile(r"^\s*\d+\.\s+(\d{4}-\d\d-\d\d \d\d:\d\d)\s+(\[owner\] )?(.*)$")
+PLACE_RE = re.compile(r"^\s*\d+\.\s+📍 (when [^:]{1,60}): (.*)$")
+
+
+def short_title(text):
+    """One skimmable line: drop the due-date tail and the explanation after a dash/paren/period."""
+    t = re.sub(r":\s+\w{3} \d{1,2} \w{3}(?: \d{4})? \((?:in \d+ days?|today|tomorrow)\)\..*$", "", text)
+    for sep in (" — ", " – ", ". ", " (Via", " (in "):
+        i = t.find(sep)
+        if i > 15:
+            t = t[:i]
+    t = t.rstrip(" .:")
+    return clip(t, 60)
+
+
+def shopping_block():
+    """HA's shopping list, numbered like the other lists (`shop list --json` syncs with HA first; when HA
+    is unreachable it prints the last synced state and says so on stderr)."""
+    rc, out, err = run(["shop", "list", "--json"], 10, "shopping list", full=True)
+    try:
+        items = json.loads(out) if rc == 0 else None
+    except ValueError:
+        items = None
+    if not isinstance(items, list):
+        last = next((l for l in reversed(err.strip().splitlines()) if l.strip()), "")
+        raise Fail(clip(re.sub(r"^[\w-]+: ", "", last.strip()), 100) if rc else "unreadable answer")
+    stale = ["⚠️ HA not reachable: last synced list"] if "HA not reachable" in err else []
+    if not items:
+        return "\n".join(["🛒 Shopping list is empty"] + stale)
+    lines = [f"🛒 Shopping ({len(items)})"]
+    for n, it in enumerate(items, 1):
+        q = it.get("qty")
+        lines.append(f"{n}. " + (f"{q}× " if q and q != 1 else "") + clip(str(it.get("text") or "?"), 80))
+    return "\n".join(lines + stale + ["→ /shop: where to buy"])
+
+
+def cmd_lists():
+    """HA's shopping list first, then the local lists; the local "shopping" list is unused (shopping items
+    go to `shop add`), so it is replaced by HA's and only its open items are counted."""
+    try:
+        shop, shop_fail = shopping_block(), None
+    except Fail as e:
+        shop_fail = re.sub(r"^shopping list: ", "", str(e))
+        shop = f"🛒 Shopping: ⚠️ couldn't read it ({shop_fail})"
+    try:
+        out = run(["lists", "show"], 6, "lists").strip()
+    except Fail as e:
+        if shop_fail:
+            raise Fail(f"shopping list: {shop_fail}; {e}")
+        return shop + f"\n\n⚠️ Other lists: {e}"
+    blocks, legacy = [], 0
+    for b in (out.split("\n\n") if out and out != "(no lists)" else []):
+        if b.startswith("🛒 Shopping"):
+            m = re.match(r"🛒 Shopping \((\d+)\)", b)
+            legacy = int(m.group(1)) if m else 0
+        else:
+            blocks.append(b)
+    if legacy:
+        shop += f"\n🗒️ +{legacy} on my old local shopping list (ask me to move them)"
+    return "\n\n".join([shop] + blocks)
+
+
+def cmd_shop():
+    """The plan card (`shop card`, text only), after a best-effort sync so items ticked off in HA are gone."""
+    try:
+        run(["shop", "sync", "--json"], 8, "shopping list")
+        warn = ""
+    except Fail:
+        warn = "\n\n⚠️ HA not reachable: showing the last synced list"
+    return (run(["shop", "card"], 5, "shopping list").strip() or "🛒 Shopping list is empty") + parcels_line() + warn
+
+
+def parcels_line():
+    """The parcels line under the /shop card (`parcels line`, cache only); nothing when none are coming or on error."""
+    try:
+        rc, out, _ = run(["parcels", "line"], 4, "parcels", full=True)
+    except Fail:
+        return ""
+    out = out.strip() if rc == 0 else ""
+    return ("\n\n" + out.splitlines()[0]) if out else ""
+
+
+def cmd_parcels(arg=None):
+    """Parcels card (`parcels`, cache only); /parcels picked = he picked up what waits at the station."""
+    if arg:
+        if arg.lower().strip() not in ("picked", "abgeholt", "done", "collected"):
+            return "📦 /parcels takes one word: picked (after a station pickup)."
+        return run(["parcels", "picked", "station"], 10, "parcels").strip() + "\n\n" + \
+            (run(["parcels"], 5, "parcels").strip())
+    return run(["parcels"], 5, "parcels").strip() or "📦 Parcels: nothing known yet"
+
+
+def cmd_gym(arg=None):
+    """The next session from the stored plan (`gym plan next`: local DB + plan file, no API call); /gym recap = the
+    last session (`gym recap`)."""
+    sub = gym_word(arg)
+    if sub is not None:
+        return cmd_gym_word(sub)
+    return run(["gym", "plan", "next"], 8, "gym").strip() or "🏋️ Gym · nothing logged yet"
+
+
+WARRANTY_SOON_DAYS = 90       # as contracts: ⚠️ when the warranty ends within this many days
+WARRANTY_LOGGED_MAX = 4       # logged entries shown on the card (the rest: "… +N more")
+_WTY_DATE = re.compile(r"(bought|warranty to) (\d{1,2})\.(\d{1,2})\.(\d{4})")
+
+
+def _wfold(s):
+    return unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
+
+
+def warranty_logged():
+    """His own warranty entries: the `lists` warranty list that voice-plan's warranty action writes
+    ("product · shop · bought DD.MM.YYYY · warranty to DD.MM.YYYY"), open items only.
+    -> [{"name", "until" (date|None), "text"}]; raises Fail when the list can't be read."""
+    out = run(["lists", "show", "warranty", "--json"], 5, "logged warranties").strip()
+    try:
+        data = json.loads(out or "{}")
+    except ValueError:
+        raise Fail("logged warranties: unreadable answer")
+    items = []
+    for it in (data.get("open") or []) if isinstance(data, dict) else []:
+        text = str(it.get("text") or "").strip() if isinstance(it, dict) else ""
+        if not text:
+            continue
+        until, rest = None, []
+        for part in (p.strip() for p in text.split(" · ")):
+            m = _WTY_DATE.fullmatch(part)
+            if m:
+                try:
+                    d = date(int(m.group(4)), int(m.group(3)), int(m.group(2)))
+                except ValueError:
+                    rest.append(part)
+                    continue
+                if m.group(1) == "warranty to":
+                    until = d
+                continue
+            rest.append(part)
+        items.append({"name": " · ".join(rest) or text, "until": until, "text": text})
+    return items
+
+
+def warranty_logged_lines(items, words, today):
+    """Card lines for the logged entries: still covered (or no end date) first by end date; with words, the
+    matches incl. expired ones. -> (lines, shown count)."""
+    if words:
+        items = [i for i in items if all(re.search(r"(?<![a-z0-9])" + re.escape(w), _wfold(i["text"])) for w in words)]
+    else:
+        items = [i for i in items if i["until"] is None or i["until"] >= today]
+    items.sort(key=lambda i: (i["until"] is None, i["until"] or date.max))
+    lines = []
+    for i in items[:WARRANTY_LOGGED_MAX]:
+        u = i["until"]
+        if u is None:
+            when = ""
+        elif u < today:
+            when = f" · expired {u:%d.%m.%Y}"
+        elif (u - today).days <= WARRANTY_SOON_DAYS:
+            when = f" · ⚠️ until {u:%d.%m.%Y} ({(u - today).days} d)"
+        else:
+            when = f" · until {u:%d.%m.%Y}"
+        lines.append(f"• {i['name'][:80]}{when}")
+    if len(items) > WARRANTY_LOGGED_MAX:
+        lines.append(f"… +{len(items) - WARRANTY_LOGGED_MAX} more")
+    return lines, len(items)
+
+
+def cmd_warranty(query=None):
+    """Still under warranty: shop purchases from paperless (`contracts warranty`: cards only) plus the ones he
+    logged himself (the `lists` warranty list, voice-plan's warranty action); query filters both (one arg)."""
+    q = " ".join((query or "").split())[:60]
+    try:
+        logged, logged_err = warranty_logged(), None
+    except Fail as e:
+        logged, logged_err = [], str(e)
+    words = [w for w in _wfold(q).split() if w]
+    llines, lcount = warranty_logged_lines(logged, words, now().date())
+    # paperless rows make room for the logged ones (the card stays phone-sized)
+    args = ["contracts", "warranty", "--max", str(max(3, 7 - len(llines))), "--budget", "6"]
+    if q:
+        args += ["--", *q.split()]
+    try:
+        card = run(args, 14, "paperless").strip() or ("🛡 Warranty · no answer" if not llines else "")
+    except Fail as e:
+        if not llines:
+            raise
+        card = f"🛡 Warranty · ⚠️ paperless not reachable ({str(e).removeprefix('paperless: ')[:80]})"
+    if llines:
+        head, *body = card.splitlines() or ["🛡 Warranty"]
+        note = body.pop() if body and body[-1].startswith("24 mo") else None   # contracts' legal-default line
+        block = [f"📝 Logged by you{f' · {lcount} match' + ('es' if lcount != 1 else '') if words else f' ({lcount})'}"]
+        card = "\n".join([head, *body, *block, *llines] + ([note] if note else []))
+    elif logged_err and not words:
+        card += f"\n⚠️ {logged_err}"
+    return card
+
+
+def cmd_reminders():
+    mine, others, places = [], 0, []
+    for l in run(["remind", "list"], 6, "reminders").splitlines():
+        pm = PLACE_RE.match(l)                      # location reminders (remind add --on): always his
+        if pm:
+            text = re.sub(r"  \((?:tag [^)]*|urgent|held until [^)]*)\)", "", pm.group(2))
+            every = text.endswith("  (every time)")
+            places.append((pm.group(1), text.removesuffix("  (every time)"), every))
+            continue
+        m = REM_RE.match(l)
+        if not m:
+            continue
+        if not m.group(2):
+            others += 1
+            continue
+        text = re.sub(r"  \(tag [^)]*\)$", "", m.group(3))
+        series = re.search(r"  \((every [^)]*)\)$", text)
+        if series:
+            text = text[: series.start()]
+        mine.append((datetime.strptime(m.group(1), "%Y-%m-%d %H:%M"), text, series.group(1) if series else ""))
+    tail = f"\n+ {others} follow-up{'s' if others != 1 else ''} of my own (not listed)" if others else ""
+    if not mine and not places:
+        return '⏰ No reminders set. Say "remind me …" to add one.' + tail
+    shown = mine[:10]
+    lines = ["⏰ Your reminders" + (f" (next 10 of {len(mine)})" if len(mine) > 10 else "")]
+    month = None
+    for at, text, series in shown:
+        mlabel = at.strftime("%B %Y") if at.year != datetime.now().year else at.strftime("%B")
+        if mlabel != month:
+            month = mlabel
+            lines += ["", mlabel]
+        lines.append(f"{at:%a %d}  {at:%H:%M}  {short_title(text)}" + (f"  🔁 {series}" if series else ""))
+    if places:
+        lines += ["", "📍 By place"] + [f"{when[0].upper() + when[1:]}: {short_title(text)}" + ("  🔁" if every else "")
+                                       for when, text, every in places[:10]]
+    lines += ["", "Ask me for details on any of them."]
+    return "\n".join(lines) + tail
+
+
+# /home: strictly read-only. One `ha list --json` (REST GET, already privacy-gated by ha), the latest
+# ha-health-watch snapshot file, and ha_privacy.text_gate over the whole answer.
+NO_INFO_DOMAINS = {"person", "device_tracker", "zone", "proximity", "geo_location"}  # dropped unread
+LOW_BATTERY = 15.0  # % (= ha-health-watch)
+DOWN = ("unavailable", "unknown", "<hidden>", "", "None")
+OUTDOOR_RE = re.compile(r"balcon|terrace|terrasse|patio|garden|garten|yard|outdoor|outside|aussen|roof|veranda", re.I)
+TEMP_SKIP_RE = re.compile(r"cpu|chip|processor|internal|board|nvme|disk|gpu|\bsoc\b|battery|nozzle|printer|"
+                          r"fridge|freezer|water|device temp", re.I)
+VACUUM_STATE = {"docked": "docked", "cleaning": "cleaning", "returning": "returning to the dock", "idle": "idle",
+                "paused": "paused", "error": "⚠️ error", "unavailable": "unavailable", "unknown": "unknown"}
+
+
+def ha_privacy():
+    """~/bin/lib/ha_privacy (next to this script, else ~/bin/lib); missing = Fail (fail closed)."""
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    for d in (here, REAL_LIB):
+        if os.path.isfile(os.path.join(d, "ha_privacy.py")):
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            import ha_privacy
+            return ha_privacy
+    raise Fail("privacy gate (ha_privacy) not found")
+
+
+def gate(s):
+    """ha_privacy.text_gate; applied before any clip() so a cut never splits a value the gate would mask."""
+    return ha_privacy().text_gate(s)
+
+
+def fnum(v):
+    try:
+        f = float(v)
+        return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
+def home_rows():
+    """`ha list --json` -> {entity_id: row}, location/person/tracker domains dropped before anything reads them."""
+    try:
+        rows = json.loads(run(["ha", "list", "--json", "--limit", "5000"], 10, "Home Assistant") or "[]")
+    except ValueError:
+        raise Fail("Home Assistant: unreadable answer")
+    if not isinstance(rows, list):
+        raise Fail("Home Assistant: unexpected answer")
+    out = {}
+    for r in rows:
+        eid = str((r or {}).get("entity_id") or "") if isinstance(r, dict) else ""
+        if "." not in eid or eid.split(".", 1)[0] in NO_INFO_DOMAINS:
+            continue
+        r["attributes"] = r.get("attributes") if isinstance(r.get("attributes"), dict) else {}
+        r["state"] = str(r.get("state"))
+        out[eid] = r
+    return out
+
+
+def dom(eid):
+    return eid.split(".", 1)[0]
+
+
+def nice_name(r, strip=()):
+    n = str(r.get("name") or r["entity_id"].split(".", 1)[1].replace("_", " "))
+    for s in strip:
+        n = re.sub(rf"\s*{s}$", "", n, flags=re.I)
+    return clip(gate(n), 30)
+
+
+def home_lights(R):
+    lights = {e: r for e, r in R.items() if dom(e) == "light"}
+    on = []
+    for e, r in lights.items():
+        if r["state"] != "on":
+            continue
+        members = r["attributes"].get("entity_id")
+        if isinstance(members, list) and any(m in lights for m in members):
+            continue  # a light group: its member bulbs are counted
+        on.append(r)
+    if not on:
+        return "💡 All lights off"
+    rooms = {}
+    for r in on:
+        a = r.get("area") or "no room"
+        rooms[a] = rooms.get(a, 0) + 1
+    order = sorted(rooms.items(), key=lambda x: (-x[1], x[0] == "no room", x[0]))
+    return f"💡 {len(on)} light{'s' if len(on) != 1 else ''} on · " + ", ".join(
+        f"{a} {n}" if len(rooms) > 1 else a for a, n in order)
+
+
+def home_temps(R):
+    per = {}  # area -> (rank, text)
+    for e, r in R.items():
+        a, area = r["attributes"], r.get("area")
+        if not area:
+            continue
+        if dom(e) == "climate":
+            cur = fnum(a.get("current_temperature"))
+            if cur is None:
+                continue
+            t, txt = fnum(a.get("temperature")), f"{area} {cur:.1f}°"
+            if t is not None and r["state"] not in ("off",) + DOWN:
+                txt += f"→{t:g}°"
+            if a.get("hvac_action") == "heating":
+                txt += "🔥"
+            elif a.get("hvac_action") == "cooling":
+                txt += "❄️"
+            rank = (0, e)
+        elif dom(e) == "sensor" and a.get("device_class") == "temperature":
+            v = fnum(r["state"])
+            if v is None or TEMP_SKIP_RE.search(f"{e} {r.get('name') or ''}"):
+                continue
+            unit = str(a.get("unit_of_measurement") or "°C")
+            if unit not in ("°C", "°F"):
+                continue
+            slug = re.sub(r"[^a-z0-9]+", "_", area.lower()).strip("_")
+            rank = (1 if e == f"sensor.{slug}_temperature" else 2, e)
+            txt = f"{area} {v:.1f}°" + ("F" if unit == "°F" else "")
+        else:
+            continue
+        if area not in per or rank < per[area][0]:
+            per[area] = (rank, txt)
+    if not per:
+        return None
+    order = sorted(per, key=lambda x: (bool(OUTDOOR_RE.search(x)), x.lower()))
+    return "🌡 " + " · ".join(per[a][1] for a in order)
+
+
+def home_damp():
+    """damp-watch's one line (its state file only, no extra HA read); None when absent, stale or failing."""
+    try:
+        line = run(["damp-watch", "line"], 5, "damp watch").strip()
+    except Fail:
+        return None
+    return clip(line.splitlines()[0], 90) if line else None
+
+
+def home_vacuums(R):
+    vacs = sorted(e for e in R if dom(e) == "vacuum")
+    out = []
+    for e in vacs:
+        r = R[e]
+        st = VACUUM_STATE.get(r["state"], r["state"].replace("_", " "))
+        bat = fnum(r["attributes"].get("battery_level"))
+        if bat is None:
+            s = R.get(f"sensor.{e.split('.', 1)[1]}_battery")
+            bat = fnum(s["state"]) if s else None
+        who = nice_name(r) if len(vacs) > 1 else "Vacuum"
+        out.append(f"{who}: {st}" + (f" · {bat:.0f}%" if bat is not None and r["state"] not in DOWN else ""))
+    return ("🧹 " + "; ".join(out)) if out else None
+
+
+def home_media(R):
+    seen, out = set(), []
+    for e in sorted(R):
+        r = R[e]
+        if dom(e) != "media_player" or r["state"] not in ("playing", "on"):
+            continue
+        a = r["attributes"]
+        grp = a.get("group_members")
+        if isinstance(grp, list) and len(grp) > 1 and grp[0] != e and grp[0] in R:
+            continue  # a speaker grouped under another one: the group leader is shown
+        name = nice_name(r)
+        if name in seen:
+            continue
+        seen.add(name)
+        what = gate(next((str(a[k]) for k in ("app_name", "source", "media_title") if a.get(k)), ""))
+        if r["state"] == "on":
+            out.append(f"{name} on" + (f" ({clip(what, 24)})" if what else ""))
+        else:
+            out.append(name + (f" ({clip(what, 24)})" if what else ""))
+    if not out:
+        return "🎵 Nothing playing"
+    more = f" +{len(out) - 3}" if len(out) > 3 else ""
+    return "🎵 Playing: " + " · ".join(out[:3]) + more
+
+
+def home_batteries(R):
+    ids = set(R)
+    phones = {e[: -len("_battery_level")] for e in ids
+              if e.endswith("_battery_level") and e[: -len("_level")] + "_state" in ids}
+    vacs = {"sensor." + e.split(".", 1)[1] for e in ids if dom(e) == "vacuum"}
+    low = []
+    for e in sorted(ids):
+        r = R[e]
+        if r["attributes"].get("device_class") != "battery" or dom(e) not in ("sensor", "binary_sensor"):
+            continue
+        if any(e.startswith(p + "_battery") for p in phones) or any(e.startswith(v + "_") for v in vacs):
+            continue  # phones (person data) and vacuums (they charge themselves) are left out
+        name = nice_name(r, strip=("battery level", "battery"))
+        if dom(e) == "binary_sensor":
+            if r["state"] == "on":
+                low.append((-1.0, f"{name} low"))
+            continue
+        v = fnum(r["state"])
+        if v is not None and str(r["attributes"].get("unit_of_measurement") or "%") == "%" and v < LOW_BATTERY:
+            low.append((v, f"{name} {v:.0f}%"))
+    if not low:
+        return "🔋 Batteries ok"
+    low.sort()
+    more = f" +{len(low) - 4}" if len(low) > 4 else ""
+    return "🔋 Low: " + ", ".join(t for _, t in low[:4]) + more
+
+
+def health_snaps():
+    """(latest, previous) valid ha-health-watch snapshots (dicts with 'findings'), either may be None."""
+    try:
+        names = sorted(n for n in os.listdir(HEALTH_DIR) if re.fullmatch(r"snap-\d{8}-\d{6}\.json", n))
+    except OSError:
+        return None, None
+    got = []
+    for n in reversed(names):
+        try:
+            with open(os.path.join(HEALTH_DIR, n)) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(s, dict) and isinstance(s.get("findings"), dict):
+            got.append(s)
+            if len(got) == 2:
+                break
+    return (got + [None, None])[0], (got + [None, None])[1]
+
+
+def health_label(k, f, R):
+    lab, area = str(f.get("label") or k), str(f.get("area") or "")
+    if f.get("kind") == "ent" and lab in R:
+        lab = nice_name(R[lab])
+    elif f.get("kind") in ("issue", "sup"):
+        lab = lab.replace("_", " ")
+    if area and f.get("kind") in ("dev", "ent") and area.lower() not in lab.lower():
+        lab = f"{area} {lab}"
+    return clip(gate(lab), 32)
+
+
+def home_health(R):
+    cur, prev = health_snaps()
+    if cur is None:
+        return ["🩺 HA health: no ha-health-watch snapshot yet"]
+    F = {k: f for k, f in cur["findings"].items() if isinstance(f, dict) and f.get("kind") != "bat"}
+    known = sum(1 for f in F.values() if f.get("known"))
+    opened = {k: f for k, f in F.items() if not f.get("known")}
+    prev_keys = set(prev["findings"]) if prev else set(F)  # first snapshot = baseline: nothing is new
+    new = sorted(k for k in opened if k not in prev_keys)
+    age = ""
+    try:
+        taken = datetime.fromisoformat(str(cur.get("taken"))).astimezone(TZ).replace(tzinfo=None)
+        h = (now() - taken).total_seconds() / 3600
+        if h >= 36:
+            age = f" (snapshot {h / 24:.0f} d old)"
+    except (TypeError, ValueError):
+        age = " (snapshot time unknown)"
+    try:
+        with open(os.path.join(HEALTH_DIR, "state.json")) as f:
+            if (json.load(f) or {}).get("fail_streak"):
+                age += " · watch failing"
+    except (OSError, ValueError, AttributeError):
+        pass
+    kn = f" · {known} known offline" if known else ""
+    if not opened:
+        return [f"🩺 HA health: all ok{kn}{age}"]
+    lines = [f"🩺 HA health: {len(opened)} open" + (f" ({len(new)} new)" if new else "") + kn + age]
+    order = new + sorted((k for k in opened if k not in new),
+                         key=lambda k: (["dev", "ent", "int", "issue", "sup"].index(opened[k].get("kind"))
+                                        if opened[k].get("kind") in ("dev", "ent", "int", "issue", "sup") else 9, k))
+    labels = [health_label(k, opened[k], R) + (" 🆕" if k in new else "") for k in order]
+    more = f", +{len(labels) - 3} more" if len(labels) > 3 else ""
+    return lines + ["↳ " + ", ".join(labels[:3]) + more]
+
+
+def cmd_home():
+    gate("")  # no privacy gate = no answer
+    try:
+        R = home_rows()
+    except Fail as e:
+        raise Fail(gate(str(e)))
+    lines = [f"🏠 Home · {now():%H:%M}", home_lights(R)]
+    lines += [x for x in (home_temps(R), home_damp(), home_vacuums(R)) if x]
+    lines += [home_media(R)] + home_health(R) + [home_batteries(R)]
+    return "\n".join(gate(l) for l in lines)
+
+
+# /train, /rave, /trip: local data only (train-watch legs + its live status, rave-radar's list, the trip config files,
+# owner reminders, TODO.md's "Waiting on you"); no calendar or Claude call.
+CONF = os.path.expanduser("~/.config")
+TRIP_CONDITIONS = os.path.expanduser(os.environ.get("TG_CMD_TRIP_CONDITIONS") or f"{CONF}/trip-conditions/trips.json")
+PRETRIP = os.path.expanduser(os.environ.get("TG_CMD_PRETRIP") or f"{CONF}/pretrip-check/trip.json")
+TRIPS_EXTRA = os.path.expanduser(os.environ.get("TG_CMD_TRIPS") or f"{CONF}/tg-cmd/trips.json")
+TODO_MD = os.path.expanduser(os.environ.get("TG_CMD_TODO") or "~/workspace/TODO.md")
+TRAIN_LEGS = 4      # legs shown by /train (2 lines each)
+BOARD_LEGS = 6      # legs on the /train board (TG_CMD_PICTURES=1; its caption lists the same legs)
+RAVE_ROWS = 8
+
+
+def local_dt(s):
+    d = datetime.fromisoformat(s)
+    return d.astimezone(TZ).replace(tzinfo=None) if d.tzinfo else d
+
+
+def legs_ahead():
+    """train-watch's legs still ahead (or under way), soonest first, with _dep/_arr as local datetimes."""
+    out, t = [], now()
+    for g in json.loads(run(["train-watch", "list", "--json"], 5, "train watch") or "[]"):
+        try:
+            g["_dep"] = local_dt(g["dep"])
+            g["_arr"] = local_dt(g["arr"]) if g.get("arr") else None
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (g["_arr"] or g["_dep"]) >= t:
+            out.append(g)
+    return sorted(out, key=lambda g: g["_dep"])
+
+
+def leg_status(g):
+    """`train-watch status ID --json` -> dict, None when it fails or times out (one leg must not sink /train)."""
+    try:
+        rc, out, _ = run(["train-watch", "status", g["id"], "--json"], 10, "train status", full=True)
+        return json.loads(out) if rc == 0 else None
+    except (Fail, ValueError):
+        return None
+
+
+def train_verdict(g, s):
+    if not isinstance(s, dict):
+        return "⚪ no live status right now"
+    live, alt = s.get("live") or {}, s.get("alt")
+    near = g["_dep"] - now() <= timedelta(hours=24)
+    if s.get("fine"):
+        d = live.get("delay") or 0
+        txt = ("✅ on time" if not d else f"✅ +{d} min") if near else "✅ as planned"
+        return txt + (f" · pl {live['platform']}" if near and live.get("platform") else "")
+    alt_txt = f" → alt {alt.get('dep')} {' › '.join(alt.get('lines') or [])} → {alt.get('arr')}" if alt else ""
+    keys = [p.get("key", "") for p in s.get("problems") or [] if isinstance(p, dict)]
+    if "cancelled" in keys:
+        return "❌ cancelled" + (alt_txt or " · no alternative found, check SBB")
+    bits = []
+    for k in keys:
+        if k.startswith("delay"):
+            bits.append(f"+{live.get('delay')} min" + (f" (arr {live['arr']})" if live.get("arr") else ""))
+        elif k.startswith("platform:"):
+            bits.append(f"now pl {k.rsplit(':', 1)[1]}")
+        elif k.startswith("bus:"):
+            bits.append("🚌 replacement bus")
+        elif k.startswith("timetable:"):
+            bits.append(f"new arr {k.split(':', 1)[1]}")
+        elif k.startswith("transfer:"):
+            bits.append(f"tight change at {k.split(':', 1)[1]}")
+    return clip("⚠️ " + (" · ".join(dict.fromkeys(bits)) or "problem") + alt_txt, 90)
+
+
+def leg_line(g):
+    arr = f" {g['_arr']:%H:%M}" if g["_arr"] else ""
+    return f"{day_txt(g['_dep'].date())} {g['_dep']:%H:%M} {g.get('from')} → {g.get('to')}{arr}"
+
+
+def train_data(n):
+    """(legs ahead, the first n, their live statuses): one `status --json` per shown leg, in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    legs = legs_ahead()
+    shown, stats = legs[:n], []
+    if shown:
+        with ThreadPoolExecutor(max_workers=len(shown)) as ex:
+            stats = list(ex.map(leg_status, shown))
+    return legs, shown, stats
+
+
+def cmd_train():
+    return train_text(*train_data(TRAIN_LEGS))
+
+
+def train_text(legs, shown, stats):
+    if not legs:
+        return "🚆 No train legs planned ahead."
+    more = f" · next {len(shown)} of {len(legs)}" if len(legs) > len(shown) else ""
+    lines = [f"🚆 Trains{more} · home = door to door"]
+    for g, s in zip(shown, stats):
+        rides = " › ".join(g.get("lines") or [])
+        lines += [leg_line(g), "   " + (f"{rides} · " if rides else "") + train_verdict(g, s)]
+    return "\n".join(lines)
+
+
+def place_txt(s):
+    s = card_txt(s or "?")
+    return "Home" if s.lower() == "home" else s
+
+
+def board_row(g, s, ci):
+    """One /train board row (cardimg.Card.board) from a leg and its live status (None = no status)."""
+    near = g["_dep"] - now() <= timedelta(hours=24)
+    live = (s.get("live") or {}) if isinstance(s, dict) else {}
+    lines = live.get("lines") if near and live.get("lines") else g.get("lines")
+    row = {"time": f"{g['_dep']:%H:%M}", "day": day_txt(g["_dep"].date()), "today": g["_dep"].date() == now().date(),
+           "dest": place_txt(g.get("to")), "origin": place_txt(g.get("from")),
+           "lines": [card_txt(x) for x in lines or [] if x], "arr": f"{g['_arr']:%H:%M}" if g["_arr"] else "",
+           "platform": str(live["platform"]) if near and live.get("platform") else "", "note": ""}
+    if not isinstance(s, dict):
+        return {**row, "status": "No status", "color": ci.TEXT2}
+    if s.get("fine"):
+        d = live.get("delay") or 0
+        if not near:
+            return {**row, "status": "As planned", "color": ci.ACCENT}
+        return {**row, "status": f"+{d} min" if d else "On time", "color": ci.WARN if d else ci.GOOD}
+    keys = [p.get("key", "") for p in s.get("problems") or [] if isinstance(p, dict)]
+    alt = s.get("alt") if isinstance(s.get("alt"), dict) else None
+    d = live.get("delay") or 0
+    if "cancelled" in keys:
+        status, color = "Cancelled", ci.BAD
+    elif any(k.startswith("transfer:") for k in keys):
+        status, color = "Tight change", ci.BAD
+    elif any(k.startswith("delay") for k in keys):
+        status, color = (f"+{d} min" if d else "Delayed"), (ci.BAD if d >= 15 else ci.WARN)
+        row["arr"] = live.get("arr") or row["arr"]
+    elif any(k.startswith("bus:") for k in keys):
+        status, color = "Bus", ci.WARN
+    elif any(k.startswith("platform:") for k in keys):
+        status, color = "New platform", ci.WARN
+    elif any(k.startswith("timetable:") for k in keys):
+        status, color = "New times", ci.WARN
+    else:
+        status, color = "Check", ci.WARN
+    bits = []
+    for k in keys:
+        if k.startswith("transfer:"):
+            bits.append(f"change at {card_txt(k.split(':', 1)[1])} at risk")
+        elif k.startswith("platform:"):
+            st, _, pl = k[len("platform:"):].rpartition(":")
+            if pl and pl == row["platform"]:
+                row["platform_new"] = True
+            else:
+                bits.append(f"pl {pl} at {card_txt(st)}")
+        elif k.startswith("bus:"):
+            bits.append(f"replacement bus from {card_txt(k.split(':', 1)[1])}")
+        elif k.startswith("timetable:"):
+            bits.append(f"new arr {k.split(':', 1)[1]}")
+    if alt:
+        bits.append(f"alt {alt.get('dep')} {' › '.join(card_txt(x) for x in alt.get('lines') or [])} → {alt.get('arr')}")
+    elif status == "Cancelled":
+        bits.append("no alternative found, check SBB")
+    note = " · ".join(dict.fromkeys(b for b in bits if b))
+    return {**row, "status": status, "color": color, "note": note[:1].upper() + note[1:]}
+
+
+def train_render(legs, shown, stats):
+    ci = cardimg()
+    sub = f"Door to door · next {len(shown)} of {len(legs)}" if len(legs) > len(shown) else \
+        f"Door to door · {plural(len(shown), 'leg')}"
+    c = ci.Card("Departures", sub)
+    rows = [board_row(g, s, ci) for g, s in zip(shown, stats)]
+    drawn = c.board(rows)
+    foot = [f"Live status at {now():%H:%M}"]
+    if drawn < len(rows):
+        foot.append(f"+ {len(rows) - drawn} more in the text")
+    if not any(isinstance(x, dict) for x in stats):
+        foot.append("no live status right now")
+    c.trim(min_height=640, footer=True)
+    c.footer(" · ".join(foot))
+    return c.save("train")
+
+
+def pic_train():
+    legs, shown, stats = train_data(BOARD_LEGS)
+    text = train_text(legs, shown, stats)
+    if not legs:
+        return text, text, None
+    return text, text, lambda: train_render(legs, shown, stats)
+
+
+VIBE_HINT = ("🎬 /vibe + a mood or a film, e.g.\n/vibe cozy rainy sunday\n/vibe mind-bending scifi like Arrival\n"
+             "/vibe short funny 90min\n/vibe a dark crime series")
+
+
+def cmd_vibe(arg=None):
+    """`media vibe --json TEXT`: 4 library movies for the mood/film, plain text with ▶ Emby links; bare = a hint."""
+    words = " ".join((arg or "").split())[:200].split()
+    if not words:
+        return VIBE_HINT
+    return vibe_data(words).get("text") or "🎬 Vibe · no answer"
+
+
+def vibe_data(words):
+    out = run(["media", "vibe", "--json", "--", *words], 16, "Emby vibe")
+    try:
+        d = json.loads(out)
+    except ValueError:
+        raise Fail("Emby vibe: unreadable answer")
+    if not isinstance(d, dict):
+        raise Fail("Emby vibe: unreadable answer")
+    return d
+
+
+def cmd_finish():
+    """`media finish --json`: paused shows with episodes left, plain text with ▶ Emby links (exit 3 = some shows
+    didn't load: the text says so)."""
+    return finish_data().get("text") or "🏁 Finish next · no answer"
+
+
+def finish_data(n=None, timeout=20):
+    rc, out, err = run(["media", "finish", "--json", *(["-n", str(n)] if n else [])], timeout, "Emby finish", full=True)
+    if rc not in (0, 3):
+        raise Fail("Emby finish: " + ((err or "").strip().splitlines() or ["exit %d" % rc])[-1][:120])
+    try:
+        d = json.loads(out)
+    except ValueError:
+        raise Fail("Emby finish: unreadable answer")
+    if not isinstance(d, dict):
+        raise Fail("Emby finish: unreadable answer")
+    return d
+
+
+def cmd_doctor(arg=None):
+    """`media doctor --json --no-probe [-- TITLE]`: why open Seerr requests aren't on Emby yet (bare: all, stuck
+    first) or one title + forward lines; plain text (exit 3 = a part didn't load: the text says so)."""
+    words = " ".join((arg or "").split())[:120].split()
+    rc, out, err = run(["media", "doctor", "--json", "--no-probe", *(["--", *words] if words else [])], 45,
+                       "Request doctor", full=True)
+    if rc not in (0, 3):
+        raise Fail("Request doctor: " + ((err or "").strip().splitlines() or ["exit %d" % rc])[-1][:120])
+    try:
+        text = (json.loads(out) or {}).get("text")
+    except ValueError:
+        raise Fail("Request doctor: unreadable answer")
+    return text or "🩺 Request doctor · no answer"
+
+
+PARTY_HINT = "🎉 /party: the WLEDs follow the music's tempo\n/party off restores the lights · /party status"
+PARTY_VERBS = {"": "on", "on": "on", "start": "on", "off": "off", "stop": "off", "end": "off", "status": "status"}
+
+
+def cmd_party(arg=None):
+    """`party on|off|status` (writes: WLED effect + restore; party's own text, also on its exit 1)."""
+    verb = PARTY_VERBS.get(" ".join((arg or "").lower().split()))
+    if verb is None:
+        return PARTY_HINT
+    code, out, err = run(["party", verb], 18, "Party lights", full=True)
+    if code not in (0, 1) or not out.strip():
+        last = next((l for l in reversed(err.strip().splitlines()) if l.strip()), "")
+        raise Fail(f"Party lights: {last.strip()[:120] or f'exit {code}'}")
+    return out
+
+
+def cmd_usage():
+    """`product card`: top used / unused / noisy features from the usage store (read-only, counts only)."""
+    code, out, err = run(["product", "card"], 20, "Usage", full=True)
+    if code != 0 or not out.strip():
+        raise Fail(f"Usage: {(err.strip().splitlines() or [f'exit {code}'])[-1][:120]}")
+    return out
+
+
+def cmd_crate(arg=None):
+    """`crate-now`: the track playing on Spotify (HA) -> the crate list (writes: lists add crate; dedupes)."""
+    code, out, err = run(["crate-now"], 18, "Crate", full=True)
+    if code not in (0, 3) or not out.strip():
+        last = next((l for l in reversed(err.strip().splitlines()) if l.strip()), "")
+        raise Fail(f"Crate: {last.strip()[:120] or f'exit {code}'}")
+    return out
+
+
+def cmd_gohome(arg=None):
+    """`gohome [STOP]`: its own card (<= 8 lines, read-only: transport API, calcache, `vault ha now`)."""
+    return run(["gohome", *([arg] if arg else [])], 18, "way home")
+
+
+def load_json_file(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def span(a, b):
+    """'21–27.11', '27.11–1.12', '30.12.2026–2.1.2027'."""
+    if a.year != b.year:
+        return f"{a.day}.{a.month}.{a.year}–{b.day}.{b.month}.{b.year}"
+    return f"{a.day}–{b.day}.{b.month}" if a.month == b.month else f"{a.day}.{a.month}–{b.day}.{b.month}"
+
+
+def load_trips():
+    """Trips from trip-conditions' trips.json, pretrip-check's trip.json and the optional tg-cmd trips.json, merged
+    by name: [{name, emoji, from, to (dates), legs [str], match [str], todo [str], link, pack (path)}]."""
+    trips = {}
+
+    def add(name, start, end, emoji=None, legs=(), match=(), todo=(), link=None, pack=None):
+        if not name:
+            return
+        try:
+            start, end = date.fromisoformat(str(start)), date.fromisoformat(str(end or start))
+        except ValueError:
+            if name.lower() not in trips:                   # dates may be left out only to add to a known trip
+                return
+            start = end = None
+        t = trips.setdefault(name.lower(), {"name": name, "emoji": None, "from": start, "to": end, "legs": [],
+                                            "match": [name], "todo": [], "link": None, "pack": None})
+        t["emoji"] = t["emoji"] or emoji
+        t["link"] = t["link"] or link
+        t["pack"] = t["pack"] or (pack if isinstance(pack, str) and pack else None)
+        for k, v in (("legs", legs), ("match", match), ("todo", todo)):
+            t[k] += [x for x in v if isinstance(x, str) and x and x not in t[k]]
+
+    for t in (load_json_file(TRIP_CONDITIONS, {}).get("trips") or {}).values():
+        if not isinstance(t, dict):
+            continue
+        stays = []
+        for l in t.get("legs") or []:
+            try:
+                stays.append(f"{l['name']} {span(date.fromisoformat(l['from']), date.fromisoformat(l['to']))}")
+            except (KeyError, TypeError, ValueError):
+                pass
+        add(t.get("name"), t.get("from"), t.get("to"), t.get("emoji"), ["🏝 " + " › ".join(stays)] if stays else [])
+    p = load_json_file(PRETRIP, {})
+    if isinstance(p, dict):
+        add(p.get("name"), p.get("from"), p.get("until"), legs=["✈️ " + x for x in p.get("legs") or [] if isinstance(x, str)])
+    x = load_json_file(TRIPS_EXTRA, {})
+    for t in (x.get("trips") if isinstance(x, dict) else x) or []:
+        if isinstance(t, dict):
+            add(t.get("name"), t.get("from"), t.get("to"), t.get("emoji"), t.get("legs") or [], t.get("match") or [],
+                t.get("todo") or [], t.get("link"), t.get("pack"))
+    return sorted(trips.values(), key=lambda t: (t["from"], t["to"]))
+
+
+def trip_matches(t, text):
+    low = text.lower()
+    return any(m.lower() in low for m in t["match"]) or bool(t["emoji"] and t["emoji"] in text)
+
+
+def owner_reminders():
+    out = []
+    for l in run(["remind", "list"], 6, "reminders").splitlines():
+        m = REM_RE.match(l)
+        if m and m.group(2):
+            text = re.sub(r"  \((?:tag [^)]*|every [^)]*)\)$", "", m.group(3))
+            out.append((datetime.strptime(m.group(1), "%Y-%m-%d %H:%M"), text))
+    return out
+
+
+def waiting_on_owner():
+    """TODO.md "Waiting on you" titles + the status before any '(' (the board's internal notes stay out)."""
+    try:
+        with open(TODO_MD) as f:
+            text = f.read()
+    except OSError:
+        return []
+    m = re.search(r"^## Waiting on you\s*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+    out = []
+    for l in (m.group(1).splitlines() if m else []):
+        i = re.match(r"^- \*\*(.+?)\*\*(?:\s*[—–-]\s*(.*))?$", l)
+        if i:
+            out.append(i.group(1) + (": " + i.group(2).split("(")[0].strip(" ;,") if i.group(2) else ""))
+    return out
+
+
+def trip_head(t):
+    today, nights = now().date(), (t["to"] - t["from"]).days
+    when = f"{t['from']:%a} {span(t['from'], t['to'])}" if nights else day_txt(t["from"])
+    if t["from"] > today:
+        n = (t["from"] - today).days
+        rel = "tomorrow" if n == 1 else f"in {n} days"
+    elif today == t["to"] and nights:
+        rel = "last day"
+    else:
+        rel = f"day {(today - t['from']).days + 1} of {nights + 1}" if nights else "today"
+    return f"{t['emoji'] or '🧳'} {t['name']} · {when}" + (f" ({nights} nights)" if nights > 1 else "") + f" · {rel}"
+
+
+def trip_pack_line(t):
+    """'📦 Offline pack 24 KB (20.10) · "send the pack" → ~/reports/…' when the trip's pack file exists, else None."""
+    if not t.get("pack"):
+        return None
+    path = os.path.expanduser(t["pack"])
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    home = os.path.expanduser("~")
+    shown = "~" + path[len(home):] if path.startswith(home + "/") else path
+    return (f"📦 Offline pack {max(1, round(st.st_size / 1024))} KB ({datetime.fromtimestamp(st.st_mtime):%d.%m})"
+            f" · “send the pack” → {shown}")
+
+
+def trip_list(trips):
+    rows = [f"{t['emoji'] or '🧳'} {t['name']} · "
+            + (span(t['from'], t['to']) if t['to'] > t['from'] else f"{t['from'].day}.{t['from'].month}")
+            + (f" · in {(t['from'] - now().date()).days} d" if t["from"] > now().date() else " · now")
+            + (" 📦" if trip_pack_line(t) else "") for t in trips]
+    more = [f"+ {len(rows) - 8} more"] if len(rows) > 8 else []
+    return "\n".join([f"🧳 Trips ahead ({len(rows)})"] + rows[:8] + more + ["/trip WORDS shows one"])
+
+
+def trip_select(arg=None):
+    """(answer, trip, trips ahead, query): answer = a text-only reply (no trip, the list, an unknown name), else None."""
+    today = now().date()
+    trips = [t for t in load_trips() if t["to"] >= today]
+    if not trips:
+        return "🧳 No trip planned.", None, trips, ""
+    q = (arg or "").strip().lower().lstrip("/")
+    if q in ("list", "all", "trips"):
+        return trip_list(trips), None, trips, q
+    if q:
+        pick = next((t for t in trips if q in t["name"].lower()), None) or \
+            next((t for t in trips if any(q in m.lower() or (len(m) >= 4 and m.lower() in q) for m in t["match"])), None)
+        if not pick:
+            return f"🧳 No trip ahead called “{clip(arg.strip(), 30)}”.\n/trip list shows them.", None, trips, q
+        trips = [pick] + [x for x in trips if x is not pick]
+    return None, trips[0], trips, q
+
+
+def cmd_trip(arg=None):
+    answer, t, trips, q = trip_select(arg)
+    return answer or trip_text(t, trips, q)
+
+
+def trip_text(t, trips, q):
+    pack = trip_pack_line(t)
+    lines = [trip_head(t)] + t["legs"][:3]
+    try:
+        trains = [g for g in legs_ahead() if t["from"] <= g["_dep"].date() <= t["to"] + timedelta(days=1)]
+    except Fail:
+        trains = []
+    lines += ["🚆 " + leg_line(g) for g in trains[:2]]
+    todos = [f"☐ {clip(x, 70)}" for x in t["todo"]]
+    todos += [f"☐ {clip(x, 70)}" for x in waiting_on_owner() if trip_matches(t, x)]
+    try:
+        rem = owner_reminders()
+    except Fail:
+        rem = []
+    for at, text in rem:
+        if at.date() <= t["to"] and trip_matches(t, text):
+            text = re.sub(r"^\W*" + re.escape(t["name"]) + r"\W*:\s*", "", text, flags=re.I) or text
+            todos.append(f"☐ {at:%d.%m} {short_title(text)}")
+    room = 10 - len(lines) - (1 if t["link"] else 0) - (1 if pack else 0) - (1 if todos else 0)
+    if todos:
+        lines.append("Open:")
+        if len(todos) > room:
+            todos = todos[: room - 1] + [f"+ {len(todos) - room + 1} more (ask me)"]
+        lines += todos
+    elif not t["link"]:
+        lines.append("Nothing open.")
+    if t["link"]:
+        lines.append(f"🗺 {t['link']}")
+    if pack:
+        lines.append(pack)
+    if len(trips) > 1 and len(lines) < 10 and not q:
+        lines.append(f"Then: {trips[1]['emoji'] or '🧳'} {trips[1]['name']} {span(trips[1]['from'], trips[1]['to'])}"
+                     + (" · 📦 pack ready" if trip_pack_line(trips[1]) else ""))
+    return "\n".join(lines)
+
+
+def trip_conf(t):
+    """(key, trip) from trip-conditions' config with t's name (its place legs), else (None, None)."""
+    for k, v in (load_json_file(TRIP_CONDITIONS, {}).get("trips") or {}).items():
+        if isinstance(v, dict) and str(v.get("name") or "").lower() == t["name"].lower():
+            return k, v
+    return None, None
+
+
+def aware(s):
+    d = datetime.fromisoformat(s)
+    return d if d.tzinfo else d.replace(tzinfo=TZ)
+
+
+def trip_flights(t):
+    """flight-watch's flights from the day before the trip to the day after, as journeys (a leg that leaves where the
+    last one landed within 24 h joins it), soonest first; [] when flight-watch fails."""
+    try:
+        rows = json.loads(run(["flight-watch", "list", "--json"], 5, "flights") or "[]")
+    except (Fail, ValueError):
+        return []
+    fl = []
+    for f in rows if isinstance(rows, list) else []:
+        try:
+            f = {**f, "_dep": aware(f["dep"]), "_arr": aware(f["arr"])}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if t["from"] - timedelta(days=1) <= local_dt(f["dep"]).date() <= t["to"] + timedelta(days=1):
+            fl.append(f)
+    out = []
+    for f in sorted(fl, key=lambda f: f["_dep"]):
+        last = out[-1][-1] if out else None
+        if last and last.get("to") == f.get("from") and timedelta(0) <= f["_dep"] - last["_arr"] < timedelta(hours=24):
+            out[-1].append(f)
+        else:
+            out.append([f])
+    return out
+
+
+def trip_conditions(key):
+    """`trip-conditions KEY --json --days 1 --no-advisory` (today's sea and dive estimate per place), None on failure."""
+    try:
+        d = json.loads(run(["trip-conditions", key, "--json", "--days", "1", "--no-advisory"], 7, "conditions"))
+        return d if isinstance(d, dict) else None
+    except (Fail, ValueError):
+        return None
+
+
+def flight_no(s):
+    return re.sub(r"^([A-Z0-9]{2})(\d+[A-Z]?)$", r"\1 \2", str(s or "").replace(" ", "")) or "?"
+
+
+def journey_route(j, label):
+    """(label, stops, hops) for Card.route: stops with local times (each airport's own offset), hops = flight numbers."""
+    stops = [(card_txt(j[0].get("from") or "?"), f"{j[0]['_dep']:%a %H:%M}")]
+    for a, b in zip(j, j[1:]):
+        stops.append((card_txt(a.get("to") or "?"), f"{a['_arr']:%H:%M}–{b['_dep']:%H:%M}"))
+    stops.append((card_txt(j[-1].get("to") or "?"), f"{j[-1]['_arr']:%a %H:%M}"))
+    return (label, f"{j[0]['_dep']:%a %d.%m}"), stops, [flight_no(f.get("no")) for f in j]
+
+
+def trip_countdown(t, journeys, place=None):
+    """(big value, label) for the /trip card: days or hours to the first flight (else the start), the trip day."""
+    n, today = now(), now().date()
+    first = journeys[0][0] if journeys else None
+    dep = local_dt(first["dep"]) if first else None
+    if dep and dep.date() > t["from"] + timedelta(days=1):
+        dep, first = None, None
+    target = dep or datetime.combine(t["from"], datetime.min.time())
+    what = f"{flight_no(first.get('no'))} {target:%a %d.%m %H:%M}" if first else f"starts {t['from']:%a %d.%m}"
+    if target > n:
+        days = (target.date() - today).days
+        if days >= 2:
+            return str(days), f"days to go · {what}"
+        hours = max(1, -int(-(target - n).total_seconds() // 3600))
+        return f"{hours} h", f"to go · {what}"
+    total = (t["to"] - t["from"]).days + 1
+    if today >= t["to"] and total > 1:
+        return "Last day", "of " + plural(total, "day")
+    day = max(1, (today - t["from"]).days + 1)
+    return f"Day {day}", f"of {total}" + (f" · {place}" if place else "")
+
+
+DIVE_PILL = {"go": ("Long-range: go", (24, 70, 44), "GOOD"), "marginal": ("Long-range: maybe", (82, 58, 20), "WARN"),
+             "no": ("Long-range: no", (90, 30, 30), "BAD")}
+VIS_COLOUR = {"good": "GOOD", "fair": "WARN", "reduced": "BAD"}
+
+
+def trip_tiles(legs, cond, ci):
+    """Card.tiles items, one per place leg: dates, spot, today's dive estimate (trip-conditions), wind, waves, sea."""
+    recs = {r.get("leg"): r for d in (cond or {}).get("days") or [] if isinstance(d, dict)
+            for r in d.get("legs") or [] if isinstance(r, dict)}
+    rank = {"go": 2, "marginal": 1, "no": 0}
+    items, scores = [], []
+    for i, l in enumerate(legs):
+        until = legs[i + 1]["from"] if i + 1 < len(legs) else l["to"]
+        sub = [f"{span(l['from'], until)} · {plural((until - l['from']).days, 'night')}"]
+        if l.get("spot"):
+            sub.append(card_txt(l["spot"]))
+        it = {"title": card_txt(l["name"]), "color": l.get("_color"), "sub": sub, "pill": None, "lines": []}
+        r = recs.get(l["name"])
+        dv = (r or {}).get("dive") or {}
+        if dv.get("long_range") in DIVE_PILL:
+            s_, fill, col = DIVE_PILL[dv["long_range"]]
+            it["pill"] = (s_, fill, getattr(ci, col))
+        if dv.get("visibility"):
+            it["lines"].append((f"Vis {dv['visibility']}", getattr(ci, VIS_COLOUR.get(dv["visibility"], "TEXT2"))))
+        wind, sea = (r or {}).get("wind") or {}, (r or {}).get("sea") or {}
+        bits = [f"{round(wind['kn'])} kn" if isinstance(wind.get("kn"), (int, float)) else "",
+                f"waves {sea['wave_m']:.1f} m" if isinstance(sea.get("wave_m"), (int, float)) else ""]
+        if any(bits):
+            it["lines"].append(" · ".join(b for b in bits if b))
+        if isinstance(sea.get("temp_c"), (int, float)):
+            it["lines"].append((f"Sea {round(sea['temp_c'])}°", ci.TEXT2))
+        if not r:
+            it["lines"].append((card_txt(l.get("dive_label") or "no reading"), ci.TEXT2))
+        items.append(it)
+        scores.append((rank.get(dv.get("long_range"), -1), {"good": 2, "fair": 1, "reduced": 0}.get(dv.get("visibility"), -1)))
+    if len(set(scores)) > 1 and scores.count(max(scores)) == 1 and max(scores)[0] >= 1:
+        items[scores.index(max(scores))]["star"] = True      # the one clearly best place to dive today
+    return items
+
+
+def trip_render(t, text):
+    from concurrent.futures import ThreadPoolExecutor
+    ci = cardimg()
+    key, conf = trip_conf(t)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fj = ex.submit(trip_flights, t)
+        fc = ex.submit(trip_conditions, key) if key else None
+        journeys, cond = fj.result(), (fc.result() if fc else None)
+    today = now().date()
+    legs = []
+    for l in (conf or {}).get("legs") or []:
+        try:
+            legs.append({**l, "from": date.fromisoformat(l["from"]), "to": date.fromisoformat(l["to"])})
+        except (KeyError, TypeError, ValueError):
+            pass
+    legs.sort(key=lambda l: l["from"])
+    here = next((l["name"] for l in reversed(legs) if l["from"] <= today <= l["to"]), None)
+    nights = (t["to"] - t["from"]).days
+    when = f"{t['from']:%a %d.%m} – {t['to']:%a %d.%m}" if nights else f"{t['from']:%a %d.%m}"
+    c = ci.Card(card_txt(t["name"]) or "Trip", when + (f" · {plural(nights, 'night')}" if nights else ""))
+    value, label = trip_countdown(t, journeys, card_txt(here) if here else None)
+    c.big(value, label, color=ci.ACCENT)
+    landed = now().replace(tzinfo=TZ)
+    for i, j in [(i, j) for i, j in enumerate(journeys) if j[-1]["_arr"] > landed][:3]:   # flown journeys drop off
+        name = "Out" if i == 0 and len(journeys) > 1 else "Back" if i == len(journeys) - 1 and len(journeys) > 1 else "Flight"
+        c.route(*journey_route(j, name))
+    if legs:
+        c.gap(8)
+        c.rich(ci.PAD, c.y + 18, " → ".join(plain(l["name"]) for l in legs), ci.font(34, True), ci.TEXT,
+               maxw=c.w - 2 * ci.PAD, glyph=ci.TEXT2)
+        c.y += 56
+        c.trip_strip(legs, t["from"], t["to"], today if t["from"] <= today <= t["to"] else None)
+        for l in legs:
+            if l.get("crossing") and c.room(120):
+                c.rich(ci.PAD, c.y + 16, f"{l['from'].day}.{l['from'].month} · {plain(l['crossing'])}", ci.font(26),
+                       ci.TEXT2, maxw=c.w - 2 * ci.PAD)
+                c.y += 40
+        c.gap(10)
+        c.tiles(trip_tiles(legs, cond, ci), max_h=max(160, c.h - ci.PAD - 40 - 44 - c.y))
+    else:
+        for r in [plain(x) for x in t["legs"] if plain(x)][:4]:   # the trip's own leg lines, → drawn
+            c.rich(ci.PAD, c.y + 20, r, ci.font(30), ci.TEXT, maxw=c.w - 2 * ci.PAD, glyph=ci.TEXT2)
+            c.y += 46
+    n_open = sum(1 for ln in text.splitlines() if ln.startswith("☐"))
+    more = re.search(r"^\+ (\d+) more \(ask me\)$", text, re.M)
+    n_open += int(more.group(1)) if more else 0
+    bits = [plural(n_open, "open to-do") if n_open else "nothing open", "offline pack ready" if trip_pack_line(t) else ""]
+    c.lines([(" · ".join(b for b in bits if b), ci.TEXT2)], size=28)
+    foot = []
+    if legs:
+        mode = (((cond or {}).get("days") or [{}])[0] or {}).get("mode")
+        foot.append("Dive: today's estimate from wind and waves" + (" (a preview, not your dates)" if mode == "preview" else "")
+                    if cond else "No sea reading right now")
+    c.trim(min_height=640, footer=bool(foot))
+    if foot:
+        c.footer(" · ".join(foot))
+    return c.save("trip")
+
+
+def pic_trip(arg=None):
+    answer, t, trips, q = trip_select(arg)
+    if answer:
+        return answer, answer, None
+    text = trip_text(t, trips, q)
+    return text, text, lambda: trip_render(t, text)
+
+
+def _words(s):
+    return {w for w in re.findall(r"\w{4,}", (s or "").lower())}
+
+
+def leg_events(legs):
+    """Events he is going to, from 🚆 titles like 'A → B (Artist)' / '(after X)': [(date, name, town)]."""
+    out = []
+    for g in legs:
+        m = re.search(r"\((?:after\s+)?([^()]+)\)\s*$", g.get("title") or "")
+        if not m:
+            continue
+        after = bool(re.search(r"\(after\s", g["title"]))
+        d = g["_dep"].date() - timedelta(days=1 if after and g["_dep"].hour < 12 else 0)
+        town = g.get("from") if after else g.get("to")
+        town = re.sub(r"\s+(?:HB|Hbf|Bf|Bahnhof|SBB)$", "", (town or "").split(",")[0].strip())
+        out.append((d, m.group(1).strip(), town))
+    return out
+
+
+def cmd_rave():
+    items = json.loads(run(["rave-radar", "list", "--days", "180", "--json"], 6, "rave radar") or "[]")
+    try:
+        legs = legs_ahead()
+    except Fail:
+        legs = []
+    going = leg_events(legs)
+    trips = load_trips()
+    rows, used = [], set()
+    for i in items:
+        if not isinstance(i, dict):
+            continue
+        try:
+            d = date.fromisoformat(i["date"]) if i.get("date") else None
+        except ValueError:
+            d = None
+        city = i.get("city") or ""
+        hits = {k for k, (gd, name, town) in enumerate(going) if d and gd == d
+                and (_words(name) & _words(i.get("artist")) or _words(town) & _words(city))}
+        used |= hits
+        rows.append((d, i.get("artist") or i.get("title") or "?", city, i.get("kind"), i.get("venue"), bool(hits),
+                     i.get("presale"), i.get("soldout")))
+    extra = []
+    for k, (d, name, town) in enumerate(going):         # one row per event: the trip there and back name it twice
+        if k not in used and not any(e[0] == d and _words(e[1]) & _words(name) for e in extra):
+            extra.append((d, name, town))
+    rows += [(d, name, town, "show", None, True, None, False) for d, name, town in extra]
+    if not rows:
+        return "🎧 No upcoming raves on the radar."
+    rows.sort(key=lambda r: (r[0] is None, r[0] or date.max))
+    out = [f"🎧 Raves · next {min(len(rows), RAVE_ROWS)}" + (f" of {len(rows)}" if len(rows) > RAVE_ROWS else "")]
+    for d, artist, city, kind, venue, go, presale, soldout in rows[:RAVE_ROWS]:
+        where = f"{venue} lineup, {city}" if kind == "lineup" and venue else city
+        marks = []
+        if go:
+            marks.append("🎟 going")
+        away = next((t for t in trips if d and t["from"] <= d <= t["to"]), None)
+        if away and not go:
+            marks.append(f"✈️ clashes with {away['name']}")
+        if soldout:
+            marks.append("sold out")
+        try:
+            if presale and date.fromisoformat(str(presale)[:10]) >= now().date():
+                marks.append(f"presale {date.fromisoformat(str(presale)[:10]):%d.%m}")
+        except ValueError:
+            pass
+        out.append(clip(f"{day_txt(d) if d else 'date tba'} · {artist} · {where}" + "".join(f" · {m}" for m in marks), 80))
+    return "\n".join(out)
+
+
+# /back: one catch-up card after time away. Read-only and token-free: remind's recent.json + place-state.json and
+# `remind list`, `bills list`, `media recent`, the latest unraid-health report, `gift-radar list`, `calcache show`.
+# Counts and titles of his own reminders, bills, media and calendar only; birthdays as first names.
+REMIND_DIR = os.path.dirname(os.path.expanduser(os.environ.get("REMIND_DB") or "~/.local/state/remind/reminders.json"))
+UNRAID_REPORTS = os.path.expanduser(os.environ.get("TG_CMD_UNRAID_REPORTS") or "~/reports/unraid")
+BACK_DAYS = 2            # default window without a recent trip in place-state
+BACK_MAX_DAYS = 30       # recent.json keeps fired reminders 30 days
+BACK_TRIP_FRESH_H = 72   # a home arrival this recent makes the whole absence the default window
+BACK_USAGE = "Use /back or /back N (N = days, 1–30)."
+SFMT = "%Y-%m-%d %H:%M"
+MEDIA_CAP = 40           # `media recent -n`
+MEDIA_RE = re.compile(r"^\w{3} (\d\d)\.(\d\d) (\d\d):(\d\d)\s+(movie|tv)\s+(.+?)\s*$")
+REPORT_RE = re.compile(r"^(\d{4}-\d\d-\d\d)\.md$")
+FLAG_RE = re.compile(r"^- \*\*(WARN|CRIT)\*\* (.+?)(?: \((baseline|since (\d{4}-\d\d-\d\d))\))?\s*$")
+BDAY_RE = re.compile(r"^\w{3} (\d\d)\.(\d\d)\.(\d{4})\s+in\s+(\d+) d\s+(\S.*?)(?:\s{2,}\S.*)?$")
+
+
+def sdt(s):
+    try:
+        return datetime.strptime(s, SFMT)
+    except (TypeError, ValueError):
+        return None
+
+
+def back_window(arg):
+    """(since, header) for /back [N]; None when N is bad. Default: the whole absence when place-state shows he is
+    away now or came home within BACK_TRIP_FRESH_H, else the last BACK_DAYS days."""
+    t = now()
+    if arg is not None and arg.strip():
+        a = arg.strip().lower().removesuffix("d").strip()
+        if not a.isdigit() or not 1 <= int(a) <= BACK_MAX_DAYS:
+            return None
+        return t - timedelta(days=int(a)), f"last {int(a)} day{'s' if int(a) != 1 else ''}"
+    st = load_json_file(os.path.join(REMIND_DIR, "place-state.json"), {})
+    st = st if isinstance(st, dict) else {}
+    trip = st.get("trip") if isinstance(st.get("trip"), dict) else {}
+    left = None
+    if st.get("zone") not in (None, "home") and sdt(st.get("left")):
+        left = sdt(st["left"])
+    elif sdt(trip.get("left")) and sdt(trip.get("back")) and t - sdt(trip["back"]) <= timedelta(hours=BACK_TRIP_FRESH_H):
+        left = sdt(trip["left"])
+    if left and t - left <= timedelta(days=BACK_MAX_DAYS):
+        return left, f"since {day_txt(left.date())} {left:%H:%M}"
+    return t - timedelta(days=BACK_DAYS), f"last {BACK_DAYS} days"
+
+
+def names(xs, n=2, width=26):
+    """'A, B (+3)' from the first n titles."""
+    xs = [clip(x, width) for x in xs if x]
+    return ", ".join(xs[:n]) + (f" (+{len(xs) - n})" if len(xs) > n else "")
+
+
+def when_txt(at):
+    return f"{day_txt(at.date())} {at:%H:%M}"
+
+
+def back_fired(since):
+    """Owner reminders fired since `since` (remind's recent.json); open = not yet snoozed or done."""
+    rec = load_json_file(os.path.join(REMIND_DIR, "recent.json"), {})
+    rows = sorted((sdt(o.get("fired")), o.get("state"), short_title(o.get("text") or ""))
+                  for o in (rec.values() if isinstance(rec, dict) else []) if isinstance(o, dict) and o.get("owner")
+                  and sdt(o.get("fired")) and sdt(o.get("fired")) >= since)
+    if not rows:
+        return None
+    still = [title for _, state, title in rows if state == "fired"]
+    return f"⏰ {len(rows)} reminder{'s' if len(rows) != 1 else ''} fired · " + \
+        (f"open: {names(still)}" if still else "all handled")
+
+
+def back_upcoming(_since):
+    """His timed reminders due in the next 48 h (`remind list`, owner ones only)."""
+    t, rows = now(), []
+    for l in run(["remind", "list"], 6, "reminders").splitlines():
+        m = REM_RE.match(l)
+        if m and m.group(2):
+            at = datetime.strptime(m.group(1), SFMT)
+            if t <= at <= t + timedelta(hours=48):
+                text = re.sub(r"  \((?:tag [^)]*|every [^)]*)\)", "", m.group(3))
+                rows.append(f"{when_txt(at)} {clip(short_title(text), 24)}")
+    return f"🔜 Next 48 h: {names(rows, 2, 44)}" if rows else None
+
+
+def back_bills(_since):
+    """Open bills due within 7 days (overdue too), payee + day only."""
+    today, rows = now().date(), []
+    for b in sorted(json.loads(run(["bills", "list", "--open", "--json"], 6, "bill tracker") or "[]"),
+                    key=lambda b: b.get("due") or ""):
+        try:
+            due = date.fromisoformat(b["due"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (due - today).days <= 7:
+            rows.append(f"{clip(b.get('payee') or '?', 20)} " + ("overdue" if due < today else day_txt(due)))
+    return f"💳 {len(rows)} bill{'s' if len(rows) != 1 else ''} due ≤ 7 d: {names(rows, 2, 32)}" if rows else None
+
+
+def back_media(since):
+    """New in the library since `since` (`media recent`: Radarr/Sonarr imports, newest first) → count + 2 titles."""
+    t, titles, hits = now(), [], 0
+    for l in run(["media", "recent", "-n", str(MEDIA_CAP)], 12, "media").splitlines():
+        m = MEDIA_RE.match(l.strip())
+        if not m:
+            continue
+        d, mo, hh, mi = (int(x) for x in m.groups()[:4])
+        try:
+            at = datetime(t.year, mo, d, hh, mi)
+        except ValueError:
+            continue
+        if at > t + timedelta(days=1):
+            at = at.replace(year=t.year - 1)
+        if at < since:
+            continue
+        hits += 1
+        title = re.sub(r" \(\d{4}\)$", "", m.group(6)) if m.group(5) == "movie" else re.sub(r" S\d+ .*$", "", m.group(6))
+        if title not in titles:
+            titles.append(title)
+    more = "+" if hits >= MEDIA_CAP else ""      # every line in the window: there may be more
+    return f"🎬 New on Emby: {len(titles)}{more} · {names(titles)}" if titles else None
+
+
+def back_server(since):
+    """Warnings of the latest daily unraid-health report that are new since `since` (its "New since last run"
+    when the report is that recent, and known issues marked since a day in the window); baseline ones never."""
+    try:
+        reps = sorted(f for f in os.listdir(UNRAID_REPORTS) if REPORT_RE.match(f))
+    except OSError:
+        return None
+    if not reps:
+        return None
+    rday = REPORT_RE.match(reps[-1]).group(1)
+    flags, sec = [], None
+    try:
+        with open(os.path.join(UNRAID_REPORTS, reps[-1])) as f:
+            for l in f:
+                if l.startswith("## "):
+                    sec = "new" if l.startswith("## New since") else "known" if l.startswith("## Known issues") else None
+                    continue
+                m = FLAG_RE.match(l.rstrip("\n")) if sec else None
+                if not m:
+                    continue
+                day = rday if sec == "new" else m.group(4)
+                if day and day >= f"{since:%Y-%m-%d}":
+                    flags.append((m.group(1) != "CRIT", re.sub(r"^Unraid warning: ", "", m.group(2))))
+    except OSError as e:
+        raise Fail(f"server report: {type(e).__name__}")
+    if not flags:
+        return None
+    crit = sum(1 for w, _ in flags if not w)
+    head = " + ".join(x for x in (f"{crit} critical" if crit else "",
+                                    f"{len(flags) - crit} warning{'s' if len(flags) - crit != 1 else ''}"
+                                    if len(flags) > crit else "") if x)
+    return f"🖥 Server: {head} · {names([t for _, t in sorted(flags, key=lambda x: x[0])], 2, 36)}"
+
+
+def back_birthdays(_since):
+    """Birthdays in the next 7 days (`gift-radar list`, which reads the people-and-dates memory): first names."""
+    rows = []
+    for l in run(["gift-radar", "list", "--days", "7", "--date", f"{now():%Y-%m-%d}"], 6, "birthdays").splitlines():
+        m = BDAY_RE.match(l.strip())
+        if m:
+            d = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            rows.append(f"{m.group(5).split()[0]} {day_txt(d)}")
+    return f"🎂 {names(rows, 3, 24)}" if rows else None
+
+
+def back_next_event(_since):
+    """The next calendar event from calcache (all-day ones from tomorrow on; today's all-day markers skipped)."""
+    code, out, _ = run(["calcache", "show", "--days", "14", "--json"], 6, "calendar", full=True)
+    if code == 3:
+        return None                                  # no cache yet
+    if code != 0:
+        raise Fail("calendar: calcache failed")
+    t, best = now(), None
+    for e in json.loads(out or "[]"):
+        try:
+            if e.get("all_day"):
+                at, timed = datetime.fromisoformat(e["start"][:10]), False
+                if at.date() <= t.date():
+                    continue
+            else:
+                at, timed = datetime.fromisoformat(e["start"]).astimezone(TZ).replace(tzinfo=None), True
+                if at < t:
+                    continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        if best is None or at < best[0]:
+            best = (at, timed, e)
+    if not best:
+        return None
+    at, timed, e = best
+    town = e.get("town")
+    return f"📅 Next: {when_txt(at) if timed else day_txt(at.date())} {clip(e.get('title') or '?', 40)}" + \
+        (f" · {town}" if town else "")
+
+
+BACK_SOURCES = [("reminders", back_fired), ("reminders", back_upcoming), ("bills", back_bills), ("Emby", back_media),
+                ("server", back_server), ("birthdays", back_birthdays), ("calendar", back_next_event)]
+
+
+def cmd_back(arg=None):
+    win = back_window(arg)
+    if win is None:
+        return BACK_USAGE
+    since, label = win
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(len(BACK_SOURCES)) as ex:
+        futs = [(what, ex.submit(fn, since)) for what, fn in BACK_SOURCES]
+    lines, failed = [], []
+    for what, fu in futs:
+        try:
+            line = fu.result()
+        except Exception:  # Fail or a bug in one source: the rest of the card still goes out
+            if what not in failed:
+                failed.append(what)
+            continue
+        if line:
+            lines.append(clip(line, 110))
+    if len(failed) == len({w for w, _ in BACK_SOURCES}):
+        raise Fail("no data source answered")
+    out = [f"👋 Catch-up · {label}"] + (lines or ["Nothing new, nothing due soon."])
+    if failed:
+        out.append("⚠️ Not checked: " + ", ".join(failed))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- /pack
+# A short packing list for the next event within PACK_DAYS (calcache + the trip files): the private template of its
+# type (PACK_TEMPLATES) plus event lines: photo ID (the entry asks for ID / an age limit), passport + EUR (abroad),
+# toothbrush + charger (a night away), earplugs + powerbank (a train home after midnight). `pack --todo` copies it
+# into HA.
+PACK_TEMPLATES = os.path.expanduser(os.environ.get("TG_CMD_PACK_TEMPLATES") or f"{CONF}/tg-cmd/pack-templates.json")
+PACK_DAYS = 10           # /pack alone: the next typed event starting within this many days
+PACK_LINES = 10          # whole card, header included
+PACK_ORDER = ("wedding", "rave", "beach", "business")
+PACK_KEYWORDS = {        # title words per type (+ the template's own "match"; rave also matches rave-radar's artists)
+    "wedding": r"wedding|hochzeit|hochziit|heirat|trauung|mariage|matrimonio|\bgig\b|dj[- ]?set|sound ?gear",
+    "rave": r"\brave|club|techno|festival|open[- ]?air|afterhour|warehouse|boiler room",
+    "beach": r"beach|strand|ferien|holiday|vacation|urlaub|vacances|\binsel|island",
+    "business": r"visit|besuch|meeting|customer|kunde|client|conference|konferenz|workshop|summit|expo|messe|"
+                r"offsite|onsite|business|dienstreise",       # counts only abroad
+}
+PACK_ALIASES = {"club": "rave", "techno": "rave", "party": "rave", "gig": "wedding", "hochzeit": "wedding",
+                "dj": "wedding", "work": "business", "abroad": "business", "trip": "beach", "holiday": "beach",
+                "long": "beach"}
+PACK_EXTRAS = (          # (reason, item, skipped when an item already matches)
+    ("abroad", "🛂 Passport", r"passport"),
+    ("abroad", "💶 EUR cash", r"\bEUR\b|€|\beuro"),
+    ("id", "🪪 Official photo ID", r"photo id|passport|\bID\b"),
+    ("overnight", "🪥 Toothbrush", r"toothbrush|wash ?bag|toiletr"),
+    ("overnight", "🔌 Phone charger", r"charger"),
+    ("night_train", "👂 Earplugs", r"earplug"),
+    ("night_train", "🔋 Powerbank", r"power ?bank"),
+)
+PACK_FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
+PACK_HOME_FLAGS = {"\U0001F1E8\U0001F1ED"}
+PACK_ID_RE = re.compile(r"(?<![\d+])(?:18|16|21)\s*\+|\bID\b")   # title fallback for caches without id_check
+
+
+def pack_templates():
+    d = load_json_file(PACK_TEMPLATES, None)
+    types = d.get("types") if isinstance(d, dict) else None
+    out = {str(k).lower(): v for k, v in (types or {}).items() if isinstance(v, dict) and isinstance(v.get("items"), list)}
+    if not out:
+        raise Fail("no packing templates yet")
+    return out
+
+
+def pack_artists():
+    """rave-radar's artist names + aliases (lowercase); [] when it is missing or fails."""
+    try:
+        code, out, _ = run(["rave-radar", "artists", "list", "--json"], 6, "artists", full=True)
+        rows = json.loads(out) if code == 0 else []
+    except (Fail, ValueError):
+        return []
+    names = []
+    for a in rows if isinstance(rows, list) else []:
+        if isinstance(a, dict):
+            names += [n.strip().lower() for n in [a.get("name"), *(a.get("aliases") or [])]
+                      if isinstance(n, str) and len(n.strip()) >= 3]
+    return names
+
+
+def artist_hit(text, names):
+    """An artist named in text: whole words, or close enough for a typo ("Brechja") when the name is 6+ letters."""
+    import difflib
+    low = text.lower()
+    toks = re.findall(r"[\w'&.-]+", low)
+    for n in names:
+        if re.search(r"(?<!\w)" + re.escape(n) + r"(?!\w)", low):
+            return True
+        k = len(n.split())
+        if len(n) >= 6 and any(difflib.SequenceMatcher(None, " ".join(toks[i:i + k]), n).ratio() >= 0.85
+                               for i in range(len(toks) - k + 1)):
+            return True
+    return False
+
+
+def pack_type(ctx, abroad, days, types, artists, is_trip=False):
+    for k in PACK_ORDER + tuple(t for t in types if t not in PACK_ORDER):
+        if k not in types or (k == "business" and not abroad):
+            continue
+        pats = [PACK_KEYWORDS.get(k)] + [re.escape(m) for m in types[k].get("match") or [] if isinstance(m, str) and m]
+        if any(p and re.search(p, ctx, re.I) for p in pats) or (k == "rave" and artist_hit(ctx, artists)):
+            return k
+    if (is_trip or days >= 4) and "beach" in types:
+        return "beach"
+    return "business" if abroad and "business" in types else None
+
+
+def pack_candidates(types):
+    """Upcoming events (calcache, no travel legs or @Town markers) and trips, each {name, start, type, abroad, id,
+    overnight, night_train}, soonest first."""
+    t = now()
+    code, out, _ = run(["calcache", "show", "--days", "21", "--json"], 6, "calendar", full=True)
+    if code not in (0, 3):
+        raise Fail("calendar: calcache failed")
+    evs = []
+    for e in (json.loads(out or "[]") if code == 0 else []):
+        try:
+            if e.get("all_day"):
+                s, en = datetime.fromisoformat(e["start"][:10]), datetime.fromisoformat(e["end"][:10])
+            else:
+                s = datetime.fromisoformat(e["start"]).astimezone(TZ).replace(tzinfo=None)
+                en = datetime.fromisoformat(e["end"]).astimezone(TZ).replace(tzinfo=None)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        evs.append(dict(e, s=s, e=en, title=str(e.get("title") or ""), flags=e.get("flags") or {}))
+    artists = pack_artists()
+    legs = [g for g in evs if g["flags"].get("travel")]
+    out = []
+    for e in evs:
+        f, title = e["flags"], e["title"]
+        if f.get("travel") or title.startswith("@") or e["e"] <= t:
+            continue
+        near = [g for g in legs if g["s"] < e["e"] + timedelta(hours=3) and g["e"] > e["s"] - timedelta(hours=4)]
+        ctx = " ".join([title] + [p for g in near for p in re.findall(r"\(([^)]{1,80})\)", g["title"])])
+        abroad = bool(f.get("abroad") or "✈" in title or any(g["flags"].get("travel") == "flight" for g in near)
+                      or set(PACK_FLAG_RE.findall(title)) - PACK_HOME_FLAGS)
+        night_train = any(g["flags"].get("travel") in ("train", "bus") and g["s"] >= e["s"]
+                          and g["s"].hour < 7
+                          and ((g.get("train") or {}).get("to") == "home" or re.search(r"→\s*home\b", g["title"], re.I))
+                          for g in near)
+        days = (e["e"] - e["s"]).days
+        out.append({"name": title, "ctx": ctx, "start": e["s"], "end": e["e"], "all_day": bool(e.get("all_day")),
+                    "type": pack_type(ctx, abroad, days, types, artists), "abroad": abroad,
+                    "id": bool(f.get("id_check") or PACK_ID_RE.search(title)), "night_train": night_train,
+                    "overnight": bool(days >= 2 or (f.get("away_overnight") and not night_train))})
+    for tr in load_trips():
+        if not tr["from"] or tr["to"] < t.date():
+            continue
+        same = [c for c in out if c["start"].date() <= tr["to"] and c["end"].date() >= tr["from"]]
+        txt = " ".join([tr["name"], tr["emoji"] or ""] + tr["legs"])
+        abroad = bool("✈" in txt or "🏝" in txt or set(PACK_FLAG_RE.findall(txt)) - PACK_HOME_FLAGS)
+        days = (tr["to"] - tr["from"]).days + 1
+        kind = pack_type(tr["name"], abroad, days, types, artists, is_trip=True)
+        if any(trip_matches(tr, c["ctx"]) or (kind and c["type"] == kind) for c in same):
+            continue                                    # the calendar event itself says more (times, legs, flags)
+        out.append({"name": tr["name"], "ctx": txt, "start": datetime.combine(tr["from"], datetime.min.time()),
+                    "end": datetime.combine(tr["to"], datetime.min.time()) + timedelta(days=1), "all_day": True,
+                    "type": kind, "abroad": abroad, "id": False, "night_train": False, "overnight": days >= 2})
+    return sorted(out, key=lambda c: c["start"])
+
+
+def pack_build(arg=None):
+    """(header, items) for the card, or (message, None) for list/usage/nothing-found answers."""
+    types = pack_templates()
+    a = (arg or "").strip()
+    low = a.lower().lstrip("/")
+    if low in ("list", "types", "help", "?"):
+        rows = [f"{(v.get('emoji') or '•')} {k} · {clip(str(v.get('label') or k), 34)} ({len(v['items'])})"
+                for k, v in types.items()]
+        return "\n".join(["🎒 Packing lists"] + rows[:PACK_LINES - 2] +
+                         ["/pack TYPE shows one · /pack = next event (10 d)"]), None
+    t = now()
+    cands = pack_candidates(types)
+    kind = PACK_ALIASES.get(low, low)
+    if not a:
+        ev = next((c for c in cands if c["type"] and c["start"] <= t + timedelta(days=PACK_DAYS)), None)
+        if not ev:
+            return f"🎒 Nothing to pack for in the next {PACK_DAYS} days.\n/pack list shows the lists · /pack TYPE shows one.", None
+        kind = ev["type"]
+    elif kind in types:
+        ev = next((c for c in cands if c["type"] == kind), None)
+    else:
+        ev = next((c for c in cands if low in c["name"].lower()), None) or \
+            next((c for c in cands if low in c["ctx"].lower()), None)
+        if not ev:
+            return f"🎒 No list or event called “{clip(a, 30)}”.\nLists: {', '.join(types)} (/pack list).", None
+        if not ev["type"]:
+            return f"🎒 {clip(ev['name'], 40)}: no list fits it.\n/pack TYPE picks one: {', '.join(types)}.", None
+        kind = ev["type"]
+    tpl = types[kind]
+    items = [x.strip() for x in tpl["items"] if isinstance(x, str) and x.strip()]
+    extra = []
+    for reason, item, pat in PACK_EXTRAS if ev else ():
+        if ev[reason] and not any(re.search(pat, x, re.I) for x in extra + items):
+            extra.append(item)
+    icon = tpl.get("emoji") or "🎒"
+    if ev:
+        d = ev["start"].date()
+        n = (d - t.date()).days
+        head = f"🎒 {icon} {clip(ev['name'], 36)} · {day_txt(d)}" + (f" (in {n} d)" if n >= 2 else "")
+    else:
+        head = f"🎒 {icon} {clip(str(tpl.get('label') or kind), 40)}"
+    return head, extra + items
+
+
+def pack_card(head, items):
+    room = PACK_LINES - 1
+    per = max(1, -(-len(items) // room))
+    return "\n".join([head] + [" · ".join(items[i:i + per]) for i in range(0, len(items), per)])
+
+
+def cmd_pack(arg=None):
+    head, items = pack_build(arg)
+    return head if items is None else pack_card(head, items)
+
+
+
+# ---------------------------------------------------------------- /sleep (healthlib: his own Health Connect days)
+def healthlib():
+    """~/bin/lib/healthlib.py (next to this script, else ~/bin/lib; TG_CMD_HEALTHLIB = a file for tests)."""
+    import importlib.util
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib", "healthlib.py")
+    path = os.environ.get("TG_CMD_HEALTHLIB") or (here if os.path.exists(here) else os.path.join(REAL_LIB, "healthlib.py"))
+    spec = importlib.util.spec_from_file_location("healthlib", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def sleep_facts():
+    H = healthlib()
+    tz, t = H.zone(), H.now()
+    rows, tags = H.load(t=t)
+    since = (date.fromtimestamp(t) - timedelta(days=40)).isoformat()
+    ins = H.insights(rows, tags, tz, t, gym=H.gym_days(since))
+    return H, tz, t, rows, ins
+
+
+def cmd_sleep():
+    H, tz, t, rows, ins = sleep_facts()
+    return "\n".join(H.card_lines(ins, tz))
+
+
+def pic_sleep():
+    H, tz, t, rows, ins = sleep_facts()
+    lines = H.card_lines(ins, tz)
+    text = "\n".join(lines)
+    if not ins.get("nights"):
+        return text, "", None
+    cap = " · ".join(lines[:2])[:200]
+
+    def render():
+        ci = cardimg()
+        bars = H.chart_rows(rows, tz, t, 14)
+        d1 = datetime.fromtimestamp(t, tz).date()
+        c = ci.Card("Sleep & energy", f"{d1 - timedelta(days=13):%d.%m}–{d1:%d.%m} · Health Connect, summarised on the phone")
+        last = ins.get("last") or {}
+        tiles = [(H.hm(last["sleep_min"]) if last.get("sleep_min") is not None else "–", "last night")]
+        if ins.get("debt7_min") is not None:
+            d = ins["debt7_min"]
+            tiles.append((H.hm(d) if abs(d) >= 15 else "0", "7-day debt" if d >= 0 else "7-day surplus",
+                          ci.WARN if d >= 180 else ci.TEXT))
+        elif ins.get("avg7_min") is not None:
+            tiles.append((H.hm(ins["avg7_min"]), "7-day avg"))
+        if ins.get("steps7") is not None:
+            tiles.append((f"{ins['steps7'] / 1000:.1f}k", "steps / day"))
+        c.stats(tiles)
+        base = ins.get("baseline_min")
+        vals = [round(h, 1) if h is not None else 0 for _, h in bars]
+        cols = [ci.FAINT if h is None else (ci.WARN if base and h * 60 < base - 60 else ci.ACCENT) for _, h in bars]
+        note = "Hours asleep per night" + (f" (usual {H.hm(base)}; amber = 1 h+ under)" if base else "")
+        c.bar_chart(vals, [lb for lb, _ in bars], height=420, colors=cols, value_fmt=lambda v: f"{v:.1f}" if v else "", note=note)
+        c.lines([x.replace("→", "›") for x in lines[2:]], size=28)   # the card font has no →
+        return c.save("sleep")
+    return text, cap, render
+
+
+COMMANDS = {
+    "bills": ("Open and upcoming bills", cmd_bills),
+    "queue": ("What's downloading (Sonarr/Radarr)", cmd_queue),
+    "space": ("Server disk space and forecast", cmd_space),
+    "reminders": ("Your upcoming reminders", cmd_reminders),
+    "home": ("Home: lights, temperatures, media, HA health", cmd_home),
+    "list": ("Your lists (shopping, todo, …)", cmd_lists),
+    "shop": ("Shopping list: what to buy where", cmd_shop),
+    "parcels": ("📦 Parcels: what's coming, pickups (/parcels picked)", cmd_parcels),
+    "gym": ("Next gym session from your plan", cmd_gym),
+    "cat": ("Cat week: litter visits, weight, feeder", cmd_cat),
+    "train": ("Next trains with live status", cmd_train),
+    "gohome": ("Way home: next 3 connections + the last tonight (/gohome stop)", cmd_gohome),
+    "rave": ("Upcoming raves and events", cmd_rave),
+    "trip": ("Next trip: dates, legs, open to-dos", cmd_trip),
+    "warranty": ("Still under warranty? (/warranty tv filters)", cmd_warranty),
+    "back": ("Catch-up after time away (/back 3 = 3 days)", cmd_back),
+    "week": ("Your week: calendar, trains, weather, late nights", cmd_week),
+    "pack": ("Packing list for the next event (/pack rave)", cmd_pack),
+    "vibe": ("4 movies from your library for a mood (/vibe cozy rainy sunday; /vibe dark crime series)", cmd_vibe),
+    "finish": ("Shows you started: closest to the end first", cmd_finish),
+    "doctor": ("Why a Seerr request isn't on Emby yet (/doctor dune)", cmd_doctor),
+    "party": ("Party lights: WLEDs follow the music (/party off restores)", cmd_party),
+    "crate": ("➕ Save the track playing on Spotify to your crate", cmd_crate),
+    "usage": ("What you use: top, unused, noisy (30 days)", cmd_usage),
+    "sleep": ("Sleep & energy: last night, sleep debt, trends", cmd_sleep),
+}
+PICTURES.update({"train": pic_train, "trip": pic_trip, "sleep": pic_sleep})
+ARGS = {"parcels", "trip", "warranty", "back", "pack", "gohome", "vibe", "party", "doctor", "gym"}   # one optional argument (the registry tool's text_arg: "/warranty tv", "/back 3")
+FALLBACK_HINT = {
+    "bills": "bills", "queue": "what's downloading",
+    "space": "how much space is left",
+    "reminders": "what reminders do I have", "home": "what's on at home", "list": "what's on my lists",
+    "shop": "what's on my shopping list", "parcels": "where are my parcels", "gym": "what's my next gym session", "cat": "how is the cat doing", "sleep": "how did I sleep",
+    "train": "are my trains on time", "gohome": "how do I get home from here", "rave": "what raves are coming up", "trip": "what's left for my next trip",
+    "warranty": "is my X still under warranty",
+    "back": "what did I miss while I was away",
+    "week": "what's my week",
+    "pack": "what do I need to pack",
+    "vibe": "a movie from my library for a cozy evening",
+    "finish": "which shows should I finish",
+    "doctor": "why isn't X on Emby yet",
+    "party": "party lights on (or off)",
+    "crate": "add the playing track to my crate",
+    "usage": "which features do I use",
+}
+
+
+def redact(text):
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import secretscan
+        return secretscan.redact(text)
+    except Exception:
+        return text
+
+
+def finish(text):
+    text = redact(text.strip())
+    if len(text) > MAX_CHARS:
+        text = text[: MAX_CHARS - 2].rstrip() + "\n…"
+    print(text)
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if len(argv) == 2 else 2
+    name, args = argv[1], argv[2:]
+    if args and (name.lstrip("/") not in ARGS or len(args) > 1):
+        what = "take one argument at most" if name.lstrip("/") in ARGS else "take no arguments"
+        print(f"tg-cmd: commands {what}; got {' '.join(argv[1:])!r}", file=sys.stderr)
+        return 2
+    if name == "--list":
+        for n, (desc, _) in COMMANDS.items():
+            print(f"/{n:<10} {desc}")
+        return 0
+    if name.lstrip("/") not in COMMANDS:
+        print(f"tg-cmd: unknown command {name!r} (known: {', '.join(COMMANDS)})", file=sys.stderr)
+        return 2
+    name = name.lstrip("/")
+    try:
+        if pictures_on() and name in PICTURES:
+            picture(name, *args)
+        else:
+            finish(COMMANDS[name][1](*args))
+        return 0
+    except Fail as e:
+        finish(f"⚠️ /{name} failed: {e}.\nAsk me in a normal message (\"{FALLBACK_HINT[name]}?\") and I'll look.")
+    except Exception as e:  # a bug here must still give the owner a sensible answer
+        finish(f"⚠️ /{name} failed ({type(e).__name__}).\nAsk me in a normal message (\"{FALLBACK_HINT[name]}?\") and I'll look.")
+    return 3
+
+
+EXIT_OUTCOME = {0: "ok", 2: "usage", 3: "fail"}   # 2 = usage hint (not a failure); 3 = the owner got a "⚠️ failed"
+
+
+def _usage_log(argv, rc, t0):
+    """One usage-store exec record per command run (`usage`: latency, outcome, caller channel, actor: owner only when
+    the plugin / voice relay / app ran it; agent = a Claude session or subagent; test = TG_CMD_TEST/USAGE_TEST set);
+    never fails."""
+    try:
+        name = argv[1].lstrip("/") if len(argv) > 1 else ""
+        if name not in COMMANDS or os.environ.get("TG_CMD_NOW") or os.environ.get("TG_CMD_BIN"):   # tests: no record
+            return
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+        import usage
+        ch = usage.caller_channel()
+        usage.log("tg." + name, "exec", channel=ch, actor=usage.caller_actor(ch), ms=(_time.time() - t0) * 1000,
+                  outcome=EXIT_OUTCOME.get(rc, "error"),
+                  attrs={"args": len(argv) > 2, "picture": bool(pictures_on() and name in PICTURES), "rc": rc})
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    import time as _time
+    _t0 = _time.time()
+    _rc = main(sys.argv)
+    _usage_log(sys.argv, _rc, _t0)
+    sys.exit(_rc)

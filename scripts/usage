@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""usage: the local usage-analytics store (token-free; nothing leaves the box). Lib: ~/bin/lib/usage.py (schema,
+privacy rules, context dimensions); analysis: `product`.
+
+  usage log FEATURE [KIND] [--channel C] [--actor A] [--ms N] [--outcome O] [--ref R] [--attr k=v]...
+        record one event into the spool (kind default invoke; values with spaces are dropped). Always exit 0.
+  usage tick [--json]        cron */2: refresh the context snapshot, fold spool + collectors, derive engagement
+  usage backfill [--json]    first run over all history + menu-usage day counts (idempotent)
+  usage ctx [--json] [--refresh]   current coarse context (time, place, motion, phone, calendar, home)
+  usage stats [--json]       rows per source and kind, last event per source, runs rows, last tick
+  usage tail [-n 20] [--feature F] [--kind K]   newest events (ids, kinds, channel, a few context dims; no text)
+  usage hook                 PostToolUse hook body (stdin = hook JSON; ~/.claude/hooks/usage-hook.sh)
+  usage _notify SRC PID [BUTTONS]   tg / tg-buttons: stdin = the Bot API response (records notify_sent)
+Env: USAGE=off (no writes), USAGE_STATE (store dir), USAGE_* source overrides (tests: ~/opt/usage-tests/run.sh).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import usage  # noqa: E402
+
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == "hook":
+        return usage.hook_main()
+    if len(argv) > 1 and argv[1] == "_notify":
+        return usage.notify_main(argv[2] if len(argv) > 2 else "tg", argv[3] if len(argv) > 3 else "",
+                                 sys.stdin.read(65536), argv[4] if len(argv) > 4 else 0)
+    if len(argv) > 1 and argv[1] == "log":
+        try:
+            p = argparse.ArgumentParser(prog="usage log")
+            p.add_argument("feature")
+            p.add_argument("kind", nargs="?", default="invoke")
+            for o in ("--channel", "--actor", "--outcome", "--ref"):
+                p.add_argument(o)
+            p.add_argument("--ms", type=float)
+            p.add_argument("--attr", action="append", default=[])
+            a = p.parse_args(argv[2:])
+            attrs = dict(x.split("=", 1) for x in a.attr if "=" in x)
+            for k, v in attrs.items():
+                attrs[k] = int(v) if v.isdigit() else {"true": True, "false": False}.get(v, v)
+            usage.log(a.feature, a.kind, a.channel, a.actor, a.ms, a.outcome, a.ref, attrs, src="cli")
+        except BaseException:
+            pass
+        return 0
+    p = argparse.ArgumentParser(prog="usage", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("cmd", choices=["tick", "backfill", "ctx", "stats", "tail"])
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("-n", type=int, default=20)
+    p.add_argument("--feature")
+    p.add_argument("--kind")
+    a = p.parse_args(argv[1:])
+    if a.cmd in ("tick", "backfill"):
+        out = usage.tick(backfill=a.cmd == "backfill")
+        bad = {k: v for k, v in out.items() if isinstance(v, str) and v.startswith("error")}
+        if a.json or a.cmd == "backfill":
+            print(json.dumps(out, indent=None if a.json else 1))
+        if bad:
+            print(f"usage {a.cmd}: " + "; ".join(f"{k}: {v}" for k, v in bad.items()), file=sys.stderr)
+            return 1
+        return 0
+    if a.cmd == "ctx":
+        if a.refresh:
+            con = usage.connect()
+            with con:
+                c = usage.refresh_ctx(con)
+            con.close()
+        else:
+            j = usage._json(usage.CTX_FILE, {}) or {}
+            c = j.get("ctx") or usage.build_ctx()
+        _, t = usage.time_ctx(time.time())
+        c = {**t, **c}
+        print(json.dumps(c, indent=1, sort_keys=True) if a.json else
+              "\n".join(f"{k:12} {v}" for k, v in sorted(c.items())))
+        return 0
+    if not os.path.exists(usage.DB):
+        print("usage: no store yet (run `usage backfill`)", file=sys.stderr)
+        return 1
+    con = usage.connect(ro=True)
+    if a.cmd == "stats":
+        st = {"events": con.execute("SELECT count(*) FROM events").fetchone()[0],
+              "by_src": {r[0]: {"n": r[1], "last": dt.datetime.fromtimestamp(r[2]).isoformat(timespec="minutes")}
+                         for r in con.execute("SELECT src, count(*), max(ts) FROM events GROUP BY src")},
+              "by_kind": dict(con.execute("SELECT kind, count(*) FROM events GROUP BY kind").fetchall()),
+              "runs_rows": con.execute("SELECT count(*), coalesce(sum(n),0) FROM runs").fetchone()[:],
+              "ctx_snapshots": con.execute("SELECT count(*) FROM ctx_log").fetchone()[0],
+              "last_tick": usage.mget(con, "last_tick"),
+              "spool_files": len([x for x in usage._ls(usage.SPOOL) if x.endswith(".jsonl")])}
+        st["runs_rows"] = list(st["runs_rows"])
+        print(json.dumps(st, indent=1))
+        return 0
+    q, args = "SELECT * FROM events WHERE 1=1", []
+    if a.feature:
+        q, args = q + " AND feature=?", args + [a.feature]
+    if a.kind:
+        q, args = q + " AND kind=?", args + [a.kind]
+    rows = con.execute(q + " ORDER BY ts DESC LIMIT ?", args + [a.n]).fetchall()
+    for r in reversed(rows):
+        c = json.loads(r["ctx"])
+        bits = [f"{k}={c[k]}" for k in ("hour_band", "zone", "trigger", "driving", "event") if k in c]
+        print(f"{dt.datetime.fromtimestamp(r['ts']).strftime('%d.%m %H:%M')} {r['feature']:28} {r['kind']:13} "
+              f"{r['channel'] or '-':9} {r['actor'] or '-':9} {r['outcome'] or '':8} {r['ms'] if r['ms'] is not None else '':>6} "
+              + " ".join(bits))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

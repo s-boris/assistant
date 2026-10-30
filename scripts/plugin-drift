@@ -1,0 +1,289 @@
+#!/usr/bin/env -S python3 -I
+"""plugin-drift [--json] [--strict] [--quiet]
+Where each ~/plugins plugin loads from, and which source changes the next restart picks up or misses.
+
+  mode     source  the running plugin's CLAUDE_PLUGIN_ROOT is its ~/plugins folder (a directory marketplace
+                   loaded in place: the working tree at session start is what runs)
+           cache   the root is ~/.claude/plugins/cache/...; source edits need a version bump +
+                   `claude plugin marketplace update` + `claude plugin update` before a restart
+           (inferred) a plugin without a process of its own (heartbeat: in-process hooks) takes the mode of
+                   a running plugin from the same marketplace
+           unknown no running plugin process found (no session up)
+  pending  source files changed since the main session started: they load at the next restart (mode source).
+           By content: each file against the repo commit deployed when the session started (the last deploy in
+           the harness's deploys.jsonl before it; a deploy rewrites every file, so file times say nothing). A
+           session older than the repo's plugins/ falls back to file times (said in the line).
+  dirty    live files in ~/plugins that are not as on the harness repo's main (plugins/<name>/ in ~/opt/assistant,
+           deployed byte for byte): edited live, live only (not ignored there) or missing live. They load too
+           (the live folder is used), and the next deploy refuses an edited file until it is in the repo.
+  cache    files that differ between the source and the installed cache copy (installed_plugins.json installPath)
+Exit: 0 fine; 1 drift that the next restart would miss (mode cache or unknown with cache drift; --strict: any
+cache drift); 2 usage/setup error. Only file names and line counts are printed, never contents; .env files,
+node_modules, .git and __pycache__ are skipped.
+Env (tests): PLUGIN_DRIFT_SRC (~/plugins), PLUGIN_DRIFT_REPO (~/opt/assistant: plugins/ on its main),
+PLUGIN_DRIFT_DEPLOYS (~/.local/state/assistant/deploys.jsonl),
+PLUGIN_DRIFT_INSTALLED (~/.claude/plugins/installed_plugins.json),
+PLUGIN_DRIFT_ROOTS ("name=/root,..." instead of scanning /proc; "none" = no process),
+PLUGIN_DRIFT_SINCE (epoch seconds instead of the main session's start; 0 = skip pending).
+"""
+import filecmp, json, os, subprocess, sys, time
+
+HOME = os.path.expanduser('~')
+SRC = os.environ.get('PLUGIN_DRIFT_SRC', os.path.join(HOME, 'plugins'))
+REPO = os.environ.get('PLUGIN_DRIFT_REPO', os.path.join(HOME, 'opt/assistant'))
+DEPLOYS = os.environ.get('PLUGIN_DRIFT_DEPLOYS', os.path.join(HOME, '.local/state/assistant/deploys.jsonl'))
+INSTALLED = os.environ.get('PLUGIN_DRIFT_INSTALLED', os.path.join(HOME, '.claude/plugins/installed_plugins.json'))
+SKIP_DIRS = {'node_modules', '.git', '__pycache__'}
+
+
+def skip_file(name):
+    return name == '.env' or name.startswith('.env.') or name.endswith('.pyc')
+
+
+def walk(root):
+    out = {}
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+        for f in files:
+            if not skip_file(f):
+                p = os.path.join(d, f)
+                out[os.path.relpath(p, root)] = p
+    return out
+
+
+def proc_roots():
+    """CLAUDE_PLUGIN_ROOT of every readable process -> set of roots."""
+    roots = set()
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f'/proc/{pid}/environ', 'rb') as fh:
+                env = fh.read().split(b'\0')
+        except OSError:
+            continue
+        for kv in env:
+            if kv.startswith(b'CLAUDE_PLUGIN_ROOT='):
+                roots.add(os.path.realpath(kv.split(b'=', 1)[1].decode(errors='replace')))
+    return roots
+
+
+def session_start():
+    """Start time (epoch) of the main session: the oldest `claude ... --channels` process."""
+    try:
+        btime = next(int(l.split()[1]) for l in open('/proc/stat') if l.startswith('btime'))
+        hz = os.sysconf('SC_CLK_TCK')
+    except (OSError, StopIteration, ValueError):
+        return None
+    best = None
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        try:
+            argv = open(f'/proc/{pid}/cmdline', 'rb').read().split(b'\0')
+            if not argv or os.path.basename(argv[0]) != b'claude' or b'--channels' not in argv:
+                continue
+            stat = open(f'/proc/{pid}/stat').read()
+            start = btime + int(stat.rsplit(')', 1)[1].split()[19]) / hz
+        except (OSError, IndexError, ValueError):
+            continue
+        best = start if best is None else min(best, start)
+    return best
+
+
+def numstat(a, b):
+    try:
+        la = open(a, 'rb').read().decode(errors='replace').splitlines()
+        lb = open(b, 'rb').read().decode(errors='replace').splitlines()
+    except OSError:
+        return ''
+    import difflib
+    add = rem = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, la, lb, autojunk=False).get_opcodes():
+        if tag != 'equal':
+            rem += i2 - i1
+            add += j2 - j1
+    return f'+{add} -{rem}'
+
+
+def version(root):
+    try:
+        return json.load(open(os.path.join(root, '.claude-plugin/plugin.json'))).get('version', '?')
+    except (OSError, ValueError):
+        return '?'
+
+
+def git(*args, inp=None):
+    try:
+        r = subprocess.run(['git', '-C', REPO, *args], input=inp, capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r
+
+
+def tree_blobs(ref, sub):
+    """{file: blob id} of plugins/<sub>/ at ref in the repo; None = no such folder there (or unreadable)."""
+    pre = f'plugins/{sub}/'
+    r = git('ls-tree', '-r', '-z', ref, '--', pre)
+    if r is None or r.returncode != 0:
+        return None
+    out = {}
+    for e in r.stdout.split(b'\0'):
+        if b'\t' in e:
+            meta, path = e.split(b'\t', 1)
+            rel = path.decode(errors='replace')[len(pre):]
+            if not any(part in SKIP_DIRS for part in rel.split('/')) and not skip_file(os.path.basename(rel)):
+                out[rel] = meta.split()[2].decode()
+    return out or None
+
+
+def blob_ids(live, names):
+    """{file: blob id} of these live files as the repo would store them; None = git failed."""
+    if not names:
+        return {}
+    h = git('hash-object', '--no-filters', '--stdin-paths', inp=''.join(live[f] + '\n' for f in names).encode())
+    ids = h.stdout.decode().split() if h is not None and h.returncode == 0 else []
+    return dict(zip(names, ids)) if len(ids) == len(names) else None
+
+
+def ignored(sub, names):
+    """The names the repo's .gitignore files ignore under plugins/<sub>/; None = git failed."""
+    if not names:
+        return set()
+    pre = f'plugins/{sub}/'
+    c = git('check-ignore', '--no-index', '-z', '--stdin', inp=''.join(pre + f + '\0' for f in names).encode())
+    if c is None or c.returncode not in (0, 1):
+        return None
+    return {p.decode(errors='replace')[len(pre):] for p in c.stdout.split(b'\0') if p}
+
+
+def dirty(sub, live, ids):
+    """Live files of plugin folder sub that are not as on the repo's main (plugins/<sub>/): edited live, live
+    only (and not ignored by the repo's .gitignore files) or missing live. None = no such folder on main (or the
+    repo can't be read)."""
+    repo = tree_blobs('main', sub)
+    if repo is None or ids is None:
+        return None
+    out = [f'{f} (missing live)' for f in sorted(set(repo) - set(live))]
+    out += [f'{f} (edited live)' for f in sorted(set(live) & set(repo)) if ids.get(f) != repo[f]]
+    only = sorted(set(live) - set(repo))
+    ign = ignored(sub, only)
+    if ign is None:
+        return None
+    return sorted(out + [f'{f} (live only)' for f in only if f not in ign])
+
+
+def session_sha(since):
+    """The repo commit deployed when the session started: the last ok deploy at or before since (None: none)."""
+    best = None
+    try:
+        with open(DEPLOYS, encoding='utf-8') as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                    ts = float(d.get('ts') or 0)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if d.get('ok') and d.get('sha') and ts <= since and (best is None or ts >= best[0]):
+                    best = (ts, str(d['sha']))
+    except OSError:
+        return None
+    return best[1] if best else None
+
+
+def pending(sub, live, ids, since):
+    """(files the next restart loads that differ from what the session loaded, 'repo' | 'time')."""
+    if not since:
+        return [], 'repo'
+    sha = session_sha(since)
+    base = tree_blobs(sha, sub) if sha else None
+    if base is None or ids is None:   # the session predates the repo's plugins/ (or no record): file times
+        return sorted(f for f, path in live.items() if os.path.getmtime(path) > since), 'time'
+    changed = sorted(f for f in live if ids.get(f) != base.get(f))
+    ign = ignored(sub, [f for f in changed if f not in base]) or set()
+    return [f for f in changed if f not in ign], 'repo'
+
+
+def main(argv):
+    as_json, strict, quiet = '--json' in argv, '--strict' in argv, '--quiet' in argv
+    bad = [a for a in argv if a not in ('--json', '--strict', '--quiet')]
+    if bad:
+        print(__doc__.strip(), file=sys.stderr if bad != ['--help'] and bad != ['-h'] else sys.stdout)
+        return 0 if bad in (['--help'], ['-h']) else 2
+    try:
+        market = json.load(open(os.path.join(SRC, '.claude-plugin/marketplace.json')))
+        installed = json.load(open(INSTALLED)).get('plugins', {})
+    except (OSError, ValueError) as e:
+        print(f'plugin-drift: cannot read marketplace or installed list: {e.__class__.__name__}', file=sys.stderr)
+        return 2
+    mname = market.get('name', '')
+    env_roots = os.environ.get('PLUGIN_DRIFT_ROOTS')
+    if env_roots is not None:
+        roots = set() if env_roots in ('', 'none') else {os.path.realpath(x.split('=', 1)[-1]) for x in env_roots.split(',')}
+    else:
+        roots = proc_roots()
+    since_env = os.environ.get('PLUGIN_DRIFT_SINCE')
+    since = (float(since_env) or None) if since_env is not None else session_start()
+
+    rows = []
+    for p in market.get('plugins', []):
+        name, rel = p.get('name'), p.get('source', '')
+        if not isinstance(rel, str):
+            continue
+        src = os.path.realpath(os.path.join(SRC, rel))
+        inst = (installed.get(f'{name}@{mname}') or [{}])[0]
+        cache = inst.get('installPath') or ''
+        mode = 'source' if src in roots else 'cache' if cache and os.path.realpath(cache) in roots else None
+        sfiles, cfiles = walk(src), (walk(cache) if cache and os.path.isdir(cache) else {})
+        drift = []
+        for f in sorted(set(sfiles) | set(cfiles)):
+            if f not in cfiles:
+                drift.append((f, 'only in source'))
+            elif f not in sfiles:
+                drift.append((f, 'only in cache'))
+            elif not filecmp.cmp(sfiles[f], cfiles[f], shallow=False):
+                drift.append((f, numstat(cfiles[f], sfiles[f])))
+        sub = rel.lstrip('./') or rel
+        ids = blob_ids(sfiles, sorted(sfiles))
+        pend, how = pending(sub, sfiles, ids, since)
+        rows.append({'plugin': name, 'mode': mode, 'inferred': False, 'source': src, 'cache': cache,
+                     'src_version': version(src), 'cache_version': inst.get('version', '?'),
+                     'cache_drift': drift, 'pending': pend, 'pending_by': how, 'dirty': dirty(sub, sfiles, ids)})
+    known = {r['mode'] for r in rows if r['mode']}
+    for r in rows:
+        if r['mode'] is None and len(known) == 1:
+            r['mode'], r['inferred'] = next(iter(known)), True
+        r['mode'] = r['mode'] or 'unknown'
+        r['problem'] = bool(r['cache_drift']) and (strict or r['mode'] in ('cache', 'unknown'))
+
+    if as_json:
+        print(json.dumps({'session_start': since, 'plugins': rows}, indent=2))
+    else:
+        if since and not quiet:
+            print('session started ' + time.strftime('%d.%m %H:%M', time.localtime(since)))
+        for r in rows:
+            if quiet and not r['problem']:
+                continue
+            how = r['mode'] + (' (inferred)' if r['inferred'] else '')
+            print(f"{r['plugin']}: loads from {how}; source {r['src_version']}, cache {r['cache_version']}")
+            if r['pending']:
+                by = ', by file time: the session predates the repo\'s plugins/' if r['pending_by'] == 'time' else ''
+                print(f"  pending at next restart ({len(r['pending'])}{by}): " + ', '.join(r['pending'][:12])
+                      + (' …' if len(r['pending']) > 12 else ''))
+            if r['dirty'] is None:
+                print(f'  not compared with the repo: no plugins/ folder for it on the main of {REPO}, or unreadable')
+            elif r['dirty']:
+                print(f"  not as on the repo's main ({len(r['dirty'])}): " + ', '.join(r['dirty'][:12]))
+            if r['cache_drift']:
+                tag = 'DRIFT, next restart misses these' if r['problem'] and r['mode'] != 'source' else 'cache copy stale (unused while loading from source)'
+                print(f"  {tag} ({len(r['cache_drift'])}):")
+                for f, s in r['cache_drift'][:30]:
+                    print(f'    {f}  {s}')
+                if r['mode'] != 'source':
+                    print('  fix: bump .claude-plugin/plugin.json version, commit, then '
+                          f"`claude plugin marketplace update {mname} && claude plugin update {r['plugin']}@{mname}`, restart")
+    return 1 if any(r['problem'] for r in rows) else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

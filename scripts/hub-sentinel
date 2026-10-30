@@ -1,0 +1,322 @@
+#!/usr/local/bin/python3.13 -I
+"""hub-sentinel: tells him and the brain when the hub is down, from ONE cron line.
+
+  hub-sentinel check [--now EPOCH]   one probe of the hub's /health (cron: every minute)
+  hub-sentinel status [--json]       state: up / down since, alerted, last probe
+  hub-sentinel run-job NAME --slot S (internal) one critical registry job from here (the jobs fallback)
+
+A probe fails on no answer, a non-200 or a body that is not JSON (5 s). Once the hub has failed for >= 3 minutes
+(--after S) it sends ONE app push (default `tool call phone.push` through claude-hub-phone, level info: his quiet
+hours hold it) and writes ONE note
+~/inbox/hub-sentinel-<epoch>.md for the brain's next beat. While it stays down: nothing more. The first good probe
+after an alert sends one "back" line and appends "Recovered" to the note; a blip shorter than --after stays silent.
+Reminders: while the hub counts as down (the same >= --after rule), every check also runs `remind hub fallback`
+(~/bin/remind): the due pass from here (trigger sentinel), since the hub's timers and sweep wait for the hub
+(reminders are hub-only; there is no other mode). The store's lock
+and journal send each slot once, so a timer woken when the hub is back finds its slot gone. The pass runs outside
+the probe's lock under its own (fallback.lock; one at a time, a busy one is skipped), so a ringing --call reminder
+never holds up the next probe; its counts go to fallback.json and the Recovered line.
+Critical jobs: while the hub counts as down, every check also starts the registry jobs the hub runs
+(runs_on "hub") in group "critical" (home autopilot, home-ctx feed, Emby watch, agent watch) whose cron fires in this
+minute, detached, each slot once (jobs.json: the last slot per job), exactly as the hub's workflow.job runs them
+(core.watchjobs.run_live; usage src "sentinel"). Minute-level hub schedules never catch up, so a slot run from here
+is not run again when the hub is back. Off alone: ~/.config/assistant/hub-sentinel-jobs-off.
+Never a hub dependency: no hub calls besides /health, no events emit (the ledger may be the thing that is down).
+Switch: ~/.config/assistant/hub-sentinel-off (the reminder fallback too). State: ~/.local/state/hub-sentinel/
+state.json + fallback.json (0600).
+Env: HUB_URL (core.hub's default otherwise) · HUB_SENTINEL_PUSH = the push command prefix (tests; JSON appended) ·
+HUB_SENTINEL_REMIND = the remind command (tests; `hub fallback` appended) · HUB_SENTINEL_JOBS_SPAWN=inline (tests: run
+the jobs in the check itself) · ASSISTANT_SCHEDULES = the registry (tests).
+Exit: 0 ok (also when down: cron stays quiet) · 2 usage.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _r in (os.environ.get("ASSISTANT_LIB", ""), os.path.join(_here, "lib"), os.path.join(_here, "..")):
+    if _r and os.path.isfile(os.path.join(_r, "core", "__init__.py")):
+        sys.path.insert(0, os.path.abspath(_r))
+        break
+
+import argparse  # noqa: E402
+import json  # noqa: E402
+import shlex  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from core import http as corehttp  # noqa: E402
+from core import jsonstate, locks  # noqa: E402
+from core import notes as notes  # noqa: E402
+
+AFTER = 180
+FALLBACK_TIMEOUT = 290  # a due pass may ring a --call reminder (<= 150 s) and send texts (30 s each) first
+
+
+def home() -> Path:
+    return Path(os.path.expanduser("~"))
+
+
+def sdir() -> Path:
+    return home() / ".local" / "state" / "hub-sentinel"
+
+
+def hub_url() -> str:
+    u = os.environ.get("HUB_URL", "").rstrip("/")
+    if u:
+        return u
+    from core import hub
+
+    return hub.url().rstrip("/")
+
+
+def probe() -> tuple[bool, str]:
+    try:
+        with corehttp.open(hub_url() + "/health", timeout=5) as r:
+            code = getattr(r, "status", 200)
+            body = r.read(1 << 16)
+        json.loads(body or b"null")
+        return code == 200, f"http {code}"
+    except ValueError:
+        return False, "not json"
+    except Exception as e:  # noqa: BLE001 (any failure to answer is "down")
+        return False, type(getattr(e, "reason", e)).__name__
+
+
+def push(title: str, body: str) -> int:
+    msg = json.dumps({"level": "info", "title": title, "body": body, "tag": "hub-sentinel"})
+    pre = os.environ.get("HUB_SENTINEL_PUSH")
+    argv = shlex.split(pre) if pre else [str(home() / "bin" / "tool"), "call", "phone.push"]
+    try:
+        return subprocess.run([*argv, msg], capture_output=True, timeout=60, check=False).returncode
+    except (OSError, subprocess.SubprocessError):
+        return 127
+
+
+def hm(t: float) -> str:
+    return time.strftime("%H:%M", time.localtime(t))
+
+
+def fb_load(down_since: int) -> dict:
+    """This outage's fallback counts (a file left from an earlier outage counts as none)."""
+    d = jsonstate.load(sdir() / "fallback.json", {}) or {}
+    return d if isinstance(d, dict) and d.get("down_since") == down_since else {}
+
+
+def fallback(now: float, down_since: int) -> None:
+    """`remind hub fallback` once (the due pass from here), outside the probe's lock."""
+    fd = locks.acquire(sdir() / "fallback.lock", wait=0)
+    if fd is None:
+        return  # the previous minute's pass still runs (a call ringing): never two at once
+    try:
+        pre = os.environ.get("HUB_SENTINEL_REMIND")
+        argv = shlex.split(pre) if pre else [str(home() / "bin" / "remind")]
+        out: dict = {}
+        try:
+            r = subprocess.run([*argv, "hub", "fallback"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                               timeout=FALLBACK_TIMEOUT, check=False)  # fmt: skip
+            rc = r.returncode
+            try:
+                out = json.loads((r.stdout.strip().splitlines() or ["{}"])[-1])
+            except ValueError:
+                out = {}
+        except subprocess.TimeoutExpired:
+            rc = 124
+        except OSError:
+            rc = 127
+        out = out if isinstance(out, dict) else {}
+        ran = bool(out.get("ran"))
+        d = fb_load(down_since)
+        d.update(down_since=down_since, t=int(now), rc=rc, mode=out.get("mode"), runs=d.get("runs", 0) + ran,
+                 sent=d.get("sent", 0) + (int(out.get("sent") or 0) if ran else 0))  # fmt: skip
+        jsonstate.save(sdir() / "fallback.json", d, mode=0o600)
+    finally:
+        locks.release(fd)
+
+
+JOBS_GROUP = "critical"  # the registry group whose hub-run jobs the sentinel runs while the hub is down
+
+
+def critical_jobs() -> list[tuple[str, str]]:
+    """[(name, cron)]: the registry jobs the hub runs (runs_on hub) in group critical that a schedule can run."""
+    from core import schedules
+
+    reg = schedules.load()
+    return [(e.name, e.cron) for e in reg.jobs.values()
+            if e.runs_on == "hub" and e.group == JOBS_GROUP and not e.movable()]  # fmt: skip
+
+
+def installed(name: str) -> bool:
+    """The job's program is here (an absolute path that exists, or a bare command such as timeout): a job whose
+    script is missing would only fail from here too, so the fallback leaves it to the hub's run and its job.failed."""
+    from core import watchjobs
+
+    a0 = watchjobs.argv(watchjobs.runnable(name), str(home()))[0]
+    return not os.path.isabs(a0) or os.path.exists(a0)
+
+
+def jobs_load() -> dict:
+    d = jsonstate.load(sdir() / "jobs.json", {}) or {}
+    return d if isinstance(d, dict) else {}
+
+
+def jobs_fallback(now: float, down_since: int) -> list[str]:
+    """The critical hub jobs due in this minute, started from here (detached), each slot once. -> names started."""
+    if (home() / ".config" / "assistant" / "hub-sentinel-jobs-off").exists():
+        return []
+    try:
+        from zoneinfo import ZoneInfo
+
+        from core import watchjobs
+
+        tz = ZoneInfo(watchjobs.local_tz())
+        slot = int(now // 60 * 60)
+        due = [n for n, c in critical_jobs() if watchjobs.cron_match(c, slot, tz) and installed(n)]
+    except Exception:  # noqa: BLE001  (an unreadable registry or zone: nothing runs; the probe stays the job)
+        return []
+    if not due:
+        return []
+    fd = locks.acquire(sdir() / "jobs.lock", wait=5)
+    if fd is None:
+        return []  # a slot is skipped, never run twice
+    try:
+        d = jobs_load()
+        last = d.get("last") if isinstance(d.get("last"), dict) else {}
+        mine = [n for n in due if int(last.get(n) or 0) < slot]
+        if mine:
+            last.update({n: slot for n in mine})
+            runs = d.get("runs", 0) if d.get("down_since") == down_since else 0
+            jsonstate.save(sdir() / "jobs.json", {"last": last, "down_since": down_since, "runs": runs + len(mine),
+                                                   "t": int(now)}, mode=0o600)  # fmt: skip
+    finally:
+        locks.release(fd)
+    for n in mine:
+        if os.environ.get("HUB_SENTINEL_JOBS_SPAWN") == "inline":
+            run_job(n, slot)
+            continue
+        try:
+            subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "run-job", n, "--slot", str(slot)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, cwd=str(home()))  # fmt: skip
+        except OSError:
+            pass
+    return mine
+
+
+def run_job(name: str, slot: int) -> int:
+    from core import watchjobs
+
+    if name not in {n for n, _c in critical_jobs()}:
+        return 2  # only what the jobs fallback may run
+    return watchjobs.run_live(name, str(home()), src="sentinel", extra_env={"HUB_SENTINEL_SLOT": str(slot)})
+
+
+def check(now: float, after: int) -> int:
+    if (home() / ".config" / "assistant" / "hub-sentinel-off").exists():
+        return 0
+    sdir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = locks.acquire(sdir() / "check.lock", wait=0)
+    if fd is None:
+        return 0
+    down_for = None  # the outage start, when the hub counts as down after this probe (the reminder fallback runs)
+    try:
+        p = sdir() / "state.json"
+        st = jsonstate.load(p, {}) or {}
+        ok, why = probe()
+        st.update(last_probe=int(now), last=why)
+        if ok:
+            if st.get("alerted"):
+                mins = max(1, round((now - st["down_since"]) / 60))
+                rc = push("Hub back", f"after {mins} min")
+                fb = fb_load(st["down_since"])
+                rem = f" Reminders: {fb['runs']} due pass(es) from here, {fb['sent']} sent." if fb.get("runs") else ""
+                jb = jobs_load()
+                if jb.get("down_since") == st["down_since"] and jb.get("runs"):
+                    rem += f" Critical jobs: {jb['runs']} run(s) from here."
+                note = home() / "inbox" / str(st.get("note") or "")
+                if st.get("note") and note.exists():
+                    with open(note, "a", encoding="utf-8") as f:
+                        f.write(f"\nRecovered {hm(now)} after {mins} min (push exit {rc}).{rem}\n")
+            for k in ("down_since", "alerted", "note", "push_rc"):
+                st.pop(k, None)
+            st["up_since"] = st.get("up_since") or int(now)
+        else:
+            st.pop("up_since", None)
+            st.setdefault("down_since", int(now))
+            if not st.get("alerted") and now - st["down_since"] >= after:
+                mins = round((now - st["down_since"]) / 60)
+                st["push_rc"] = push("Hub down", f"since {hm(st['down_since'])} ({mins} min): schedules, reminders"
+                                     " and Telegram may wait; I'm on it")  # fmt: skip
+                text = notes.compose(
+                    f"hub down since {hm(st['down_since'])} (sentinel)",
+                    [f"claude-hub's /health has failed for {mins} min (last: {why}). App push sent (exit"
+                     f" {st['push_rc']}). Hub schedules, timers and the Telegram adapter wait while it is down.",
+                     "Reminders: while it stays down the sentinel runs `remind hub fallback` each minute"
+                     " (the due pass from here).",
+                     "Critical jobs (home autopilot, home-ctx, Emby watch, agent watch): the sentinel runs them from"
+                     " here at their minutes while it stays down (`hub-sentinel status`).",
+                     "The sentinel appends \"Recovered\" here when /health answers again."],
+                    "hub status; hub health --json; server.docker for claude-hub*; fix or tell him",
+                    source="hub-sentinel",
+                )  # fmt: skip
+                try:
+                    st["note"] = notes.write_new(home() / "inbox", "hub-sentinel", text).name
+                except OSError:
+                    st["note"] = ""
+                st["alerted"] = int(now)
+            if now - st["down_since"] >= after:
+                down_for = int(st["down_since"])
+        jsonstate.save(p, st, mode=0o600)
+    finally:
+        locks.release(fd)
+    if down_for is not None:
+        jobs_fallback(now, down_for)  # quick (detached starts) before the reminder pass, which may ring a call
+        fallback(now, down_for)
+    return 0
+
+
+def status(as_json: bool) -> int:
+    st = jsonstate.load(sdir() / "state.json", {}) or {}
+    fb = fb_load(st["down_since"]) if st.get("down_since") else {}
+    if as_json:
+        print(json.dumps({**st, **({"fallback": fb} if fb else {})}, sort_keys=True))
+        return 0
+    if st.get("down_since"):
+        rem = ""
+        if fb:
+            rem = f" · reminders: {fb.get('runs', 0)} due pass(es), {fb.get('sent', 0)} sent ({fb.get('mode')})"
+        jb = jobs_load()
+        if jb.get("down_since") == st["down_since"] and jb.get("runs"):
+            rem += f" · critical jobs: {jb['runs']} run(s) from here"
+        print(
+            f"hub: DOWN since {hm(st['down_since'])} · alerted {'yes' if st.get('alerted') else 'no'} · last {st.get('last')}"  # noqa: E501
+            + rem
+        )
+    else:
+        print(f"hub: up · last probe {hm(st['last_probe']) if st.get('last_probe') else '-'} ({st.get('last', '-')})")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="hub-sentinel", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check")
+    c.add_argument("--now", type=float)
+    c.add_argument("--after", type=int, default=AFTER)
+    c.add_argument("--cron", action="store_true")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    r = sub.add_parser("run-job")
+    r.add_argument("name")
+    r.add_argument("--slot", type=int, required=True)
+    a = ap.parse_args(argv)
+    if a.cmd == "run-job":
+        return run_job(a.name, a.slot)
+    if a.cmd == "check":
+        return check(a.now if a.now is not None else time.time(), max(60, a.after))
+    return status(a.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

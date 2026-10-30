@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.share.json",
+  "title": "his content, shared on purpose (frame without files, or POST /v1/share meta part with file parts). Paperwork never comes here (vault bot)",
+  "type": "object",
+  "properties": {
+    "share_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,64}$"
+    },
+    "kind": {
+      "enum": [
+        "link",
+        "youtube",
+        "text",
+        "image",
+        "pdf",
+        "audio",
+        "video",
+        "file"
+      ]
+    },
+    "intent": {
+      "enum": [
+        "summary",
+        "save",
+        "what",
+        "fish",
+        "trackid",
+        "dance",
+        "file"
+      ]
+    },
+    "url": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 2048,
+      "pattern": "^https?://"
+    },
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 20000
+    },
+    "files": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "mime": {
+            "type": "string",
+            "pattern": "^[a-z0-9.+-]+/[A-Za-z0-9.+*-]+$"
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "mime"
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "share_id",
+    "kind",
+    "intent"
+  ]
+}

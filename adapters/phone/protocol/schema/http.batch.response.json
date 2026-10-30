@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.batch.response.json",
+  "title": "batch result: accepted + duplicates (idempotent by id); any invalid item -> 422 for the whole batch",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "accepted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dup": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "accepted",
+    "dup"
+  ]
+}

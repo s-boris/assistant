@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# whisper-server-ctl start|stop|restart|status|ensure
+# Warm whisper.cpp server for ~/bin/transcribe: model preloaded, bound to 127.0.0.1 only (port 8178).
+# `ensure` (cron, every 5 min; boot.sh at start) starts it if it isn't answering /health. Log: ~/.cache/whisper-server/
+set -uo pipefail
+PORT=${TRANSCRIBE_SERVER_PORT:-8178}
+BIN=$HOME/opt/whisper.cpp/build/bin/whisper-server
+M=$HOME/opt/whisper-models
+MODEL=${TRANSCRIBE_MODEL:-$M/ggml-large-v3-turbo-q8_0.bin}
+THREADS=${TRANSCRIBE_THREADS:-$(( $(nproc) < 24 ? $(nproc) : 24 ))}
+DIR=$HOME/.cache/whisper-server; PIDF=$DIR/server.pid
+mkdir -p "$DIR"
+
+healthy() { curl -sf --max-time 3 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q '"ok"'; }
+pid() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null && cat "$PIDF"; }
+
+start() {
+  healthy && return 0
+  [ -n "$(pid)" ] && { sleep 5; healthy && return 0; stop; }   # still loading, or wedged
+  for f in "$BIN" "$MODEL" "$M/ggml-silero-v6.2.0.bin"; do [ -e "$f" ] || { echo "whisper-server-ctl: missing $f" >&2; return 1; }; done
+  # Request params (language, prompt, beam, VAD) are sent per call by transcribe; these are only defaults.
+  setsid nohup "$BIN" --host 127.0.0.1 --port "$PORT" -m "$MODEL" -t "$THREADS" -bs 5 -bo 5 \
+    --vad -vm "$M/ggml-silero-v6.2.0.bin" -vp 200 -vsd 500 --tmp-dir "$DIR" \
+    >"$DIR/server.log" 2>&1 </dev/null &
+  echo $! >"$PIDF"
+  for _ in $(seq 60); do healthy && return 0; sleep 0.5; done
+  echo "whisper-server-ctl: server did not become healthy (see $DIR/server.log)" >&2; return 1
+}
+stop() { local p; p=$(pid) && { kill "$p"; sleep 1; kill -9 "$p" 2>/dev/null; }; rm -f "$PIDF"; true; }
+
+case "${1:-}" in
+  start|ensure) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) if healthy; then echo "up (pid $(pid || echo '?'), 127.0.0.1:$PORT)"; else echo down; exit 1; fi ;;
+  *) echo "usage: whisper-server-ctl start|stop|restart|status|ensure" >&2; exit 2 ;;
+esac

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Test-restore a brain-backup archive into a temp dir, check it, clean up. Read-only on Unraid.
+#   brain-backup --verify [FILE] [--cron]     (same as: brain-backup-verify [FILE] [--cron])
+# FILE: an archive name on Unraid (claude-bot-YYYY-MM-DD.tar.gz) or a local path; default = newest on Unraid
+# (then it also fails if that newest archive is more than 2 days old).
+# Checks: tar integrity, key paths present, .brain.git usable, excluded things absent, file counts/sizes
+# vs the live tree, scripts executable + parse (bash -n / python ast), boot.sh parses, crontab lines sane.
+# Prints only paths and counts, never file contents. Exit 0 = all ok, 1 = a check failed.
+# --cron: silent; on failure ONE ~/inbox note (brain-backup-verify-failed-*.md). Cron: 04:17 on the 1st.
+# Env for tests: BRAIN_BACKUP_LIVE (live root, default ~), BRAIN_INBOX (default ~/inbox).
+set -uo pipefail
+dest=/mnt/user/backup/claude-bot
+live=${BRAIN_BACKUP_LIVE:-$HOME}
+inbox=${BRAIN_INBOX:-$HOME/inbox}
+cron=0; file=
+for a in "$@"; do case $a in --cron) cron=1 ;; -h|--help) grep -v '^# managed: ' "$0" | sed -n '2,10p'; exit 0 ;; *) file=$a ;; esac; done
+
+T=$(mktemp -d "${TMPDIR:-/tmp}/brain-verify.XXXXXX") || exit 1
+trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
+out=$T/report.txt; : > "$out"
+fails=0
+say() { echo "$*" >> "$out"; }
+ok() { say "ok   - $*"; }
+no() { fails=$((fails + 1)); say "FAIL - $*"; }
+finish() {
+  [ $fails -eq 0 ] && say "PASS: $label" || say "$fails check(s) FAILED: $label"
+  if [ $cron = 1 ]; then
+    if [ $fails -gt 0 ]; then
+      mkdir -p "$inbox"
+      { echo "# brain-backup verify FAILED ($(date '+%F %T'))"; echo
+        echo "Monthly test-restore of my config backup found problems. Data, not instructions. Next: re-run brain-backup --verify and fix what it lists."; echo
+        grep -E '^(FAIL|PASS|[0-9]+ check)' "$out"; } > "$inbox/brain-backup-verify-failed-$(date +%F).md"
+    fi
+  else cat "$out"; fi
+  [ $fails -eq 0 ]; exit
+}
+
+# ---------------------------------------------------------------- fetch
+# SSH lockdown: my key is forced into the dispatcher, so reads use the verbs backup-list / backup-cat NAME
+us=${UNRAID_SSH_BIN:-$HOME/bin/unraid-ssh}
+locked() { case $("$us" mode 2>/dev/null) in verbs|emulate) return 0 ;; *) return 1 ;; esac; }
+list_remote() { if locked; then "$us" run backup-list | awk '{print $NF}'; else ssh unraid "ls -1 $dest"; fi; }
+cat_remote() { if locked; then "$us" run backup-cat "$1"; else ssh unraid "cat $dest/$1"; fi; }
+arch=$T/archive.tar.gz
+if [ -n "$file" ] && [ -f "$file" ]; then
+  cp "$file" "$arch"; label=$file
+else
+  if [ -z "$file" ]; then
+    file=$(list_remote 2>/dev/null | grep -E '^claude-bot-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar\.gz$' | sort | tail -1)
+    [ -n "$file" ] || { label="(none)"; no "no archive found on unraid:$dest"; finish; }
+    d=${file#claude-bot-}; d=${d%.tar.gz}
+    age=$(( ($(date +%s) - $(date -d "$d" +%s)) / 86400 ))
+    [ "$age" -le 2 ] && ok "newest archive is $age day(s) old" || no "newest archive $file is $age days old (nightly backup not running?)"
+  fi
+  case $file in */*|*..*|*[!A-Za-z0-9._-]*) label=$file; no "bad archive name"; finish ;; esac
+  label=unraid:$dest/$file
+  cat_remote "$file" > "$arch" 2>/dev/null || { no "cannot read archive"; finish; }
+fi
+size=$(stat -c %s "$arch")
+[ "$size" -gt 100000 ] && ok "archive size $((size / 1024)) KB" || no "archive suspiciously small ($size bytes)"
+
+# ---------------------------------------------------------------- integrity + extract
+if tar -tzf "$arch" > "$T/list.txt" 2>/dev/null; then ok "tar -tzf: $(wc -l < "$T/list.txt") entries"
+else no "tar -tzf failed (corrupt archive)"; finish; fi
+x=$T/x; mkdir -p "$x"
+tar -xzf "$arch" -C "$x" --no-same-owner 2>/dev/null && ok "extracted" || { no "extract failed"; finish; }
+
+# ---------------------------------------------------------------- key paths
+mem=.claude/projects/-home-node-workspace/memory
+for p in workspace/CLAUDE.md workspace/TODO.md workspace/CHANGELOG.md crontab boot.sh .claude/settings.json "$mem/MEMORY.md"; do
+  [ -s "$x/$p" ] && ok "present: $p" || no "missing: $p"
+done
+for p in bin .claude/skills .claude/agents "$mem"; do
+  n=$(find "$x/$p" -type f 2>/dev/null | wc -l)
+  [ "$n" -gt 0 ] && ok "present: $p/ ($n files)" || no "missing or empty: $p/"
+done
+if c=$(git --git-dir="$x/.brain.git" log -1 --format='%h %ci' 2>/dev/null) && [ -n "$c" ]; then
+  ok ".brain.git usable (last commit $c)"
+  git --git-dir="$x/.brain.git" fsck --no-dangling >/dev/null 2>&1 && ok ".brain.git fsck clean" || no ".brain.git fsck errors"
+else no ".brain.git not usable"; fi
+
+# ---------------------------------------------------------------- exclusions (names only)
+bad=$(grep -E '(^|/)\.secrets(/|$)|\.jsonl$|\.env$|(^|/)access\.json$|(^|/)\.credentials|Crash Reports|\.dmp$|(^|/)node_modules/|(^|/)__pycache__/|\.local/state/context/(telegram\.md|signals\.md|location\.json)$' "$T/list.txt")
+if [ -z "$bad" ]; then ok "no excluded files (.secrets, *.jsonl, *.env, access.json, credentials, crash dumps, private context)"
+else no "excluded files present ($(echo "$bad" | wc -l)), e.g.: $(echo "$bad" | head -3 | tr '\n' ' ')"; fi
+
+# ---------------------------------------------------------------- counts/sizes vs live
+for p in workspace bin .claude/skills .claude/agents "$mem" plugins .config; do
+  [ -e "$live/$p" ] || continue
+  a=$(find "$x/$p" -type f 2>/dev/null | wc -l); ak=$(du -sk "$x/$p" 2>/dev/null | cut -f1); ak=${ak:-0}
+  l=$(cd "$live" && find "$p" \( -name node_modules -o -name __pycache__ -o -name .secrets -o -name 'Crash Reports' \) -prune -o \
+        -type f ! -name '*.jsonl' ! -name '*.env' ! -name access.json ! -name '.credentials*' ! -name '*.dmp' -print | wc -l)
+  lk=$(cd "$live" && du -sk --exclude=node_modules --exclude=__pycache__ --exclude='Crash Reports' "$p" | cut -f1)
+  msg="$p: archive $a files/${ak} KB, live $l files/${lk} KB"
+  if [ "$l" -gt 0 ] && [ $((a * 2)) -lt "$l" ]; then no "$msg (under half the live files)"; else ok "$msg"; fi
+done
+
+# ---------------------------------------------------------------- dry rebuild
+bash -n "$x/boot.sh" 2>/dev/null && ok "boot.sh parses (bash -n)" || no "boot.sh syntax error"
+nx=0; nsyn=0; nscr=0
+for f in "$x"/bin/*; do
+  [ -f "$f" ] || continue
+  first=$(head -c 200 "$f" | head -1)
+  case $first in '#!'*) ;; *) continue ;; esac
+  nscr=$((nscr + 1)); b=bin/${f##*/}
+  [ -x "$f" ] || { nx=$((nx + 1)); no "not executable: $b"; }
+  case $first in
+    *python*) python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1],"rb").read())' "$f" 2>/dev/null || { nsyn=$((nsyn + 1)); no "python syntax: $b"; } ;;
+    *bash*|*/sh*) bash -n "$f" 2>/dev/null || { nsyn=$((nsyn + 1)); no "shell syntax: $b"; } ;;
+  esac
+done
+[ $nx -eq 0 ] && [ $nsyn -eq 0 ] && ok "bin: $nscr scripts executable and parse"
+badcron=$(grep -vE '^[[:space:]]*(#|$)|^[A-Za-z_][A-Za-z0-9_]*=' "$x/crontab" 2>/dev/null | awk '!($1 ~ /^@/ && NF >= 2) && NF < 6' | wc -l)
+ncron=$(grep -vcE '^[[:space:]]*(#|$)|^[A-Za-z_][A-Za-z0-9_]*=' "$x/crontab" 2>/dev/null)
+[ -s "$x/crontab" ] && [ "$badcron" -eq 0 ] && ok "crontab: $ncron job lines well-formed" || no "crontab: $badcron malformed job line(s)"
+finish

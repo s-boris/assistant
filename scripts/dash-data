@@ -1,0 +1,2899 @@
+#!/usr/bin/env python3
+"""dash-data: collect safe-to-publish stats for the Claude Bot Dashboard (~/opt/dash).
+
+  dash-data              write ~/.local/state/dash/data.json and the generated site ~/.local/state/dash/www
+                         (what dash-publish copies): index.html = the data-free template ~/opt/dash/index.html
+                         with the data inlined as its fallback copy, + data.json. The template never holds data;
+                         {{key}} tokens in it are filled from the profile, only for the keys in PAGE_PROFILE_KEYS;
+                         page_version (a hash of the template) goes into data.json and the page's dash-version meta,
+                         so an open tab sees a deploy and reloads itself once
+  dash-data --inline     the same, plus www/dashboard.html: the page with the data embedded and no
+                         doctype/head wrapper (ready for a claude.ai Artifact upload)
+  dash-data --stdout     print the JSON instead of writing anything
+  dash-data --no-cache   re-parse every transcript (normally only changed files are re-read)
+
+What it reads (read-only): Claude Code transcripts (ONLY usage numbers, model, timestamps, tool names and
+what kind of turn it was; never message text), subagent .meta.json descriptions, ~/jobs/**/*.jsonl result
+records, TODO.md titles, PROACTIVE.md/CHANGELOG.md lines (shortened), crontab,
+reminder counts (no text), agent-watch status, brain git log dates, vault/browser status
+lines (selected fields), disk/memory/load, the curated data map ~/.config/dash/dataflow.json, GOALS.md (goal
+titles, step counts, next open step; for the Goals card's "Done" counts also the brain history of GOALS.md/TODO.md
+and remind's counts-only fired.log, numbers only), dayline.json ("Today I did"; live `dayline --stdout` when the file is
+older than today's log lines), the "Last night" card (PROACTIVE.md lines from 22:00 to 08:00, last 8 nights) and ~/.local/state/context/today.json (ONLY the HN picks and each source's
+public status line: no reminders, location, Telegram content or coordinates), and the Health tab's
+`systems` block (phone/gateway, voice relay, vault, web agent, home autopilots, cron failures: each from its own
+status command, states/counts/versions/timings only; no web-task titles, no URLs, no names), the Gym card from
+`gym plan next --json` (local DB, token-free; numbers, plan day and exercise names only: sessions this week vs the
+plan's days/week, 8 weekly counts, streak, next day + lead exercise, squat/bench/deadlift e1RM last + 4-week change,
+free evenings), and the Agents tab's `agents` block from lib/agentfeed.py (agent-watch status --json, the agent
+transcripts' tool names, own short descriptions and prose AFTER agentfeed.clean, counts, tokens, cost, traces' trigger;
+never inputs, outputs, prompts or results; DASH_AGENTS=off; the page streams it live from flowd's /live/agents),
+and the CI tab's `ci` block from lib/cifeed.py (land queue, last 15 lands, nightly full suite, hub runner record,
+green rate and median land time before/after the CI speed-up, legacy suites red on main with a suites x main runs
+grid, core/hub deploys, a 24-hour timeline of lands per hour with deploy and main-run markers: branch/step/suite names,
+releases, times, counts; DASH_CI=off; live from flowd's /live/ci), its `scorecard` speed tiles from `scorecard feed
+--json` (land p95, failed lands, failed cron runs: values, baselines, 48 hourly points; DASH_SCORECARD=off) and its
+cron heatmap in systems.cron.heat (cron-fail's run log: runs and failures per job and local hour over 24 hours; job
+names and counts only). The Health tab's `doing` block ("How I'm doing"): the scorecard's first-reply p95 and cost per
+day (48 hourly points, 7-day base), the scorecard ids over their bar now, lands per day for 8 days with today's red
+branches fixed vs open (counts from deploys.jsonl), board items done per day (PROACTIVE.md dated lines); DASH_DOING=off.
+The "codebase" block (Codebase tab): plugins, hooks and a rough
+test-check count (grep, nothing is run), cached hourly in assistant-stats.json; skills/agents (minus any marked
+private); brain git counts (live). Its strings get one `secretscan --redact` pass. Line counts are NOT here:
+the "growth" block (~/.local/state/dash-growth.json from ~/bin/dash-growth: daily line counts by part, script/
+skill/agent/crontab-line counts, CLAUDE.md KB, per-day heartbeats/owner messages/subagents, numbers only; refreshed
+at most hourly) is the page's one line count, incl. today's lines by language. Today's activity point is taken
+from this run's own counts, so it never lags.
+Seven tabs (System, Today, Usage, Activity, Codebase, Privacy, Architecture): every field shipped
+is read by the page; duplicates (skills list, cron, changelog, brain) ship once.
+Log-derived lines (Last night, Today I did, activity/changelog lists) also pass scrub(): amounts -> [amount],
+people from the memory note -> 'someone' unless the rest of the page already shows that first name.
+Every free-text field passes clean() (addresses, e-mails, phone/ID numbers, IPs, URLs with queries, long
+digit runs are masked); the final JSON must pass `secretscan --stdin` or nothing is written (exit 3).
+Cost is an ESTIMATE at Anthropic list prices (API-equivalent), not a bill.
+"""
+import argparse
+import collections
+import datetime as dt
+import glob
+import gzip
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+TZ = assistant_profile.tz()
+P = lambda *a: os.path.join(HOME, *a)  # noqa: E731
+
+PROJECTS = os.environ.get('DASH_PROJECTS', P('.claude', 'projects'))
+JOBS = os.environ.get('DASH_JOBS', P('jobs'))
+STATE_DIR = os.environ.get('DASH_STATE', P('.local', 'state', 'dash'))
+OUT = os.path.join(STATE_DIR, 'data.json')
+CACHE = os.path.join(STATE_DIR, 'cache.json')
+PAGE_DIR = os.environ.get('DASH_PAGE_DIR', P('opt', 'dash'))
+INDEX = os.path.join(PAGE_DIR, 'index.html')            # the data-free template (repo: dash/index.html)
+WWW_DIR = os.environ.get('DASH_WWW', os.path.join(STATE_DIR, 'www'))   # generated site: index.html + data.json
+INLINE_OUT = os.path.join(WWW_DIR, 'dashboard.html')
+PAGE_PROFILE_KEYS = ('network.server_name',)            # the only profile values the page may show ({{key}})
+DATAFLOW = os.environ.get('DASH_DATAFLOW', P('.config', 'dash', 'dataflow.json'))
+WORKSPACE = os.environ.get('DASH_WORKSPACE', P('workspace'))
+HB_GATE_LOG = os.environ.get('DASH_HB_GATE_LOG', P('.local', 'state', 'hb-gate.log'))
+DAYLINE = os.environ.get('DASH_DAYLINE', P('.local', 'state', 'dash', 'dayline.json'))
+CONTEXT = os.environ.get('DASH_CONTEXT', P('.local', 'state', 'context', 'today.json'))
+GYM_BIN = os.environ.get('DASH_GYM', P('bin', 'gym'))   # 'off' = no Gym card
+SCORECARD_BIN = os.environ.get('DASH_SCORECARD', P('bin', 'scorecard'))   # 'off' = no speed tiles on the CI tab
+TRACES_BIN = os.environ.get('DASH_TRACES', P('bin', 'traces'))   # 'off' = no Traces panel
+# The hub's status feed drives the System tab's "Hub & gateway" card, the Telegram row and the map colours, live
+# over SSE (dash.<domain>/hub/stream). Mode: DASH_HUB, else ~/.config/dash/hub-mode (the rollback switch), else feed.
+#   feed      the page streams; dash-data only embeds the feed's snapshot (block `hub`) as the fallback and no longer
+#             checks the Telegram channel itself
+#   snapshot  rollback: the page does not stream; the same 5-min snapshot drives the card and the map
+#   off       no hub block, no card (the page before the hub feed; the Telegram channel check runs here again)
+HUB_MODE_FILE = os.environ.get('DASH_HUB_MODE_FILE', P('.config', 'dash', 'hub-mode'))
+HUB_URL = os.environ.get('DASH_HUB_URL', 'http://claude-hub:8702')
+CACHE_VERSION = 3
+KIND_KEYS = ('main', 'subagent', 'headless')
+OWNER_TURNS = {'telegram': 'telegram', 'you (app/terminal)': 'app'}
+TIMELINE_MAX_RUNS = 60
+
+# USD per million tokens, Anthropic first-party list prices (claude-api skill, cached 2026-10-06).
+# Cache writes: 5-minute TTL = 1.25x input, 1-hour TTL = 2x input.
+PRICES = {
+    'claude-opus-5-5': (4.00, 20.00, 0.20),
+    'claude-sonnet-5-5': (2.00, 10.00, 0.10),  # cache read $0.10
+    'claude-haiku-5-5': (0.10, 0.50, 0.01),
+    'claude-fable-5-1': (10.00, 50.00, 0.25),
+    'claude-fable-5': (10.00, 50.00, 1.00),
+    'claude-opus-5': (5.00, 25.00, 0.50),
+    'claude-opus-4-8': (5.00, 25.00, 0.50),
+    'claude-opus-4-7': (5.00, 25.00, 0.50),
+    'claude-opus-4-6': (5.00, 25.00, 0.50),
+    'claude-sonnet-5': (2.00, 10.00, 0.20),
+    'claude-sonnet-4-6': (3.00, 15.00, 0.30),
+    'claude-haiku-4-5': (1.00, 5.00, 0.10),
+}
+DEFAULT_PRICE_MODEL = 'claude-opus-5-5'
+
+
+def price_for(model):
+    m = (model or '').lower()
+    if m in PRICES:
+        return PRICES[m], True
+    for k in sorted(PRICES, key=len, reverse=True):
+        if m.startswith(k):
+            return PRICES[k], True
+    return PRICES[DEFAULT_PRICE_MODEL], False
+
+
+def cost_parts(model, inp, out, cr, cw5, cw1h):
+    (pin, pout, pcr), _ = price_for(model)
+    return {
+        'input': inp * pin / 1e6,
+        'output': out * pout / 1e6,
+        'cache_read': cr * pcr / 1e6,
+        'cache_write': (cw5 * pin * 1.25 + cw1h * pin * 2.0) / 1e6,
+    }
+
+
+# ----------------------------------------------------------------------------------------- privacy filter
+RX_EMAIL = re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+')
+RX_URLQ = re.compile(r'https?://([^\s/?#]+)[^\s?#]*\?[^\s)]*')
+RX_IPV4 = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b')
+RX_PHONE = re.compile(r'(?<![\w.])\+?\d{2,3}[\s/.-]?\(?\d{2,3}\)?[\s/.-]?\d{3}[\s/.-]?\d{2}[\s/.-]?\d{2}(?![\w.])')
+RX_IBAN = re.compile(r'\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}(?:\s?[A-Z0-9]{1,4})?\b')
+RX_AHV = re.compile(r'\b756[.\s]?\d{4}[.\s]?\d{4}[.\s]?\d{2}\b')
+RX_LONGNUM = re.compile(r'(?<![\w.-])\d[\d\s]{5,}\d(?![\w.-])')   # 7+ digits, as the page's privacy sweep
+RX_STREET = re.compile(r"\b[A-ZÄÖÜ][\wäöüßéè-]{1,}(?:strasse|straße|gasse|weg|platz|allee|rain|graben)\b(?:\s*\d+\s?[a-z]?\b)?")
+RX_STREET2 = re.compile(r"\b(?:Via|Viale|Piazza|Corso|Rue|Chemin|Avenue|Route|Boulevard)\s+(?:[A-Z][\w'’.-]*\s+){0,4}\d+\s?[a-z]?\b")
+RX_TOKENISH = re.compile(r'\b(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}\b')
+RX_SECRET_WORDS = re.compile(r'(?i)\b(password|passwort|token|api[_ -]?key|secret|bearer)\s*[:=]\s*\S+')
+
+
+def clean(text, maxlen=None):
+    """Mask anything that identifies people or accounts, then shorten."""
+    if text is None:
+        return None
+    s = str(text)
+    s = s.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+    s = RX_SECRET_WORDS.sub(lambda m: m.group(1) + ': [hidden]', s)
+    s = RX_EMAIL.sub('[email]', s)
+    s = RX_URLQ.sub(lambda m: m.group(1), s)
+    s = RX_IPV4.sub('[ip]', s)
+    s = RX_IBAN.sub('[iban]', s)
+    s = RX_AHV.sub('[id]', s)
+    s = RX_PHONE.sub('[phone]', s)
+    s = RX_STREET2.sub('[address]', s)
+    s = RX_STREET.sub('[street]', s)
+    s = RX_TOKENISH.sub('[id]', s)
+    s = RX_LONGNUM.sub('[number]', s)
+    s = re.sub(r'\*\*|`', '', s)
+    s = re.sub(r'\s{2,}', ' ', s).strip()
+    if maxlen and len(s) > maxlen:
+        cut = s[:maxlen - 1]
+        sp = cut.rfind(' ')
+        if sp > maxlen * 0.6:
+            cut = cut[:sp]
+        s = cut.rstrip(' ,;:-—') + '…'
+    return s
+
+
+def drop_parens(s):
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r'\s*\([^()]*\)', '', s)
+    i = s.find('(')
+    if i >= 0:
+        s = s[:i]
+    return re.sub(r'\s{2,}', ' ', s).strip()
+
+
+def first_clause(s, minlen=28):
+    """Up to the first '; ' / '. ' / ' — ', taking one more clause when the first is very short."""
+    out = ''
+    rest = s
+    while rest:
+        m = re.search(r'; |\. | — ', rest)
+        if not m:
+            out += rest
+            break
+        out += rest[:m.start()]
+        rest = rest[m.end():]
+        if len(out) >= minlen:
+            break
+        out += '; '
+    return out.strip(' ;.')
+
+
+def title_of(text, maxlen=96):
+    """Short title of a changelog/log line: parentheticals dropped, 'subject: first clause'."""
+    s = drop_parens(clean(text) or '')
+    subj, sep, rest = s.partition(': ')
+    if sep and len(subj) <= 50 and rest:
+        s = subj + ': ' + first_clause(rest)
+    else:
+        s = first_clause(s)
+    return clean(s, maxlen)
+
+
+def short_desc(text, maxlen=90):
+    """Cron comment → one short phrase: parentheticals dropped, up to the first ':' / ';' / '.'."""
+    s = drop_parens(clean(text) or '')
+    s = re.split(r': |; |\. |\.$', s, maxsplit=1)[0]
+    return clean(s, maxlen)
+
+
+# ----------------------------------------------------------------------------------------- small helpers
+def now_local():
+    """Now in the owner's zone; DASH_NOW (ISO 8601 with offset) pins it for tests."""
+    pin = os.environ.get('DASH_NOW')
+    if pin:
+        return dt.datetime.fromisoformat(pin).astimezone(TZ)
+    return dt.datetime.now(TZ)
+
+
+def iso_epoch(ts):
+    try:
+        return dt.datetime.fromisoformat(str(ts).replace('Z', '+00:00')).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def local(epoch):
+    return dt.datetime.fromtimestamp(epoch, TZ)
+
+
+def day_fraction(now):
+    """Share of now's local day that has passed, in real seconds: DST days are 23 h / 25 h long (aware datetime
+    subtraction within one zone is wall-clock maths, so it is done on epoch seconds)."""
+    t = now.astimezone(TZ)
+    d0 = dt.datetime.combine(t.date(), dt.time(), TZ).timestamp()
+    d1 = dt.datetime.combine(t.date() + dt.timedelta(days=1), dt.time(), TZ).timestamp()
+    return (t.timestamp() - d0) / (d1 - d0)
+
+
+def hour_slots(now, n=48):
+    """The last n hours up to now's hour as real instants: [(start_epoch, key, label, day)], oldest first.
+    Epoch-based, so a spring-forward night skips 02:00 and a fall-back night shows it twice (the repeat as 02:00′);
+    the zone's offsets are whole hours, so local hours start on UTC hours."""
+    end = int(now.timestamp()) // 3600 * 3600
+    out, seen = [], set()
+    for i in range(n - 1, -1, -1):
+        t = local(end - i * 3600)
+        key = t.strftime('%Y-%m-%dT%H')
+        out.append((end - i * 3600, key, t.strftime('%H:00') + ('′' if key in seen else ''), t.strftime('%a')))
+        seen.add(key)
+    return out
+
+
+def run(cmd, timeout=10, env=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, NO_COLOR='1', TERM='dumb', **(env or {})))
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, '', str(e)
+
+
+def read_text(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def human_dur(sec):
+    sec = int(max(0, sec))
+    d, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    if d:
+        return f'{d}d {h}h'
+    if h:
+        return f'{h}h {m}m'
+    return f'{m}m'
+
+
+# ----------------------------------------------------------------------------------------- transcripts
+def tool_label(name):
+    n = name or '?'
+    if n.startswith('mcp__'):
+        parts = n.split('__')
+        server = parts[1] if len(parts) > 1 else 'mcp'
+        tool = parts[-1]
+        server = re.sub(r'^plugin_', '', server)
+        server = re.sub(r'^claude_ai_', '', server)
+        server = server.replace('telegram-plus_telegram', 'telegram').replace('_', ' ')
+        tool = re.sub(r'^browser_', '', tool)
+        return f'{server}: {tool}'
+    return n
+
+
+def classify_user(d):
+    o = d.get('origin') or {}
+    kind = o.get('kind') if isinstance(o, dict) else None
+    m = d.get('message') or {}
+    c = m.get('content')
+    if isinstance(c, list):
+        if all(isinstance(x, dict) and x.get('type') == 'tool_result' for x in c):
+            return None
+        c = ' '.join(x.get('text', '') for x in c if isinstance(x, dict) and x.get('type') == 'text')
+    c = (c or '')[:40]
+    if kind == 'channel':
+        return 'telegram'
+    if c.startswith('[heartbeat]') or (kind == 'plugin' and o.get('name') == 'heartbeat'):
+        return 'heartbeat'   # the cron fallback types "[heartbeat]"; the mod's beats arrive as origin plugin/heartbeat
+    if c.startswith('[self-scheduled'):
+        return 'scheduled'
+    if kind in ('task-notification', 'peer'):
+        return 'agent'
+    if kind == 'human':
+        return 'you (app/terminal)'
+    return None
+
+
+def parse_transcript(path, stream_json=False):
+    """Numbers only. Returns dict(msgs, tools, turns, costs, version)."""
+    msgs = {}      # message id -> [ts, model, in, out, cr, cw5, cw1h]
+    tools = {}     # tool_use id -> [ts, label]
+    turns = {}     # ts string -> kind
+    costs = {}     # startTime -> max totalCostUSD (Claude Code's own counter)
+    results = []   # stream-json result records: [ts, {model: [in,out,cr,cw]}, cost]
+    version = None
+    last_ts = None
+    opener = gzip.open if path.endswith('.gz') else open   # transcript-compact gzips old subagent transcripts
+    with opener(path, 'rt', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            # cheap substring pre-filter (spacing-agnostic); json.loads only for lines that can matter
+            is_asst = '"assistant"' in line
+            is_user = '"user"' in line and ('"origin"' in line or '[self-scheduled' in line or '[heartbeat]' in line)
+            is_cost = '"cost-state"' in line
+            is_result = stream_json and '"result"' in line
+            if not (is_asst or is_user or is_cost or is_result):
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            t = d.get('type')
+            ts = iso_epoch(d.get('timestamp')) if d.get('timestamp') else None
+            if ts:
+                last_ts = ts
+            if t == 'assistant':
+                m = d.get('message') or {}
+                u = m.get('usage') or {}
+                model = m.get('model') or '?'
+                if d.get('version'):
+                    version = d['version']
+                for blk in m.get('content') or []:
+                    if isinstance(blk, dict) and blk.get('type') == 'tool_use' and blk.get('id'):
+                        tools[blk['id']] = [ts or last_ts, tool_label(blk.get('name'))]
+                if model.startswith('<') or not u:
+                    continue
+                cc = u.get('cache_creation') or {}
+                cwt = int(u.get('cache_creation_input_tokens') or 0)
+                cw1h = int(cc.get('ephemeral_1h_input_tokens') or 0)
+                cw5 = int(cc.get('ephemeral_5m_input_tokens') or 0)
+                if cw1h + cw5 != cwt:
+                    cw5 = max(0, cwt - cw1h)
+                rec = [ts or last_ts, model, int(u.get('input_tokens') or 0), int(u.get('output_tokens') or 0),
+                       int(u.get('cache_read_input_tokens') or 0), cw5, cw1h]
+                mid = m.get('id') or d.get('requestId') or d.get('uuid')
+                old = msgs.get(mid)
+                if old is None or rec[3] >= old[3]:
+                    msgs[mid] = rec
+            elif t == 'user':
+                k = classify_user(d)
+                if k and d.get('timestamp'):
+                    turns[d['timestamp']] = k
+            elif t == 'cost-state':
+                st = str(d.get('startTime'))
+                c = float(d.get('totalCostUSD') or 0)
+                costs[st] = max(costs.get(st, 0), c)
+            elif t == 'result':
+                mu = {}
+                for model, v in (d.get('modelUsage') or {}).items():
+                    mu[model] = [int(v.get('inputTokens') or 0), int(v.get('outputTokens') or 0),
+                                 int(v.get('cacheReadInputTokens') or 0), int(v.get('cacheCreationInputTokens') or 0)]
+                results.append([last_ts, mu, float(d.get('total_cost_usd') or 0)])
+    return {'msgs': msgs, 'tools': tools, 'turns': turns, 'costs': costs, 'results': results,
+            'version': version}
+
+
+def load_cache(use):
+    c = read_json(CACHE) if use else None
+    return c.get('files', {}) if isinstance(c, dict) and c.get('v') == CACHE_VERSION else {}
+
+
+def save_cache(files):
+    atomic_write(CACHE, json.dumps({'v': CACHE_VERSION, 'files': files}, separators=(',', ':')))
+
+
+def transcript_files():
+    """(path, kind, label, stream_json) for every transcript we count."""
+    out = []
+    for proj in sorted(glob.glob(os.path.join(PROJECTS, '*'))):
+        if not os.path.isdir(proj):
+            continue
+        pname = os.path.basename(proj)
+        headless = pname.startswith('-home-node-jobs')
+        for f in glob.glob(os.path.join(proj, '**', '*.jsonl'), recursive=True):
+            rel = os.path.relpath(f, proj)
+            if '/subagents/' in '/' + rel:
+                out.append((f, 'subagent', None, False))
+            elif headless:
+                out.append((f, 'headless', 'job ' + pname.replace('-home-node-jobs-', ''), False))
+            elif rel.count(os.sep) == 0:
+                out.append((f, 'main', None, False))
+    # ~/jobs: `claude -p` stream-json records; a git checkout parked there (a land worktree) holds test fixtures,
+    # never runs, so its tree is skipped
+    for root, dirs, files in os.walk(JOBS):
+        if '.git' in dirs or '.git' in files:
+            dirs[:] = []
+            continue
+        dirs.sort()
+        for name in sorted(files):
+            if name.endswith('.jsonl'):
+                f = os.path.join(root, name)
+                out.append((f, 'headless', 'job ' + os.path.relpath(f, JOBS).split(os.sep)[0], True))
+    # old subagent transcripts gzipped by transcript-compact (a run with both copies is deduped by message id)
+    for f in glob.glob(os.path.join(PROJECTS, '*', '**', 'subagents', '*.jsonl.gz'), recursive=True):
+        out.append((f, 'subagent', None, False))
+    return out
+
+
+def collect_tokens(use_cache=True, now=None):
+    cache = load_cache(use_cache)
+    newcache = {}
+    files = transcript_files()
+    parsed = []
+    for path, kind, label, sj in files:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        key = path
+        c = cache.get(key)
+        if c and c.get('size') == st.st_size and c.get('mtime') == st.st_mtime:
+            data = c['data']
+        else:
+            data = parse_transcript(path, stream_json=sj)
+        newcache[key] = {'size': st.st_size, 'mtime': st.st_mtime, 'data': data}
+        parsed.append((path, kind, label, sj, data))
+    try:
+        save_cache(newcache)
+    except OSError:
+        pass
+
+    now = now or now_local()
+    today = now.date()
+    seen_msgs = set()
+    seen_tools = set()
+    seen_turns = {}
+    rows = []          # [ts, kind, model, in, out, cr, cw5, cw1h, cost_override or None, run_key]
+    tool_rows = []     # [ts, label]
+    runs = {}          # run_key -> info
+    cc_costs = {}
+    version = None
+    version_ts = 0
+    for path, kind, label, sj, data in parsed:
+        run_key = None
+        if kind == 'subagent':
+            stem = path[:-len('.jsonl.gz')] if path.endswith('.gz') else path[:-len('.jsonl')]
+            aid = os.path.basename(stem).replace('agent-', '')
+            run_key = 'sub:' + aid
+            meta = read_json(stem + '.meta.json', {})
+            runs[run_key] = {'id': aid[:8], 'kind': 'subagent', 'description': clean(meta.get('description') or 'subagent', 70),
+                             'agent_type': clean(meta.get('agentType'), 30), 'effort': meta.get('effort'),
+                             'background': meta.get('requestShape') == 'background', 'depth': meta.get('spawnDepth')}
+        elif kind == 'headless':
+            run_key = 'job:' + path
+            rid = os.path.splitext(os.path.relpath(path, JOBS if path.startswith(JOBS) else os.path.dirname(path)))[0]
+            runs[run_key] = {'id': clean(rid, 24), 'kind': 'headless', 'description': clean(label, 70),
+                             'agent_type': 'claude -p', 'effort': None, 'background': True}
+        for st_, c in (data.get('costs') or {}).items():
+            cc_costs[st_] = max(cc_costs.get(st_, 0), c)
+        if kind == 'main' and data.get('version'):
+            mt = os.path.getmtime(path)
+            if mt > version_ts:
+                version, version_ts = data['version'], mt
+        if sj and data.get('results'):
+            # stream-json: the result record holds the accurate totals
+            for ts, mu, cost in data['results']:
+                ts = ts or os.path.getmtime(path)
+                tot_tokens = sum(sum(v) for v in mu.values()) or 1
+                for model, (i, o, r, w) in mu.items():
+                    share = (i + o + r + w) / tot_tokens
+                    rows.append([ts, kind, model, i, o, r, w, 0, cost * share, run_key])
+        else:
+            for mid, rec in data['msgs'].items():
+                if mid in seen_msgs:
+                    continue
+                seen_msgs.add(mid)
+                ts = rec[0] or os.path.getmtime(path)
+                rows.append([ts, kind, rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], None, run_key])
+        for tid, (ts, lab) in data['tools'].items():
+            if tid in seen_tools:
+                continue
+            seen_tools.add(tid)
+            tool_rows.append([ts, lab, kind])
+        if kind == 'main':
+            for tss, k in data['turns'].items():
+                seen_turns[tss] = k
+
+    # ---- aggregate
+    def blank():
+        return {'messages': 0, 'input': 0, 'output': 0, 'cache_read': 0, 'cache_write': 0, 'tokens': 0,
+                'cost_usd': 0.0, 'cost': {'input': 0.0, 'output': 0.0, 'cache_read': 0.0, 'cache_write': 0.0}}
+
+    def add(b, r, parts, cost):
+        b['messages'] += 1
+        b['input'] += r[3]
+        b['output'] += r[4]
+        b['cache_read'] += r[5]
+        b['cache_write'] += r[6] + r[7]
+        b['tokens'] += r[3] + r[4] + r[5] + r[6] + r[7]
+        b['cost_usd'] += cost
+        for k, v in parts.items():
+            b['cost'][k] += v
+
+    totals = blank()
+    by_kind = collections.defaultdict(blank)
+    by_model = collections.defaultdict(blank)
+    daily = collections.defaultdict(lambda: {'kinds': collections.defaultdict(int), 'ck': collections.defaultdict(float),
+                                             'b': blank(), 'runs': set()})
+    hourly = collections.defaultdict(lambda: {'kinds': collections.defaultdict(int), 'cost_usd': 0.0})   # by slot index
+    unknown_models = set()
+    run_stats = collections.defaultdict(lambda: {'start': None, 'end': None, 'b': blank(), 'models': set()})
+    slots = hour_slots(now)
+    h_start = slots[0][0]
+    for r in rows:
+        ts, kind, model = r[0], r[1], r[2]
+        parts = cost_parts(model, r[3], r[4], r[5], r[6], r[7])
+        _, known = price_for(model)
+        if not known:
+            unknown_models.add(model)
+        cost = r[8] if r[8] is not None else sum(parts.values())
+        r.append((parts, cost))  # the 24 h / 7 d windows add these unscaled parts
+        if r[8] is not None:  # reported total: scale the parts to it so the split still adds up
+            s = sum(parts.values()) or 1
+            parts = {k: v * cost / s for k, v in parts.items()}
+        add(totals, r, parts, cost)
+        add(by_kind[kind], r, parts, cost)
+        add(by_model[model], r, parts, cost)
+        lt = local(ts)
+        dkey = lt.date().isoformat()
+        dd = daily[dkey]
+        dd['kinds'][kind] += r[3] + r[4] + r[5] + r[6] + r[7]
+        dd['ck'][kind] += cost
+        add(dd['b'], r, parts, cost)
+        if r[9]:
+            rs = run_stats[r[9]]
+            rs['start'] = ts if rs['start'] is None else min(rs['start'], ts)
+            rs['end'] = ts if rs['end'] is None else max(rs['end'], ts)
+            rs['models'].add(model)
+            add(rs['b'], r, parts, cost)
+        if ts >= h_start and (ts - h_start) // 3600 < len(slots):
+            hk = int((ts - h_start) // 3600)
+            hourly[hk]['kinds'][kind] += r[3] + r[4] + r[5] + r[6] + r[7]
+            hourly[hk]['cost_usd'] += cost
+
+    for rk, rs in run_stats.items():
+        if rs['start'] is not None:
+            daily[local(rs['start']).date().isoformat()]['runs'].add(rk)
+
+    def rnd(b):
+        o = dict(b)
+        o['cost_usd'] = round(o['cost_usd'], 4)
+        o['cost'] = {k: round(v, 4) for k, v in o['cost'].items()}
+        return o
+
+    # tools + turns per day
+    tools_all = collections.Counter()
+    tools_daily = collections.defaultdict(collections.Counter)
+    for ts, lab, kind in tool_rows:
+        if not ts:
+            continue
+        tools_all[lab] += 1
+        d = local(ts).date()
+        tools_daily[d.isoformat()]['replies' if lab == 'telegram: reply' else 'calls'] += 1
+    turns_daily = collections.defaultdict(collections.Counter)
+    for tss, k in seen_turns.items():
+        e = iso_epoch(tss)
+        if e:
+            turns_daily[local(e).date().isoformat()][k] += 1
+
+    days = sorted(set(daily) | set(turns_daily) | set(tools_daily))
+    daily_out = []
+    if days:
+        d0 = dt.date.fromisoformat(days[0])
+        n = (today - d0).days + 1
+        for i in range(max(n, 1)):
+            dk = (d0 + dt.timedelta(days=i)).isoformat()
+            dd = daily.get(dk) or {'kinds': {}, 'ck': {}, 'b': blank(), 'runs': ()}
+            b, tdy = rnd(dd['b']), tools_daily.get(dk, {})
+            daily_out.append({
+                'date': dk,
+                'tokens': {k: dd['kinds'].get(k, 0) for k in KIND_KEYS},
+                'messages': b['messages'], 'cost_usd': b['cost_usd'], 'cost': b['cost'],
+                'cost_by_kind': {k: round(dd['ck'].get(k, 0.0), 4) for k in KIND_KEYS},
+                'input': b['input'], 'output': b['output'], 'cache_read': b['cache_read'], 'cache_write': b['cache_write'],
+                'runs': len(dd['runs']),
+                'subagent_runs': sum(1 for k in dd['runs'] if k.startswith('sub:')),
+                'turns': dict(turns_daily.get(dk, {})),
+                'tool_calls': tdy.get('calls', 0) + tdy.get('replies', 0),
+                'telegram_replies': tdy.get('replies', 0),
+            })
+
+    hourly_out = []
+    for i, (_, hk, label, day) in enumerate(slots):
+        hh = hourly.get(i) or {'kinds': {}, 'cost_usd': 0}
+        hourly_out.append({'hour': hk, 'label': label, 'day': day,
+                           'tokens': {k: hh['kinds'].get(k, 0) for k in KIND_KEYS},
+                           'cost_usd': round(hh['cost_usd'], 4)})
+
+    run_list = []
+    for rk, rs in run_stats.items():
+        info = runs.get(rk)
+        if not info or rs['start'] is None:
+            continue
+        b = rnd(rs['b'])
+        run_list.append(dict(info, start=local(rs['start']).strftime('%Y-%m-%d %H:%M'),
+                             minutes=round((rs['end'] - rs['start']) / 60, 1), messages=b['messages'],
+                             tokens=b['tokens'], output=b['output'], cost_usd=b['cost_usd'],
+                             models=sorted(rs['models']), _start=rs['start']))
+    top_runs = sorted(run_list, key=lambda x: -x['tokens'])[:15]
+    recent_runs = sorted(run_list, key=lambda x: -x['_start'])[:15]
+    for x in run_list:
+        x.pop('_start', None)
+
+    def window(hours):
+        cut = now.timestamp() - hours * 3600
+        b = blank()
+        for r in rows:
+            if r[0] >= cut:
+                add(b, r, *r[10])
+        return rnd(b)
+
+    today_key = today.isoformat()
+    td = next((d for d in daily_out if d['date'] == today_key), None)
+
+    # cost pace: today so far vs the average of the (up to) 14 full days before it that have data
+    prev = [d for d in daily_out if d['date'] < today_key][-14:]
+    avg = round(sum(d['cost_usd'] for d in prev) / len(prev), 4) if prev else None
+    today_usd = td['cost_usd'] if td else 0.0
+    day_frac = day_fraction(now)
+    cost_pace = {
+        'days': len(prev), 'avg_usd': avg, 'today_usd': today_usd,
+        'today_pct_of_avg': round(today_usd / avg * 100, 1) if avg else None,
+        'day_elapsed_pct': round(day_frac * 100, 1),
+    }
+
+    # timeline of the last 24 h: agent/worker runs as bars, the owner's messages as dots (times only, no text)
+    t_cut = now.timestamp() - 24 * 3600
+    tl_runs = []
+    for rk, rs in run_stats.items():
+        info = runs.get(rk)
+        if not info or rs['start'] is None or rs['end'] < t_cut:
+            continue
+        tl_runs.append({'start': local(rs['start']).isoformat(timespec='seconds'),
+                        'end': local(rs['end']).isoformat(timespec='seconds'),
+                        'kind': info['kind'], 'description': info['description'],
+                        'agent_type': info.get('agent_type'), 'effort': info.get('effort'),
+                        'minutes': round((rs['end'] - rs['start']) / 60, 1),
+                        'cost_usd': round(rs['b']['cost_usd'], 4), '_s': rs['start']})
+    tl_runs.sort(key=lambda x: x['_s'])
+    for x in tl_runs:
+        x.pop('_s')
+    owner_msgs = []
+    for tss, k in seen_turns.items():
+        e = iso_epoch(tss)
+        if e and e >= t_cut and k in OWNER_TURNS:
+            owner_msgs.append({'at': local(e).isoformat(timespec='seconds'), 'via': OWNER_TURNS[k]})
+    owner_msgs.sort(key=lambda x: x['at'])
+    timeline = {'from': local(t_cut).isoformat(timespec='seconds'), 'to': now.isoformat(timespec='seconds'),
+                'runs': tl_runs[-TIMELINE_MAX_RUNS:], 'runs_dropped': max(0, len(tl_runs) - TIMELINE_MAX_RUNS),
+                'owner_messages': owner_msgs}
+    first = min((r[0] for r in rows), default=None)
+    last = max((r[0] for r in rows), default=None)
+    pricing = {m: {'input': p[0], 'output': p[1], 'cache_read': p[2], 'cache_write_5m': round(p[0] * 1.25, 4),
+                   'cache_write_1h': p[0] * 2} for m, p in PRICES.items() if m in by_model}
+    return {
+        'note': ('Estimated cost at Anthropic list prices (API-equivalent, USD). If you are on a Claude subscription '
+                 'this is not what you pay; it shows how heavy the usage is.'),
+        'pricing_usd_per_mtok': pricing,
+        'first': local(first).isoformat(timespec='minutes') if first else None,
+        'last': local(last).isoformat(timespec='minutes') if last else None,
+        'totals': rnd(totals),
+        'by_kind': {k: rnd(v) for k, v in by_kind.items()},
+        'by_model': sorted(({'model': m, **rnd(v)} for m, v in by_model.items()), key=lambda x: -x['tokens']),
+        'today': td,
+        'cost_pace': cost_pace,
+        'timeline': timeline,
+        'last_24h': window(24),
+        'last_7d': window(24 * 7),
+        'daily': daily_out,
+        'hourly': hourly_out,
+        'top_runs': top_runs,
+        'recent_runs': recent_runs,
+        'runs_total': len(run_list),
+        'tools_top': [{'name': n, 'calls': c} for n, c in tools_all.most_common(15)],
+        'tool_calls_total': sum(tools_all.values()),
+        'claude_code_counter_usd': round(sum(cc_costs.values()), 2),
+        'claude_code_counter_note': ("Claude Code's own running cost counter for the main session processes "
+                                     '(written only now and then, so it lags; includes subagents).'),
+        'claude_code_version': version,
+        'transcript_files': len(parsed),
+    }
+
+
+# ----------------------------------------------------------------------------------------- activity
+def todo_sections(txt):
+    """TODO.md text -> {lowercased '## section': [raw item titles]} ('- **Title** — status' or the first clause)."""
+    sections = {}
+    cur = None
+    for line in txt.splitlines():
+        m = re.match(r'^##\s+(.*)$', line)
+        if m:
+            cur = m.group(1).strip().lower()
+            sections[cur] = []
+            continue
+        if cur is None or not line.startswith('- '):
+            continue
+        item = line[2:].strip()
+        b = re.match(r'\*\*(.+?)\*\*', item)
+        title = b.group(1) if b else re.split(r'\s+—\s+|:\s', item, maxsplit=1)[0]
+        sections[cur].append(title.rstrip(':'))
+    return sections
+
+
+def parse_todo():
+    sections = {k: [clean(t, 80) for t in v]
+                for k, v in todo_sections(read_text(os.path.join(WORKSPACE, 'TODO.md'))).items()}
+    return {
+        'due': sections.get('due', []),
+        'in_progress': sections.get('in progress', []),
+        'waiting': sections.get('waiting on you', []),
+        'ideas': sections.get('ideas', []),
+    }
+
+
+# Work-log lines (PROACTIVE.md, CHANGELOG.md): "- YYYY-MM-DD[ HH:MM] text" and the short form most lines use since
+# 18.10, "- DD.MM[.][ HH:MM] text" (year: the current one, the one before when that date is more than a day ahead, as
+# board-lint reads them). A ~ before the time is fine; one separator (— – - :) after the date or time is dropped.
+RX_LOG_ISO = re.compile(r'^- (\d{4}-\d\d-\d\d)(?:[ T]~?(\d\d:\d\d))?\s*(?:—|–|-|:)?\s*(.*)$')
+RX_LOG_DM = re.compile(r'^- (\d\d)\.(\d\d)\.?(?:[ T]~?(\d\d:\d\d))?\s*(?:—|–|-|:)?\s*(.*)$')
+
+
+def log_entry(line, today=None):
+    """(ISO date, 'HH:MM' or None, text) of one work-log line in either form, else None."""
+    m = RX_LOG_ISO.match(line)
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    m = RX_LOG_DM.match(line)
+    if not m:
+        return None
+    today = today or now_local().date()
+    try:
+        d = dt.date(today.year, int(m.group(2)), int(m.group(1)))
+        if d > today + dt.timedelta(days=1):
+            d = d.replace(year=d.year - 1)
+    except ValueError:
+        return None
+    return d.isoformat(), m.group(3), m.group(4)
+
+
+def parse_log(path, n=30, with_time=True):
+    out = []
+    for line in read_text(path).splitlines():
+        e = log_entry(line)
+        if not e:
+            continue
+        date, hhmm, text = e
+        kind = None
+        km = re.match(r'(started|done|finished|failed)\s*:\s*(.*)$', text, re.I)
+        if km:
+            kind = km.group(1).lower()
+            text = km.group(2)
+        out.append({'date': date, 'time': hhmm, 'kind': kind, 'text': title_of(text, 96)})
+    return out[-n:][::-1]
+
+
+RX_GOAL = re.compile(r'^##\s+(?:(\d+)[.)]\s*)?(.+?)\s*$')
+RX_STEP = re.compile(r'^\s*[-*]\s+\[([ xX])\]\s+(.*)$')
+RX_BLOCKED = re.compile(r'\b(blocked|parked|waiting)\b', re.I)
+
+
+def parse_goals(path=None):
+    """GOALS.md: '## N. Title (notes)' + '- [ ]' / '- [x]' steps -> titles, counts and the next unblocked step."""
+    goals = []
+    cur = None
+    for line in read_text(path or os.path.join(WORKSPACE, 'GOALS.md')).splitlines():
+        m = RX_GOAL.match(line)
+        if m:
+            cur = {'n': int(m.group(1)) if m.group(1) else len(goals) + 1, 'title': clean(drop_parens(m.group(2)), 60),
+                   'open': 0, 'done': 0, 'blocked': 0, 'next': None, 'next_blocked': False}
+            goals.append(cur)
+            continue
+        s_ = RX_STEP.match(line) if cur else None
+        if not s_:
+            continue
+        if s_.group(1).lower() == 'x':
+            cur['done'] += 1
+            continue
+        cur['open'] += 1
+        blocked = bool(RX_BLOCKED.search(s_.group(2)))
+        cur['blocked'] += blocked
+        if cur['next'] is None or (cur['next_blocked'] and not blocked):
+            cur['next'], cur['next_blocked'] = title_of(s_.group(2), 80), blocked
+    for g in goals:
+        g['total'] = g['open'] + g['done']
+        g['pct'] = round(100 * g['done'] / g['total']) if g['total'] else 0
+    return {'goals': goals, 'open': sum(g['open'] for g in goals), 'done': sum(g['done'] for g in goals),
+            'total': sum(g['total'] for g in goals)}
+
+
+# ----------------------------------------------------------------------------------- done metrics (Goals card)
+BRAIN_GIT = os.environ.get('DASH_BRAIN_GIT', P('.brain.git'))
+REMIND_FIRED = os.environ.get('DASH_REMIND_FIRED', P('.local', 'state', 'remind', 'fired.log'))
+DONE_WINDOWS = (7, 30)   # days, rolling
+RX_DATED = re.compile(r'^- (\d{4}-\d\d-\d\d)(?:[ T](\d\d:\d\d))?\s*(?:—|–|-|:)?\s*(.*)$')
+
+
+def brain_versions(rel, since):
+    """Committed versions of a brain-tracked file (`rel` relative to ~, e.g. workspace/TODO.md) as [(epoch, text)],
+    oldest first: the last version from before `since` (the baseline, if any) + every change after it.
+    Two `git log` calls + one `git cat-file --batch`; [] when the brain repo is missing or git fails."""
+    iso_since = local(since).isoformat(timespec='seconds')
+    base = ['git', '--git-dir', BRAIN_GIT, 'log', '--format=C %ct', '--raw', '--no-abbrev', '--no-renames']
+    spec = ':(top)' + rel   # from the work tree's top, whatever the cwd (a plain path is cwd-relative inside it)
+    rc1, before, _ = run(base + ['-1', '--before=' + iso_since, '--', spec], timeout=10)
+    rc2, after, _ = run(base + ['--since=' + iso_since, '--', spec], timeout=15)
+    if rc1 or rc2:
+        return []
+    commits = []
+    for chunk in (before, after):
+        t = None
+        for line in chunk.splitlines():
+            if line.startswith('C '):
+                t = int(line[2:].strip() or 0)
+            elif line.startswith(':') and t is not None:
+                f = line.split('\t')[0].split()
+                if len(f) >= 4 and f[3].strip('0'):   # all-zero blob = the file was deleted in that commit
+                    commits.append((t, f[3]))
+    if not commits:
+        return []
+    blobs = sorted({b for _, b in commits})
+    try:
+        r = subprocess.run(['git', '--git-dir', BRAIN_GIT, 'cat-file', '--batch'], input=('\n'.join(blobs) + '\n').encode(),
+                           capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    data, pos, texts = r.stdout, 0, {}
+    while pos < len(data):
+        nl = data.find(b'\n', pos)
+        if nl < 0:
+            break
+        hdr = data[pos:nl].split()
+        if len(hdr) != 3:          # '<sha> missing'
+            pos = nl + 1
+            continue
+        size = int(hdr[2])
+        texts[hdr[0].decode()] = data[nl + 1:nl + 1 + size].decode('utf-8', 'replace')
+        pos = nl + 1 + size + 1
+    return sorted((t, texts[b]) for t, b in commits if b in texts)
+
+
+def step_key(text, words=3):
+    """Identity of a GOALS step / TODO title across edits: its first words, lowercased, without parentheticals
+    (dates and notes added on ticking) or strike-through."""
+    return ' '.join(re.findall(r'[a-z0-9]+', drop_parens(text.replace('~~', '')).lower())[:words])
+
+
+def goal_ticks(txt):
+    """GOALS.md text -> {step key: goal number} of its ticked ('- [x]') steps (numbering as parse_goals)."""
+    out, n, idx = {}, None, 0
+    for line in txt.splitlines():
+        m = RX_GOAL.match(line)
+        if m:
+            idx += 1
+            n = int(m.group(1)) if m.group(1) else idx
+            continue
+        s_ = RX_STEP.match(line) if n is not None else None
+        if s_ and s_.group(1).lower() == 'x':
+            out.setdefault(step_key(s_.group(2)), n)
+    return out
+
+
+def waiting_keys(txt):
+    return {step_key(t) for t in todo_sections(txt).get('waiting on you', [])}
+
+
+def dated_epochs(path, skip_started=False):
+    """Epochs of the dated lines of a log (log_entry: '- YYYY-MM-DD[ HH:MM] …' or '- DD.MM[ HH:MM] …'; no time ->
+    12:00); 'started:' lines skipped if asked."""
+    out = []
+    for line in read_text(path).splitlines():
+        e = log_entry(line)
+        if not e or (skip_started and re.match(r'started\s*:', e[2], re.I)):
+            continue
+        try:
+            d = dt.datetime.strptime(e[0] + ' ' + (e[1] or '12:00'), '%Y-%m-%d %H:%M').replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        out.append(d.timestamp())
+    return out
+
+
+def done_metrics(goals, now=None):
+    """'Done' counts for the Goals card, rolling 7 and 30 days, numbers only (no titles or text leave here):
+    GOALS.md steps ticked (brain history + the live file: a step's first version as [x]; per goal too), TODO items
+    finished (PROACTIVE.md dated lines minus 'started:'), things built (CHANGELOG.md dated lines), owner questions
+    answered (TODO 'Waiting on you' items that left the section and are not back) vs still waiting now, and
+    reminders fired (remind's counts-only fired.log). Adds ticked_7d/ticked_30d to each entry of `goals`."""
+    now = now or now_local()
+    t_now = now.timestamp()
+    since = {d: t_now - d * 86400 for d in DONE_WINDOWS}
+    oldest = since[max(DONE_WINDOWS)]
+
+    def counts(times):
+        return {'d%d' % d: sum(1 for t in times if since[d] <= t <= t_now + 86400) for d in DONE_WINDOWS}
+
+    def history(name):
+        """Brain versions + the live file (newest). Without brain history the live file is only a baseline (epoch 0),
+        so nothing in it counts as recent."""
+        path = os.path.join(WORKSPACE, name)
+        cur = [(min(os.path.getmtime(path), t_now), read_text(path))] if os.path.exists(path) else []
+        return (brain_versions('workspace/' + name, oldest) or [(0.0, t) for _, t in cur]) + cur
+
+    # GOALS.md: a step counts once, at the first version that shows it ticked (a baseline's ticks fall before the window)
+    ticks, seen = [], set()
+    for t, txt in history('GOALS.md'):
+        for k, n in goal_ticks(txt).items():
+            if k not in seen:
+                seen.add(k)
+                ticks.append((t, n))
+    for g in goals:
+        c = counts([t for t, n in ticks if n == g['n']])
+        g['ticked_7d'], g['ticked_30d'] = c['d7'], c['d30']
+    # TODO 'Waiting on you': the last time each item left the section; items back in it don't count, and an item
+    # that leaves while a new one with the same first word arrives (a reworded/follow-up question) is the same one
+    left, prev, cache = {}, None, {}
+    tv = history('TODO.md')
+    for t, txt in tv:
+        cur = cache.get(txt)
+        if cur is None:
+            cur = cache[txt] = waiting_keys(txt)
+        if prev is not None:
+            arrived = sorted(cur - prev)
+            for k in sorted(prev - cur):
+                twin = next((a for a in arrived if a.split(' ')[0] == k.split(' ')[0]), None)
+                if twin is not None:
+                    arrived.remove(twin)
+                else:
+                    left[k] = t
+        prev = cur
+    waiting_now = len(todo_sections(tv[-1][1]).get('waiting on you', [])) if tv else 0
+    answered = [t for k, t in left.items() if k not in (prev or set())]
+    fired, fired_since = [], None
+    for line in read_text(REMIND_FIRED).splitlines():
+        try:
+            d = dt.datetime.strptime(line[:16], '%Y-%m-%d %H:%M').replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        fired.append(d.timestamp())
+        fired_since = fired_since or line[:10]
+    return {
+        'windows': list(DONE_WINDOWS),
+        'goal_steps': counts([t for t, _ in ticks]),
+        'todo_done': counts(dated_epochs(os.path.join(WORKSPACE, 'PROACTIVE.md'), skip_started=True)),
+        'built': counts(dated_epochs(os.path.join(WORKSPACE, 'CHANGELOG.md'))),
+        'answered': counts(answered),
+        'waiting_now': waiting_now,
+        'reminders': counts(fired) if os.path.exists(REMIND_FIRED) else None,
+        'reminders_since': fired_since,
+    }
+
+
+def goals_block():
+    """parse_goals() + done_metrics(): per-goal ticked counts and the card's 'Done' table (fails soft)."""
+    g = parse_goals()
+    try:
+        g['done_metrics'] = done_metrics(g['goals'])
+    except Exception as e:   # noqa: BLE001 - a metrics bug must never cost the whole dashboard
+        g['done_metrics'] = None
+        print(f'dash-data: done metrics failed: {type(e).__name__}', file=sys.stderr)
+    return g
+
+
+def dayline():
+    """'Today I did': dayline.json (21:07 cron), or a live `dayline --stdout` when the file is not from today or
+    PROACTIVE/CHANGELOG changed after it was written."""
+    today = now_local().strftime('%Y-%m-%d')
+    try:
+        d = json.loads(read_text(DAYLINE) or 'null')
+    except ValueError:
+        d = None
+    newest_log = max((os.path.getmtime(os.path.join(WORKSPACE, f)) for f in ('PROACTIVE.md', 'CHANGELOG.md')
+                      if os.path.exists(os.path.join(WORKSPACE, f))), default=0)
+    if not isinstance(d, dict) or d.get('date') != today or os.path.getmtime(DAYLINE) < newest_log:
+        try:
+            r = subprocess.run([P('bin', 'dayline'), '--stdout'], capture_output=True, text=True, timeout=20,
+                               env=dict(os.environ, DAYLINE_WORKSPACE=WORKSPACE))
+            if r.returncode == 0:
+                d = json.loads(r.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            pass
+    if not isinstance(d, dict) or not d.get('date'):
+        return None
+    return {
+        'date': str(d['date'])[:10], 'today': d['date'] == today,
+        'done': [{'time': e.get('time'), 'kind': e.get('kind'), 'text': title_of(e.get('text'), 96)}
+                 for e in (d.get('proactive') or [])[::-1][:20] if isinstance(e, dict)],
+        'changes': len(d.get('changes') or []),
+    }
+
+
+# ----------------------------------------------------------------------------------------- names and amounts
+# PROACTIVE/CHANGELOG are my own logs, but a line can still carry a name or a sum (e.g. a calendar or insurance
+# note). On top of clean(), every log-derived line (Last night, Today I did, the activity and changelog lists):
+# money -> [amount]; people from the memory note -> 'someone' (a first name stays only when the rest of the
+# dashboard already shows it, surnames never); "X's" of a capitalized word the rest of the dashboard never shows
+# -> "someone's" (names I have no note on).
+PEOPLE_NOTE = os.environ.get('DASH_PEOPLE', P('.claude', 'projects', '-home-node-workspace', 'memory', 'people-and-dates.md'))
+NOT_NAMES = set('''Jan January Feb February Mar March Apr April May Jun June Jul July Aug August Sep Sept September Oct
+October Nov November Dec December Mon Monday Tue Tuesday Wed Wednesday Thu Thursday Fri Friday Sat Saturday Sun Sunday
+The This That These His Her Their Owner Family Close Friends How Related Never Use Also Only When What Who Not None
+Google Calendar Telegram Gmail'''.split())   # generic words only: anything else in the note counts as a name (masking is safe)
+_CUR = r"(?:CHF|SFr\.?|Fr\.|EUR|USD|GBP|US\$|\$|€|£)"
+_NUM = r"~?\d[\d'’.,]*"
+RX_MONEY = re.compile(_CUR + r"\s?" + _NUM + r"(?:\s?[–-]\s?" + _NUM + r")?(?:\s?(?:k|Mio\.?|M)\b)?(?:\.?[–-](?!\d))?"
+                      r"|(?<![\w.])" + _NUM + r"(?:\s?k)?\s?(?:CHF|SFr|Fr\.|EUR|USD|GBP|€|£|francs?|Franken|dollars?|euros?)(?![A-Za-z])"
+                      r"|(?<![\w.])\d[\d'’]*\.[–-](?!\d)")
+RX_MONEY_WORD = re.compile(r"(?i)\b(paid|pay|pays|costs?|prices?|priced|premiums?|prämien?|rent|miete|salary|lohn|refund|"
+                           r"fees?|balance|saldo|owes?|owed)\b(\s*(?:of|is|was|=|:|about|ca\.?)?\s*)(" + _NUM + r")"
+                           r"(?![\d'’.,]*\d)(?!\s?(?:%|[KMGT]i?B\b|[kKMB]\b|h\b|min\b|days?\b|tokens?\b|lines?\b|tests?\b|runs?\b|items?\b|x\b))")
+RX_DEC2 = re.compile(r"(?<![\w.'’/])(\d{1,3}(?:['’]\d{3})+|\d+)\.(\d\d)(?![\w.]|\s?(?:[KMGT]i?B\b|%|°|h\b|min\b|ms\b|s\b|x\b))")
+RX_NAMEWORD = r"[A-ZÄÖÜ][a-zäöüéèëçñ]{2,}"
+RX_POSSESSIVE = re.compile(r"(?<!\bThe )\b([A-ZÄÖÜ][\wäöüéè-]*)['’]s\b")
+
+
+def mask_amounts(s):
+    s = RX_MONEY.sub('[amount]', s)
+    s = RX_MONEY_WORD.sub(lambda m: m.group(1) + m.group(2) + '[amount]', s)
+
+    def dec2(m):   # 375.00 / 1'250.50 -> amount; 13.10 (a DD.MM date) stays
+        d, mo = int(re.sub(r"\D", '', m.group(1))), int(m.group(2))
+        return m.group(0) if 1 <= d <= 31 and 1 <= mo <= 12 and "'" not in m.group(1) and '’' not in m.group(1) else '[amount]'
+    return RX_DEC2.sub(dec2, s)
+
+
+_PEOPLE = None
+
+
+def people():
+    """(first names, surnames) from the people note. Surnames: the second word of 'First [“Nick”] Last' pairs."""
+    global _PEOPLE
+    if _PEOPLE is None:
+        txt = re.sub(r'(?s)\A---.*?\n---', '', read_text(PEOPLE_NOTE))
+        words = set(re.findall(r'\b' + RX_NAMEWORD + r'\b', txt)) - NOT_NAMES
+        sur = {b for a, b in re.findall(r'\b(' + RX_NAMEWORD + r')\s+(?:"[^"\n]+"\s+)?(' + RX_NAMEWORD + r')\b', txt)
+               if a in words and b in words}
+        _PEOPLE = (words - sur, sur)
+    return _PEOPLE
+
+
+def shown_words(data, skip):
+    """Capitalized words the dashboard already shows outside the log-derived blocks (skip = (block, key) pairs)."""
+    out = set()
+    for k, v in data.items():
+        if isinstance(v, dict):
+            v = {kk: vv for kk, vv in v.items() if (k, kk) not in skip}
+        for s in strings_of(v):
+            out.update(re.findall(r'\b[A-ZÄÖÜ][\wäöüéè-]+', s))
+    return out
+
+
+def strings_of(o):
+    if isinstance(o, str):
+        yield o
+    elif isinstance(o, dict):
+        for v in o.values():
+            yield from strings_of(v)
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            yield from strings_of(v)
+
+
+def scrub(text, shown=frozenset()):
+    """Names and amounts out of one log line (see above); clean() and title_of() still do the rest."""
+    if not text:
+        return text
+    s = mask_amounts(str(text))
+    first, sur = people()
+    hide = (first - set(shown)) | sur
+    if hide:
+        s = re.sub(r'\b(?:' + '|'.join(sorted(map(re.escape, hide), key=len, reverse=True)) + r')\b', 'someone', s)
+    s = RX_POSSESSIVE.sub(lambda m: m.group(0) if m.group(1) in shown or m.group(1) == 'someone' else "someone's", s)
+    s = re.sub(r'\bsomeone(?:\s+(?:"[^"]*"\s+)?someone)+\b', 'someone', s)
+    return s
+
+
+def scrub_tree(o, shown):
+    if isinstance(o, str):
+        return scrub(o, shown)
+    if isinstance(o, list):
+        return [scrub_tree(x, shown) for x in o]
+    if isinstance(o, dict):
+        return {k: (scrub_tree(v, shown) if k in ('text', 'done', 'changes') or not isinstance(v, str) else v)
+                for k, v in o.items()}
+    return o
+
+
+# ----------------------------------------------------------------------------------------- last night
+# "Last night" card: what I built between 22:00 the evening before and 08:00, from PROACTIVE.md lines
+# (log_entry: "- YYYY-MM-DD HH:MM text" or "- DD.MM HH:MM text"). Lines without a time are skipped (only counted).
+NIGHTS = 7
+NIGHT_ITEMS = 40
+RX_LOG = re.compile(r'^- (\d{4}-\d\d-\d\d)(?:[ T]~?(\d\d:\d\d))?\s*(?:—|–|-|:)?\s*(.*)$')
+RX_LOG_KIND = re.compile(r'(started|done|finished|failed)(?=[\s:]|$)\s*:?\s*(.*)$', re.I)
+
+
+def night_of(day, hhmm):
+    """Morning date of the night a log line belongs to: 22:00 the evening before .. 07:59; None by day."""
+    if hhmm < '08:00':
+        return day
+    if hhmm >= '22:00':
+        return day + dt.timedelta(days=1)
+    return None
+
+
+def lastnight(shown=frozenset(), now=None):
+    now = now or now_local()
+    hm = now.strftime('%H:%M')
+    cur = now.date() + dt.timedelta(days=1) if hm >= '22:00' else now.date()
+    days = [cur - dt.timedelta(days=i) for i in range(NIGHTS + 2)]
+    buckets = {d: [] for d in days}
+    untimed = 0
+    for line in read_text(os.path.join(WORKSPACE, 'PROACTIVE.md')).splitlines():
+        e = log_entry(line, now.date())
+        if not e:
+            continue
+        ds, lt, text = e
+        try:
+            day = dt.date.fromisoformat(ds)
+        except ValueError:
+            continue
+        if not lt:
+            untimed += days[-1] - dt.timedelta(days=1) <= day <= cur
+            continue
+        n = night_of(day, lt)
+        if n not in buckets:
+            continue
+        text, kind = text.strip(), None
+        km = RX_LOG_KIND.match(text)
+        if km:
+            kind = 'done' if km.group(1).lower() == 'finished' else km.group(1).lower()
+            text = km.group(2)
+        text = title_of(scrub(text, shown), 90)
+        if text:
+            buckets[n].append((ds, lt, {'time': lt, 'kind': kind, 'text': text}))
+    nights = []
+    for d in days:
+        items = [x[2] for x in sorted(buckets[d], key=lambda x: (x[0], x[1]))]
+        nights.append({'date': d.isoformat(), 'in_progress': d == cur and (hm < '08:00' or hm >= '22:00'),
+                       'count': len(items), 'items': items[:NIGHT_ITEMS]})
+    i = 1 if nights[0]['in_progress'] and not nights[0]['count'] else 0   # empty night just begun: keep showing the last one
+    return {'window': '22:00–08:00', 'tonight': nights[i], 'earlier': nights[i + 1:i + 1 + NIGHTS], 'untimed': untimed}
+
+
+CONTEXT_TAGS = ('AI', 'self-hosting', 'finance', 'games', 'science')
+
+
+def context_card():
+    """Only the public parts of ~/bin/context's snapshot: HN picks and per-source status lines."""
+    try:
+        c = json.loads(read_text(CONTEXT) or 'null')
+    except ValueError:
+        return None
+    if not isinstance(c, dict):
+        return None
+    ts = iso_epoch(c.get('generated_at'))
+    picks = []
+    for x in ((c.get('hn') or {}).get('picks') or [])[:10]:
+        try:
+            picks.append({'id': int(x['id']), 'title': clean(x.get('title'), 110), 'points': int(x.get('points') or 0),
+                          'domain': clean(x.get('domain'), 40), 'tags': [t for t in x.get('tags') or [] if t in CONTEXT_TAGS]})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return {'generated_local': local(ts).strftime('%Y-%m-%d %H:%M') if ts else None,
+            'age_min': round((time.time() - ts) / 60) if ts else None, 'hn': picks}
+
+
+RX_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+GYM_LIFTS = ('squat', 'bench', 'deadlift')
+GYM_WEEK_STATUS = {'gym', 'active', 'missed', 'open'}
+GYM_ACT_KINDS = ('shuffle', 'rave')          # dance from calendar titles (gym's other_activity)
+GYM_DAYS = {'today', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'}
+
+
+def agents_block():
+    """Agents tab: running / stalled agents and those ended in the last 6 h, plus the Main row, from lib/agentfeed.py
+    (agent-watch status --json + the transcripts + traces' trigger). Every text in it already passed agentfeed.clean
+    (fail closed); counts, states, times otherwise. This is the 5-min fallback: the page goes live over flowd's
+    /live/agents. None when DASH_AGENTS=off or on any error (the tab then says so)."""
+    if os.environ.get('DASH_AGENTS') == 'off':
+        return None
+    try:
+        import agentfeed
+        return agentfeed.snapshot(6, now=now_local().timestamp())   # DASH_NOW pins it too
+    except Exception:
+        return None
+
+
+def ci_block():
+    """CI tab (and the Health tab's summary) from lib/cifeed.py (deploys.jsonl land, ci-nightly, legacy-main and deploy
+    rows, the deploy lock and queue tickets, `assistant land` processes, the hub runner's newest signed record,
+    legacy-main.json, deployed.json, hub.json): branch, step and suite names, releases, times, counts only. This is the
+    5-min fallback: the page goes live over flowd's /live/ci. None when DASH_CI=off or on any error."""
+    if os.environ.get('DASH_CI') == 'off':
+        return None
+    try:
+        import cifeed
+        return cifeed.snapshot(now_local().timestamp())
+    except Exception:
+        return None
+
+
+SPEED_IDS = ('land_p95', 'land_fail', 'cron_fail')
+SPEED_STATUS = ('ok', 'high', 'regressed', 'no-data')
+
+
+def scorecard_block():
+    """CI tab's speed tiles from `scorecard feed --json` (the hourly scorecard run's section; none when older than 2 h):
+    land time p95, failed-land share, failed-cron share, each with this hour's value, its 7-day baseline, n, status
+    (ok | high | regressed | no-data) and the 48 hourly points, oldest first. Numbers only. None when
+    DASH_SCORECARD=off, no feed yet or anything unexpected."""
+    d = scorecard_feed()
+    if d is None:
+        return None
+    ms = [sc_metric(m, ('s', 'share')) for m in d['metrics'] if isinstance(m, dict) and m.get('id') in SPEED_IDS]
+    if not ms:
+        return None
+    return {'at_local': sc_at(d), 'metrics': sorted(ms, key=lambda x: SPEED_IDS.index(x['id']))}
+
+
+_SC = {}
+
+
+def scorecard_feed():
+    """`scorecard feed --json` once per build (the CI tab's speed strip and the Health tab's "How I'm doing" read it):
+    the dict with a metrics list, else None (off, missing, failed, not JSON)."""
+    if 'feed' not in _SC:
+        _SC['feed'] = None
+        if SCORECARD_BIN != 'off' and os.path.exists(SCORECARD_BIN):
+            code, out, _ = run([SCORECARD_BIN, 'feed', '--json'], timeout=20)
+            try:
+                d = json.loads(out) if code == 0 else None
+            except ValueError:
+                d = None
+            if isinstance(d, dict) and isinstance(d.get('metrics'), list):
+                _SC['feed'] = d
+    return _SC['feed']
+
+
+def sc_num(v):
+    return round(float(v), 4) if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) < 1e12 else None
+
+
+def sc_at(d):
+    at = sc_num(d.get('at'))
+    return dt.datetime.fromtimestamp(at, TZ).strftime('%H:%M') if at else None
+
+
+def sc_metric(m, units):
+    """One scorecard metric, numbers checked: this hour's value, its 7-day base, n, status, the last 48 hourly points."""
+    ser = m.get('series') if isinstance(m.get('series'), list) else []
+    return {'id': m['id'], 'unit': m.get('unit') if m.get('unit') in units else None,
+            'value': sc_num(m.get('value')), 'base': sc_num(m.get('base')),
+            'n': m['n'] if isinstance(m.get('n'), int) and not isinstance(m.get('n'), bool) else 0,
+            'window_h': m['window_h'] if isinstance(m.get('window_h'), int) else None,
+            'status': m['status'] if m.get('status') in SPEED_STATUS else 'no-data',
+            'series': [sc_num(x.get('value')) if isinstance(x, dict) else None for x in ser[-48:]]}
+
+
+DOING_IDS = ('reply_p95', 'cost_day')   # the "How I'm doing" sparklines: first reply to him, cost per day
+DOING_DAYS = 8                           # the week trend: the 7 days before today + today
+
+
+def day_keys(now, n=DOING_DAYS):
+    d0 = now.date()
+    return [(d0 - dt.timedelta(days=n - 1 - i)).isoformat() for i in range(n)]
+
+
+def lands_week(now):
+    """Lands per local day (n, green) over the week trend's days, and today's red lands: their branches, of those the
+    ones a later land of the same branch made green (fixed) and the ones still red (open). Counts only, from
+    deploys.jsonl via lib/cifeed.py's reader. None without a land row or on any error."""
+    try:
+        import cifeed
+        rows = [r for r in cifeed.rows() if r.get('op') == 'land']
+    except Exception:
+        return None
+    keys = day_keys(now)
+    days = {k: [0, 0] for k in keys}
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    lands = []
+    for r in rows:
+        t = r.get('end') or r.get('ts')
+        if not isinstance(t, (int, float)) or isinstance(t, bool) or t > now.timestamp() + 60:
+            continue
+        lands.append((float(t), str(r.get('branch') or ''), bool(r.get('ok'))))
+        k = dt.datetime.fromtimestamp(t, TZ).date().isoformat()
+        if k in days:
+            days[k][0] += 1
+            days[k][1] += bool(r.get('ok'))
+    if not lands:
+        return None
+    red = {}
+    for t, b, ok in lands:
+        if not ok and t >= midnight and b:
+            red[b] = min(red.get(b, t), t)
+    fixed = sum(1 for b, t in red.items() if any(ok and b2 == b and t2 > t for t2, b2, ok in lands))
+    return {'days': [{'day': k, 'n': days[k][0], 'green': days[k][1]} for k in keys],
+            'red_today': sum(1 for t, b, ok in lands if not ok and t >= midnight),
+            'red_branches': len(red), 'fixed': fixed, 'open': len(red) - fixed}
+
+
+def doing_block(now=None):
+    """Health tab's "How I'm doing": the scorecard's first-reply p95 and cost-per-day sparklines (48 h against the
+    7-day base) with the run's time, which of its metrics are over their bar now (ids and status), lands per day and
+    today's red branches fixed vs still red, and board items done per day (PROACTIVE.md dated lines). Numbers, ids
+    and states only; the rest of the block (reply times, errors, blocks, helpers, cost per day) the page reads from
+    `traces`, `tokens` and `systems.cron`. None when DASH_DOING=off; each part null on its own when missing."""
+    if os.environ.get('DASH_DOING') == 'off':
+        return None
+    now = now or now_local()
+    out = {'at_local': None, 'metrics': [], 'over': [], 'checked': 0, 'lands': None, 'done': None}
+    d = scorecard_feed()
+    if d is not None:
+        ms = [m for m in d['metrics'] if isinstance(m, dict) and isinstance(m.get('id'), str)
+              and re.fullmatch(r'[a-z0-9_]{1,32}', m['id'])]
+        out['at_local'] = sc_at(d)
+        out['metrics'] = sorted((sc_metric(m, ('s', 'usd')) for m in ms if m['id'] in DOING_IDS),
+                                key=lambda x: DOING_IDS.index(x['id']))
+        out['over'] = [{'id': m['id'], 'status': m['status']} for m in ms if m.get('status') in ('high', 'regressed')]
+        out['checked'] = sum(1 for m in ms if m.get('status') in ('ok', 'high', 'regressed'))
+    try:
+        out['lands'] = lands_week(now)
+    except Exception:   # noqa: BLE001 - one part never costs the block
+        out['lands'] = None
+    keys = day_keys(now)
+    cnt = collections.Counter(dt.datetime.fromtimestamp(t, TZ).date().isoformat()
+                              for t in dated_epochs(os.path.join(WORKSPACE, 'PROACTIVE.md'), skip_started=True))
+    out['done'] = {'days': [{'day': k, 'n': cnt.get(k, 0)} for k in keys]} if os.path.exists(os.path.join(WORKSPACE, 'PROACTIVE.md')) else None
+    return out
+
+
+def traces_card():
+    """Usage tab's "Turns and errors" panel from `traces dash-json` (local SQLite, token-free): owner reply latency,
+    cost by trigger, slowest turns, error rates by tool, model latency. Numbers, categories and agent titles only.
+    None when traces is missing, off or fails (no panel then)."""
+    if TRACES_BIN == 'off' or not os.path.exists(TRACES_BIN):
+        return None
+    try:
+        p = subprocess.run([TRACES_BIN, 'dash-json', '--days', '7'], capture_output=True, text=True, timeout=30)
+        d = json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return d if isinstance(d, dict) and isinstance(d.get('tiles'), dict) else None
+
+
+def gym_card():
+    """Today tab's Gym card from `gym plan next --json` (local DB only, no tokens): sessions this week vs the plan,
+    8 weekly counts (sparkline), streak, last and next session (plan day + lead exercise), squat/bench/deadlift e1RM
+    (last value + change over 4 weeks), free evenings (null without a calendar cache), dance (shuffle/rave count +
+    hours this week and over 8 weeks; per week its hours and status gym/active/missed/open). None when gym is missing,
+    fails or prints something unexpected; single bad fields become null."""
+    if GYM_BIN == 'off' or not os.path.exists(GYM_BIN):
+        return None
+    code, out, _ = run([GYM_BIN, 'plan', 'next', '--json'], timeout=20)
+    try:
+        g = json.loads(out) if code == 0 else None
+    except ValueError:
+        return None
+    if not isinstance(g, dict):
+        return None
+
+    def num(v, lo=-1e4, hi=1e4):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi else None
+
+    def date(v):
+        return v if isinstance(v, str) and RX_DATE.match(v) else None
+
+    def sub(k):
+        v = g.get(k)
+        return v if isinstance(v, dict) else {}
+    wk, last, nxt, oa = sub('week'), sub('last_session'), sub('next'), sub('other_activity')
+
+    def status(v):
+        return v if v in GYM_WEEK_STATUS else None
+
+    def act(b):                 # {shuffle, rave} -> {count, hours} each, range-checked
+        b = b if isinstance(b, dict) else {}
+        return {k: {'count': num((b.get(k) or {}).get('count'), 0, 50) or 0,
+                    'hours': num((b.get(k) or {}).get('hours'), 0, 600) or 0}
+                for k in GYM_ACT_KINDS if isinstance(b.get(k), dict)}
+    dance_h = {}
+    for w in oa.get('weeks') if isinstance(oa.get('weeks'), list) else []:
+        if isinstance(w, dict) and date(w.get('start')):
+            dance_h[w['start']] = round(sum(x['hours'] for x in act(w).values()), 1)
+    weeks = [{'start': date(w.get('start')), 'sessions': num(w.get('sessions'), 0, 50), 'status': status(w.get('status')),
+              'dance_h': dance_h.get(w.get('start'))}
+             for w in (g.get('weeks') if isinstance(g.get('weeks'), list) else [])[-8:] if isinstance(w, dict)]
+    lifts = []
+    for x in g.get('lifts') if isinstance(g.get('lifts'), list) else []:
+        if isinstance(x, dict) and x.get('lift') in GYM_LIFTS:
+            lifts.append({'lift': x['lift'], 'exercise': clean(x.get('exercise'), 48) or None, 'last': num(x.get('last'), 0),
+                          'last_date': date(x.get('last_date')), 'change': num(x.get('change'))})
+    free = g.get('free_evenings')
+    reps = nxt.get('lead_reps') if isinstance(nxt.get('lead_reps'), list) else []
+    return {
+        'week': {'sessions': num(wk.get('sessions'), 0, 50), 'target': num(wk.get('target'), 1, 7),
+                 'status': status(wk.get('status'))},
+        'activity': ({'this_week': act(oa.get('this_week')), 'total': act(oa.get('total')),
+                      'weeks': len(oa['weeks']) if isinstance(oa.get('weeks'), list) else None} if oa else None),
+        'weeks': weeks,
+        'streak_weeks': num(g.get('streak_weeks'), 0), 'longest_streak_weeks': num(g.get('longest_streak_weeks'), 0),
+        'last_session': ({'date': date(last.get('date')), 'days_ago': num(last.get('days_ago'), 0),
+                          'day': clean(last.get('day'), 4) or None} if date(last.get('date')) else None),
+        'next': ({'key': clean(nxt.get('key'), 4) or None, 'name': clean(nxt.get('name'), 60),
+                  'lead': clean(nxt.get('lead'), 48) or None, 'sets': num(nxt.get('lead_sets'), 1, 20),
+                  'reps': [num(r, 1, 100) for r in reps[:2]] if len(reps) >= 2 else None,
+                  'kg': num(nxt.get('lead_kg'), 0, 1000), 'est_min': num(nxt.get('est_min'), 1, 600)}
+                 if nxt.get('name') else None),
+        'lifts': lifts,
+        'free_evenings': [d for d in free if d in GYM_DAYS][:7] if isinstance(free, list) else None,
+    }
+
+
+def server_checks():
+    """Server health (the Unraid report's critical/warning counts) and array capacity from the context snapshot, as
+    health checks next to the container's own (Health once said all OK while the server had 2 critical)."""
+    try:
+        c = json.loads(read_text(CONTEXT) or 'null')
+    except ValueError:
+        return []
+    srv = c.get('server') if isinstance(c, dict) else None
+    if not isinstance(srv, dict):
+        return []
+    ts = iso_epoch(c.get('generated_at'))
+    stale = not ts or time.time() - ts > 26 * 3600
+    when = (' · snapshot ' + local(ts).strftime('%d.%m. %H:%M')) if ts else ''
+    out = []
+    hl = srv.get('health')
+    if isinstance(hl, str) and hl.strip():
+        cr, wa = re.search(r'(\d+)\s+critical', hl), re.search(r'(\d+)\s+warning', hl)
+        crit, warn = int(cr.group(1)) if cr else 0, int(wa.group(1)) if wa else 0
+        rep = re.search(r'report (\d{4}-\d\d-\d\d \d\d:\d\d)', hl)
+        st = 'unknown' if stale or not (cr or wa) else 'critical' if crit else 'warn' if warn else 'ok'
+        out.append(check('Server (Unraid)', st, f'{crit} critical · {warn} warning' + ('' if warn == 1 else 's'),
+                         'Unraid health report' + (f' of {rep.group(1)}' if rep else '') + when))
+    cap = srv.get('capacity')
+    if isinstance(cap, str) and cap.strip():
+        p, d = re.search(r'([\d.]+)%\s*used', cap), re.search(r'in (\d+) d\b', cap)
+        pct, days = (float(p.group(1)) if p else None), (int(d.group(1)) if d else None)
+        st = ('unknown' if stale or pct is None else
+              'critical' if pct >= 97 or (days is not None and days < 14) else
+              'warn' if pct >= 90 or (days is not None and days < 60) else 'ok')
+        out.append(check('Array capacity', st, (f'{pct:.0f}% used' if pct is not None else '?') +
+                         (f', full in ~{days} d' if days is not None else ''), cap.split(';')[0] + when))
+    return out
+
+
+CRON_DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+
+def cron_human(f):
+    mi, ho, dom, mon, dow = f
+
+    def hhmm(h, m):
+        return f'{int(h):02d}:{int(m):02d}'
+    if mi == '*' and ho == '*':
+        return 'every minute'
+    m = re.fullmatch(r'\*/(\d+)', mi)
+    if m and ho == '*':
+        return f'every {m.group(1)} min'
+    if ho == '*' and re.fullmatch(r'[\d,]+', mi):
+        return 'hourly at ' + ', '.join(':' + x.zfill(2) for x in mi.split(','))
+    m = re.fullmatch(r'(\d+)-(\d+)/(\d+)', ho)
+    if m and mi.isdigit():
+        return f'every {m.group(3)} h, {hhmm(m.group(1), mi)}–{hhmm(m.group(2), mi)}'
+    if mi.isdigit() and ho.isdigit():
+        t = hhmm(ho, mi)
+        if dom == '*' and dow == '*':
+            return f'daily {t}'
+        if dom == '*' and dow != '*':
+            days = []
+            for part in dow.split(','):
+                if '-' in part:
+                    a, b = part.split('-')
+                    days.append(f'{CRON_DOW[int(a)]}–{CRON_DOW[int(b)]}')
+                elif part.isdigit():
+                    days.append(CRON_DOW[int(part)])
+            return f'{", ".join(days)} {t}'
+        if dom.isdigit() and dow == '*':
+            return f'monthly on day {dom}, {t}'
+    return ' '.join(f)
+
+
+def job_label(cmd):
+    m = re.search(re.escape(HOME) + r'/bin/([\w.-]+)(?:\s+([a-z][\w-]*))?', cmd)
+    if m and m.group(1) not in ('tg',):
+        return m.group(1) + (' ' + m.group(2) if m.group(2) else '')
+    m = re.search(r'inbox/([a-z-]+)-\$\(date', cmd)
+    if m:
+        return f'note to inbox: {m.group(1)}'
+    if cmd.startswith('find '):
+        return 'cleanup (find -delete)'
+    m = re.search(re.escape(HOME) + r'/bin/(\w[\w-]*)', cmd)
+    return m.group(1) if m else cmd.split()[0]
+
+
+def registry_why():
+    """Cron line name -> the schedule registry's `why` (lines written by `assistant cron` end in # assistant:NAME and
+    no longer sit under their old comment block); {} without the registry."""
+    try:
+        import tomllib
+        with open(SCHEDULES, 'rb') as f:
+            jobs = tomllib.load(f).get('jobs') or {}
+    except (OSError, ValueError, ImportError):
+        return {}
+    out = {}
+    for j in jobs.values():
+        if isinstance(j, dict) and j.get('line') and j.get('why'):
+            out.setdefault(str(j['line']), str(j['why']))
+    return out
+
+
+def parse_crontab():
+    txt = read_text(P('crontab'))
+    jobs = []
+    comment = []
+    why = registry_why()
+    rx_job = re.compile(r'^(#\s*)?((?:[\d*/,-]+\s+){4}[\d*/,-]+)\s+(\S.*)$')
+    for line in txt.splitlines():
+        s = line.strip()
+        if not s:
+            comment = []
+            continue
+        m = rx_job.match(s)
+        if m:
+            fields = m.group(2).split()
+            cmd = m.group(3)
+            mk = re.search(r'\s#\s*assistant:([\w.-]+)\s*$', cmd)
+            if mk:
+                cmd = cmd[:mk.start()]
+            desc = short_desc(why[mk.group(1)]) if mk and why.get(mk.group(1)) else (
+                short_desc(' '.join(comment)) if comment else '')
+            job = {'schedule': ' '.join(fields), 'when': cron_human(fields), 'job': clean(job_label(cmd), 40),
+                   'description': desc, 'enabled': not m.group(1)}
+            prev = jobs[-1] if jobs else None
+            if prev and (prev['job'], prev['description'], prev['enabled']) == (job['job'], desc, job['enabled']):
+                prev['when'] += '; ' + job['when']   # same job at several times (e.g. the commute guard)
+                prev['schedule'] += '; ' + job['schedule']
+            else:
+                jobs.append(job)
+            continue
+        if s.startswith('#'):
+            c = s.lstrip('#').strip()
+            if re.match(r'(PROPOSED|DISABLED|moved to)', c):
+                continue
+            comment.append(c)
+        else:
+            comment = []
+    return jobs
+
+
+def parse_agent_watch():
+    rc, out, _ = run([P('bin', 'agent-watch'), 'status'], timeout=10)
+    lines = out.splitlines()
+    agents = []
+    hdr = next((i for i, l in enumerate(lines) if l.strip().startswith('ID ') and 'STATE' in l), None)
+    if hdr is None:
+        return agents
+    h = lines[hdr]
+    cols = ['ID', 'STATE', 'RUN', 'SILENT', 'LAST', 'OWNER TAG', 'DESCRIPTION']
+    pos = [h.find(c) for c in cols]
+    if min(pos) < 0:
+        return agents
+    for l in lines[hdr + 1:]:
+        if not l.strip():
+            continue
+        vals = [l[p:e].strip() for p, e in zip(pos, pos[1:] + [None])]
+        a = dict(zip(['id', 'state', 'run', 'silent', 'last', 'owner_tag', 'description'], vals))
+        a['id'] = a['id'][:8]
+        a['description'] = clean(a['description'], 70)
+        a['owner_tag'] = None if a['owner_tag'] in ('-', '') else clean(a['owner_tag'], 40)
+        agents.append(a)
+    return agents
+
+
+def reminders():
+    rs = read_json(P('.local', 'state', 'remind', 'reminders.json'))
+    if not isinstance(rs, list):
+        return None
+    rs = [r for r in rs if isinstance(r, dict)]
+    tags = collections.Counter()
+    known = {'deadline', 'bill', 'watch', 'kk', 'guard'}
+    for r in rs:
+        t = (r.get('tag') or '').split(':')[0]
+        tags[t if t in known else ('untagged' if not t else 'other')] += 1
+    ats = sorted(str(r['at']) for r in rs if r.get('at'))
+    return {'total': len(rs), 'for_owner': sum(1 for r in rs if r.get('owner')),
+            'for_me': sum(1 for r in rs if not r.get('owner')),
+            'next_at': ats[0] if ats else None,
+            'by_tag': dict(tags.most_common(8)),
+            'next_7d': sum(1 for a in ats if a <= (now_local() + dt.timedelta(days=7)).strftime('%Y-%m-%d %H:%M'))}
+
+
+def brain_stats():
+    rc, out, _ = run(['git', '--git-dir', P('.brain.git'), 'log', '--format=%ad|%s', '--date=format-local:%Y-%m-%d %H:%M'],
+                     timeout=10, env={'TZ': TZ.key})
+    if rc != 0:
+        return None
+    per = collections.Counter()
+    manual = 0
+    last = None
+    for l in out.splitlines():
+        d, _, s = l.partition('|')
+        last = last or d
+        per[d[:10]] += 1
+        if not s.startswith('auto'):
+            manual += 1
+    wk = (now_local() - dt.timedelta(days=6)).strftime('%Y-%m-%d')
+    return {'commits': sum(per.values()), 'manual': manual, 'last': last,
+            'last_7d': sum(n for d, n in per.items() if d >= wk)}
+
+
+def frontmatter(txt):
+    m = re.match(r'---\s*\n(.*?)\n---', txt, re.S)
+    return m.group(1) if m else ''
+
+
+def is_private(txt):
+    """Skills/agents marked `private: true`, `hidden: true` or `dashboard: hide` in their frontmatter stay off the page."""
+    return bool(re.search(r'^(?:private|hidden):\s*(?:true|yes)\s*$|^dashboard:\s*(?:hide|hidden|no|false)\s*$',
+                          frontmatter(txt), re.M | re.I))
+
+
+def capabilities():
+    def described(pattern, name):
+        out = []
+        for d in sorted(glob.glob(P('.claude', *pattern))):
+            txt = read_text(d)
+            m = re.search(r'^description:\s*(.+)$', txt, re.M)
+            if not is_private(txt):
+                out.append({'name': name(d), 'what': clean(re.split(r'(?<=[.!?])\s', m.group(1).strip() if m else '',
+                                                                    maxsplit=1)[0], 110)})
+        return out
+    skills = described(('skills', '*', 'SKILL.md'), lambda d: os.path.basename(os.path.dirname(d)))
+    agents = described(('agents', '*.md'), lambda d: os.path.basename(d)[:-3])
+    return {'skills': skills, 'agents': agents}
+
+
+# ---------------------------------------------------------------- codebase stats
+# Test-suite line and check counts only (never file contents). Recomputed at most hourly (ASSIST_TTL), cached in
+# ~/.local/state/dash/assistant-stats.json. Third-party trees (venvs, node_modules, vendor, llama.cpp, whisper.cpp)
+# and anything private (~/.secrets, vault data, context, reports, nginx-mirror) are never walked.
+ASSIST_CACHE = os.path.join(STATE_DIR, 'assistant-stats.json')
+ASSIST_TTL = int(os.environ.get('DASH_ASSIST_TTL', '3600'))
+ASSIST_VERSION = 3   # cache format: plugins, hooks, tests only (line counts: dash-growth)
+LANG_EXT = {'.py': 'Python', '.sh': 'Shell', '.bash': 'Shell', '.js': 'JavaScript', '.mjs': 'JavaScript',
+            '.cjs': 'JavaScript', '.ts': 'TypeScript', '.tsx': 'TypeScript', '.html': 'HTML', '.css': 'CSS'}
+SKIP_DIRS = {'node_modules', '__pycache__', '.git', 'vendor', 'dist', 'build', '.venv', 'venv', 'data', 'state'}
+# a "check" = one assertion line (assert / self.assertX / assert.equal / expect( / the shell+python harness helpers)
+RX_CHECK = re.compile(r'^\s*(?:await\s+)?(?:(?:self\.)?assert\w*(?:\.\w+)?\s*[( ]|assert\s|(?:ok|check|eq|has|expect)\s*[( ])')
+RX_SHFN = re.compile(r'^\s*\w+\s*\(\)\s*\{')
+
+
+def lang_of(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in LANG_EXT:
+        return LANG_EXT[ext]
+    if ext:
+        return None
+    try:
+        with open(path, 'rb') as f:
+            first = f.readline(200)
+    except OSError:
+        return None
+    if not first.startswith(b'#!'):
+        return None
+    if b'python' in first:
+        return 'Python'
+    if re.search(rb'\b(?:ba|da|z)?sh\b', first):
+        return 'Shell'
+    if re.search(rb'\b(?:node|bun|deno)\b', first):
+        return 'JavaScript'
+    return None
+
+
+def file_lines(path, checks=False, seen=None):
+    """(non-blank lines, test checks) of a text file; binaries, files over 2 MB and copies of a file already in
+    `seen` (same bytes, e.g. the vault's copies of my tests) count as nothing."""
+    try:
+        if os.path.getsize(path) > 2 * 1024 * 1024:
+            return 0, 0
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return 0, 0
+    if b'\0' in raw[:4096]:
+        return 0, 0
+    if seen is not None:
+        hsh = hash(raw)
+        if hsh in seen:
+            return 0, 0
+        seen.add(hsh)
+    loc = nc = 0
+    for l in raw.decode('utf-8', 'replace').splitlines():
+        if l.strip():
+            loc += 1
+            if checks and RX_CHECK.match(l) and not RX_SHFN.match(l):
+                nc += 1
+    return loc, nc
+
+
+def code_files(root, recurse=True, skip_tests=False):
+    """[(path, lang)] of my code under root (no symlinks, no third-party dirs)."""
+    out = []
+    if os.path.isfile(root):
+        lg = lang_of(root)
+        return [(root, lg)] if lg else []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.')
+                         and not (skip_tests and d in ('test', 'tests')))
+        for fn in sorted(files):
+            p = os.path.join(dirpath, fn)
+            if os.path.islink(p) or (skip_tests and re.match(r'(test_|.*[._]test\.)', fn)):
+                continue
+            lg = lang_of(p)
+            if lg:
+                out.append((p, lg))
+        if not recurse:
+            break
+    return out
+
+
+def test_paths():
+    paths = sorted(glob.glob(P('opt', '*-tests')))
+    paths += [p for p in (P('opt', 'claude-vault', 'tests'),) if os.path.isdir(p)]
+    paths += sorted(glob.glob(P('plugins', '*', 'test')))
+    paths += sorted(glob.glob(P('.claude', 'hooks', 'test_*')))
+    paths += sorted(glob.glob(P('opt', '*-src', 'test_*')))
+    return [p for p in paths if not os.path.islink(p)]
+
+
+def codebase_stats():
+    """Plugins, hooks and the test suites (files, lines, a rough check count). Line counts of the codebase itself
+    come from dash-growth (the page's one line count)."""
+    plugins = sorted(d for d in os.listdir(P('plugins')) if os.path.isdir(P('plugins', d)) and not d.startswith('.')) if os.path.isdir(P('plugins')) else []
+    suites = test_paths()
+    t_files = t_loc = t_checks = 0
+    seen = set()
+    for root in suites:
+        for p, _ in code_files(root, True, False):
+            l, c = file_lines(p, checks=True, seen=seen)
+            if l:
+                t_files, t_loc, t_checks = t_files + 1, t_loc + l, t_checks + c
+    hooks_ev = hooks_n = 0
+    try:
+        with open(P('.claude', 'settings.json')) as f:
+            hk = (json.load(f) or {}).get('hooks') or {}
+        hooks_ev = len(hk)
+        hooks_n = sum(len(m.get('hooks') or []) for ms in hk.values() for m in ms)
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return {
+        'version': ASSIST_VERSION,
+        'computed_at': time.time(),
+        'computed_local': now_local().strftime('%Y-%m-%d %H:%M'),
+        'plugins': {'count': len(plugins), 'names': [clean(x, 30) for x in plugins]},
+        'hooks': {'events': hooks_ev, 'handlers': hooks_n},
+        'tests': {'suites': len(suites), 'checks': t_checks, 'files': t_files, 'loc': t_loc},
+    }
+
+
+def cached_codebase_stats():
+    try:
+        with open(ASSIST_CACHE) as f:
+            c = json.load(f)
+        if c.get('version') == ASSIST_VERSION and time.time() - float(c.get('computed_at', 0)) < ASSIST_TTL:
+            return c
+    except (OSError, ValueError, TypeError):
+        pass
+    c = codebase_stats()
+    try:
+        atomic_write(ASSIST_CACHE, json.dumps(c, ensure_ascii=False))
+    except OSError:
+        pass
+    return c
+
+
+def redact_strings(obj):
+    """One `secretscan --redact` pass over every string in obj (line-preserving); fails closed to '[redacted]'."""
+    leaves = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k in o:
+                if isinstance(o[k], str):
+                    leaves.append((o, k))
+                else:
+                    walk(o[k])
+        elif isinstance(o, list):
+            for i, x in enumerate(o):
+                if isinstance(x, str):
+                    leaves.append((o, i))
+                else:
+                    walk(x)
+    walk(obj)
+    if not leaves:
+        return obj
+    text = '\n'.join(c[k].replace('\n', ' ').replace('\r', ' ') for c, k in leaves) + '\n'
+    sc = P('bin', 'secretscan')
+    try:
+        r = subprocess.run([sc, '--redact'], input=text, capture_output=True, text=True, timeout=60)
+        lines = r.stdout.split('\n')[:len(leaves)] if r.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired):
+        lines = []
+    if len(lines) != len(leaves):
+        lines = ['[redacted]'] * len(leaves)
+    for (c, k), v in zip(leaves, lines):
+        c[k] = v
+    return obj
+
+
+def codebase():
+    """Codebase tab: plugins, hooks, tests (cached hourly), the skill and subagent list, config snapshots (live)."""
+    st = cached_codebase_stats()
+    caps = capabilities()
+    out = {
+        'stats': {k: st.get(k) for k in ('computed_local', 'plugins', 'hooks', 'tests')},
+        'skills': caps['skills'],
+        'agents': caps['agents'],
+        'brain': brain_stats(),
+    }
+    return redact_strings(out)
+
+
+
+def status_now():
+    st = {}
+    try:
+        with open(P('.local', 'state', 'tg-status', 'state.json')) as f:
+            s = json.load(f)
+        st['mode'] = s.get('mode')
+        if s.get('since'):
+            st['since'] = local(float(s['since'])).strftime('%H:%M')
+    except (OSError, ValueError, AttributeError, TypeError):   # missing, corrupt or not an object
+        pass
+    rc, out, _ = run([P('bin', 'tg-status'), 'show', '--plain'], timeout=10)
+    if rc == 0 and out.strip():
+        st['header'] = clean(out.strip().splitlines()[0], 120)
+    return st
+
+
+def heartbeat_gate(now):
+    """Today's heartbeat pre-check decisions (hb-gate log, counts only) and the mod's counters; None before the gate ran."""
+    day, c = now.strftime('%Y-%m-%d'), {'wake': 0, 'skip': 0}
+    try:
+        with open(HB_GATE_LOG, encoding='utf-8') as f:
+            for line in f:
+                p = line.split(' ', 3)
+                if len(p) > 2 and p[0] == day and p[2] in c:
+                    c[p[2]] += 1
+    except OSError:
+        return None
+    return {'wake_today': c['wake'], 'skip_today': c['skip']}
+
+
+def inbox_count():
+    try:
+        return len([f for f in os.listdir(P('inbox')) if not f.startswith('.')])
+    except OSError:
+        return None
+
+
+# ----------------------------------------------------------------------------------------- health
+def hub_mode():
+    m = os.environ.get('DASH_HUB', '').strip()
+    if not m:
+        m = (read_text(HUB_MODE_FILE) or '').strip()
+    return m if m in ('feed', 'snapshot', 'off') else 'feed'
+
+
+def hub_block(mode):
+    """The hub feed's snapshot (one GET, 3 s): states, counts and ids only. None when off, unreachable or malformed."""
+    if mode == 'off':
+        return None
+    try:
+        with urllib.request.urlopen(HUB_URL.rstrip('/') + '/feed', timeout=3) as r:
+            d = json.load(r)
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and isinstance(d.get('parts'), list) else None
+
+
+def check(name, status, value, detail=None):
+    return {'name': name, 'status': status, 'value': clean(value, 120), 'detail': clean(detail, 200) if detail else None}
+
+
+def health():
+    out = []
+    # Telegram channel: the hub feed covers it (channel-check is retired; hub-mode off has no channel check)
+    # Privacy vault
+    rc, txt, _ = run([os.environ.get('DASH_VAULT') or P('bin', 'vault'), 'status'], timeout=15)
+    if rc == 0 and txt.strip():
+        lines = txt.strip().splitlines()
+        head = lines[0]
+        llm = next((l.split(':', 1)[1].strip() for l in lines if l.startswith('local LLM')), '?')
+        tg = next((l.split(':', 1)[1].strip() for l in lines if l.startswith('telegram:')), '?')
+        alerts = re.search(r'alerts:\s*(\d+)', txt)
+        pend = re.search(r'raw requests pending:\s*(\d+)', txt)
+        up = re.search(r'\bup (\S+)', head)
+        st = 'ok' if 'healthy' in llm and (alerts and alerts.group(1) == '0') else 'warn'
+        detail = f'Telegram archive: {tg}'
+        if 'not logged in' in tg:
+            detail += ' (waiting on your api_id/api_hash)'
+        out.append(check('Privacy vault', st, f"up {up.group(1) if up else '?'}, local LLM {llm}, alerts {alerts.group(1) if alerts else '?'}",
+                         detail + (f'; raw requests pending {pend.group(1)}' if pend else '')))
+    else:
+        out.append(check('Privacy vault', 'critical', 'vault not reachable'))
+    # Browser: Chrome runs in claude-hub-browser; `browser status --json` is browser-hub's (container: chrome,
+    # version, service, view)
+    bst = jcall([os.environ.get('DASH_BROWSER') or P('bin', 'browser'), 'status', '--json'], timeout=15)
+    c = (bst or {}).get('container') or {}
+    svc, view = c.get('svc') or {}, c.get('view') or {}
+    ver = re.sub(r'^Chrome/', '', str(c.get('version') or '?'))
+    if c.get('chrome') == 'up':
+        out.append(check('Browser', 'ok' if svc.get('up') else 'warn', f'Chrome {ver} in claude-hub-browser',
+                         f"browser service {'up' if svc.get('up') else 'down'}" + (f" ({svc['mode']})" if svc.get('mode') else '')
+                         + f"; owner view {'on' if view.get('on') else 'off'}"))
+    else:
+        out.append(check('Browser', 'warn', 'Chrome not running in claude-hub-browser' if c else 'claude-hub-browser not answering'))
+    # Local speech model
+    rc, txt, _ = run([os.environ.get('DASH_WHISPER_CTL') or P('bin', 'whisper-server-ctl'), 'status'], timeout=10)
+    out.append(check('Voice transcription', 'ok' if txt.startswith('up') else 'warn',
+                     'whisper server up' if txt.startswith('up') else 'whisper server down',
+                     'runs locally on loopback; audio never leaves the container'))
+    # Backups
+    log = read_text(P('.local', 'state', 'brain-backup.log')).strip().splitlines()
+    fails = sorted(glob.glob(P('inbox', 'brain-backup-failed-*')))
+    if fails:
+        out.append(check('Nightly backup', 'critical', 'last run failed', 'see the inbox note'))
+    elif log:
+        m = re.search(r'(\d+)\s+(\w{3}\s+\d+\s+[\d:]+)\s+\S*claude-bot-(\d{4}-\d\d-\d\d)', log[-1])
+        size = re.search(r'\s(\d{4,})\s+\w{3}\s+\d', log[-1])
+        when = m.group(3) if m else 'unknown'
+        age_ok = m and (now_local().date() - dt.date.fromisoformat(m.group(3))).days <= 1
+        out.append(check('Nightly backup', 'ok' if age_ok else 'warn', f'last archive {when}',
+                         (f'{int(size.group(1)) / 1e6:.0f} MB, ' if size else '') + 'Unraid share, 14 days kept'))
+    else:
+        out.append(check('Nightly backup', 'unknown', 'no run logged yet', 'scheduled daily 03:47 (set up 2026-10-10)'))
+    # Brain snapshots
+    rc, txt, _ = run(['git', '--git-dir', P('.brain.git'), 'log', '-1', '--format=%ct'], timeout=10)
+    if rc == 0 and txt.strip().isdigit():
+        age = time.time() - int(txt.strip())
+        out.append(check('Config snapshots', 'ok' if age < 6 * 3600 else 'warn', f'last {human_dur(age)} ago',
+                         'brain repo, auto every 30 min when something changed'))
+    # Subagents
+    agents = parse_agent_watch()
+    stalled = [a for a in agents if a.get('state') == 'stalled']
+    out.append(check('Background agents', 'warn' if stalled else 'ok',
+                     f"{sum(1 for a in agents if a.get('state') == 'running')} running, {len(stalled)} stalled"))
+    # Inbox backlog
+    n = inbox_count()
+    if n is not None:
+        out.append(check('Inbox backlog', 'ok' if n <= 5 else 'warn', f'{n} note(s) waiting'))
+    # Cron daemon
+    rc, txt, _ = run(['pgrep', '-x', 'cron'], timeout=5)
+    out.append(check('Cron daemon', 'ok' if rc == 0 else 'critical', 'running' if rc == 0 else 'not running'))
+    # Disk
+    du = shutil.disk_usage(HOME)
+    pct = du.used / du.total * 100
+    rc, txt, _ = run(['du', '-sb', HOME], timeout=30)
+    home_b = int(txt.split()[0]) if rc == 0 and txt.split() else None
+    out.append(check('Disk', 'ok' if pct < 85 else ('warn' if pct < 95 else 'critical'),
+                     f'{pct:.0f}% used, {du.free / 1e9:.0f} GB free',
+                     (f'{HOME} holds {home_b / 1e9:.1f} GB' if home_b else None)))
+    # Memory (cgroup if limited, else host)
+    mem = None
+    try:
+        cur = int(read_text('/sys/fs/cgroup/memory.current').strip())
+        mx = read_text('/sys/fs/cgroup/memory.max').strip()
+        mem = (cur, int(mx) if mx.isdigit() else None)
+    except ValueError:
+        pass
+    mi = {}
+    for l in read_text('/proc/meminfo').splitlines():
+        k, _, v = l.partition(':')
+        mi[k] = int(v.split()[0]) * 1024 if v.split() else 0
+    if mem and mem[1]:
+        p = mem[0] / mem[1] * 100
+        out.append(check('Memory', 'ok' if p < 85 else 'warn', f'{mem[0] / 1e9:.1f} of {mem[1] / 1e9:.0f} GB container limit'))
+    elif mem:
+        out.append(check('Memory', 'ok', f'{mem[0] / 1e9:.1f} GB used by the container',
+                         f"host: {mi.get('MemAvailable', 0) / 1e9:.0f} of {mi.get('MemTotal', 0) / 1e9:.0f} GB available"))
+    # Load
+    la = os.getloadavg()
+    cpus = os.cpu_count() or 1
+    out.append(check('CPU load', 'ok' if la[1] < cpus * 0.8 else 'warn', f'{la[0]:.1f} / {la[1]:.1f} / {la[2]:.1f}',
+                     f'{cpus} CPU threads (1, 5, 15 min averages)'))
+    # Uptime
+    rc, txt, _ = run(['ps', '-o', 'etimes=', '-p', '1'], timeout=5)
+    cup = int(txt.strip()) if txt.strip().isdigit() else None
+    hup = float(read_text('/proc/uptime').split()[0]) if read_text('/proc/uptime') else None
+    out.append(check('Uptime', 'ok', f'container {human_dur(cup) if cup else "?"}',
+                     f'host (Unraid) {human_dur(hup)}' if hup else None))
+    out[:0] = server_checks()   # the server first: the Today card lists problems in this order
+    summary = collections.Counter(c['status'] for c in out)
+    return {'checks': out, 'summary': dict(summary)}
+
+
+# ----------------------------------------------------------------------------------------- data map
+def dir_size(path):
+    total = 0
+    files = 0
+    for root, dirs, fs in os.walk(path):
+        for f in fs:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+                files += 1
+            except OSError:
+                pass
+    return total, files
+
+
+def dataflow():
+    try:
+        with open(DATAFLOW) as f:
+            df = json.load(f)
+    except (OSError, ValueError) as e:
+        return {'error': f'data map missing or invalid: {type(e).__name__}'}
+    if not isinstance(df, dict):
+        return {'error': 'data map missing or invalid: not an object'}
+    for s in df.get('stores', []):
+        paths = s.pop('paths', None)
+        count_only = s.pop('count_only', False)
+        if paths:
+            sizes = [dir_size(os.path.expanduser(p)) for p in paths]
+            b, n = sum(x[0] for x in sizes), sum(x[1] for x in sizes)
+            s['live'] = {'files': n} if count_only else {'bytes': b, 'files': n}
+    for k in ('version', 'sensitivity_levels', 'routes', 'edge_labels', 'viewbox'):
+        df.pop(k, None)
+    df['nodes'] = [{k: n[k] for k in ('id', 'label', 'sub', 'group') if k in n} for n in df.get('nodes', [])]
+    df['live'] = vault_live()
+    if isinstance(df['live'], dict):
+        df['live'].pop('calls_24h', None)   # older cached copies
+    return df
+
+
+# Live privacy-vault numbers for the Data tab: COUNTS ONLY. The audit log also holds free text (raw-request
+# queries and reasons); only `event` and `ts` are read here, nothing else is copied.
+VAULT = os.environ.get('DASH_VAULT', 'vault')
+VAULT_CACHE = os.path.join(STATE_DIR, 'vault-live.json')
+VAULT_TTL = int(os.environ.get('DASH_VAULT_TTL', '1800'))   # dash-publish runs every 5 min; ask the vault every 30
+READ_SOURCES = ('telegram', 'mail', 'documents', 'finance', 'search')
+READ_EVENTS = {
+    'tg_search': 'telegram', 'tg_recent': 'telegram', 'tg_summarize': 'telegram', 'tg_facts_read': 'telegram',
+    'tg_window': 'telegram', 'tg_who': 'telegram', 'tg_find_chat': 'telegram',
+    'gmail_search': 'mail', 'gmail_get': 'mail',
+    'paperless_search': 'documents', 'paperless_get': 'documents', 'paperless_recent': 'documents',
+    'paperless_fields': 'documents',
+    'find': 'search', 'facts': 'search',
+}
+
+
+def read_source(event):
+    """Which private source an audit event read content from (None = status, write, admin or job event)."""
+    if event in READ_EVENTS:
+        return READ_EVENTS[event]
+    if event.startswith(('firefly_', 'finance_')) and not event.endswith(('_refused', '_status', '_failed')):
+        return 'finance'
+    return None
+
+
+def vault_live():
+    cached = read_json(VAULT_CACHE)
+    if isinstance(cached, dict) and VAULT_TTL > 0 and 0 <= time.time() - cached.get('_at', 0) < VAULT_TTL:
+        cached.pop('_at', None)
+        return cached
+    rc, out, _ = run([VAULT, 'audit', '--days', '8', '--json'], timeout=20)
+    try:
+        audit = json.loads(out) if rc == 0 else None
+    except ValueError:
+        audit = None
+    if not isinstance(audit, list):
+        return {'error': 'privacy vault not reachable'}
+
+    def jrun(*args):
+        rc, out, _ = run([VAULT, *args, '--json'], timeout=20)
+        try:
+            v = json.loads(out) if rc == 0 else None
+        except ValueError:
+            v = None
+        return v if isinstance(v, dict) else {}
+    st, mt = jrun('status'), jrun('metrics')
+    now = now_local()
+    today = now.date()
+    days = [today - dt.timedelta(days=i) for i in range(6, -1, -1)]
+    daily = {d: 0 for d in days}
+    by24 = collections.Counter()
+    raw_rel = raw_test = 0
+    first = None
+    cut24, cut7 = now.timestamp() - 86400, now.timestamp() - 7 * 86400   # real hours (DST days are 23/25 h)
+    for e in audit:
+        if not isinstance(e, dict):
+            continue
+        try:
+            ts = dt.datetime.fromisoformat(str(e.get('ts', ''))).astimezone(TZ)
+        except (TypeError, ValueError):
+            continue
+        first = ts if first is None or ts < first else first
+        ev = str(e.get('event', ''))
+        if ev == 'raw_released' and ts.timestamp() >= cut7:
+            if e.get('source') == 'test':
+                raw_test += 1
+            else:
+                raw_rel += 1
+        src = read_source(ev)
+        if not src:
+            continue
+        if ts.date() in daily:
+            daily[ts.date()] += 1
+        if ts.timestamp() >= cut24:
+            by24[src] += 1
+    first_day = first.date() if first else today
+    series = [{'date': d.isoformat(), 'label': d.strftime('%a'), 'n': daily[d] if d >= first_day else None,
+               'today': d == today} for d in days]
+    # 7-day average over complete days only (not today, not the vault's first, partial day)
+    full = [x['n'] for x in series if not x['today'] and x['n'] is not None and x['date'] > first_day.isoformat()]
+    llm = st.get('llm') or {}
+    m = re.match(r'([A-Za-z]+)-(\d+(?:\.\d+)?)-(\d+B)', str(llm.get('model') or ''))
+    pol = re.search(r'v(\d+(?:\.\d+)*)', str((st.get('vault') or {}).get('policy') or ''))
+    tg, gm = st.get('tg') or {}, st.get('gmail') or {}
+    n_acc = len(gm.get('accounts') or []) or (1 if gm.get('configured') else 0)
+    sources = [
+        {'name': 'Telegram', 'ok': bool(tg.get('logged_in')),
+         'note': 'live' if (tg.get('live') or {}).get('state') == 'running' else ('synced' if tg.get('logged_in') else 'not logged in')},
+        {'name': 'Gmail', 'ok': bool(gm.get('configured')) and not gm.get('error'),
+         'note': f"{n_acc} account{'s' if n_acc != 1 else ''}" if gm.get('configured') else 'not set up'},
+        {'name': 'paperless', 'ok': bool((st.get('paperless') or {}).get('configured')), 'note': 'documents'},
+        {'name': 'Firefly', 'ok': bool((st.get('firefly') or {}).get('configured')), 'note': 'finances'},
+    ]
+    routes = [r for r in (mt.get('routes') or []) if isinstance(r, dict)]
+    alerts = st.get('alerts')
+    res = {
+        'as_of': now.strftime('%H:%M'),
+        'reads_24h': sum(by24.values()),
+        'reads_24h_by': {k: by24.get(k, 0) for k in READ_SOURCES},
+        'reads_daily': series,
+        'reads_avg': round(sum(full) / len(full), 1) if full else None,
+        'raw_released_7d': raw_rel,
+        'raw_tests_7d': raw_test,
+        'raw_pending': int((st.get('raw') or {}).get('pending') or 0),
+        'alerts': alerts if isinstance(alerts, int) else None,
+        'llm_ok': bool(llm.get('healthy')) if st else None,
+        'llm': f'{m.group(1).capitalize()} {m.group(2)} {m.group(3)}' if m else 'local LLM',
+        'policy': ('v' + pol.group(1)) if pol else None,
+        'errors_24h': sum(int(r.get('errors') or 0) for r in routes) if routes else None,
+        'sources': sources if st else [],
+    }
+    try:
+        atomic_write(VAULT_CACHE, json.dumps(dict(res, _at=time.time())))
+    except OSError:
+        pass
+    return res
+
+
+# ----------------------------------------------------------------------------------------- systems (System tab)
+# Live status of the big components, each from its own existing status command (read-only, run in parallel with
+# timeouts). Only states, counts, versions and timings go on the page: no names of people, no texts, no web-task
+# titles or URLs, no coordinates. DASH_SYSTEMS=off = no block (the System tab then shows server, cron, agents, board).
+SYSTEMS = os.environ.get('DASH_SYSTEMS', 'on')
+PHONE_BIN = os.environ.get('DASH_PHONE', P('bin', 'phone'))
+VOICE_BIN = os.environ.get('DASH_VOICE', P('bin', 'voice-relay'))
+WEBAGENT_BIN = os.environ.get('DASH_WEBAGENT', P('bin', 'webagent'))
+ABX_BIN = os.environ.get('DASH_ABX', P('bin', 'abx'))
+HA_BIN = os.environ.get('DASH_HA', P('bin', 'ha'))
+# the gateway runs in claude-hub-phone: its allow-listed mirror (`hub phone inbox`)
+PHONEGW_DB = os.environ.get('DASH_PHONEGW_DB') or P('.local', 'state', 'claude-hub', 'phonegw-mirror.db')
+USAGE_DB = os.environ.get('DASH_USAGE_DB', P('.local', 'state', 'product', 'usage.db'))
+CRONFAIL_DIR = os.environ.get('DASH_CRONFAIL', P('.local', 'state', 'cron-fail'))
+SCHEDULES = os.environ.get('DASH_SCHEDULES', P('bin', 'lib', 'core', 'schedules.toml'))   # the schedule registry
+SYS_TIMEOUT = int(os.environ.get('DASH_SYS_TIMEOUT', '15'))   # per command; the whole block waits at most this + 5 s
+
+
+def jcall(cmd, timeout=SYS_TIMEOUT):
+    """Run a status command, return its JSON (dict or list) or None."""
+    rc, out, _ = run(cmd, timeout=timeout)
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        v = json.loads(out)
+    except ValueError:
+        return None
+    return v if isinstance(v, (dict, list)) else None
+
+
+def _num(v, lo=0, hi=1e9):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi else None
+
+
+def _word(v, n=24):
+    """A short status token (letters, digits, - _ . space), else None."""
+    s = str(v or '').strip()
+    return s[:n] if s and re.fullmatch(r'[\w .:/+-]{1,64}', s) else None
+
+
+def _hhmm(epoch):
+    try:
+        t = dt.datetime.fromtimestamp(float(epoch), TZ)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    now = now_local()
+    return t.strftime('%H:%M') if t.date() == now.date() else t.strftime('%d.%m. %H:%M')
+
+
+def _iso_hhmm(s):
+    try:
+        return _hhmm(dt.datetime.fromisoformat(str(s)).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _ro_db(path, sql, args=()):
+    import sqlite3
+    if not os.path.exists(path):
+        return None
+    try:
+        con = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=3)
+        try:
+            return con.execute(sql, args).fetchone()
+        finally:
+            con.close()
+    except Exception:   # noqa: BLE001  (a locked or missing table = unknown, never a crash)
+        return None
+
+
+def _vtuple(s):
+    try:
+        return tuple(int(x) for x in str(s).lstrip('v').split('.'))
+    except ValueError:
+        return ()
+
+
+ROUTE_NAME = {'home': 'Home', 'lan': 'Home', 'tunnel': 'Tunnel', 'vpn': 'Tunnel', 'internet': 'Internet', 'public': 'Internet'}
+
+
+def sys_phone():
+    st = jcall([PHONE_BIN, 'status', '--json'])
+    if not isinstance(st, dict) or not st.get('ok'):
+        return {'status': 'critical', 'summary': 'gateway not answering'}
+    row = _ro_db(PHONEGW_DB, "SELECT v FROM state WHERE device_id='_gw' AND k='app_latest'")
+    latest = {}
+    if row:
+        try:
+            latest = json.loads(row[0]) or {}
+        except (TypeError, ValueError):
+            latest = {}
+    lname = _word(latest.get('name'), 12) if _vtuple(latest.get('name')) else None
+    lcode = _num(latest.get('code'), 0, 1e6)
+    # the app's own route pill (Home / Tunnel / Internet) from its last app.route usage event
+    app_route = None
+    r = _ro_db(USAGE_DB, "SELECT outcome, ts FROM events WHERE feature LIKE 'app.route%' ORDER BY ts DESC LIMIT 1")
+    if r and r[0]:
+        app_route = {'route': ROUTE_NAME.get(str(r[0]).lower()), 'at': _hhmm(r[1])}
+    devs = []
+    now = time.time()
+    for d in st.get('devices') or []:
+        if not isinstance(d, dict) or d.get('status') != 'active':
+            continue
+        code = _num(d.get('app_code'), 0, 1e6)
+        gw_route = str(d.get('route') or d.get('last_route') or '')
+        route = 'Internet' if gw_route == 'public' else None
+        if route is None and gw_route == 'lan':   # the gateway sees home Wi-Fi and the tunnel alike: ask the app
+            route = (app_route or {}).get('route') if (app_route or {}).get('route') in ('Home', 'Tunnel') else 'Home or tunnel'
+        sel = d.get('selftest') or {}
+        bud = d.get('app_budget') or {}
+        last = _num(d.get('last_seen'), 0, 1e11)
+        devs.append({
+            'name': _word(d.get('name'), 16) or 'phone',
+            'online': bool(d.get('online')),
+            'app': _word(d.get('app'), 12),
+            'app_code': code,
+            'update': bool(lcode and code and code < lcode),
+            'route': route if d.get('online') else None,
+            'connected_min': round(_num(d.get('connected_s'), 0, 1e9) / 60) if _num(d.get('connected_s'), 0, 1e9) is not None else None,
+            'last_seen': _hhmm(last) if last else None,
+            'last_seen_min': round((now - last) / 60) if last else None,
+            'rtt_ms': _num(d.get('rtt_ms'), 0, 1e6),
+            'probe_p95_ms': _num(d.get('probe_p95_ms'), 0, 1e7),
+            'push_p95_ms': _num(d.get('push_p95_ms'), 0, 1e8),
+            'battery': _word(d.get('battery_band'), 10),
+            'selftest': [_num(sel.get('green'), 0, 999), _num(sel.get('total'), 0, 999)] if sel else None,
+            'selftest_red': len(sel.get('red') or []) if sel else 0,
+            'over_budget': len(bud.get('over') or []),
+            'reconnects_d': _num((bud.get('app') or {}).get('reconnects_d'), 0, 1e6),
+        })
+    pub = ((st.get('front') or {}).get('public') or {})
+    public = {'enabled': bool(pub.get('enabled')), 'site': bool(pub.get('site')),
+              'live': _num(pub.get('live'), 0, 1e6) or 0, 'banned': _num(pub.get('banned_now'), 0, 1e6) or 0}
+    held = _num((st.get('held') or {}).get('n'), 0, 1e6) or 0
+    online = [d for d in devs if d['online']]
+    if not devs:
+        status, summary = 'warn', 'no paired phone'
+    elif not online:
+        status, summary = 'warn', 'phone offline'
+    elif any(d['update'] or d['selftest_red'] for d in devs):
+        status, summary = 'warn', 'app update waiting' if any(d['update'] for d in devs) else 'self-test red'
+    else:
+        status, summary = 'ok', 'connected'
+    return {'status': status, 'summary': summary, 'uptime_s': _num(st.get('uptime_s'), 0, 1e10),
+            'where': 'hub',
+            'latest': {'name': lname, 'code': lcode} if lname else None, 'devices': devs, 'public': public,
+            'held': held, 'app_route': app_route}
+
+
+def sys_voice():
+    st = jcall([VOICE_BIN, 'status'])
+    # the 7-day numbers: in claude-hub-voice the call log stays in the container and its voice.status carries them
+    # (stats_7d, numbers only); a hub relay without them (an older release) falls back to the local log's `stats`,
+    # which stopped at the move (stats_src says which)
+    s7 = st.get('stats_7d') if isinstance(st, dict) else None
+    src = 'hub' if isinstance(s7, dict) else 'local'
+    if src == 'local':
+        s7 = jcall([VOICE_BIN, 'stats', '--days', '7', '--json'])
+    if not isinstance(st, dict) and not isinstance(s7, dict):
+        return {'status': 'critical', 'summary': 'relay not answering'}
+    st, s7 = st if isinstance(st, dict) else {}, s7 if isinstance(s7, dict) else {}
+
+    def med(k):
+        return _num((s7.get(k) or {}).get('median'), 0, 1e8)
+
+    def p90(k):
+        return _num((s7.get(k) or {}).get('p90'), 0, 1e8)
+    ring = s7.get('ring') or {}
+    n = lambda k: _num(s7.get(k), 0, 1e6) or 0   # noqa: E731
+    problems = n('errors') + n('tool_errors') + n('reconnect_failed')   # a failed ring is shown, not alarmed on
+    live = _num(st.get('live'), 0, 99) or 0
+    res = {
+        'live': live,
+        'provider': _word(st.get('provider'), 16),
+        'minutes_today': _num(st.get('minutes_today'), 0, 1e5),
+        'minutes_cap': _num(st.get('minutes_cap'), 0, 1e5),
+        'tg_calls': st.get('tg_calls') == 'on',
+        'calls_7d': n('calls'), 'connected_7d': n('connected'),
+        'ring': {k: _num(ring.get(k), 0, 1e6) or 0 for k in ('answered', 'declined', 'failed')},
+        'reply_ms': med('reply_ms'), 'reply_p90_ms': p90('reply_ms'),
+        'handoff_ms': med('handoff_ms'), 'duration_s': med('duration_s'),
+        'handoffs': n('handoffs'), 'fast_hits': n('fast_hits'),
+        'reconnect_ok': n('reconnect_ok'), 'reconnect_failed': n('reconnect_failed'),
+        'link_lost': n('link_lost'), 'link_back': n('link_back'), 'link_gap_ms': med('link_gap_ms'),
+        'errors': n('errors') + n('tool_errors'), 'model_fallbacks': n('model_fallbacks'),
+    }
+    res['stats_src'] = src
+    # the relay runs in claude-hub-voice: status (and stats_7d) live from there; its last few calls (reply times only
+    # are used)
+    rec = [c for c in (st.get('calls') or []) if isinstance(c, dict)]
+    rms = sorted(x for c in rec for x in (c.get('reply_ms') or []) if isinstance(x, (int, float)) and 0 <= x < 1e6)
+    res['where'] = 'hub'
+    res['hub_recent'] = {'calls': len(rec), 'reply_ms': rms[len(rms) // 2] if rms else None}
+    res['status'] = 'warn' if problems else 'ok'
+    res['summary'] = (f'{live} call live' if live else 'ready') + (f' · {problems} problem' + ('s' if problems != 1 else '') + ' in 7 d' if problems else '')
+    return res
+
+
+def sys_vault():
+    st = jcall([VAULT, 'status', '--json'])
+    dep = jcall([VAULT, 'deploy', 'status', '--json'])
+    if not isinstance(st, dict):
+        return {'status': 'critical', 'summary': 'vault not answering'}
+    llm = st.get('llm') or {}
+    q = llm.get('queue') or {}
+    m = re.search(r'(\d+) calls, (\d+) errors?, (\d+) callers? left early', str(st.get('metrics') or ''))
+    tg = st.get('tg') or {}
+    gm = st.get('gmail') or {}
+    ha = st.get('ha') or {}
+    inbox = st.get('inbox') or {}
+    v = st.get('vault') or {}
+    pol = re.search(r'v(\d+(?:\.\d+)*)', str(v.get('policy') or ''))
+    res = {
+        'uptime_s': _num(v.get('uptime_seconds'), 0, 1e10),
+        'policy': ('v' + pol.group(1)) if pol else None,
+        'llm': {'state': _word(llm.get('state'), 16), 'healthy': bool(llm.get('healthy')),
+                'busy': bool(llm.get('busy_with')), 'waiting': _num(llm.get('waiting'), 0, 1e5) or 0,
+                'queued': len(q.get('queue') or []), 'restarts': _num(llm.get('restarts'), 0, 1e5) or 0},
+        'calls_24h': int(m.group(1)) if m else None, 'errors_24h': int(m.group(2)) if m else None,
+        'left_early_24h': int(m.group(3)) if m else None,
+        'feeds': [
+            {'name': 'Telegram', 'ok': (tg.get('live') or {}).get('state') == 'running' and bool(tg.get('logged_in'))},
+            {'name': 'Gmail', 'ok': bool(gm.get('configured')) and not gm.get('error')},
+            {'name': 'Home Assistant', 'ok': ha.get('feed') == 'on' and not ha.get('error')},
+        ],
+        'needs_you': _num(inbox.get('needs_you'), 0, 1e5) if inbox.get('on') else None,
+    }
+    deploy = None
+    if isinstance(dep, dict):
+        rn = dep.get('runner') or {}
+        reqs = [r for r in dep.get('requests') or [] if isinstance(r, dict)]
+        pending = [r for r in reqs if r.get('state') not in ('deployed', 'failed', 'denied', 'rejected', 'expired', 'cancelled', 'superseded')]
+        done = [r for r in reqs if r.get('state') == 'deployed']
+        sha = str(rn.get('deployed') or '')
+        deploy = {'runner': bool(rn.get('alive')), 'state': _word(rn.get('state'), 16),
+                  'running': sha[:7] if re.fullmatch(r'[0-9a-f]{7,40}', sha) else None,
+                  'last': _iso_hhmm(done[0].get('finished_at')) if done else None,
+                  'pending': len(pending), 'last_failed': bool(reqs and reqs[0].get('state') == 'failed')}
+    res['deploy'] = deploy
+    bad_feed = [f['name'] for f in res['feeds'] if not f['ok']]
+    if not res['llm']['healthy']:
+        res['status'], res['summary'] = 'critical', 'local LLM down'
+    elif bad_feed or (deploy and (deploy['pending'] or deploy['last_failed'] or not deploy['runner'])):
+        res['status'] = 'warn'
+        res['summary'] = (bad_feed[0] + ' feed down') if bad_feed else ('deploy waiting for approval' if deploy['pending']
+                                                                        else 'last deploy failed' if deploy['last_failed'] else 'deploy runner silent')
+    else:
+        res['status'], res['summary'] = 'ok', 'up'
+    return res
+
+
+WEB_DONE = ('done', 'aborted', 'failed', 'expired', 'cancelled', 'stale')
+
+
+def sys_web():
+    stats = jcall([WEBAGENT_BIN, 'stats', '--json'])
+    tasks = jcall([WEBAGENT_BIN, 'status', '--all', '--json'])
+    if not isinstance(stats, dict) and not isinstance(tasks, list):
+        return {'status': 'unknown', 'summary': 'webagent not answering'}
+    stats = stats if isinstance(stats, dict) else {}
+    tasks = [t for t in (tasks or []) if isinstance(t, dict)]
+    tasks.sort(key=lambda t: str(t.get('created') or ''), reverse=True)
+    open_ = [t for t in tasks if t.get('state') not in WEB_DONE]
+    recent = []
+    for t in tasks[:5]:   # kind, mode, state and time only: never the title or the URL
+        when = None
+        try:
+            when = _hhmm(dt.datetime.strptime(str(t.get('created')), '%Y-%m-%d %H:%M').replace(tzinfo=TZ).timestamp())
+        except ValueError:
+            pass
+        recent.append({'kind': _word(t.get('kind'), 16), 'mode': _word(t.get('mode'), 8),
+                       'state': _word(t.get('state'), 16), 'when': when,
+                       'waiting': bool(t.get('pending')) and t.get('state') not in WEB_DONE})
+    rc, out, _ = run([ABX_BIN, 'list'], timeout=10)
+    sessions = len([ln for ln in out.splitlines() if ln.strip()]) if rc == 0 else None
+    k = lambda x: _num(stats.get(x), 0, 1e6)   # noqa: E731
+    res = {'tasks_30d': k('tasks'), 'completed_30d': k('completed'), 'committed_30d': k('committed'),
+           'approvals_30d': k('approvals'), 'guard_blocks_30d': k('guard_blocks'), 'failed_30d': k('failed'),
+           'median_approval_s': k('median_approval_s'), 'open': len(open_),
+           'waiting': sum(1 for t in recent if t['waiting']), 'sessions': sessions, 'recent': recent}
+    if res['failed_30d']:
+        res['status'], res['summary'] = 'warn', f"{res['failed_30d']} failed in 30 d"
+    else:
+        res['status'] = 'ok'
+        res['summary'] = (f"{len(open_)} task" + ('s' if len(open_) != 1 else '') + ' open') if open_ else 'idle'
+    return res
+
+
+HOME_SWITCHES = (   # entity -> label, and whether "on" needs attention
+    ('input_boolean.away_mode', 'Away mode', False),
+    ('input_boolean.deebot_fault_hold', 'Vacuum fault hold', True),
+    ('input_boolean.home_autopilot_2', 'Autopilot 2', False),
+    ('input_boolean.autopilot2_leaving', 'Leaving scene', False),
+    ('input_boolean.autopilot2_arrival', 'Arrival scene', False),
+    ('input_boolean.autopilot2_bedtime', 'Bedtime scene', False),
+    ('input_boolean.autopilot2_wakeup', 'Wake-up light', False),
+    ('input_boolean.movie_autopilot', 'Movie autopilot', False),
+)
+
+
+def sys_home():
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as ex:   # four reads side by side (each bounded by SYS_TIMEOUT)
+        bools, autos, vac, err = ex.map(jcall, ([HA_BIN, 'list', 'input_boolean', '--json'], [HA_BIN, 'list', 'automation', '--json'],
+                                               [HA_BIN, 'state', 'vacuum.deebot', '--json'], [HA_BIN, 'state', 'sensor.deebot_error', '--json']))
+    if not isinstance(bools, list) and not isinstance(autos, list):
+        return {'status': 'unknown', 'summary': 'Home Assistant not answering'}
+    state = {str(e.get('entity_id')): e.get('state') for e in (bools or []) if isinstance(e, dict)}
+    switches = [{'name': label, 'on': state[eid] == 'on', 'alert': alert and state[eid] == 'on'}
+                for eid, label, alert in HOME_SWITCHES if eid in state]
+    ap = [e for e in (autos or []) if isinstance(e, dict) and str(e.get('entity_id', '')).startswith('automation.autopilot_')]
+    code = str((err or {}).get('state') or '')
+    res = {'switches': switches,
+           'autopilots_on': sum(1 for e in ap if e.get('state') == 'on'), 'autopilots': len(ap),
+           'vacuum': _word((vac or {}).get('state'), 16),
+           'vacuum_error': int(code) if code.isdigit() and code not in ('0', '100', '1021') else None}
+    hold = any(s['alert'] for s in switches)
+    if hold:
+        res['status'] = 'warn'
+        res['summary'] = 'vacuum held after a fault' + (f" (code {res['vacuum_error']})" if res['vacuum_error'] else '')
+    else:
+        away = any(s['on'] for s in switches if s['name'] == 'Away mode')
+        res['status'], res['summary'] = 'ok', 'away mode on' if away else 'all quiet'
+    return res
+
+
+B36 = '0123456789abcdefghijklmnopqrstuvwxyz'
+
+
+def cron_heat(failing=()):
+    """The CI tab's cron heatmap: cron-fail's run log (runs-YYYYMMDD.jsonl rows {ts, job, ok}) over the last 24 hours
+    by local hour, oldest first (the last is this hour so far). Every job: `jobs` = each one that failed in that window
+    or fails now (most failures first) with its runs and failures per hour; `ok` = every other job by name, as
+    [job, runs per hour as 24 base-36 digits, 'z' = 35 or more] (no failures to send: keeps the payload small).
+    Job names and counts only. None without run rows."""
+    now = now_local().timestamp()
+    top = dt.datetime.fromtimestamp(now, TZ).replace(minute=0, second=0, microsecond=0).timestamp()
+    t0 = top - 23 * 3600
+    per = {}
+    try:
+        files = sorted(f for f in os.listdir(CRONFAIL_DIR) if re.fullmatch(r'runs-\d{8}\.jsonl', f))[-3:]
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            with open(os.path.join(CRONFAIL_DIR, f), encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                        t, job = float(r['ts']), str(r['job'])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if not (t0 <= t <= now + 60) or not re.fullmatch(r'[\w.-]{1,48}', job):
+                        continue
+                    j = per.setdefault(job, ([0] * 24, [0] * 24))
+                    i = min(23, int((t - t0) // 3600))
+                    j[0][i] += 1
+                    if not r.get('ok'):
+                        j[1][i] += 1
+        except OSError:
+            continue
+    if not per:
+        return None
+    for job in failing:
+        if job not in per and re.fullmatch(r'[\w.-]{1,48}', job):
+            per[job] = ([0] * 24, [0] * 24)
+    bad = sorted((j for j in per if sum(per[j][1]) or j in failing), key=lambda j: (-sum(per[j][1]), j))
+    rest = sorted(j for j in per if j not in bad)
+    return {'hours': [dt.datetime.fromtimestamp(t0 + i * 3600, TZ).hour for i in range(24)],
+            'jobs': [{'job': j, 'failing': j in failing, 'runs': per[j][0], 'fail': per[j][1]} for j in bad],
+            'ok': [[j, ''.join(B36[min(35, n)] for n in per[j][0])] for j in rest],
+            'n_jobs': len(per), 'runs': sum(sum(v[0]) for v in per.values()), 'failed': sum(sum(v[1]) for v in per.values()),
+            'recovered': sum(1 for j in per if sum(per[j][1]) and j not in failing)}   # failed in the window, not failing now
+
+
+def sys_cron():
+    jobs = sum(1 for ln in (read_text(os.path.join(HOME, 'crontab')) or '').splitlines()
+               if ln.strip() and not ln.lstrip().startswith('#') and 'cron-fail' in ln)
+    failing = []
+    try:
+        names = sorted(os.listdir(CRONFAIL_DIR))
+    except OSError:
+        names = []
+    for f in names:
+        if f.endswith('.streak'):
+            try:
+                since = os.path.getmtime(os.path.join(CRONFAIL_DIR, f))
+            except OSError:
+                since = None
+            name = f[:-len('.streak')]
+            if re.fullmatch(r'[\w.-]{1,48}', name):
+                failing.append({'job': name, 'since': _hhmm(since) if since else None})
+    runs = {}   # the schedule registry says where each periodic job runs (cron here, hub schedules, keepers)
+    try:
+        import tomllib
+        with open(SCHEDULES, 'rb') as f:
+            for j in (tomllib.load(f).get('jobs') or {}).values():
+                if isinstance(j, dict) and j.get('runs_on') in ('cron', 'hub', 'keepers', 'window'):
+                    runs[j['runs_on']] = runs.get(j['runs_on'], 0) + 1
+    except (OSError, ValueError, ImportError):
+        runs = {}
+    try:
+        heat = cron_heat({f['job'] for f in failing})
+    except Exception:   # noqa: BLE001  (the heatmap never breaks the cron block)
+        heat = None
+    return {'status': 'warn' if failing else 'ok', 'wrapped': jobs, 'failing': failing, 'runs_on': runs or None, 'heat': heat,
+            'summary': (f"{len(failing)} job" + ('s' if len(failing) != 1 else '') + ' failing') if failing else 'no failures'}
+
+
+SYS_PARTS = (('phone', sys_phone), ('voice', sys_voice), ('vault', sys_vault), ('web', sys_web),
+             ('home', sys_home), ('cron', sys_cron))
+
+
+def systems():
+    if SYSTEMS == 'off':
+        return None
+    from concurrent.futures import ThreadPoolExecutor
+    out = {}
+    t0 = time.time()
+    ex = ThreadPoolExecutor(max_workers=len(SYS_PARTS))
+    futs = {k: ex.submit(fn) for k, fn in SYS_PARTS}
+    deadline = t0 + SYS_TIMEOUT + 5
+    for k, f in futs.items():
+        try:
+            out[k] = f.result(timeout=max(0.1, deadline - time.time()))
+        except Exception as e:   # noqa: BLE001  (one broken or slow part never breaks or stalls the page)
+            out[k] = {'status': 'unknown', 'summary': 'not checked (' + ('timed out' if 'Timeout' in type(e).__name__ else type(e).__name__) + ')'}
+    ex.shutdown(wait=False, cancel_futures=True)   # stragglers end with their own subprocess timeout
+    out['checked'] = now_local().strftime('%H:%M')
+    out['seconds'] = round(time.time() - t0, 1)
+    return out
+
+
+# ----------------------------------------------------------------------------------------- assemble
+def build(use_cache=True):
+    t0 = time.time()
+    now = now_local()
+    tokens = collect_tokens(use_cache)
+    timeline = tokens.pop('timeline')
+    todo = parse_todo()
+    agents = parse_agent_watch()
+    hl = health()
+    data = {
+        'schema': 1,
+        'title': 'Claude Bot Dashboard',
+        'page_version': page_version(read_text(INDEX)),
+        'generated_at': now.isoformat(timespec='seconds'),
+        'generated_local': now.strftime('%Y-%m-%d %H:%M'),
+        'tz': TZ.key,
+        'now': status_now(),
+        'tokens': tokens,
+        'activity': {
+            'todo': {'due': todo['due'], 'in_progress': todo['in_progress'], 'waiting': todo['waiting'],
+                     'ideas_count': len(todo['ideas'])},
+            'agents': agents,
+            'changelog': parse_log(os.path.join(WORKSPACE, 'CHANGELOG.md')),
+            'cron': parse_crontab(),
+            'reminders': reminders(),
+            'heartbeat': heartbeat_gate(now),
+            'timeline': timeline,
+            'dayline': dayline(),
+        },
+        'goals': goals_block(),
+        'context': context_card(),
+        'gym': gym_card(),
+        'traces': traces_card(),
+        'agents': agents_block(),
+        'ci': ci_block(),
+        'scorecard': scorecard_block(),
+        'doing': doing_block(now),
+        'health': hl,
+        'systems': systems(),
+        'hub_mode': hub_mode(),
+        'hub': hub_block(hub_mode()),
+        'dataflow': dataflow(),
+        'codebase': codebase(),
+        'growth': growth(tokens['daily']),
+    }
+    # log-derived lines last: names and amounts out (scrub), judged against what the rest of the page shows
+    shown = shown_words(data, LOG_BLOCKS)
+    act = data['activity']
+    for k in ('changelog', 'dayline', 'todo'):
+        act[k] = scrub_tree(act[k], shown)
+    act['lastnight'] = lastnight(shown, now)
+    data['build_seconds'] = round(time.time() - t0, 2)
+    return data
+
+
+LOG_BLOCKS = {('activity', 'changelog'), ('activity', 'dayline'), ('activity', 'lastnight'), ('activity', 'todo')}
+
+
+GROWTH = os.environ.get('DASH_GROWTH', P('.local', 'state', 'dash-growth.json'))
+GROWTH_BIN = os.environ.get('DASH_GROWTH_BIN', P('bin', 'dash-growth'))
+
+
+def growth_ahead(g, now):
+    """True when the growth file holds a point after today or an `updated` in the future: written by a clock that ran
+    ahead (a test under a fake clock), so it is stale, never fresh."""
+    if not isinstance(g, dict):
+        return False
+    today = now.date().isoformat()
+    try:
+        upd = float(g.get('updated_epoch') or 0)
+    except (TypeError, ValueError):
+        upd = 0
+    days = g.get('days') if isinstance(g.get('days'), list) else []
+    return (upd > now.timestamp() + 300 or str(g.get('updated', ''))[:10] > today
+            or any(isinstance(d, dict) and str(d.get('date', '')) > today for d in days))
+
+
+def growth(daily=()):
+    """Codebase tab charts + tiles: daily points of my codebase from ~/bin/dash-growth, which this
+    refreshes at most hourly (it backfills from git with --backfill). Numbers and dates only; labels are dash-growth's
+    own constants. `daily` = this run's tokens.daily: today's activity point comes from it (dash-growth copies the
+    previous run's, which lags). Points after today never reach the page."""
+    now = now_local()
+    today = now.date().isoformat()
+    pinned_live = os.environ.get('DASH_NOW') and 'DASH_GROWTH' not in os.environ   # a pinned clock never writes the live file
+    if GROWTH_BIN and os.access(GROWTH_BIN, os.X_OK) and not pinned_live:
+        ahead = growth_ahead(read_json(GROWTH, {}), now)
+        # DASH_GROWTH_OUT: dash-growth writes the very file this reads (a moved DASH_GROWTH never touches the live one)
+        run([GROWTH_BIN] if ahead else [GROWTH_BIN, '--if-stale', '55'], timeout=90, env={'DASH_GROWTH_OUT': GROWTH})
+    g = read_json(GROWTH, {}) or {}
+    if not isinstance(g, dict):
+        return None
+    future_upd = growth_ahead({'updated': g.get('updated'), 'updated_epoch': g.get('updated_epoch')}, now)
+
+    def num(x):
+        return x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+
+    def nums(o, keys):
+        o = o if isinstance(o, dict) else {}
+        return {k: num(o.get(k)) or 0 for k in keys}
+
+    parts = [{'key': clean(str(x.get('key', '')), 20), 'label': clean(str(x.get('label', '')), 40)}
+             for x in (g.get('parts') if isinstance(g.get('parts'), list) else []) if isinstance(x, dict)]
+    keys = [x['key'] for x in parts]
+    rx_date = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+    raw_days = g.get('days') if isinstance(g.get('days'), list) else []
+    days, last = [], {}
+    for d in raw_days:
+        if not isinstance(d, dict) or not rx_date.match(str(d.get('date', ''))) or d['date'] > today:
+            continue
+        last = d
+        days.append({'date': d['date'], 'live': d.get('source') == 'live', 'loc_total': num(d.get('loc_total')) or 0,
+                     'loc': nums(d.get('loc'), keys),
+                     'counts': nums(d.get('counts'), ('scripts', 'skills', 'agents', 'cron')),
+                     'claude_md_kb': num(d.get('claude_md_kb'))})
+    act = dict(g.get('activity')) if isinstance(g.get('activity'), dict) else {}
+    for d in daily or []:   # same definitions as dash-growth: owner messages = Telegram + app/terminal
+        t = d.get('turns') or {}
+        act[d['date']] = {'heartbeats': t.get('heartbeat', 0), 'owner_msgs': t.get('telegram', 0) + t.get('you (app/terminal)', 0),
+                          'subagents': d.get('subagent_runs', 0)}
+    activity = [dict({'date': k}, **nums(v, ('heartbeats', 'owner_msgs', 'subagents')))
+                for k, v in sorted(act.items()) if rx_date.match(str(k)) and k <= today]
+    if not days:
+        return None
+    langs = last.get('langs') if isinstance(last.get('langs'), dict) else {}
+    return {'updated': '' if future_upd else clean(str(g.get('updated', '')), 20), 'parts': parts, 'days': days, 'activity': activity,
+            'langs': [{'lang': clean(str(k), 30), 'loc': num(v) or 0} for k, v in langs.items() if num(v)],
+            'files': nums(last.get('files'), keys)}
+
+
+def secret_check(text):
+    sc = P('bin', 'secretscan')
+    if not os.path.exists(sc):
+        return True, 'secretscan missing'
+    try:
+        r = subprocess.run([sc, '--stdin', '-q'], input=text, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def atomic_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.' + os.path.basename(path))
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+RX_DATA_BLOCK = re.compile(r'(<script id="dash-data" type="application/json"[^>]*>)(.*?)(</script>)', re.S)
+
+
+def embed(page, payload, mode):
+    def rep(m):
+        tag = re.sub(r'data-mode="[^"]*"', f'data-mode="{mode}"', m.group(1))
+        return tag + payload + m.group(3)
+    new, n = RX_DATA_BLOCK.subn(rep, page, count=1)
+    if n != 1:
+        raise SystemExit('dash-data: no <script id="dash-data"> block in the page')
+    return new
+
+
+RX_VERSION_META = re.compile(r'(<meta name="dash-version" content=")[^"]*(">)')
+
+
+def page_version(template):
+    """The page's code version: a short hash of the data-free template, or None without one. dash-data writes it into
+    data.json (page_version) and into the generated page (<meta name="dash-version">); an open tab whose own version
+    differs from data.json's reloads itself once, so a deploy reaches open tabs without a manual reload."""
+    if not template:
+        return None
+    return 'v' + hashlib.sha256(template.encode('utf-8')).hexdigest()[:12]   # 'v': never a bare digit run
+
+
+def stamp_version(page, version):
+    """<meta name="dash-version" content=""> in the page -> content="<version>" (a template without the tag stays as is)."""
+    return RX_VERSION_META.sub(lambda m: m.group(1) + (version or '') + m.group(2), page, count=1)
+
+
+RX_PROFILE_TOKEN = re.compile(r'\{\{([a-z_]+(?:\.[a-z_]+)+)\}\}')
+
+
+def fill_profile(page):
+    """{{key}} in the template -> the profile value (HTML-escaped), only for PAGE_PROFILE_KEYS; other tokens stay."""
+    keys = set(RX_PROFILE_TOKEN.findall(page)) & set(PAGE_PROFILE_KEYS)
+    if not keys:
+        return page
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+    import assistant_profile
+    vals = {k: html.escape(str(assistant_profile.get(k))) for k in keys}
+    return RX_PROFILE_TOKEN.sub(lambda m: vals.get(m.group(1), m.group(0)), page)
+
+
+def artifact_fragment(page):
+    """Page without doctype/html/head/body: the claude.ai Artifact skeleton adds those."""
+    head = re.search(r'<!--dash:head-->(.*?)<!--/dash:head-->', page, re.S)
+    body = re.search(r'<!--dash:body-->(.*?)<!--/dash:body-->', page, re.S)
+    if not head or not body:
+        raise SystemExit('dash-data: page is missing the dash:head/dash:body markers')
+    return head.group(1).strip() + '\n' + body.group(1).strip() + '\n'
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Collect data for the Claude Bot Dashboard.')
+    ap.add_argument('--inline', action='store_true', help='also write www/dashboard.html with the data embedded')
+    ap.add_argument('--stdout', action='store_true', help='print the JSON, write nothing')
+    ap.add_argument('--no-cache', action='store_true', help='re-parse every transcript')
+    ap.add_argument('--out', help='write data.json here instead')
+    a = ap.parse_args()
+
+    data = build(use_cache=not a.no_cache)
+    text = json.dumps(data, ensure_ascii=False, indent=1)
+    ok, why = secret_check(text)
+    if not ok:
+        print('dash-data: secretscan flagged the output, nothing written: ' + why, file=sys.stderr)
+        sys.exit(3)
+    if a.stdout:
+        print(text)
+        return
+    out = a.out or OUT
+    atomic_write(out, text + '\n')
+    if a.out:
+        print(out)
+        return
+    atomic_write(os.path.join(WWW_DIR, 'data.json'), text + '\n')
+    payload = json.dumps(data, ensure_ascii=False, separators=(',', ':')).replace('</', '<\\/')
+    page = read_text(INDEX)   # the template is only read, never written
+    if page:
+        page = stamp_version(fill_profile(page), data.get('page_version'))
+        atomic_write(os.path.join(WWW_DIR, 'index.html'), embed(page, payload, 'fallback'))
+        fonts = os.path.join(PAGE_DIR, 'fonts')   # self-hosted Geist (woff2 + OFL): the page loads nothing from other sites
+        if os.path.isdir(fonts):
+            shutil.copytree(fonts, os.path.join(WWW_DIR, 'fonts'), dirs_exist_ok=True)
+        if a.inline:
+            atomic_write(INLINE_OUT, artifact_fragment(embed(page, payload, 'inline')))
+    elif a.inline:
+        raise SystemExit(f'dash-data: {INDEX} missing, cannot build dashboard.html')
+    t = data['tokens']
+    print(f"dash-data: {out} ({len(text) / 1024:.0f} KB, {data['build_seconds']} s): "
+          f"{t['totals']['tokens'] / 1e6:.1f}M tokens, est. ${t['totals']['cost_usd']:.2f} list price, "
+          f"{t['runs_total']} agent/worker runs" + (f'; {INLINE_OUT}' if a.inline and page else ''))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,20 @@
+#!/bin/sh
+# phone-routine: the phone app's routines, run by phonegw's bridge (tile taps) or by hand.
+#   phone-routine leaving     the Leaving card on his phone (< 5 s): next leg, battery, leave reminders, due items
+# Talks to the phonegw internal API (PHONEGW_URL, PHONEGW_TOKEN_FILE; defaults as the `phone` CLI's: claude-hub-phone
+# + ~/.secrets/phone-cli-token); exit 0 sent · 4 no device/queued · 7 gateway down.
+case "${1:-}" in
+  leaving) ;;
+  -h|--help|help|"") sed -n 2,5p "$0" | sed 's/^# \{0,1\}//'; [ -n "${1:-}" ]; exit $? ;;
+  *) echo "phone-routine: unknown routine" >&2; exit 2 ;;
+esac
+url="${PHONEGW_URL:-http://claude-hub-phone:8796}"; tok="${PHONEGW_TOKEN_FILE:-$HOME/.secrets/phone-cli-token}"
+[ -r "$tok" ] || { echo "phone-routine: no gateway token $tok" >&2; exit 7; }
+out=$(curl -sS -m 15 --noproxy '*' -H "Authorization: Bearer $(cat "$tok")" -H 'Content-Type: application/json' \
+      -d '{"name":"leaving"}' "$url/internal/routine" 2>/dev/null) || { echo "phone-routine: gateway down" >&2; exit 7; }
+printf '%s\n' "$out"
+case "$out" in
+  *'"status": "sent"'*|*'"status":"sent"'*) exit 0 ;;
+  *'"ok": false'*|*'"ok":false'*|*queued*) exit 4 ;;
+  *) exit 1 ;;
+esac

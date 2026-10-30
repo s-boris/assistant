@@ -1,0 +1,898 @@
+#!/usr/bin/env python3
+"""flight-watch: silent watch of the owner's planned flights (free public flight pages, no API key, read-only).
+
+  flight-watch sync FILE|- [FILE ...]   import the ✈️ events from saved Google Calendar list_events JSON (the MCP
+                                        result: a page object with "events" or "items", a list of pages, or a list
+                                        of events; descriptions needed): one flight per "QR 9101 Frankfurt Sat 14.11 16:10 →
+                                        Doha Sat 14.11 23:40" line (lib/flights.py); replaces every calendar
+                                        flight, keeps flights added by hand, drops past ones; prints counts only
+  flight-watch sync --from-cache        the same from calcache's cache (its `flight` legs; no MCP needed); calendar
+                                        flights past the cache window are kept
+               [--allow-empty]          a source with no calendar events at all (an empty cache or page) would
+                                        drop every calendar flight: refused (exit 2, flights unchanged) unless given
+  flight-watch add FLIGHT YYYY-MM-DD --from AAA --to BBB --dep HH:MM [--arr HH:MM] [--title TEXT]
+                                        a flight by hand (local times at each airport; codes or known city names)
+  flight-watch list [--json]            flights ahead: id, flight, route, local times, phase, last check + result
+  flight-watch rm ID
+  flight-watch check [--cron] [--dry-run] [--force] [--now ISO]
+  flight-watch status ID [--json] [--now ISO]   live verdict for one flight now; writes no note and no state
+
+Flights: ~/.local/state/flights/flights.json ({"flights": [{id, no, from, to, dep, arr, title, source, event_id,
+leg, next}]}; dep/arr = local time at each airport with its offset; next = the connecting leg's id).
+Sources (no key, no login; read-only): FlightStats' public flight tracker page (its embedded __NEXT_DATA__ JSON:
+status, scheduled + estimated/actual times, gate, terminal, cancelled, diverted; covers about today - 3 .. today + 2)
+first, FlightAware's public flight page (embedded trackpollBootstrap JSON: ~11 days of history + about one day ahead,
+gates, cancelled) as fallback and for recent timetable history. Nothing found = quiet ("no data"), never a guess.
+Cadence (cron runs `check --cron` every 15 min; each flight is checked only when due): more than 48 h before
+departure once a day; 48 h .. 6 h before hourly; from 6 h before every run until 2 h after the arrival. Crossing
+7 days, 1 day and 6 h before departure always triggers a check.
+A check where every source fails is retried on the next run (no state change), so cron-fail sees the streak.
+Problems (each notes once per flight; state.json next to flights.json):
+  schedule    days ahead (<= 8 days): the flight's recent days in the same IATA season (same weekday first) leave
+              10+ min off the planned local time; on its date: the live schedule moved departure (10+ min) or
+              arrival (15+ min) away from the plan. A new value notes again.
+  missing     on or the day before its date, the sources list the flight number on later days but not on that
+              date (two runs in a row; one under 6 h)
+  cancelled / diverted
+  delay       departure or arrival estimated 15+ min late (buckets 15/30/60/120: a worse bucket notes again)
+  gate / terminal   the departure gate or terminal changes after one was known (the first assignment is silent)
+  connection  a leg's estimated arrival leaves under 45 min to the connecting leg's departure
+A new problem writes ONE ~/inbox/flight-watch-<id>-<epoch>.md (the flight, what changed, live status, links).
+Never messages anyone. `check --cron` exits without network when no flight is due.
+Exit: 0 ok, 1 every source failed for every flight checked, 2 usage error or bad input (sync: not a list_events
+result, or an empty source over calendar flights; the flights stay as they were).
+Phone app: a Live Update chip (lib/livecount.py) per flight from 3 h before the estimated departure ("Flight HH:MM
++N min", terminal and gate as the detail), ended at departure or when cancelled; silent without a paired phone
+(tests: LIVECOUNT_PHONE = a stub phone; test state makes no chips without it).
+Env (tests): FLIGHT_WATCH_DIR, FLIGHT_WATCH_INBOX, FLIGHT_WATCH_NOW (ISO), FLIGHT_WATCH_FS (FlightStats base URL),
+FLIGHT_WATCH_FA (FlightAware base URL), FLIGHT_WATCH_SOURCES (e.g. "fa" or "fs,fa"), CALCACHE_DIR.
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pwd
+import re
+import sys
+import urllib.error
+import urllib.parse
+from zoneinfo import ZoneInfo
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import http as web, jsonstate, locks  # noqa: E402
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+import assistant_profile as profile  # noqa: E402
+import flights as fl  # noqa: E402
+import livecount  # noqa: E402
+
+HOME_DIR = os.path.expanduser('~')
+DIR = os.environ.get('FLIGHT_WATCH_DIR') or f'{HOME_DIR}/.local/state/flights'
+INBOX = os.environ.get('FLIGHT_WATCH_INBOX') or f'{HOME_DIR}/inbox'
+FLIGHTS_F, STATE_F, LOCK_F = (os.path.join(DIR, n) for n in ('flights.json', 'state.json', '.lock'))
+CALCACHE_F = os.path.join(os.environ.get('CALCACHE_DIR') or f'{HOME_DIR}/.local/state/calcache', 'events.json')
+FS = (os.environ.get('FLIGHT_WATCH_FS') or 'https://www.flightstats.com/v2').rstrip('/')
+FA = (os.environ.get('FLIGHT_WATCH_FA') or 'https://www.flightaware.com').rstrip('/')
+SOURCES = [s.strip() for s in (os.environ.get('FLIGHT_WATCH_SOURCES') or 'fs,fa').split(',') if s.strip()]
+UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36'
+H = dt.timedelta(hours=1)
+MIN = dt.timedelta(minutes=1)
+FAR, NEAR = 48 * H, 6 * H                    # daily beyond FAR, hourly until NEAR, then every run
+EVERY = {'daily': 23 * H + 40 * MIN, 'hourly': 50 * MIN, 'live': 10 * MIN}
+MILESTONES = (dt.timedelta(days=7), dt.timedelta(days=1), NEAR)
+AFTER_ARR = 2 * H                            # keep watching this long after the (estimated) arrival
+PATTERN_AHEAD = dt.timedelta(days=8)         # recent-days timetable notes only this close
+SCHED_DEP, SCHED_ARR = 10, 15                # minutes
+DELAY_BUCKETS = (120, 60, 30, 15)
+MIN_CONNECT = 45                             # minutes
+PLANE = '✈️'
+
+
+class Fail(Exception):
+    pass
+
+
+def die(msg, code=2):
+    print(f'flight-watch: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------------------------ time
+def tz():
+    return profile.tz()
+
+
+def fixed(t):
+    """An aware time with the fixed UTC offset its own zone has at that instant. Two times in one ZoneInfo subtract
+    and compare as wall clocks (the fold is ignored), wrong in a repeated autumn hour; with fixed offsets all
+    arithmetic is real elapsed time, and strftime still shows that zone's wall time (the airport's local time)."""
+    if t is None or t.tzinfo is None or isinstance(t.tzinfo, dt.timezone):
+        return t
+    return t.replace(tzinfo=dt.timezone(t.utcoffset()))
+
+
+def iso(s, zone=None):
+    """ISO string -> aware datetime (keeps its offset; naive ones get zone or the owner's), or None."""
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(s).strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return fixed(t if t.tzinfo else t.replace(tzinfo=zone or tz()))
+
+
+def now_arg(s=None):
+    s = s or os.environ.get('FLIGHT_WATCH_NOW')
+    if not s:
+        return fixed(dt.datetime.now(tz()).replace(microsecond=0))
+    t = iso(s)
+    if not t:
+        die(f'bad --now {s!r} (ISO, e.g. 2026-11-14T16:00:00+01:00)')
+    return fixed(t.astimezone(tz()))
+
+
+def hm(t):
+    return t.strftime('%H:%M')
+
+
+def day_label(t):
+    return f"{t.strftime('%a')} {t.day:02d}.{t.month:02d}"
+
+
+def mins(td):
+    return int(round(td.total_seconds() / 60))
+
+
+def zone_of(code, fallback=None):
+    return fl.tz_of(code) or (ZoneInfo(fallback) if fallback else None)
+
+
+# ------------------------------------------------------------------------------------------------ files
+def read_json(path, default):
+    """core.jsonstate.load; missing -> default, unreadable -> exit 1 with the reason."""
+    try:
+        return jsonstate.load(path, default, strict=True)
+    except (OSError, ValueError) as e:
+        die(f'cannot read {path}: {e}', 1)
+
+
+def write_json(path, data):
+    """Private state (0600 in a 0700 dir), atomic (core.jsonstate)."""
+    jsonstate.save(path, data, newline=True, mode=0o600, dir_mode=0o700, ensure_ascii=False, indent=1)
+
+
+def lock(blocking=True):
+    """The state lock (core.locks): the fd to close when done, or None when another run holds it (blocking=False)."""
+    return locks.acquire(LOCK_F, wait=None if blocking else 0, dir_mode=0o700)
+
+
+def end_of(f):
+    return iso(f.get('arr')) or iso(f['dep']) + 12 * H
+
+
+def flights_load():
+    d = read_json(FLIGHTS_F, {'flights': []})
+    items = d.get('flights') if isinstance(d, dict) else d
+    return [f for f in (items or []) if isinstance(f, dict) and f.get('id') and iso(f.get('dep'))]
+
+
+def flights_save(items, now):
+    keep = [f for f in items if end_of(f) > now - dt.timedelta(days=1)]
+    keep.sort(key=lambda f: iso(f['dep']))
+    write_json(FLIGHTS_F, {'updated': now.isoformat(), 'flights': keep})
+    st = read_json(STATE_F, {'flights': {}})
+    ids = {f['id'] for f in keep}
+    st['flights'] = {k: v for k, v in (st.get('flights') or {}).items() if k in ids}
+    write_json(STATE_F, st)
+    return keep
+
+
+def flight_id(no, dep, src):
+    return 'f' + hashlib.sha1(f'{no}|{dep.date().isoformat()}|{src}'.encode()).hexdigest()[:7]
+
+
+def make(no, src, dst, dep, arr, title, source, event_id, leg=0):
+    return {'id': flight_id(no, dep, src), 'no': no, 'from': src, 'to': dst, 'dep': dep.isoformat(),
+            'arr': arr.isoformat() if arr else None, 'title': title, 'source': source, 'event_id': event_id,
+            'leg': leg, 'next': None}
+
+
+def from_legs(legs, title, event_id):
+    out = []
+    for i, g in enumerate(legs or []):
+        dep, arr = iso(g.get('dep')), iso(g.get('arr'))
+        if not (dep and g.get('no') and g.get('from') and g.get('to')):
+            continue
+        out.append(make(g['no'], g['from'], g['to'], dep, arr, title, 'calendar', event_id, i))
+    for a, b in zip(out, out[1:]):
+        a['next'] = b['id']
+    return out
+
+
+def from_event(e):
+    summary = ' '.join(str(e.get('summary') or '').split())
+    if not any(i in summary for i in ('✈', '\U0001F6EB', '\U0001F6EC')) or e.get('status') == 'cancelled':  # ✈️ 🛫 🛬
+        return []
+    start, end = iso((e.get('start') or {}).get('dateTime')), iso((e.get('end') or {}).get('dateTime'))
+    if not start:
+        return []
+    legs = fl.parse_event(summary, e.get('description'), start, end)
+    return from_legs(legs, summary, str(e.get('id') or summary))
+
+
+PAGE_KEYS = ('events', 'items')                            # claude.ai tool result / Google API events.list
+
+
+def page_events(data, p):
+    """Raw events of a saved list_events result: page objects with a list under "events" or "items" (the page's own
+    "summary" is the calendar's name), a list of pages, or bare events (objects with a "start")."""
+    items = data if isinstance(data, list) else [data]
+    out, ok = [], not items
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        lists = [it[k] for k in PAGE_KEYS if isinstance(it.get(k), list)]
+        if lists:
+            out += [e for lst in lists for e in lst]
+            ok = True
+        elif it.get('start'):
+            out.append(it)
+            ok = True
+    if not ok:
+        die(f'{p}: no list_events result (expected an object with "events" or "items", or a list of events); '
+            'flights unchanged')
+    return out
+
+
+def cache_flights():
+    """calcache's cache -> ([its timed ✈️ legs as flights], window end, events in the cache)."""
+    data = read_json(CALCACHE_F, None)
+    if not isinstance(data, dict) or not isinstance(data.get('events'), list):
+        die(f'no calendar cache at {CALCACHE_F} (calcache import first)')
+    out = []
+    for e in data['events']:
+        if isinstance(e, dict) and isinstance(e.get('flight'), list) and not e.get('all_day'):
+            out += from_legs(e['flight'], e.get('title'), str(e.get('id') or ''))
+    return out, iso((data.get('window') or {}).get('end')), len(data['events'])
+
+
+def cmd_sync(a, now):
+    if not a.files and not a.from_cache:
+        die('sync needs FILE|- or --from-cache')
+    found, beyond, n_src = {}, None, 0
+    if a.from_cache:
+        fs, beyond, n_src = cache_flights()
+        found.update({f['id']: f for f in fs if iso(f['dep']) > now})
+    for p in a.files:
+        try:
+            data = json.load(sys.stdin) if p == '-' else read_json(p, None)
+        except ValueError as e:
+            die(f'{p}: not JSON ({e})')
+        if data is None:
+            die(f'{p}: no such file')
+        events = page_events(data, p)
+        n_src += len(events)
+        for e in events:
+            for f in (from_event(e) if isinstance(e, dict) else []):
+                if iso(f['dep']) > now:
+                    found[f['id']] = f
+    fd = lock()
+    old = flights_load()
+    manual = [f for f in old if f.get('source') != 'calendar' and f['id'] not in found]
+    far = [f for f in old if f.get('source') == 'calendar' and beyond and iso(f['dep']) >= beyond
+           and f['id'] not in found]
+    gone = len({f['id'] for f in old if f.get('source') == 'calendar'} - set(found) - {f['id'] for f in far})
+    keep = set(found) | {f['id'] for f in far}
+    lost = sum(1 for f in old if f.get('source') == 'calendar' and f['id'] not in keep and iso(f['dep']) > now)
+    if lost and not n_src and not a.allow_empty:      # a bad import, not a calendar without flights: keep them
+        os.close(fd)
+        die(f'{"the calendar cache" if a.from_cache else "the input"} holds no events at all; keeping the {lost} '
+            'upcoming calendar flights (a bad calendar import? re-import it; really empty: --allow-empty)')
+    flights_save(manual + far + list(found.values()), now)
+    os.close(fd)
+    print(f'synced {len(found)} calendar flights ({gone} removed)'
+          + (f', kept {len(far)} past the cache window' if a.from_cache else '')
+          + f', kept {len(manual)} added by hand -> {FLIGHTS_F}')
+
+
+def cmd_add(a, now):
+    no = re.sub(r'\s+', '', a.flight.upper())
+    if not re.fullmatch(r'[A-Z0-9]{2}\d{1,4}', no):
+        die(f'bad flight number {a.flight!r} (e.g. LX1612)')
+    src, dst = fl.resolve(a.src) or fl.resolve(a.src.upper()), fl.resolve(a.dst) or fl.resolve(a.dst.upper())
+    if not src or not dst or src == dst:
+        die('--from and --to must be two different airports (IATA code or a known city)')
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', a.date) or not re.fullmatch(r'\d{1,2}:\d{2}', a.dep):
+        die('date YYYY-MM-DD and --dep HH:MM (local time at the departure airport)')
+    zf, zt = zone_of(src) or tz(), zone_of(dst) or tz()
+    try:
+        day = dt.date.fromisoformat(a.date)
+        dep = dt.datetime.combine(day, dt.time(*map(int, a.dep.split(':'))), zf)
+        arr = None
+        if a.arr:
+            arr = dt.datetime.combine(dep.astimezone(zt).date(), dt.time(*map(int, a.arr.split(':'))), zt)
+            while fixed(arr) <= fixed(dep):              # real instants (a day added on the wall clock)
+                arr += dt.timedelta(days=1)
+        dep, arr = fixed(dep), fixed(arr)
+    except ValueError as e:
+        die(f'bad date or time ({e})')
+    if dep <= now:
+        die('that departure is in the past')
+    f = make(no, src, dst, dep, arr, a.title or f'{PLANE} {fl.pretty(no)} {src} → {dst}', 'manual', None)
+    fd = lock()
+    flights_save([x for x in flights_load() if x['id'] != f['id']] + [f], now)
+    os.close(fd)
+    print(f"added {f['id']}: {fl.pretty(no)} {day_label(dep)} {hm(dep)} {src} → {dst}")
+
+
+def cmd_rm(a, now):
+    fd = lock()
+    items = flights_load()
+    rest = [f for f in items if f['id'] != a.id]
+    if len(rest) == len(items):
+        os.close(fd)
+        die(f'no flight {a.id} (flight-watch list)')
+    flights_save(rest, now)
+    os.close(fd)
+    print(f'removed {a.id}')
+
+
+# ------------------------------------------------------------------------------------------------ cadence
+def phase(f, now):
+    left = iso(f['dep']) - now
+    return 'daily' if left > FAR else 'hourly' if left > NEAR else 'live'
+
+
+def watch_end(f, st):
+    e = end_of(f)
+    est = iso((st.get('live') or {}).get('arr_est'))
+    return max(e, est or e) + AFTER_ARR
+
+
+def due(f, st, now):
+    dep = iso(f['dep'])
+    if now > watch_end(f, st) or (st.get('live') or {}).get('final'):
+        return False
+    last = iso(st.get('last'))
+    if last is None:
+        return True
+    if any(last < dep - m <= now for m in MILESTONES):
+        return True
+    return now - last >= EVERY[phase(f, now)]
+
+
+# ------------------------------------------------------------------------------------------------ sources
+def fetch(url):
+    headers = {'User-Agent': UA, 'Accept': 'text/html,application/json', 'Accept-Language': 'en'}
+    try:
+        with web.open(url, headers=headers, timeout=25) as r:
+            return r.read(4_000_000).decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        raise Fail(f'HTTP {e.code}')
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise Fail(f'unreachable ({getattr(e, "reason", e)})')
+
+
+def embedded(page, marker):
+    i = page.find(marker)
+    if i < 0:
+        raise Fail('page without flight data')
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(page[i + len(marker):].lstrip())
+    except ValueError:
+        raise Fail('unreadable flight data')
+    return obj
+
+
+def at_zone(naive_local, zname):
+    t = iso(naive_local, ZoneInfo(zname) if zname else None)
+    return t
+
+
+def fs_op(x, no):
+    """FlightStats `flight` object -> op dict."""
+    s, stt, note = x.get('schedule') or {}, x.get('status') or {}, x.get('flightNote') or {}
+    da, aa = x.get('departureAirport') or {}, x.get('arrivalAirport') or {}
+    zd, za = da.get('timeZoneRegionName') or fl.tz_name(da.get('iata')), aa.get('timeZoneRegionName') or fl.tz_name(aa.get('iata'))
+
+    def t(key, zn):
+        u = iso(s.get(key + 'UTC'))
+        return fixed(u.astimezone(ZoneInfo(zn))) if u and zn else u or at_zone(s.get(key), zn)
+    sdep, sarr = t('scheduledDeparture', zd), t('scheduledArrival', za)
+    edep, earr = t('estimatedActualDeparture', zd), t('estimatedActualArrival', za)
+    code = str(stt.get('statusCode') or '')
+    return {'src': 'FlightStats', 'no': no, 'from': da.get('iata'), 'to': aa.get('iata'), 'sdep': sdep,
+            'sarr': sarr, 'edep': edep, 'earr': earr,
+            'dep_actual': (s.get('estimatedActualDepartureTitle') == 'Actual'),
+            'arr_actual': (s.get('estimatedActualArrivalTitle') == 'Actual'),
+            'gate': da.get('gate'), 'terminal': da.get('terminal'), 'arr_terminal': aa.get('terminal'),
+            'cancelled': bool(note.get('canceled') or code == 'C'),
+            'diverted': bool(stt.get('diverted') or code in ('D', 'R')),
+            'landed': bool(note.get('landed') or code == 'L'), 'status': stt.get('status') or ''}
+
+
+def fs_days(page, no):
+    """FlightStats otherDays -> list of light ops (times only) around today."""
+    out = []
+    for d in ((page.get('props') or {}).get('initialState') or {}).get('flightTracker', {}).get('otherDays') or []:
+        for x in d.get('flights') or []:
+            da, aa = x.get('departureAirport') or {}, x.get('arrivalAirport') or {}
+            u = iso(x.get('sortTime'))
+            zn = fl.tz_name(da.get('iata'))
+            if not u or not zn:
+                continue
+            sdep = fixed(u.astimezone(ZoneInfo(zn)))
+            out.append({'src': 'FlightStats', 'no': no, 'from': da.get('iata'), 'to': aa.get('iata'), 'sdep': sdep,
+                        'url': x.get('url')})
+    return out
+
+
+class Source:
+    """Per-run cache of the pages per flight number (one fetch per number and page)."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, key, url):
+        if key not in self.cache:
+            try:
+                self.cache[key] = fetch(url)
+            except Fail as e:
+                self.cache[key] = e
+        v = self.cache[key]
+        if isinstance(v, Fail):
+            raise v
+        return v
+
+    def fs_page(self, no, day, extra=''):
+        m = re.fullmatch(r'([A-Z0-9]{2})(\d+)', no)
+        url = (f'{FS}/flight-tracker/{m.group(1)}/{m.group(2)}?year={day.year}&month={day.month}&date={day.day}'
+               + extra)
+        return embedded(self.get(('fs', no, day, extra), url), '__NEXT_DATA__ = ')
+
+    def fs(self, no, day, src):
+        """-> (op for that date and origin or None, [light ops of the days around])."""
+        page = self.fs_page(no, day)
+        tracker = ((page.get('props') or {}).get('initialState') or {}).get('flightTracker') or {}
+        days = fs_days(page, no)
+        x = tracker.get('flight') or {}
+        op = fs_op(x, no) if x else None
+        if op and op['from'] == src and op['sdep'] and op['sdep'].date() == day:
+            return op, days
+        for d in days:                                    # another leg of the number: open it by its flightId
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(d.get('url') or '').query)
+            if d['from'] == src and d['sdep'].date() == day and q.get('flightId'):
+                page2 = self.fs_page(no, day, f"&flightId={q['flightId'][0]}")
+                x2 = (((page2.get('props') or {}).get('initialState') or {}).get('flightTracker') or {}).get('flight')
+                if x2:
+                    op2 = fs_op(x2, no)
+                    if op2['from'] == src:
+                        return op2, days
+        return None, days
+
+    def fa(self, no):
+        """FlightAware -> all ops it lists (history and the next day or so)."""
+        ident = fl.icao_ident(no)
+        boot = embedded(self.get(('fa', no), f'{FA}/live/flight/{urllib.parse.quote(ident)}'),
+                        'var trackpollBootstrap = ')
+        out = []
+        for k, v in (boot.get('flights') or {}).items():
+            if not isinstance(v, dict) or str(k).startswith('INVALID'):
+                continue                                  # an ident FlightAware does not know: no data
+            for x in ((v.get('activityLog') or {}).get('flights') or []) + [v]:
+                o, d = x.get('origin') or {}, x.get('destination') or {}
+                zd = str(o.get('TZ') or '').lstrip(':') or fl.tz_name(o.get('iata'))
+                za = str(d.get('TZ') or '').lstrip(':') or fl.tz_name(d.get('iata'))
+                g, ga = x.get('gateDepartureTimes') or {}, x.get('gateArrivalTimes') or {}
+
+                def ts(v, zn):
+                    if not v:
+                        return None
+                    u = dt.datetime.fromtimestamp(int(v), dt.timezone.utc)
+                    return fixed(u.astimezone(ZoneInfo(zn))) if zn else u
+                if not g.get('scheduled') or not zd:
+                    continue
+                op = {'src': 'FlightAware', 'no': no, 'from': o.get('iata'), 'to': d.get('iata'),
+                      'sdep': ts(g.get('scheduled'), zd), 'sarr': ts(ga.get('scheduled'), za),
+                      'edep': ts(g.get('actual') or g.get('estimated'), zd),
+                      'earr': ts(ga.get('actual') or ga.get('estimated'), za),
+                      'dep_actual': bool(g.get('actual')), 'arr_actual': bool(ga.get('actual')),
+                      'gate': o.get('gate'), 'terminal': o.get('terminal'), 'arr_terminal': d.get('terminal'),
+                      'cancelled': bool(x.get('cancelled')), 'diverted': bool(x.get('diverted')),
+                      'landed': str(x.get('flightStatus') or '').lower() == 'arrived',
+                      'status': str(x.get('flightStatus') or '')}
+                if not any(p['sdep'] == op['sdep'] and p['from'] == op['from'] for p in out):
+                    out.append(op)
+        return out
+
+
+# ------------------------------------------------------------------------------------------------ assess
+def wall(t):
+    return t.hour * 60 + t.minute
+
+
+def diff_wall(a, b):
+    d = (wall(a) - wall(b)) % 1440
+    return d - 1440 if d > 720 else d
+
+
+def lookup(f, src_cache, now):
+    """-> (op on the planned date or None, recent ops of the number [light], sources ok, errors)."""
+    dep = iso(f['dep'])
+    day = dep.date()                                      # local date at the departure airport
+    op, recent, ok, errors = None, [], [], []
+    for s in SOURCES:
+        try:
+            if s == 'fs':
+                o, days = src_cache.fs(f['no'], day, f['from'])
+                recent += days
+            elif s == 'fa':
+                ops = src_cache.fa(f['no'])
+                recent += ops
+                o = next((x for x in ops if x['from'] == f['from'] and x['sdep'] and x['sdep'].date() == day
+                          and abs(x['sdep'] - dep) < 12 * H), None)
+            else:
+                continue
+            ok.append(s)
+            if o and op is None:
+                op = o
+            elif o and op is not None:                     # fill what the first source lacks
+                for k in ('gate', 'terminal', 'arr_terminal'):
+                    op[k] = op.get(k) or o.get(k)
+        except Fail as e:
+            errors.append(f"{'FlightStats' if s == 'fs' else 'FlightAware'}: {e}")
+    return op, recent, ok, errors
+
+
+def pattern(f, recent):
+    """Latest same-season departure of the number on this route before its date (same weekday first) -> op or None."""
+    dep = iso(f['dep'])
+    season = fl.season(dep.date())
+    ops = [x for x in recent if x.get('from') == f['from'] and x.get('to') == f['to'] and x.get('sdep')
+           and x['sdep'].date() < dep.date() and fl.season(x['sdep'].date()) == season]
+    if not ops:
+        return None
+    same = [x for x in ops if x['sdep'].weekday() == dep.weekday()]
+    return max(same or ops, key=lambda x: x['sdep'])
+
+
+def delay_min(sched, est):
+    return mins(est - sched) if sched and est else 0
+
+
+def op_text(op):
+    if op is None:
+        return ''
+    if op['cancelled']:
+        state = 'CANCELLED'
+    elif op['diverted']:
+        state = 'diverted'
+    else:
+        dd, ad = delay_min(op['sdep'], op['edep']), delay_min(op.get('sarr'), op.get('earr'))
+        dep_s = (f"dep {hm(op['edep'])}{' (left)' if op['dep_actual'] else ''}" if op['edep'] else
+                 f"dep {hm(op['sdep'])}")
+        arr_s = (f"arr {hm(op['earr'])}{' (landed)' if op['arr_actual'] else ''}" if op.get('earr') else
+                 f"arr {hm(op['sarr'])}" if op.get('sarr') else '')
+        state = ' · '.join(x for x in (dep_s, arr_s) if x)
+        state += f' · {"+" + str(max(dd, ad)) + " min" if max(dd, ad) >= 5 else "on time"}'
+    extra = [f"terminal {op['terminal']}" if op.get('terminal') else '', f"gate {op['gate']}" if op.get('gate') else '']
+    return ' · '.join(x for x in [state] + extra if x) + f" ({op['src']})"
+
+
+def assess(f, op, recent, ok, st, now, nxt=None, nxt_st=None):
+    """-> list of (key, text) problems; updates st['live'], st['miss'] and the known gate/terminal."""
+    dep, arr = iso(f['dep']), iso(f.get('arr'))
+    out = []
+    live = st.setdefault('live', {})
+    if op is None:
+        live['text'] = None
+        dist = dep.date() - now.astimezone(dep.tzinfo).date()
+        if dep - now > FAR:
+            p = pattern(f, recent)
+            if p:
+                live['pattern'] = f"{hm(p['sdep'])} on {day_label(p['sdep'])}"
+                d = diff_wall(p['sdep'], dep)
+                if abs(d) >= SCHED_DEP and dep - now <= PATTERN_AHEAD:
+                    out.append((f"schedule:{hm(p['sdep'])}",
+                                f"recent days' timetable: {fl.pretty(f['no'])} leaves {f['from']} at "
+                                f"{hm(p['sdep'])} ({d:+d} min vs the planned {hm(dep)}; last flown "
+                                f"{day_label(p['sdep'])}): the booking may have been retimed"))
+            other = any(x.get('from') == f['from'] and x.get('to') == f['to'] for x in recent)
+            live['result'] = 'no data yet for its date' + ('' if p else ' (recent flights are in another timetable '
+                                                            'season)' if other else ' (no recent flights seen)')
+            st['miss'] = 0
+            return out
+        later = any(x.get('sdep') and x['sdep'].date() > dep.date() for x in recent)
+        if dist.days <= 1 and ok and later:
+            st['miss'] = int(st.get('miss') or 0) + 1
+            live['result'] = 'not listed on its date'
+            if st['miss'] >= 2 or dep - now < NEAR:
+                out.append(('missing', f"{fl.pretty(f['no'])} is not listed for {day_label(dep)} "
+                                       f"(it is on later days): cancelled or retimed? Check the airline app"))
+        else:
+            st['miss'] = 0
+            live['result'] = 'no data yet for its date'
+        return out
+    st['miss'] = 0
+    live.update({'src': op['src'], 'status': op['status'], 'dep_sched': op['sdep'].isoformat(),
+                 'dep_est': op['edep'].isoformat() if op['edep'] else None,
+                 'arr_est': (op.get('earr') or op.get('sarr')).isoformat() if (op.get('earr') or op.get('sarr')) else None,
+                 'gate': op.get('gate'), 'terminal': op.get('terminal'),
+                 'final': bool(op['landed'] or op['cancelled'] or op['arr_actual']), 'text': op_text(op),
+                 'result': 'cancelled' if op['cancelled'] else 'live data'})
+    if op['cancelled']:
+        out.append(('cancelled', f"{fl.pretty(f['no'])} {f['from']} → {f['to']} on {day_label(dep)} is CANCELLED"))
+        return out
+    if op['diverted']:
+        out.append(('diverted', f"{fl.pretty(f['no'])} was diverted (no longer heading for {f['to']} as planned)"))
+    sd = mins(op['sdep'] - dep)
+    if abs(sd) >= SCHED_DEP:
+        out.append((f"schedule:{hm(op['sdep'])}", f"timetable changed: departure {hm(op['sdep'])} instead of "
+                                                  f"{hm(dep)} ({sd:+d} min, local time {f['from']})"))
+    if arr and op.get('sarr'):
+        sa = mins(op['sarr'] - arr)
+        if abs(sa) >= SCHED_ARR:
+            out.append((f"schedule-arr:{hm(op['sarr'].astimezone(arr.tzinfo))}",
+                        f"timetable changed: arrival {hm(op['sarr'].astimezone(arr.tzinfo))} instead of {hm(arr)} "
+                        f"({sa:+d} min, local time {f['to']})"))
+    dd, ad = delay_min(op['sdep'], op['edep']), delay_min(op.get('sarr'), op.get('earr'))
+    worst = max(dd, ad)
+    b = next((x for x in DELAY_BUCKETS if worst >= x), None)
+    if b:
+        parts = []
+        if dd >= 5 and op['edep']:
+            parts.append(f"departure {hm(op['edep'])} instead of {hm(op['sdep'])} (+{dd} min)")
+        if ad >= 5 and op.get('earr'):
+            parts.append(f"arrival {hm(op['earr'])} instead of {hm(op['sarr'])} (+{ad} min)")
+        out.append((f'delay{b}', 'delayed: ' + '; '.join(parts)))
+    for k in ('gate', 'terminal'):
+        new, old = op.get(k), st.get(k)
+        if new and old and new != old and not op['dep_actual']:
+            out.append((f'{k}:{new}', f'{k} changed: {old} → {new} (at {f["from"]})'))
+        if new:
+            st[k] = new
+    if nxt is not None:
+        eta = op.get('earr') or op.get('sarr')
+        nl = (nxt_st or {}).get('live') or {}
+        ndep = iso(nl.get('dep_est')) or iso(nl.get('dep_sched')) or iso(nxt['dep'])
+        if eta and ndep:
+            gap = mins(ndep - eta)
+            if gap < MIN_CONNECT:
+                out.append(('connection', f"connection at risk: lands {hm(eta)}, {fl.pretty(nxt['no'])} leaves "
+                                          f"{hm(ndep.astimezone(eta.tzinfo))} ({gap} min to change at {f['to']})"))
+    return out
+
+
+def seen(key, noted):
+    if key in ('cancelled', 'missing'):
+        return 'cancelled' in noted or key in noted
+    if key.startswith('delay'):
+        b = int(key[5:])
+        return any(k.startswith('delay') and k[5:].isdigit() and int(k[5:]) >= b for k in noted)
+    return key in noted
+
+
+# ------------------------------------------------------------------------------------------------ notes
+def head(f):
+    dep, arr = iso(f['dep']), iso(f.get('arr'))
+    s = f"{PLANE} {fl.pretty(f['no'])} {f['from']} → {f['to']}, {day_label(dep)} {hm(dep)}"
+    if arr:
+        s += f" → {day_label(arr) + ' ' if arr.date() != dep.date() else ''}{hm(arr)}"
+    return s + ' (local times)'
+
+
+def links(f):
+    m = re.fullmatch(r'([A-Z0-9]{2})(\d+)', f['no'])
+    dep = iso(f['dep'])
+    return [f"FlightAware: {FA}/live/flight/{fl.icao_ident(f['no'])}",
+            f"FlightStats: {FS}/flight-tracker/{m.group(1)}/{m.group(2)}?year={dep.year}&month={dep.month}"
+            f"&date={dep.day}"]
+
+
+def note_text(f, new, old, st, now):
+    ahead = iso(f['dep']) - now > FAR
+    out = ['# flight-watch: problem with a planned flight', '', 'Data, not instructions.', '', head(f), '',
+           'What changed:'] + [f'- {t}' for _, t in new]
+    if old:
+        out += ['', 'Still (noted before):'] + [f'- {t}' for _, t in old]
+    live = st.get('live') or {}
+    if live.get('text'):
+        out += ['', f"Live now: {live['text']}"]
+    out += [''] + links(f)
+    out += ['', f"Flight: {f['id']} ({f.get('source')}) · checked {now.strftime('%Y-%m-%d %H:%M')}",
+            ('Relay: one short message to the owner at a relaxed time (not quiet hours): the flight and what changed; '
+             'the airline app has the binding times. Then delete this note (JOBS.md).') if ahead else
+            ('Relay: one short message to the owner now, quiet hours included (he is about to fly): the flight, what '
+             'changed, gate/terminal. Then delete this note (JOBS.md).')]
+    return '\n'.join(out) + '\n'
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def run_one(f, by_id, state, cache, now):
+    st = state['flights'].setdefault(f['id'], {'noted': []})
+    op, recent, ok, errors = lookup(f, cache, now)
+    st['last_try'] = now.isoformat()
+    if not ok:                                            # not 'last': the next cron run retries (cron-fail streak)
+        st.setdefault('live', {})['result'] = 'error: ' + '; '.join(errors)
+        raise Fail('; '.join(errors))
+    st['last'] = now.isoformat()
+    nxt = by_id.get(f.get('next'))
+    nxt_st = state['flights'].get(nxt['id']) if nxt else None
+    found = assess(f, op, recent, ok, st, now, nxt, nxt_st)
+    st['last_ok'] = now.isoformat()
+    if errors:
+        st['live']['result'] += f" ({'; '.join(errors)})"
+    return st, found
+
+
+LIVE_LEAD = 3 * H                            # the phone app's countdown chip starts this long before departure
+
+
+def live_sync(a, items, flights_st, now):
+    """After the main work: one Live Update chip per flight (phone app, livecount), a countdown to the estimated
+    departure from LIVE_LEAD before it (gate and terminal as the detail line), updated when the estimate or gate
+    changes, ended at departure or when cancelled. Silent no-op without a paired phone; <= 5 s."""
+    chips, ended = [], []
+    for f in items:
+        live = (flights_st.get(f['id']) or {}).get('live') or {}
+        if live.get('result') == 'cancelled':
+            ended.append(f['id'])
+            continue
+        sched = iso(live.get('dep_sched')) or iso(f['dep'])
+        est = iso(live.get('dep_est')) or sched
+        if not sched or not est or not now < est <= now + LIVE_LEAD:
+            continue
+        late_by = mins(est - sched)
+        gate, term = live.get('gate'), live.get('terminal')
+        body = ' · '.join(x for x in (f'terminal {term}' if term else '', f'gate {gate}' if gate else 'gate not out yet')
+                          if x)
+        chips.append({'key': f['id'], 'until': est, 'body': body,
+                      'title': f'Flight {hm(sched)}' + (f' +{late_by} min' if late_by >= 5 else '')})
+    test = bool(os.environ.get('FLIGHT_WATCH_DIR') or os.environ.get('FLIGHT_WATCH_NOW') or getattr(a, 'now', None))
+    for line in livecount.sync('flight', chips, now=now, ended=ended, test=test, dry=a.dry_run):
+        if a.dry_run:
+            print(line)
+
+
+def cmd_check(a, now):
+    items = flights_load()
+    if not items:
+        live_sync(a, [], {}, now)                         # ends a chip left over (no live state: no-op)
+        return 0
+    state0 = read_json(STATE_F, {'flights': {}})
+    todo = [f for f in items if a.force and now <= watch_end(f, (state0.get('flights') or {}).get(f['id']) or {})
+            or due(f, (state0.get('flights') or {}).get(f['id']) or {}, now)]
+    if not todo:
+        live_sync(a, items, state0.get('flights') or {}, now)
+        return 0                                          # the cron fast path: nothing due, no network
+    fd = lock(blocking=False)
+    if fd is None:
+        return 0                                          # another run is still busy
+    state = read_json(STATE_F, {'flights': {}})
+    state.setdefault('flights', {})
+    by_id = {f['id']: f for f in items}
+    cache, errors = Source(), 0
+    for f in sorted(todo, key=lambda x: iso(x['dep'])):
+        try:
+            st, found = run_one(f, by_id, state, cache, now)
+            new = [(k, t) for k, t in found if not seen(k, st['noted'])]
+            if new:
+                text = note_text(f, new, [(k, t) for k, t in found if seen(k, st['noted'])], st, now)
+                if a.dry_run:
+                    print(text)
+                else:
+                    path = notes.write(INBOX, f"flight-watch-{f['id']}-{int(now.timestamp())}.md", text)
+                    if not a.cron:
+                        print(f'note: {path}')
+                st['noted'] = sorted(set(st['noted']) | {k for k, _ in new})
+            elif not a.cron:
+                print(f"{f['id']} {fl.pretty(f['no'])}: {'ok' if not found else 'known: ' + ', '.join(k for k, _ in found)}"
+                      f" · {st['live'].get('result')}" + (f" · {st['live']['text']}" if st['live'].get('text') else '')
+                      + (f" · recent: {st['live']['pattern']}" if st['live'].get('pattern') and not op_live(st) else ''))
+        except Fail as e:
+            errors += 1
+            print(f"flight-watch: {f['id']} {fl.pretty(f['no'])}: {e}", file=sys.stderr)
+    if not a.dry_run:
+        write_json(STATE_F, state)
+    os.close(fd)
+    live_sync(a, items, state['flights'], now)
+    return 1 if errors == len(todo) else 0
+
+
+def op_live(st):
+    return bool((st.get('live') or {}).get('text'))
+
+
+def cmd_list(a, now):
+    st = read_json(STATE_F, {'flights': {}}).get('flights') or {}
+    items = [f for f in flights_load() if watch_end(f, st.get(f['id']) or {}) >= now]
+    if a.json:
+        print(json.dumps([dict(f, phase=phase(f, now), last=(st.get(f['id']) or {}).get('last'),
+                               result=((st.get(f['id']) or {}).get('live') or {}).get('result'),
+                               noted=(st.get(f['id']) or {}).get('noted') or []) for f in items],
+                         ensure_ascii=False, indent=1))
+        return
+    if not items:
+        print('no flights ahead (flight-watch sync / add)')
+        return
+    for f in items:
+        s = st.get(f['id']) or {}
+        last = iso(s.get('last_try') or s.get('last'))
+        lc = f"last check {last.astimezone(tz()).strftime('%d.%m %H:%M')}: {(s.get('live') or {}).get('result')}" \
+            if last else 'not checked yet'
+        print(f"{f['id']}  {head(f)}  {f.get('source')}  [{phase(f, now)}; {lc}]"
+              + (f"  noted: {', '.join(s['noted'])}" if s.get('noted') else ''))
+
+
+def cmd_status(a, now):
+    items = flights_load()
+    f = next((x for x in items if x['id'] == a.id), None)
+    if not f:
+        die(f'no flight {a.id} (flight-watch list)')
+    state = read_json(STATE_F, {'flights': {}})
+    st = json.loads(json.dumps((state.get('flights') or {}).get(f['id']) or {'noted': []}))
+    by_id = {x['id']: x for x in items}
+    try:
+        st, found = run_one(f, by_id, {'flights': dict(state.get('flights') or {}, **{f['id']: st})}, Source(), now)
+    except Fail as e:
+        print(f'flight-watch: {e}', file=sys.stderr)
+        return 1
+    live = st.get('live') or {}
+    if a.json:
+        print(json.dumps({'id': f['id'], 'no': f['no'], 'from': f['from'], 'to': f['to'], 'dep': f['dep'],
+                          'arr': f.get('arr'), 'fine': not found, 'result': live.get('result'),
+                          'live': live.get('text'), 'gate': live.get('gate'), 'terminal': live.get('terminal'),
+                          'pattern': live.get('pattern'),
+                          'problems': [{'key': k, 'text': t} for k, t in found]}, ensure_ascii=False))
+        return 0
+    print(head(f))
+    print(f"Live: {live.get('text') or live.get('result')}")
+    if live.get('pattern'):
+        print(f"Recent days: leaves {live['pattern']}")
+    if not found:
+        print('Status: fine')
+        return 0
+    print('Problems:')
+    for _, t in found:
+        print(f'- {t}')
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='flight-watch', description=__doc__.split('\n')[0],
+                                 epilog='Details: the module docstring (sed -n 2,45p ~/bin/flight-watch).')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('sync', help='import ✈️ events from saved list_events JSON or the calcache cache')
+    s.add_argument('files', nargs='*')
+    s.add_argument('--from-cache', action='store_true')
+    s.add_argument('--allow-empty', action='store_true', help='let an empty source drop every calendar flight')
+    s = sub.add_parser('add', help='add a flight by hand')
+    s.add_argument('flight'); s.add_argument('date')
+    s.add_argument('--from', dest='src', required=True); s.add_argument('--to', dest='dst', required=True)
+    s.add_argument('--dep', required=True); s.add_argument('--arr'); s.add_argument('--title')
+    s = sub.add_parser('list', help='flights ahead with their last check')
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('rm', help='remove a flight')
+    s.add_argument('id')
+    s = sub.add_parser('check', help='check the flights that are due; note on a new problem')
+    s.add_argument('--cron', action='store_true'); s.add_argument('--dry-run', action='store_true')
+    s.add_argument('--force', action='store_true', help='check every watched flight now')
+    s = sub.add_parser('status', help='live verdict for one flight (no note, no state)')
+    s.add_argument('id'); s.add_argument('--json', action='store_true')
+    for p in sub.choices.values():
+        p.add_argument('--now')
+    a = ap.parse_args()
+    now = now_arg(a.now)
+    fn = {'sync': cmd_sync, 'add': cmd_add, 'list': cmd_list, 'rm': cmd_rm, 'check': cmd_check,
+          'status': cmd_status}[a.cmd]
+    sys.exit(fn(a, now) or 0)
+
+
+if __name__ == '__main__':
+    main()

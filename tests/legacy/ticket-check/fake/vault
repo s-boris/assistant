@@ -1,0 +1,12 @@
+#!/bin/sh
+# fake vault: `vault gmail search QUERY ... --json`. Logs argv to $FAKE_VAULT_LOG; prints the first
+# $FAKE_VAULT_DIR/<word>.json whose <word> occurs in QUERY (case-insensitive), else no results.
+[ -n "$FAKE_VAULT_LOG" ] && printf '%s\n' "$*" >> "$FAKE_VAULT_LOG"
+[ "$FAKE_VAULT_FAIL" = 1 ] && { echo "vault: unreachable" >&2; exit 1; }
+[ "$1 $2" = "gmail search" ] || { echo "fake vault: unexpected $*" >&2; exit 9; }
+q=$(printf '%s' "$3" | tr 'A-Z' 'a-z')
+for f in "$FAKE_VAULT_DIR"/*.json; do
+  w=$(basename "$f" .json)
+  case "$q" in *"$w"*) cat "$f"; exit 0;; esac
+done
+echo '{"count": 0, "total": 0, "results": [], "note": "no subject or text"}'

@@ -1,0 +1,5 @@
+#!/bin/sh
+# fake ha: `ha list media_player --json` prints $FAKE_HA_JSON (a file); FAKE_HA_FAIL=1 -> exit 1
+[ "$FAKE_HA_FAIL" = 1 ] && { echo "ha: connection refused" >&2; exit 1; }
+[ "$1 $2 $3" = "list media_player --json" ] || { echo "fake ha: unexpected $*" >&2; exit 9; }
+cat "$FAKE_HA_JSON"

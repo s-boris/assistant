@@ -1,0 +1,26 @@
+#!/bin/sh
+# The main session on the official Telegram plugin: the last-resort launcher, for when ops/start-claude itself is broken
+# (`sudo install -m 755 ~/plugins/telegram-plus/ops/start-claude.official /usr/local/bin/start-claude && restart`). The
+# next container start replaces it with ops/start-claude (the launcher installed as start-claude by ~/boot.sh).
+# It does what start-claude's fallback does: the official plugin, and tg-adapter's live instance off
+# (live.off + stopped: one poller per bot token). Same session settings as ops/start-claude (see there for why).
+# entrypoint restarts it when it exits.
+cd ~/workspace || exit
+# Keep the bot token out of this session's env (the plugin and tg read its 0600 .env file at call time).
+unset TELEGRAM_BOT_TOKEN TELEGRAM_MODE
+tmux set-environment -g -u TELEGRAM_BOT_TOKEN 2>/dev/null
+# The official plugin polls, so the live adapter stays off: its switch file (it re-checks before every poll), then SIGTERM.
+if [ -d ~/.config/tg-adapter ] && [ ! -e ~/.config/tg-adapter/live.off ]; then : > ~/.config/tg-adapter/live.off; fi
+p=$(head -n 1 ~/.local/state/tg-adapter/live/adapter.pid 2>/dev/null)
+case $p in
+  '' | *[!0-9]*) ;;
+  *) tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -qF 'src/cli.ts run' && kill -TERM "$p" 2>/dev/null ;;
+esac
+mkdir -p ~/.local/state/start-claude && echo official > ~/.local/state/start-claude/telegram-mode
+mods=
+[ -e ~/.heartbeat-mod-off ] || mods=',"heartbeat@home-plugins":true'
+# Pick the conversation back up, unless there isn't one yet.
+ls ~/.claude/projects/-home-node-workspace/*.jsonl >/dev/null 2>&1 && resume=--continue
+exec claude $resume --permission-mode bypassPermissions --remote-control claude-bot \
+  --channels plugin:telegram@claude-plugins-official \
+  --settings "{\"enabledPlugins\":{\"telegram@claude-plugins-official\":true$mods},\"disableAgentView\":true,\"crossSessionInbound\":\"refuse\"}"

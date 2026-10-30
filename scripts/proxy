@@ -1,0 +1,132 @@
+#!/bin/sh
+# Owner's nginx reverse proxy on the Webserver VM (profile network.hosts.web_vm; full /etc/nginx write access, owner-approved).
+#   proxy pull                 mirror /etc/nginx into ~/opt/nginx-mirror (git) and commit any drift
+#   proxy push "message"       commit the edited mirror, copy it to the server (deletes nothing it did not add), nginx -t,
+#                              reload. First it compares the server with the mirror: changes made there since the last
+#                              pull (certbot, a hand edit) are committed as drift and kept; if you edited the same file,
+#                              nothing is pushed. A failed copy, nginx -t or reload rolls back: the old files go back,
+#                              the files this push added are removed, nginx -t checks it (not reloaded)
+#   proxy test                 nginx -t on the server
+#   proxy cert NAME            certificate for NAME.<domain> (or <domain>; profile network.domain) via /usr/local/sbin/claude-cert
+#   proxy log [N]              git history of the mirror
+# Workflow: proxy pull → edit ~/opt/nginx-mirror/etc-nginx/... → proxy push "why". Ask the owner before exposing anything new.
+case "${1:-}" in
+  pull|push|test|cert|log) ;;
+  *) grep -v '^# managed: ' "$0" | sed -n '2,/^[^#]/p' | grep '^#' | sed 's/^# \{0,1\}//'
+     case ${1:-} in ""|help|-h|--help) exit 0;; *) exit 2;; esac ;;
+esac
+# test seams (tests/legacy/proxy in ~/opt/assistant): the server and the mirror. The server's default and the domain come from the
+# profile (~/.config/assistant/profile.json via profile-get: next to this script, else on PATH).
+pg=$(dirname "$(readlink -f "$0")")/profile-get; [ -x "$pg" ] || pg=profile-get
+host=${PROXY_HOST:-$("$pg" network.hosts.web_vm)} || exit 1
+m=${PROXY_MIRROR:-$HOME/opt/nginx-mirror}
+cd "$m" || exit 1
+m=$(pwd -P)
+COPY='-rl --checksum --omit-dir-times --no-perms --no-times'
+pull() {
+  stash=$(mktemp -d)
+  rsync -a --delete --exclude=/dash-www "$host:/etc/nginx/" "$stash/" || { rm -rf "$stash"; exit 1; }
+  # Commit the live state (as "drift") without losing local edits (new untracked files count too).
+  [ -z "$(git status --porcelain --untracked-files=all -- etc-nginx)" ] && git diff --cached --quiet \
+    || { echo "proxy: local edits pending (git -C $m status); push or discard them first" >&2; rm -rf "$stash"; return 1; }
+  rsync -a --delete --exclude=/dash-www "$stash/" etc-nginx/; rm -rf "$stash"
+  git add -A etc-nginx && { git diff --cached --quiet || git commit -qm "${1:-drift: live state}"; }
+}
+drift() {  # $1 = a dir whose etc-nginx/ holds the server's files: print the paths where they differ from HEAD
+  GIT_INDEX_FILE=$1/index git read-tree HEAD \
+    && GIT_INDEX_FILE=$1/index git -C "$1" --git-dir="$m/.git" --work-tree="$1" add -A etc-nginx \
+    && GIT_INDEX_FILE=$1/index git diff --cached --no-renames --name-only HEAD -- etc-nginx
+}
+rm_added() {  # $1 = export dir of the restored files ($1/etc-nginx): remove from the server exactly the paths in
+              # $tmp/added and the directories they created: rsync --delete with only those paths and their parent
+              # directories included; everything else is excluded, so it is never deleted
+  [ -s "$tmp/added" ] || return 0
+  : > "$1/rules"
+  while IFS= read -r p; do
+    p=${p#etc-nginx/}
+    case $p in *'*'*|*'?'*|*'['*|*'\'*|'') return 1;; esac      # not expressible as an exact filter rule
+    pre=; rest=$p
+    while :; do
+      case $rest in */*) ;; *) break;; esac
+      pre=${pre:+$pre/}${rest%%/*}; rest=${rest#*/}; echo "+ /$pre/" >> "$1/rules"
+    done
+    echo "+ /$p" >> "$1/rules"
+  done < "$tmp/added"
+  echo '- *' >> "$1/rules"
+  rsync -rl --delete --omit-dir-times --no-perms --no-times --filter="merge $1/rules" "$1/etc-nginx/" "$host:/etc/nginx/"
+}
+restore() {  # $1 = rev: put its files back on the server, remove the files this push added, then nginx -t
+  r=$(mktemp -d) || return 1
+  git archive "$1" etc-nginx | tar -x -C "$r" \
+    && rsync $COPY "$r/etc-nginx/" "$host:/etc/nginx/" \
+    && rm_added "$r" \
+    && ssh "$host" 'sudo -n /usr/sbin/nginx -t' >/dev/null 2>&1
+  rc=$?; rm -rf "${r:?}"; return $rc
+}
+leftovers() { [ -s "$tmp/added" ] && { echo "files this push added (may still be on the server):"; cat "$tmp/added"; } >&2; }
+case "$1" in
+  pull) pull "live state $(date '+%F %T')" && git log --oneline -1 ;;
+  push)
+    msg=${2:?message}
+    git add -A etc-nginx
+    git diff --cached --quiet && { echo "nothing to push"; exit 0; }
+    tmp=$(mktemp -d) || exit 1
+    trap 'rm -rf "${tmp:?}"' EXIT
+    # 1. never overwrite what changed on the server since the last pull
+    mkdir "$tmp/vm" && rsync -a --delete --exclude=/dash-www "$host:/etc/nginx/" "$tmp/vm/etc-nginx/" \
+      || { echo "proxy: cannot read the server's /etc/nginx: nothing pushed (edits kept)" >&2; exit 1; }
+    drift "$tmp/vm" > "$tmp/drift" || { echo "proxy: drift check failed: nothing pushed (edits kept)" >&2; exit 1; }
+    if [ -s "$tmp/drift" ]; then
+      git diff --cached --no-renames --name-only HEAD -- etc-nginx > "$tmp/mine"
+      if grep -Fxf "$tmp/mine" "$tmp/drift" > "$tmp/both"; then
+        { echo "proxy: changed on the server since the last pull AND edited by you: nothing pushed (edits kept)"
+          sed 's/^/  /' "$tmp/both"
+          echo "  merge by hand: git -C $m stash; proxy pull; git -C $m stash pop; fix; proxy push again"; } >&2
+        exit 1
+      fi
+      git stash push -q || { echo "proxy: git stash failed: nothing pushed" >&2; exit 1; }
+      if ! { rsync -a --delete --exclude=/dash-www "$tmp/vm/etc-nginx/" etc-nginx/ && git add -A etc-nginx \
+             && git commit -qm "drift: live state before push"; }; then
+        git checkout -q -- etc-nginx 2>/dev/null; git clean -qfd -- etc-nginx; git stash pop -q
+        echo "proxy: could not commit the server's changes: nothing pushed (edits kept)" >&2; exit 1
+      fi
+      git stash pop -q && git add -A etc-nginx \
+        || { echo "proxy: drift committed, but your edits did not re-apply: see git -C $m stash list; nothing pushed" >&2; exit 1; }
+      { echo "proxy: the server had changed since the last pull; committed as drift first:"; sed 's/^/  /' "$tmp/drift"; } >&2
+    fi
+    # 2. commit, copy, nginx -t, reload
+    git commit -qm "$msg" || exit 1
+    git diff --no-renames --name-only --diff-filter=A HEAD~1 HEAD -- etc-nginx > "$tmp/added"
+    if ! rsync $COPY etc-nginx/ "$host:/etc/nginx/"; then
+      # undo the commit so a retry still has something to push (the edits stay staged); undo what arrived
+      git reset -q --soft HEAD~1
+      if restore HEAD; then
+        echo "proxy: copy to the server FAILED; the server has its old files again (nginx -t ok, not reloaded). Local commit undone (edits kept, retry 'proxy push')." >&2
+      else
+        echo "proxy: copy to the server FAILED and the restore did not finish: part of the change may be there ('proxy test'). Local commit undone (edits kept)." >&2
+        leftovers
+      fi
+      exit 1
+    fi
+    if ssh "$host" 'sudo -n /usr/sbin/nginx -t' 2>&1 | tail -2 | grep -q 'test is successful'; then
+      ssh "$host" 'sudo -n /usr/bin/systemctl reload nginx' && { echo "pushed + reloaded: $msg"; exit 0; }
+      echo "proxy: nginx -t passed but the reload FAILED; rolling back (nginx keeps running the old config)" >&2
+    else
+      echo "nginx -t FAILED; rolling back" >&2
+      ssh "$host" 'sudo -n /usr/sbin/nginx -t' 2>&1 | tail -5 >&2
+    fi
+    if git revert --no-edit HEAD >/dev/null && restore HEAD; then
+      echo "rolled back (config restored, not reloaded)" >&2
+    else
+      echo "proxy: ROLLBACK INCOMPLETE: nginx -t still fails (or the copy back failed). nginx was not reloaded, but its next reload or restart will fail: fix it now ('proxy test')." >&2
+      leftovers
+    fi
+    exit 1 ;;
+  test) ssh "$host" 'sudo -n /usr/sbin/nginx -t' ;;
+  cert) n=${2:?name}; dom=$("$pg" network.domain) || exit 1
+        case $n in *."$dom"|"$dom") ;; *) n=$n.$dom;; esac
+        # n goes into a remote shell command: hostname characters only
+        case $n in -*|.*|*..*|*[!A-Za-z0-9.-]*) echo "proxy: bad name: $2" >&2; exit 2;; esac
+        ssh "$host" "sudo -n /usr/local/sbin/claude-cert $n" && pull "certbot: $n" ;;
+  log) git log --oneline -"${2:-15}" ;;
+esac

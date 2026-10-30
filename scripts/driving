@@ -1,0 +1,49 @@
+#!/usr/bin/env -S python3 -I
+"""Is the owner driving right now?  driving [-v]
+
+Exit 0 = yes: `whereabouts ha now --json` (the phone app when <= 30 min fresh, else `vault ha now`; consumer
+"driving", fresh only) says drive.active (his phone's car connection) and the answer is at most
+DRIVING_MAX_AGE_MIN minutes old (default 60; older = unknown). The rule is core.drive's, shared with every
+other reader of the drive flag (drive-brief, lastcall, event-card, context, the usage context). Else exit 1: not
+driving, unknown, or no source reachable. No output; -v prints one line (driving N min / not driving / unknown).
+Used for voice answers while he drives (tts + tg-voice).
+Tests: DRIVING_VAULT (the place command, `vault ha now --json` schema); ~/opt/tts-tests/run.sh.
+"""
+import json
+import os
+import pwd
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+for _lib in (os.path.expanduser("~/bin/lib"), os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "bin", "lib")):
+    if _lib not in sys.path:
+        sys.path.insert(0, _lib)
+from core import drive  # noqa: E402
+
+
+def main(argv):
+    verbose = argv[:1] == ["-v"]
+
+    def say(s):
+        if verbose:
+            print(s)
+
+    cmd = os.environ.get("DRIVING_VAULT") or "whereabouts"
+    env = dict(os.environ, WHEREABOUTS_FOR="driving", WHEREABOUTS_FRESH_ONLY="1")
+    try:
+        p = subprocess.run([cmd, "ha", "now", "--json"], env=env, capture_output=True, text=True, timeout=90,
+                           stdin=subprocess.DEVNULL)
+        answer = json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        answer = None
+    state, minutes = drive.verdict(answer)
+    if state == "yes":
+        say("driving" + (" %d min" % minutes if minutes is not None else ""))
+        return 0
+    say("not driving" if state == "no" else "unknown")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

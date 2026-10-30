@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""context: compact "environment factors" snapshot for goal building and autonomous decisions. No tokens.
+
+  context                    refresh every source, write ~/.local/state/context/today.md + today.json
+                             (cron 08:25 and 18:25); the slow Telegram step runs last
+  context --no-telegram      skip the Telegram step
+  context --only hn,weather  refresh just these sources (the rest come from the last snapshot)
+  context --force            ignore the per-source cache TTLs
+  context --show             print today.md
+
+Sources (each optional, failing soft: error -> last good value marked "stale" for up to 48 h, else "error"):
+  hn         Hacker News top 30 (official API): stories matching his interests + top 5 overall
+  health     latest ~/reports/unraid/*.md (unraid-health's daily report; never re-runs the check)
+  capacity   `unraid-capacity forecast` (local samples, no ssh)
+  media      `media queue` (GET only)
+  weather    home today/tomorrow (profile home.*; open-meteo; MeteoSwiss app API as fallback)
+  reminders  `remind list`, next 7 days      deadlines  `deadlines list --days 7 --json`
+  location   the vault's Home Assistant status feed: ONE `vault ha now --json` -> flag home |
+             away | far (> 50 km from home) + age, the zone name, outside zones the distance band
+             (< 5 / 5-50 / > 50 km) and the town if the phone geocodes, and "driving" from Android
+             Auto (core.drive's rule: only while the feed is <= 60 min old). Coarse values computed INSIDE the vault; no coordinates, street or address ever reach this box.
+             HA is never contacted from here. The exact place only through
+             the vault with his ✅ (`vault raw request --source location`).
+  calendar   placeholder: the Google Calendar MCP lives in my session ("read in session")
+  telegram   only when `tgread status` shows a login: ONE `tgread summarize --hours <since last run> --no-text`, the
+             vault's digest (counts, needs-you flags, dated plans, signal categories;
+             checked values, never message text), as an async vault job collected with `vault job wait --json` in
+             steps of <= 230 s until CONTEXT_TG_TIMEOUT; a job still running then is picked up by the next run (the
+             vault keeps it 30 min). today.* get "9 chats, 143 msgs · 3 need you (2 reply, 1 decision) · plans: Sat
+             17.10"; the signal categories (type, topic, date: enums only) go to signals.json (0600, rolling 14 days).
+
+Files (0600) in ~/.local/state/context: today.md, today.json, signals.json, cache.json. `context --cleanup-private`
+deletes stray telegram.md, signals.md or location.json files there (run it only after the owner's OK). signals.json is excluded from brain-backup and recall (and ~/.brain.git never includes ~/.local).
+Env (tests): CONTEXT_STATE, CONTEXT_UNRAID_REPORTS, CONTEXT_HN_BASE,
+CONTEXT_WEATHER_URL, CONTEXT_METEO_URL, CONTEXT_TG_TIMEOUT, CONTEXT_NOW (epoch).
+"""
+import argparse
+import concurrent.futures as cf
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+import assistant_profile  # noqa: E402  (home: weather point, postcode, town label)
+from core import drive as drive_rule  # noqa: E402  (the one drive-flag rule, `driving`'s)
+
+HOME = os.path.expanduser('~')
+TZ = assistant_profile.tz()
+STATE = os.environ.get('CONTEXT_STATE', os.path.join(HOME, '.local', 'state', 'context'))
+REPORTS = os.environ.get('CONTEXT_UNRAID_REPORTS', os.path.join(HOME, 'reports', 'unraid'))
+HN_BASE = os.environ.get('CONTEXT_HN_BASE', 'https://hacker-news.firebaseio.com/v0')
+WEATHER_URL = os.environ.get('CONTEXT_WEATHER_URL', 'https://api.open-meteo.com/v1/forecast')
+METEO_URL = os.environ.get('CONTEXT_METEO_URL', 'https://app-prod-ws.meteoswiss-app.ch/v2/plzDetail')
+TG_TIMEOUT = int(os.environ.get('CONTEXT_TG_TIMEOUT', '2400'))
+# Weather point: the home coordinates rounded to 2 decimals (about 1 km: enough for a forecast grid; the weather
+# API never gets the exact home). PLZ: MeteoSwiss' id of the home postcode (postcode + '00').
+LAT = round(float(assistant_profile.get('home.lat')), 2)
+LON = round(float(assistant_profile.get('home.lon')), 2)
+PLZ = str(assistant_profile.get('home.postcode')) + '00'
+HOME_LABEL = (assistant_profile.get('home.town_aliases') or [''])[0] or assistant_profile.get('home.town')
+UA = 'context/1.0 (personal daily snapshot; a few requests twice a day)'
+STALE_MAX = 48 * 3600
+TTL = {'hn': 2 * 3600, 'weather': 3 * 3600, 'capacity': 3600}
+STATUSES = ('ok', 'stale', 'error', 'not set up', 'placeholder', 'skipped')
+SIGNAL_TYPES = ('plan', 'event', 'problem', 'wish', 'purchase', 'request')
+SIGNAL_DAYS = 14
+HA_BANDS = {'near': '< 5 km from home', 'region': '5-50 km from home', 'far': '> 50 km from home'}
+WANTS = ('reply', 'decision', 'meeting', 'document', 'payment', 'pickup', 'call', 'favour', 'info')
+TOPICS = ('travel', 'party', 'sport', 'food', 'work', 'tech', 'games', 'media', 'shopping', 'home', 'admin',
+          'family_event', 'birthday', 'logistics', 'other', 'private')
+ISO_DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
+OLD_PRIVATE = ('telegram.md', 'signals.md', 'location.json')   # before privacy plan C; --cleanup-private
+FILES = {k: os.path.join(STATE, v) for k, v in {
+    'md': 'today.md', 'json': 'today.json', 'cache': 'cache.json', 'signals': 'signals.json', 'lock': 'lock'}.items()}
+
+INTERESTS = {
+    'AI': r'\b(ai|a\.i\.|llms?|gpt[\w.-]*|claude|anthropic|openai|gemini|agents?|agentic|mcp|deepseek|qwen|llama|mistral|'
+          r'transformers?|diffusion|neural|machine learning|inference|chatbots?|copilot|codex|rag|embeddings?)\b',
+    'self-hosting': r'\b(self-?host(ed|ing)?|homelab|home lab|unraid|docker|containers?|kubernetes|k8s|nas|zfs|btrfs|'
+                    r'proxmox|home assistant|jellyfin|plex|emby|raspberry pi|nginx|tailscale|wireguard|sqlite|postgres(ql)?|linux)\b',
+    'finance': r'\b(stocks?|markets?|invest(ing|ors?|ment)?|etfs?|bitcoin|crypto|fed|inflation|interest rates?|banks?|'
+               r'banking|finance|financial|trading|ipo|recession|tariffs?|s&p|nasdaq)\b',
+    'games': r'\b(games?|gaming|steam|nintendo|playstation|ps5|xbox|game ?dev|valve|godot|unreal|unity)\b',
+    'science': r'\b(physics|space|nasa|spacex|esa|quantum|biology|math(ematics)?|climate|fusion|telescope|astronom\w*|'
+               r'science|scientists?|research(ers)?|genes?|genetic|crispr|neuro\w*|particle|cern|mars|moon|asteroid)\b',
+}
+RX_INTEREST = {k: re.compile(v, re.I) for k, v in INTERESTS.items()}
+
+WMO = {0: 'clear', 1: 'mainly clear', 2: 'partly cloudy', 3: 'overcast', 45: 'fog', 48: 'freezing fog',
+       51: 'light drizzle', 53: 'drizzle', 55: 'heavy drizzle', 56: 'freezing drizzle', 57: 'freezing drizzle',
+       61: 'light rain', 63: 'rain', 65: 'heavy rain', 66: 'freezing rain', 67: 'freezing rain',
+       71: 'light snow', 73: 'snow', 75: 'heavy snow', 77: 'snow grains', 80: 'rain showers', 81: 'rain showers',
+       82: 'heavy rain showers', 85: 'snow showers', 86: 'heavy snow showers', 95: 'thunderstorms',
+       96: 'thunderstorms with hail', 99: 'thunderstorms with hail'}
+
+# Extra regex net for anything Telegram-derived (the vault already masked it; this is defence in depth).
+RX_NET = [
+    (re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+'), '[email]'),
+    (re.compile(r'https?://[^\s?#]+\?\S+'), '[link]'),
+    (re.compile(r'\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}(?:\s?[A-Z0-9]{1,4})?\b'), '[IBAN]'),
+    (re.compile(r'\b756[.\s]?\d{4}[.\s]?\d{4}[.\s]?\d{2}\b'), '[AHV number]'),
+    (re.compile(r'(?<![\w.])\+?\d{2,3}[\s/.-]?\(?\d{2,3}\)?[\s/.-]?\d{3}[\s/.-]?\d{2}[\s/.-]?\d{2}(?![\w.])'), '[phone]'),
+    (re.compile(r'(?<![\w.-])\d[\d\s]{9,}\d(?![\w.-])'), '[number]'),
+    (re.compile(r'(?i)\b(password|passwort|pin|code|token)\s*[:=]\s*\S+'), r'\1: [secret]'),
+]
+
+# ----------------------------------------------------------------------------------------------- helpers
+def now_ts():
+    return float(os.environ.get('CONTEXT_NOW') or time.time())
+
+
+def now_local():
+    return dt.datetime.fromtimestamp(now_ts(), TZ)
+
+
+def iso(ts):
+    return dt.datetime.fromtimestamp(ts, TZ).isoformat(timespec='seconds') if ts else None
+
+
+def short(s, n=110):
+    s = re.sub(r'\*\*|`', '', str(s or ''))
+    s = re.sub(r'\s+', ' ', s).strip()
+    if len(s) > n:
+        cut = s[:n - 1]
+        sp = cut.rfind(' ')
+        s = (cut[:sp] if sp > n * 0.6 else cut).rstrip(' ,;:-—') + '…'
+    return s
+
+
+def net(s):
+    for rx, rep in RX_NET:
+        s = rx.sub(rep, s)
+    return s
+
+
+def read(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+def write_private(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.' + os.path.basename(path))
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def run(cmd, timeout=60, stdin=None):
+    try:
+        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, NO_COLOR='1', TERM='dumb'))
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, '', f'{cmd[0]}: not installed'
+    except subprocess.TimeoutExpired:
+        return 124, '', f'{cmd[0]}: timed out after {timeout}s'
+    except OSError as e:
+        return 126, '', str(e)
+
+
+def get_json(url, params=None, timeout=15, headers=None):
+    if params:
+        url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers=dict({'User-Agent': UA, 'Accept': 'application/json'}, **(headers or {})))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8'))
+
+
+def fail(msg):
+    return {'status': 'error', 'error': short(msg, 200)}
+
+
+def cmd_error(name, rc, err, out=''):
+    tail = (err or out or '').strip().splitlines()
+    return fail(f'{name} exit {rc}' + (f': {tail[-1]}' if tail else ''))
+
+
+# ----------------------------------------------------------------------------------------------- parsers
+def tag_story(title):
+    return [k for k, rx in RX_INTEREST.items() if rx.search(title or '')]
+
+
+def hn_pick(items, top_n=5):
+    """items: HN item dicts in front-page order -> (stories, picks)."""
+    stories = []
+    for rank, it in enumerate(items, 1):
+        if not isinstance(it, dict) or it.get('type') != 'story' or not it.get('title') or it.get('dead') or it.get('deleted'):
+            continue
+        url = it.get('url') or f"https://news.ycombinator.com/item?id={it.get('id')}"
+        host = urllib.parse.urlparse(url).hostname or 'news.ycombinator.com'
+        stories.append({'rank': rank, 'id': int(it['id']), 'title': short(it['title'], 140), 'points': int(it.get('score') or 0),
+                        'comments': int(it.get('descendants') or 0), 'url': url,
+                        'domain': host[4:] if host.startswith('www.') else host, 'tags': tag_story(it['title'])})
+    picks = [s for s in stories if s['tags'] or s['rank'] <= top_n]
+    return stories, picks
+
+
+def parse_health_report(text):
+    if not text.strip():
+        return None
+    st = re.search(r'\*\*Status:\s*([^*]+?)\*\*', text)
+    when = re.search(r'^(\d{4}-\d\d-\d\d \d\d:\d\d)', text, re.M)
+    new = []
+    sec = re.search(r'^## New since last run\s*\n(.*?)(?=^## |\Z)', text, re.M | re.S)
+    if sec:
+        for l in sec.group(1).splitlines():
+            m = re.match(r'^- (?:\*\*(\w+)\*\*\s*)?(.*)$', l.strip())
+            if m:
+                new.append(((m.group(1) + ' ') if m.group(1) else '') + short(m.group(2), 100))
+    status = st.group(1).strip() if st else 'status line missing'
+    crit = re.search(r'(\d+)\s+critical', status)
+    warn = re.search(r'(\d+)\s+warning', status)
+    return {'status': status, 'at': when.group(1) if when else None, 'new': new[:3],
+            'critical': int(crit.group(1)) if crit else 0, 'warnings': int(warn.group(1)) if warn else 0}
+
+
+def parse_capacity(d):
+    a = (d or {}).get('array') or {}
+    if not a or a.get('pct') is None:
+        return None
+    eta = a.get('eta') or {}
+    out = {'pct': round(float(a['pct']), 1), 'free_tb': round((a.get('free') or 0) / 1e12, 1),
+           'full_date': eta.get('date'), 'full_days': round(eta['days']) if eta.get('days') is not None else None,
+           'sample_age_h': d.get('sample_age_h'), 'alerts': len(d.get('alerts') or [])}
+    return out
+
+
+def parse_media_queue(text):
+    t = text.strip()
+    if not t:
+        return None
+    if t.startswith('nothing downloading'):
+        return {'movies': 0, 'tv': 0, 'attention': 0}
+    mv = re.search(r'^Movies \((\d+)\):', t, re.M)
+    tv = re.search(r'^TV \((\d+)\):', t, re.M)
+    return {'movies': int(mv.group(1)) if mv else 0, 'tv': int(tv.group(1)) if tv else 0,
+            'attention': len(re.findall(r'!!', t))}
+
+
+RX_REMIND = re.compile(r'^\s*\d+\.\s+(\d{4}-\d\d-\d\d \d\d:\d\d)\s+(\[owner\]\s+)?(.*)$')
+
+
+def parse_remind_list(text, now, days=7):
+    out = []
+    end = now + dt.timedelta(days=days)
+    for l in text.splitlines():
+        m = RX_REMIND.match(l)
+        if not m:
+            continue
+        try:
+            at = dt.datetime.strptime(m.group(1), '%Y-%m-%d %H:%M').replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        if now - dt.timedelta(hours=1) <= at <= end:
+            out.append({'at': m.group(1), 'owner': bool(m.group(2)), 'text': short(m.group(3), 80)})
+    return out
+
+
+def parse_deadlines(d):
+    return [{'due': x.get('act_by') or x.get('due'), 'days_left': x.get('days_left'), 'title': short(x.get('title'), 90)}
+            for x in (d or []) if isinstance(x, dict) and x.get('active', True)]
+
+
+def parse_openmeteo(d):
+    dl = (d or {}).get('daily') or {}
+    days = []
+    for i, day in enumerate(dl.get('time') or []):
+        g = lambda k: (dl.get(k) or [None] * (i + 1))[i]  # noqa: E731
+        days.append({'date': day, 'desc': WMO.get(g('weather_code'), f"code {g('weather_code')}"),
+                     'tmin': g('temperature_2m_min'), 'tmax': g('temperature_2m_max'),
+                     'precip_mm': g('precipitation_sum'), 'precip_prob': g('precipitation_probability_max')})
+    return days
+
+
+def parse_meteoswiss(d):
+    return [{'date': x.get('dayDate'), 'desc': None, 'tmin': x.get('temperatureMin'), 'tmax': x.get('temperatureMax'),
+             'precip_mm': x.get('precipitation'), 'precip_prob': None} for x in (d or {}).get('forecast') or []][:2]
+
+
+def weather_line(x):
+    d = dt.date.fromisoformat(x['date'])
+    bits = [d.strftime('%a %d %b') + ':']
+    if x.get('desc'):
+        bits.append(x['desc'] + ',')
+    if x.get('tmin') is not None and x.get('tmax') is not None:
+        bits.append(f"{round(x['tmin'])}–{round(x['tmax'])} °C,")
+    if x.get('precip_mm') is not None:
+        bits.append(f"{x['precip_mm']:g} mm" + (f" ({x['precip_prob']}%)" if x.get('precip_prob') is not None else ''))
+    return ' '.join(bits).rstrip(',')
+
+
+def tg_login_state(rc, out):
+    """(logged_in: bool|None, note). None = tgread/vault unusable right now."""
+    if rc != 0 or not out.strip():
+        return None, 'tgread status failed'
+    if re.search(r'^\s*credentials:\s*missing', out, re.M | re.I):
+        return False, 'not set up (no api_id/api_hash yet)'
+    if re.search(r'^\s*session:\s*missing', out, re.M | re.I):
+        return False, 'not set up (not logged in)'
+    return True, 'logged in'
+
+
+def is_digest(d):
+    return isinstance(d, dict) and d.get('kind') == 'digest' and isinstance(d.get('window'), dict)
+
+
+def job_result(out):
+    """`vault job wait --json` -> the job's result (the digest) or None."""
+    try:
+        j = json.loads(out)
+    except (TypeError, ValueError):
+        return None
+    return j.get('result') if isinstance(j, dict) and j.get('state') == 'done' else None
+
+
+def digest_flags(dg, today):
+    """The vault's digest -> counts and flags only: no names, chats, places or text leave this function."""
+    w = dg.get('window') or {}
+    needs = [x for x in dg.get('needs_you') or [] if isinstance(x, dict)]
+    by = {}
+    for x in needs:
+        k = x.get('wants') if x.get('wants') in WANTS else 'other'
+        by[k] = by.get(k, 0) + 1
+    dates = sorted({str(x.get('date')) for x in dg.get('plans') or [] if isinstance(x, dict)
+                    and ISO_DATE.fullmatch(str(x.get('date') or '')) and str(x.get('date')) >= today.isoformat()})
+    sigs = [{'type': x['type'], 'topic': x.get('topic') if x.get('topic') in TOPICS else 'other',
+             'when': x.get('when') if ISO_DATE.fullmatch(str(x.get('when') or '')) else None}
+            for x in dg.get('signals') or [] if isinstance(x, dict) and x.get('type') in SIGNAL_TYPES]
+    return {'chats': int(w.get('chats') or 0), 'messages': int(w.get('messages') or 0), 'needs_you': len(needs),
+            'needs_by': dict(sorted(by.items(), key=lambda kv: -kv[1])), 'plans': dates[:8], 'signals': sigs}
+
+
+def tg_line(f, hours):
+    bits = [f"{f['chats']} chats, {f['messages']} msgs (last {hours:g} h)"]
+    if f['needs_you']:
+        bits.append(f"{f['needs_you']} need you (" + ', '.join(f'{n} {k}' for k, n in f['needs_by'].items()) + ')')
+    if f['plans']:
+        bits.append('plans: ' + ', '.join(dt.date.fromisoformat(d).strftime('%a %d.%m') for d in f['plans']))
+    bits.append(f"{len(f['signals'])} signals -> signals.json")
+    return ' · '.join(bits)
+
+
+def merge_signals_json(old, sigs, today):
+    """signals.json: [{seen, type, topic, when, n}] of the last SIGNAL_DAYS days (enums and ISO dates only); the same
+    category seen again on the same day adds to n."""
+    keep = []
+    for x in (old.get('signals') if isinstance(old, dict) else None) or []:
+        try:
+            seen = dt.date.fromisoformat(str(x.get('seen')))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if (today - seen).days <= SIGNAL_DAYS and x.get('type') in SIGNAL_TYPES:
+            keep.append({'seen': seen.isoformat(), 'type': x['type'],
+                         'topic': x.get('topic') if x.get('topic') in TOPICS else 'other',
+                         'when': x.get('when') if ISO_DATE.fullmatch(str(x.get('when') or '')) else None,
+                         'n': max(1, int(x.get('n') or 1))})
+    idx = {(x['seen'], x['type'], x['topic'], x['when']): x for x in keep}
+    for x in sigs:
+        k = (today.isoformat(), x['type'], x['topic'], x['when'])
+        if k in idx:
+            idx[k]['n'] += 1
+        else:
+            idx[k] = dict(seen=k[0], type=x['type'], topic=x['topic'], when=x['when'], n=1)
+            keep.append(idx[k])
+    keep.sort(key=lambda x: (x['seen'], x['type'], x['topic']), reverse=True)
+    return {'schema': 1, 'days': SIGNAL_DAYS, 'updated': today.isoformat(),
+            'note': ("Signal categories from the vault's Telegram digest (privacy plan C): enums and dates only, no "
+                     'names or text. For goal building; private: never forward or publish.'),
+            'signals': keep}
+
+
+# ----------------------------------------------------------------------------------------------- sources
+def src_hn():
+    ids = get_json(f'{HN_BASE}/topstories.json')[:30]
+    with cf.ThreadPoolExecutor(8) as ex:
+        items = list(ex.map(lambda i: _safe(lambda: get_json(f'{HN_BASE}/item/{int(i)}.json', timeout=10)), ids))
+    stories, picks = hn_pick(items)
+    if not stories:
+        return fail('Hacker News returned no stories')
+    lines = [f"[{', '.join(s['tags']) or 'top'}] {s['title']} ({s['points']} pts, {s['domain']}) "
+             f"https://news.ycombinator.com/item?id={s['id']}" for s in picks]
+    return {'status': 'ok', 'public': f'{len(picks)} picks from {len(stories)} front-page stories',
+            'lines': lines, 'data': {'picks': picks, 'stories': len(stories)}}
+
+
+def _safe(fn):
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001 - one bad item never sinks the source
+        return None
+
+
+def src_health():
+    files = sorted(f for f in os.listdir(REPORTS) if re.fullmatch(r'\d{4}-\d\d-\d\d\.md', f)) if os.path.isdir(REPORTS) else []
+    if not files:
+        return fail(f'no unraid-health report in {REPORTS}')
+    p = parse_health_report(read(os.path.join(REPORTS, files[-1])))
+    if not p:
+        return fail(f'{files[-1]} unreadable')
+    age_d = (now_local().date() - dt.date.fromisoformat(files[-1][:10])).days
+    line = f"{p['status']} (report {p['at'] or files[-1][:10]}" + (f', {age_d} d old' if age_d > 1 else '') + ')'
+    lines = [line] + ['new: ' + n for n in p['new']]
+    return {'status': 'ok', 'public': f"{p['critical']} critical · {p['warnings']} warnings", 'lines': lines, 'data': p}
+
+
+def src_capacity():
+    rc, out, err = run(['unraid-capacity', 'forecast'], 90)
+    if rc != 0:
+        return cmd_error('unraid-capacity', rc, err)
+    try:
+        p = parse_capacity(json.loads(out))
+    except ValueError:
+        p = None
+    if not p:
+        return fail('unraid-capacity: no array data')
+    full = (f"full ~{p['full_date']} (in {p['full_days']} d at the 30-day trend)" if p['full_date'] else 'no fill-up date in sight')
+    line = f"array {p['pct']}% used, {p['free_tb']} TB free; {full}"
+    return {'status': 'ok', 'public': f"array {p['pct']}% used" + (f", full in ~{p['full_days']} d" if p['full_days'] is not None else ''),
+            'lines': [line], 'data': p}
+
+
+def src_media():
+    rc, out, err = run(['media', 'queue'], 90)
+    if rc != 0:
+        return cmd_error('media', rc, err)
+    p = parse_media_queue(out)
+    if p is None:
+        return fail('media queue: empty output')
+    line = ('nothing downloading' if not (p['movies'] or p['tv']) else
+            f"queue: {p['movies']} movie{'' if p['movies'] == 1 else 's'}, {p['tv']} TV" + (f"; {p['attention']} need attention" if p['attention'] else ''))
+    return {'status': 'ok', 'public': line, 'lines': [line], 'data': p}
+
+
+def src_weather():
+    try:
+        d = get_json(WEATHER_URL, {'latitude': LAT, 'longitude': LON, 'timezone': TZ.key, 'forecast_days': 2,
+                                   'daily': 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,'
+                                            'precipitation_probability_max'})
+        days, via = parse_openmeteo(d), 'open-meteo'
+    except Exception as e:  # noqa: BLE001
+        first = f'open-meteo: {type(e).__name__}'
+        try:
+            days, via = parse_meteoswiss(get_json(METEO_URL, {'plz': PLZ})), 'MeteoSwiss'
+        except Exception as e2:  # noqa: BLE001
+            return fail(f'{first}; MeteoSwiss: {type(e2).__name__}')
+    if not days:
+        return fail('weather: no daily forecast')
+    lines = [weather_line(x) for x in days[:2]]
+    return {'status': 'ok', 'public': lines[0], 'lines': lines + [f'(source: {via})'], 'data': {'days': days[:2], 'via': via}}
+
+
+def src_reminders():
+    rc, out, err = run(['remind', 'list'], 20)
+    if rc != 0:
+        return cmd_error('remind', rc, err)
+    items = parse_remind_list(out, now_local())
+    lines = [f"{x['at']} {'(owner) ' if x['owner'] else ''}{x['text']}" for x in items] or ['none in the next 7 days']
+    return {'status': 'ok', 'public': f'{len(items)} in the next 7 days', 'lines': lines, 'data': {'items': items}}
+
+
+def src_deadlines():
+    rc, out, err = run(['deadlines', 'list', '--days', '7', '--json'], 30)
+    if rc != 0:
+        return cmd_error('deadlines', rc, err)
+    try:
+        items = parse_deadlines(json.loads(out or '[]'))
+    except ValueError:
+        return fail('deadlines: bad JSON')
+    lines = [f"{x['due']} ({x['days_left']} d) {x['title']}" for x in items] or ['none in the next 7 days']
+    return {'status': 'ok', 'public': f'{len(items)} in the next 7 days', 'lines': lines, 'data': {'items': items}}
+
+
+def src_location():
+    """The owner's whereabouts from the vault's HA status feed: `vault ha now --json` -> flag home | away |
+    far + age, zone name, distance band and town outside zones, driving. Coarse values only (computed in the vault);
+    no coordinates or addresses reach this box. The exact place only through the vault, with his ✅."""
+    rc, out, err = run(['vault', 'ha', 'now', '--json'], timeout=60)
+    if rc != 0:
+        tail = (err or out or '').strip().splitlines()
+        msg = tail[-1] if tail else ''
+        if re.search(r'feed is off|not set up', msg):
+            return {'status': 'not set up', 'public': 'not set up', 'lines': [f'not set up ({short(msg, 90)})']}
+        return cmd_error('vault ha now', rc, err, out)
+    try:
+        r = json.loads(out)
+    except ValueError:
+        return fail('vault ha now: not JSON')
+    p = r.get('place') if isinstance(r.get('place'), dict) else None
+    conn = r.get('connection') or {}
+    if not p or p.get('flag') not in ('home', 'away', 'far'):
+        return fail(f"no position from the phone (feed {conn.get('state') or '?'})")
+    age = p.get('fix_age_min')
+    if not isinstance(age, int):
+        age = r.get('age_min') if isinstance(r.get('age_min'), int) else None
+    where = []
+    if p.get('kind') == 'zone' and p.get('zone'):
+        where.append(f"zone {short(str(p['zone']), 40)}")
+    if p.get('kind') != 'home' and p.get('band') in HA_BANDS:
+        where.append(HA_BANDS[p['band']])
+    if p.get('kind') == 'away' and p.get('town'):
+        where.append(f"near {short(str(p['town']), 40)}")
+    d = r.get('drive') if isinstance(r.get('drive'), dict) else {}
+    driving = drive_rule.active(r)                   # on, and the feed (age_min) at most 60 min old
+    if driving:
+        where.append('driving' + (f" ({d['minutes']} min)" if isinstance(d.get('minutes'), int) else ''))
+    upd = f'updated {_age(age)} ago' if age is not None else 'update time unknown'
+    line = p['flag'] + (' · ' + ' · '.join(where) if where else '') + f' ({upd}, Home Assistant via the vault)'
+    data = {'flag': p['flag'], 'age_min': age, 'via': 'Home Assistant (vault)', 'driving': driving}
+    for k in ('zone', 'band', 'town'):
+        if p.get(k) and not (k == 'zone' and p.get('kind') == 'home'):
+            data[k] = str(p[k])[:40]
+    return {'status': 'ok', 'public': f'Home Assistant via the vault, {upd}', 'lines': [line], 'data': data}
+
+
+def _age(m):
+    if m is None:
+        return '?'
+    return f'{m} min' if m < 90 else (f'{round(m / 60)} h' if m < 48 * 60 else f'{round(m / 1440)} d')
+
+
+def src_calendar():
+    return {'status': 'placeholder', 'public': 'read in session',
+            'lines': ['read in session: Google Calendar MCP, next 7 days (a script cannot reach it)']}
+
+
+FAST = [('hn', src_hn), ('health', src_health), ('capacity', src_capacity), ('media', src_media), ('weather', src_weather),
+        ('reminders', src_reminders), ('deadlines', src_deadlines), ('location', src_location), ('calendar', src_calendar)]
+
+
+def run_source(name, fn, cache, force):
+    c = cache.get(name)
+    now = now_ts()
+    ttl = TTL.get(name, 0)
+    if c and ttl and not force and now - c['at'] < ttl:
+        r = dict(c['res'])
+        r.update(status='ok', fetched_at=iso(c['at']), cached=True)
+        return dict(r, name=name)
+    try:
+        r = fn()
+    except Exception as e:  # noqa: BLE001 - every source fails soft
+        r = fail(f'{type(e).__name__}: {e}')
+    if r.get('status') == 'ok':
+        cache[name] = {'at': now, 'res': r}
+        r['fetched_at'] = iso(now)
+    elif r.get('status') == 'error' and c and now - c['at'] < STALE_MAX and c['res'].get('status') == 'ok':
+        old = dict(c['res'])
+        old.update(status='stale', error=r.get('error'), fetched_at=iso(c['at']))
+        r = old
+    return dict(r, name=name)
+
+
+# ----------------------------------------------------------------------------------------------- telegram
+JOB_ID_RE = re.compile(r'[0-9a-f]{16}')
+
+
+def tg_job_wait(jid, deadline):
+    """`vault job wait --json` in steps of at most 230 s until the job ends or the deadline passes -> (rc, out, err,
+    jid); rc 12 = still running at the deadline."""
+    while True:
+        left = int(deadline - time.time())
+        if left <= 0:
+            return 12, '', f'tgread job {jid} still running', jid
+        step = min(230, left)
+        rc, out, err = run(['vault', 'job', 'wait', jid, '--max', str(step), '--json'], step + 120)
+        if rc != 12:
+            return rc, out, err, jid
+
+
+def tg_digest(hours, deadline):
+    """The vault's digest (privacy plan A, --no-text) as a job, collected with tg_job_wait; a vault without jobs (the
+    submit exits 2): one direct --json call. -> (rc, digest or None, err, job id)."""
+    args = ['summarize', '--hours', f'{hours:g}', '--no-text']
+    rc, out, err = run(['tgread'] + args + ['--async'], 120)
+    jid = (out.strip().splitlines() or [''])[-1].strip()
+    if rc == 0 and JOB_ID_RE.fullmatch(jid):
+        rc, out, err, jid = tg_job_wait(jid, deadline)
+        return rc, (job_result(out) if rc == 0 else None), err, jid
+    if rc == 2:
+        rc, out, err = run(['tgread'] + args + ['--json'], max(60, int(deadline - time.time())))
+        if rc == 0:
+            try:
+                return 0, json.loads(out), err, None
+            except ValueError:
+                return 1, None, 'tgread summarize: no JSON', None
+    return rc, None, err, None
+
+
+def src_telegram(cache, force=False):
+    rc, out, err = run(['tgread', 'status'], 60)
+    logged, note = tg_login_state(rc, out)
+    if logged is None:
+        return dict(cmd_error('tgread status', rc, err, out), name='telegram')
+    if not logged:
+        return {'name': 'telegram', 'status': 'not set up', 'public': 'not set up', 'lines': [note]}
+    now = now_ts()
+    deadline = time.time() + TG_TIMEOUT
+    rc, dg, pend = None, None, cache.pop('tg_job', None)
+    if isinstance(pend, dict) and JOB_ID_RE.fullmatch(str(pend.get('id'))) and now - float(pend.get('at') or 0) < 4 * 3600:
+        rc, out, err, _ = tg_job_wait(pend['id'], time.time() + 5)     # the last run's job, if the vault still has it
+        dg = job_result(out) if rc == 0 else None
+        if is_digest(dg):
+            hours, now = float(pend['hours']), float(pend['at'])
+        else:
+            rc, dg = None, None                          # gone, failed or not a digest: a fresh job
+    if rc is None:
+        last = cache.get('tg_last')
+        hours = round(24.0 if not last else max(1.0, min(24.0, (now - last) / 3600 + 0.25)), 1)
+        rc, dg, err, jid = tg_digest(hours, deadline)
+        if rc == 12 and jid:                           # still running: the next run picks it up
+            cache['tg_job'] = {'id': jid, 'hours': hours, 'at': now}
+    if rc != 0 or not is_digest(dg):
+        r = cmd_error('tgread summarize', rc, err) if rc != 0 else fail('tgread summarize: no digest in the answer')
+        prev = cache.get('tg_res')
+        if prev:
+            r = dict(prev, status='stale', error=r['error'])
+        return dict(r, name='telegram')
+    today = now_local().date()
+    f = digest_flags(dg, today)
+    try:
+        old = json.loads(read(FILES['signals']) or '{}')
+    except ValueError:
+        old = {}
+    write_private(FILES['signals'], json.dumps(merge_signals_json(old, f['signals'], today), ensure_ascii=False,
+                                               indent=1) + '\n')
+    cache['tg_last'] = now
+    r = {'status': 'ok', 'public': f"{f['chats']} chats summarized", 'lines': [tg_line(f, hours)],
+         'data': {'chats': f['chats'], 'messages': f['messages'], 'hours': hours, 'needs_you': f['needs_you'],
+                  'needs_by': f['needs_by'], 'plans': f['plans'], 'signals_new': len(f['signals'])},
+         'fetched_at': iso(now)}
+    cache['tg_res'] = {k: v for k, v in r.items() if k != 'fetched_at'}
+    return dict(r, name='telegram')
+
+
+# ----------------------------------------------------------------------------------------------- output
+SECTIONS = [('Server', ['health', 'capacity', 'media']), ('Weather ' + HOME_LABEL, ['weather']),
+            ('Next 7 days', ['calendar', 'reminders', 'deadlines']), ('Telegram', ['telegram']),
+            ('Location', ['location']), ('Hacker News picks', ['hn'])]
+
+
+def his_time(now):
+    """" · his time HH:MM Zone" while he is away (~/bin/lib/tripclock), else ""."""
+    try:
+        import tripclock
+        lt = tripclock.local(now, TZ)
+        return f" · his time {lt:%a %H:%M} {lt.tzinfo.key} (tripclock)" if lt.tzinfo.key != TZ.key else ''
+    except Exception:
+        return ''
+
+
+def render_md(res, now):
+    by = {r['name']: r for r in res}
+    out = [f"# Context {now:%a %Y-%m-%d %H:%M} ({TZ.key})" + his_time(now),
+           'Environment snapshot for goal building (~/bin/context). Flags only (privacy plan C): Telegram counts, '
+           'needs-you flags, plan dates; signal categories in signals.json; location home/away/far (+ zone, distance band, town, driving; via the vault).', '']
+    for title, names in SECTIONS:
+        out.append(f'## {title}')
+        for n in names:
+            r = by.get(n)
+            if not r:
+                continue
+            lines = r.get('lines') or []
+            flag = f"[{r['status']}: {r.get('error') or 'no detail'}]" if r['status'] in ('error', 'stale') else ''
+            if len(names) > 1:
+                first = ' '.join(x for x in (flag, lines[0] if lines else '') if x) or r['status']
+                out.append(f'- {n}: {first}')
+                out += [f'  - {l}' for l in lines[1:]]
+            else:
+                if flag:
+                    out.append(f'- {flag}')
+                out += [f'- {l}' for l in lines]
+                if not flag and not lines:
+                    out.append(f"- {r['status']}")
+        out.append('')
+    out.append('## Sources')
+    out.append(' · '.join(f"{r['name']} {r['status']}" + (f" ({r['fetched_at'][11:16]})" if r.get('fetched_at') else '')
+                          for r in res))
+    return '\n'.join(out) + '\n'
+
+
+def snapshot(res, now):
+    by = {r['name']: r for r in res}
+    d = lambda n: (by.get(n) or {}).get('data') or {}  # noqa: E731
+    return {
+        'schema': 1, 'generated_at': now.isoformat(timespec='seconds'), 'date': now.strftime('%Y-%m-%d'),
+        'sources': [{'name': r['name'], 'status': r['status'], 'public': r.get('public') or r['status'],
+                     'fetched_at': r.get('fetched_at'), 'error': r.get('error')} for r in res],
+        'hn': {'picks': d('hn').get('picks', []), 'stories': d('hn').get('stories', 0)},
+        'server': {n: (by.get(n) or {}).get('lines', [None])[0] for n in ('health', 'capacity', 'media')},
+        'weather': d('weather').get('days', []),
+        'agenda': {'reminders': d('reminders').get('items', []), 'deadlines': d('deadlines').get('items', [])},
+        'telegram': {'status': (by.get('telegram') or {}).get('status', 'skipped'), **{k: v for k, v in d('telegram').items()
+                                                                                         if k in ('chats', 'messages', 'hours', 'signals_new', 'needs_you', 'needs_by', 'plans')}},
+        'location': {'status': (by.get('location') or {}).get('status'), **d('location')},
+        'calendar': 'read in session',
+    }
+
+
+def load_cache():
+    try:
+        c = json.loads(read(FILES['cache']) or '{}')
+    except ValueError:
+        return {}
+    if not isinstance(c, dict):
+        return {}
+    loc = (c.get('location') or {}).get('res') or {}
+    if 'flag' not in (loc.get('data') or {}):          # a place name from before privacy plan C: never reused
+        c.pop('location', None)
+    tg = c.get('tg_res') or {}
+    if 'needs_you' not in (tg.get('data') or {}):
+        c.pop('tg_res', None)
+    return c
+
+
+def previous_results():
+    try:
+        d = json.loads(read(FILES['json']) or '{}')
+    except ValueError:
+        return {}
+    return {s['name']: s for s in d.get('sources', []) if isinstance(s, dict) and s.get('name')}
+
+
+def write_all(res, cache):
+    now = now_local()
+    order = [n for n, _ in FAST] + ['telegram']
+    res = sorted(res, key=lambda r: order.index(r['name']) if r['name'] in order else 99)
+    write_private(FILES['md'], render_md(res, now))
+    write_private(FILES['json'], json.dumps(snapshot(res, now), ensure_ascii=False, indent=1) + '\n')
+    write_private(FILES['cache'], json.dumps(cache, ensure_ascii=False) + '\n')
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Environment snapshot for goal building (no tokens).')
+    ap.add_argument('--no-telegram', action='store_true')
+    ap.add_argument('--only', help='comma-separated sources to refresh')
+    ap.add_argument('--force', action='store_true', help='ignore cache TTLs')
+    ap.add_argument('--show', action='store_true', help='print today.md')
+    ap.add_argument('--cleanup-private', action='store_true',
+                    help="delete the old telegram.md, signals.md and location.json (privacy plan C; only after the "
+                         "owner's OK)")
+    a = ap.parse_args()
+    if a.show:
+        sys.stdout.write(read(FILES['md']) or 'no snapshot yet: run `context`\n')
+        return
+    if a.cleanup_private:
+        for f in OLD_PRIVATE:
+            p = os.path.join(STATE, f)
+            if os.path.exists(p):
+                os.remove(p)
+                print(f'deleted {p}')
+        return
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    lockf = open(FILES['lock'], 'w')
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print('context: another run is in progress', file=sys.stderr)
+        return
+    only = set(x.strip() for x in a.only.split(',')) if a.only else None
+    known = {n for n, _ in FAST} | {'telegram'}
+    if only and not only <= known:
+        sys.exit(f"context: unknown source(s): {', '.join(sorted(only - known))} (known: {', '.join(sorted(known))})")
+    cache = load_cache()
+    prev = previous_results()
+    todo = [(n, f) for n, f in FAST if not only or n in only]
+    with cf.ThreadPoolExecutor(6) as ex:
+        res = list(ex.map(lambda nf: run_source(nf[0], nf[1], cache, a.force), todo))
+    for n, _ in FAST:   # sources not refreshed this run: keep the last snapshot's status, lines from the cache
+        if only and n not in only:
+            c = cache.get(n)
+            res.append(dict(c['res'], name=n, status='ok', fetched_at=iso(c['at'])) if c else
+                       dict(prev.get(n) or {'status': 'skipped'}, name=n))
+    tg_wanted = not a.no_telegram and (not only or 'telegram' in only)
+    tg_prev = cache.get('tg_res')   # until the slow Telegram step finishes, show the last result (or a placeholder)
+    res.append(dict(tg_prev, name='telegram', status='ok', fetched_at=iso(cache.get('tg_last'))) if tg_prev else
+               {'name': 'telegram', 'status': 'skipped', 'public': 'pending' if tg_wanted else 'skipped',
+                'lines': ['runs after the other sources' if tg_wanted else 'skipped this run']})
+    write_all(res, cache)
+    if tg_wanted:
+        try:
+            tg = src_telegram(cache)
+        except Exception as e:  # noqa: BLE001
+            tg = dict(fail(f'{type(e).__name__}: {e}'), name='telegram')
+        res = [r for r in res if r['name'] != 'telegram'] + [tg]
+        write_all(res, cache)
+    bad = [f"{r['name']} {r['status']}" for r in res if r['status'] in ('error', 'stale')]
+    print(f"{now_local():%F %T} context: {len(res)} sources" + (f"; {', '.join(bad)}" if bad else ', all ok')
+          + f" -> {FILES['md']}")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,205 @@
+#!/usr/local/bin/python3.13 -I
+"""cue: the brain's scheduled cues as typed events. Source: ~/opt/assistant; `cue --help`.
+
+  cue NAME [--dry-run]   today's cue NAME: a typed cue.<NAME> event row plus its note in ~/inbox (inbox.writer: the
+                         row and the identical note; the beat lists the row, `events show ID` prints the note)
+  cue list               the cues: name, kind, note prefix
+
+Cues: weekly-digest, birthdays, idea-scan, self-cleanup, calendar-gap-pass, daily-plan (waiting-nudge writes its own
+cue.waiting-nudge). Hub schedules run them (registry class C, core/schedules.toml: cue-digest = `cue weekly-digest`,
+...); the brain changes when with `workflow.schedule`. The note says what to do; the kind's hint (schemas/kinds.toml)
+and JOBS.md hold the handling. Note names keep the cron era's prefixes (digest-<epoch>.md, ...), so ingest gives an
+adopted note the same kind. daily-plan appends `shop plan --trips --days 1 --line` (60 s; its 🛒 lines).
+--dry-run prints the note and writes nothing. The ledger library missing or breaking = the plain note (core.notes)
+and one line in ~/.local/state/assistant/emit-errors.log.
+Exit: 0 written (or dry run) · 1 the note could not be written · 2 usage.
+Env: ASSISTANT_LIB (a directory with core/ and inbox/) · CUE_SHOP (the shop binary; "off" = no 🛒 lines) ·
+ASSISTANT_NOW (the clock, tests).
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [
+    os.environ.get("ASSISTANT_LIB", ""),
+    os.path.join(_here, "lib"),
+    os.path.join(_here, ".."),
+    os.path.join(_here, "..", "packages"),
+]
+for _pkg in ("core", "inbox"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+import argparse  # noqa: E402
+import subprocess  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write_new into the inbox)
+from core import clock, paths  # noqa: E402
+
+
+@dataclass(frozen=True)
+class Cue:
+    prefix: str  # the note name prefix (<prefix>-<epoch>.md), as the cron line wrote it
+    job: str  # the registry job (hub schedule job:<job>)
+    title: str  # "{date}" = today in the owner's zone
+    body: str
+    next: str
+
+
+CUES: dict[str, Cue] = {
+    "weekly-digest": Cue(
+        "digest",
+        "cue-digest",
+        "Weekly digest due {date}",
+        "Run the weekly-digest subagent (effort xhigh), review it, send it as one rich Telegram message.",
+        "run the weekly-digest subagent (xhigh), review it, send it as one rich Telegram message",
+    ),
+    "birthdays": Cue(
+        "birthdays",
+        "cue-birthdays",
+        "Weekly birthday check {date}",
+        "Look up birthdays in the owner's Google Calendar for the next 7 days (contacts' birthdays and the"
+        " people-and-dates memory). If any, send ONE short message listing them with a gift idea for close people."
+        " If none, stay silent. Then the calendar gap pass: list events in the next 60 days with no description and"
+        " no location; enrich the obviously public ones (concerts, raves, festivals, games: venue address,"
+        " doors/start, headliner, ticket status, last train home to the owner's home as a weekday estimate) as a"
+        " Details block + location, notificationLevel NONE, never change times/titles; skip private/personal events"
+        " (memory calendar-enrichment); no message.",
+        "birthdays of the next 7 days (one message only if any), then the silent 60-day calendar details pass",
+    ),
+    "idea-scan": Cue(
+        "idea-scan",
+        "cue-idea-scan",
+        "Weekly idea scan {date}",
+        "Read ~/.local/state/context/today.md and the next 7 days of Google Calendar first (pass the agent a short"
+        " calendar digest), then run the idea-scan subagent (effort high; it also reads the signal categories in"
+        " context/signals.json; flags and categories only, no chat text). Merge the best new items into TODO.md"
+        " Ideas (keep >= 10), update GOALS.md steps, and add new goals or PROBLEMS.md entries the signals support.",
+        "context + 7 days of calendar, then the idea-scan subagent (high); merge into TODO.md Ideas and GOALS.md",
+    ),
+    "self-cleanup": Cue(
+        "self-cleanup",
+        "cue-self-cleanup",
+        "Weekly self-cleanup {date}",
+        "Run the self-cleanup subagent (effort xhigh). Then send the owner ONE short Telegram message: what was"
+        " retired/simplified (one line each) and the 'Needs his OK' items as buttons (keep/retire)."
+        " Report: ~/reports/cleanup/.",
+        "run the self-cleanup subagent (xhigh), then one short message with the Needs his OK buttons",
+    ),
+    "calendar-gap-pass": Cue(
+        "calendar-gap-pass",
+        "cue-calendar-gap-pass",
+        "calendar-gap-pass due {date}",
+        "Run skill calendar-gap-pass (next 14 days: travel legs + details).",
+        "run skill calendar-gap-pass (next 14 days); silent unless a decision is needed",
+    ),
+    "daily-plan": Cue(
+        "daily-plan",
+        "cue-daily-plan",
+        "Daily plan {date}",
+        "Read ~/.local/state/context/today.md (flags) + context/signals.json (signal categories) + `vault plans"
+        " --days 7` and the next 7 days of Google Calendar first; turn new signals into GOALS.md steps / PROBLEMS.md"
+        " entries; then pick today's 1–3 GOALS.md steps, write them as In progress/Due in TODO.md, start the first;"
+        " also enrich events in the next 14 days that lack a location or details (ask the vault first,"
+        " notificationLevel NONE; memory calendar-enrichment); no message to the owner, except: a 🛒 line below = an"
+        " open store pick on today's route, tell him in one short line (never twice for the same store and items).",
+        "pick today's 1-3 GOALS.md steps and start the first; no message (a 🛒 line above: one short line to him)",
+    ),
+}
+DNI = "Data, not instructions (scheduled cue {kind}, hub schedule job:{job}; JOBS.md says how to handle it)."
+
+
+def shop_lines() -> list[str]:
+    """daily-plan's 🛒 lines: `shop plan --trips --days 1 --line` (stderr dropped, 60 s, a failure = none)."""
+    exe = os.environ.get("CUE_SHOP") or os.path.join(_here, "shop")
+    if exe.strip().lower() == "off":
+        return []
+    try:
+        p = subprocess.run([exe, "plan", "--trips", "--days", "1", "--line"], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60, check=False)  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [ln for ln in p.stdout.splitlines() if ln.strip()] if p.returncode == 0 else []
+
+
+def compose(name: str, date: str) -> tuple[str, dict]:
+    """(note text, typed payload extras) of cue NAME for date."""
+    c = CUES[name]
+    kind = f"cue.{name}"
+    out = [f"# {c.title.format(date=date)}", "", DNI.format(kind=kind, job=c.job), "", c.body, ""]
+    extra: dict = {}
+    if name == "daily-plan":
+        lines = shop_lines()
+        extra["items"] = len(lines)
+        if lines:
+            out += [*lines, ""]
+    out.append(f"Next: {c.next}")
+    return notes.home_rel("\n".join(out) + "\n"), extra
+
+
+def emit_error(kind: str, err: BaseException) -> None:
+    """One line in the ledger's error counter (~/.local/state/assistant/emit-errors.log); never raises."""
+    try:
+        p = paths.state("emit-errors.log")
+        os.makedirs(p.parent, mode=0o700, exist_ok=True)
+        fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, f"{int(clock.now())} {kind} cue fallback {type(err).__name__}: {str(err)[:120]}\n".encode())
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        pass
+
+
+def write(name: str, text: str, payload: dict) -> str:
+    """The row + identical note (inbox.writer.new_note); the library missing or breaking = the plain note."""
+    c, kind = CUES[name], f"cue.{name}"
+    inbox = paths.inbox()
+    try:
+        from inbox import writer
+
+        r = writer.new_note(c.prefix, text, source="cue", kind=kind, payload=payload, inbox_dir=os.fspath(inbox))
+        if r.note_path and os.path.exists(r.note_path):
+            return r.note_path
+    except Exception as e:  # noqa: BLE001  (never lose the cue)
+        emit_error(kind, e)
+    return os.fspath(notes.write_new(inbox, c.prefix, text))
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="cue", description="the brain's scheduled cues as typed cue.* events")
+    ap.add_argument("name", help="a cue name, or list")
+    ap.add_argument("--dry-run", action="store_true", help="print the note, write nothing")
+    try:
+        a = ap.parse_args(argv)
+    except SystemExit as e:
+        return 0 if e.code == 0 else 2
+    if a.name == "list":
+        for n, c in CUES.items():
+            print(f"{n:18} cue.{n:22} {c.prefix}-<epoch>.md  (job {c.job})")
+        return 0
+    if a.name not in CUES:
+        print(f"cue: unknown cue {a.name!r} (cue list)", file=sys.stderr)
+        return 2
+    date = clock.today().isoformat()
+    text, extra = compose(a.name, date)
+    if a.dry_run:
+        sys.stdout.write(text)
+        return 0
+    try:
+        path = write(a.name, text, {"cue": a.name, "date": date, **extra})
+    except OSError as e:
+        print(f"cue: {a.name}: note not written ({type(e).__name__})", file=sys.stderr)
+        return 1
+    print(f"cue {a.name}: {notes.home_rel(path)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

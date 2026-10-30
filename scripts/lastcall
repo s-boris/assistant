@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""lastcall: ring the owner when the last train home leaves in <= 25 min and he is still at the venue (token-free).
+
+  lastcall run [--dry-run] [--now ISO]     cron, every 2 min. Cheap exit (file reads only) outside an event window.
+                                           --dry-run prints the plan and the actions; it rings, texts and writes nothing.
+  lastcall status [--json] [--now ISO] [--days N]
+                                           the event nights in the next N days (default 1) with their last train home
+                                           and when it would ring (gohome lookups, read-only)
+  lastcall off [--now ISO]                 no call tonight
+
+Event night: event-card's nights (calcache) that have a 🚆/🚌 leg home; the way home starts at that leg's start stop.
+Active: from the event start until event-card's window end (the later of 04:45 and the leg's arrival + 15 min).
+Last train (the rule): connections home from that stop, door to door (`gohome STOP --json`, paged with GOHOME_NOW,
+anchored on its "last tonight", the latest one that reaches the door by 04:45). The last train is the last connection
+before the night gap: the first break of more than 2 h between departures. Connections with a wait of 60 min or more at
+a change are taxi gaps, not a way home, and are skipped. Example: 00:41, then nothing until 05:14 → the 00:41, even when
+the calendar's leg home is the 05:14. Service every < 2 h until 07:00 (night network) → no last train, no call.
+Ring: when the last train leaves in 5–25 min, once per night per event (and never twice within 3 h), any hour (a real
+alert). Before ringing, `whereabouts ha now --json` (the phone app when <= 30 min fresh, else `vault ha now`;
+consumer "lastcall", fresh only) must not show him home, near home (band near / the home town), driving (core.drive),
+in a vehicle or on a bicycle (then he has left or is on the train: silent for the night), nor in another town than the
+venue's with a fix <= 30 min old (silent this run). No place answer → remind's place-state.json (home, seen <= 10 min
+ago) → else unknown, and unknown rings: a missed last train costs more than one ring. A "home" that is not the phone
+app's (the vault's, or place-state's) counts only when it began (place.since, else its last fix) after the night began
+(its outbound leg, else the event start) and the vault's feed (age_min) is <= 90 min old; otherwise it is a stale home
+(he left and the vault missed it): unknown, and it rings.
+Call: `voice-relay call --reason "the last train home leaves in N minutes"` (marked in state before ringing: a crash
+never rings twice). Exit 0 answered: done. Exit 3 (declined, busy, no answer), 2 (relay down), 5 (failed) or anything
+else: ONE plain `tg` text naming the train, its lines, stop, platform when known and the next one after the gap;
+the arrival is at the door (gohome), a final walk of 5 min or more spelled out: "<last stop> 00:57, home 01:14 on foot
+(17 min)".
+Exit 4 (in a call or rate-limited): retried next run; still not through when < 5 min are left → the text.
+battery-guard's call (battery <= 10 %, same state and lock): answered ends the night (one ring); not answered (any exit
+but 0 and 4) leaves this ring standing, at least 5 min after it.
+Files: ~/.local/state/lastcall/ (0700): state.json (per night key: plan, ring mark, result; no titles), log.
+Phone app: a Live Update chip (lib/livecount.py) counts down to the last train from 25 min before it ("Last train
+HH:MM"), kept after the ring, never on home/left/`off` nights, ended once it has left; silent without a paired phone
+(tests: LIVECOUNT_PHONE = a stub phone; test state makes no chips without it).
+Env (tests): LASTCALL_DIR, LASTCALL_NOW, LASTCALL_GOHOME / LASTCALL_VAULT (commands, or "off"), LASTCALL_PLACE_STATE
+(remind's place-state.json, or "off"), LASTCALL_CALL_CMD (replaces `voice-relay call`), LASTCALL_TG (replaces `tg`),
+LASTCALL_EVENT_CARD (the event-card script whose nights it reads; EVENT_CARD_CALCACHE picks the calendar file).
+A simulated --now / LASTCALL_NOW skips the vault and place-state unless set; test state (LASTCALL_DIR or a simulated
+clock) without LASTCALL_CALL_CMD / LASTCALL_TG never rings or texts for real. Tests ~/opt/lastcall-tests/run.sh.
+"""
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import shlex
+import shutil
+import subprocess
+import sys
+import unicodedata
+
+sys.dont_write_bytecode = True
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import drive as drive_rule, jsonstate, locks  # noqa: E402
+import assistant_profile as profile  # noqa: E402
+import livecount  # noqa: E402
+
+HOME = os.path.expanduser('~')
+TZ = profile.tz()
+DIR = os.environ.get('LASTCALL_DIR') or os.path.join(HOME, '.local/state/lastcall')
+STATE_F = os.path.join(DIR, 'state.json')
+TEST_STATE = bool(os.environ.get('LASTCALL_DIR'))
+CALL_LEAD, CALL_MIN = 25, 5            # minutes before the last train: ring window
+GAP_MIN = 120                          # a break longer than this between departures = the night gap
+WALK_SHOW = 5                          # a final walk this long (gohome's walk_min) is named in the text
+WAIT_MAX = 60                          # a wait at a change this long = a taxi gap, not a way home
+BACK = dt.timedelta(minutes=150)       # the scan starts this long before gohome's "last tonight"
+MAX_PAGES = 6
+HORIZON = dt.time(7, 0)                # no gap before this = service all night
+REFRESH, REFRESH_NEAR, NEAR = 30, 10, 45   # plan age (min); near the train: refresh after 10 min
+CALL_TIMEOUT = 150                     # the relay rings 45 s; its CLI waits up to 120 s
+RING_SPACING = dt.timedelta(hours=3)
+FIX_FRESH, PLACE_STATE_FRESH = 30, 10  # minutes
+MOVING = {'vehicle', 'bicycle', 'in_vehicle', 'on_bicycle', 'driving'}
+HOME_STALE = 90                        # minutes: a vault feed older than this never vouches for "home"
+REGAP = dt.timedelta(minutes=5)        # after battery-guard's unanswered call, the own ring waits at least this long
+MIN = dt.timedelta(minutes=1)
+DRY = False
+SIMULATED = False
+LIVE = {}                              # night key -> the Live Update chip wanted this run (phone app, livecount)
+
+
+# ------------------------------------------------------------------------------------------------ helpers
+def fixed(t):
+    """Owner wall time with a fixed UTC offset. Two times in one ZoneInfo subtract and compare as wall clocks (the
+    fold is ignored), so in the repeated autumn hour 02:38 CET looked 23 min away at 02:15 CEST; with fixed offsets
+    all arithmetic is real elapsed time, and strftime still shows his wall time."""
+    t = t.astimezone(TZ)
+    return t.replace(tzinfo=dt.timezone(t.utcoffset()))
+
+
+def iso(s):
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(s).strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return fixed(t.replace(tzinfo=TZ) if t.tzinfo is None else t)
+
+
+def wall_near(s, now):
+    """A naive owner wall time (place-state's "YYYY-MM-DD HH:MM") as the latest matching instant not after now: in
+    the repeated autumn hour a reading from the second pass counts as the second pass."""
+    try:
+        n = dt.datetime.strptime(str(s).strip(), '%Y-%m-%d %H:%M')
+    except ValueError:
+        return iso(s)
+    cands = [fixed(n.replace(tzinfo=TZ, fold=f)) for f in (0, 1)]
+    past = [c for c in cands if c <= now]
+    return max(past) if past else cands[0]
+
+
+def hm(t):
+    return t.astimezone(TZ).strftime('%H:%M')
+
+
+def mins(td):
+    return int(td.total_seconds() // 60)
+
+
+def norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode().casefold()
+    return ' '.join(s.replace('-', ' ').replace(',', ' ').split())
+
+
+def log(msg):
+    if DRY:
+        return
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    with open(os.path.join(DIR, 'log'), 'a') as f:
+        f.write('%s %s\n' % (dt.datetime.now(TZ).strftime('%F %T'), msg))
+
+
+def read_json(path, default=None):
+    """Parsed JSON, or default when missing, unreadable or broken (core.jsonstate)."""
+    return jsonstate.load(path, default)
+
+
+def write_json(path, obj):
+    if DRY:
+        return
+    jsonstate.save(path, obj, mode=0o600, dir_mode=0o700, ensure_ascii=False, indent=1)   # atomic (core.jsonstate)
+
+
+WHEREABOUTS_ENV = {'WHEREABOUTS_FOR': 'lastcall', 'WHEREABOUTS_FRESH_ONLY': '1'}   # whereabouts: consumer entry, no stale phone
+
+
+def cmd_of(env, default):
+    v = os.environ.get(env)
+    if v == 'off':
+        return None
+    return shlex.split(v) if v else default
+
+
+def run_json(argv, extra_env=None, timeout=60):
+    env = dict(os.environ, **(extra_env or {}))
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def act(msg):
+    if DRY:
+        print('[dry-run] would ' + msg)
+    else:
+        log(msg)
+
+
+# ------------------------------------------------------------------------------------------------ event nights
+_EC = None
+
+
+def event_card():
+    """event-card as a module (its find_nights / load_events / is_home_place / home_towns)."""
+    global _EC
+    if _EC is None:
+        path = os.environ.get('LASTCALL_EVENT_CARD') or os.path.join(HOME, 'bin/event-card')
+        loader = importlib.machinery.SourceFileLoader('event_card_mod', path)
+        spec = importlib.util.spec_from_loader('event_card_mod', loader)
+        _EC = importlib.util.module_from_spec(spec)
+        loader.exec_module(_EC)
+    return _EC
+
+
+def nights(now):
+    """Event nights with a leg home: [{key, title, town, stop, towns, start (event start), end (window end)}]."""
+    ec = event_card()
+    out = []
+    for n in ec.find_nights(ec.load_events(), now.astimezone(TZ), rave_check=False):
+        back = n.get('back')
+        if not back:
+            continue
+        ev = n['ev']
+        frm = str((back.get('train') or {}).get('from') or '').strip()
+        stop = frm if frm and not ec.is_home_place(frm) else str(ev.get('town') or '').strip()
+        if not stop:
+            continue
+        towns = {norm(x) for x in (ev.get('town'), back.get('town'), stop.split(',')[0]) if x and norm(x)}
+        outs = [g['_s'] for g in n.get('legs') or [] if g is not back and g.get('_s')]
+        out.append({'key': n['key'], 'title': (ev.get('title') or 'Event').strip(), 'town': ev.get('town'),
+                    'stop': stop, 'towns': sorted(towns), 'start': fixed(ev['_s']), 'end': fixed(n['end']),
+                    'leg': fixed(back['_s']), 'out': fixed(min(outs)) if outs else None})
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ the last train
+def gohome(stop, t):
+    argv = cmd_of('LASTCALL_GOHOME', [os.path.join(HOME, 'bin/gohome')])
+    if not argv:
+        return None
+    return run_json(argv + [stop, '--json'], {'GOHOME_NOW': t.astimezone(TZ).strftime('%Y-%m-%d %H:%M')}, timeout=60)
+
+
+def usable(c):
+    w = c.get('wait') or {}
+    return not (isinstance(w, dict) and (w.get('min') or 0) >= WAIT_MAX)
+
+
+def horizon_of(ref):
+    h = ref.astimezone(TZ).replace(hour=HORIZON.hour, minute=HORIZON.minute, second=0, microsecond=0)
+    return fixed(h if h > ref else h + dt.timedelta(days=1))   # + 1 day in wall time: 07:00 stays 07:00
+
+
+def scan(stop, ref):
+    """The night's last train home from stop, seen from ref: {why: ok|gone|allnight|unknown, last, after, gap_min,
+    ref, stop}; None when gohome failed."""
+    r0 = gohome(stop, ref)
+    if not isinstance(r0, dict):
+        return None
+    base = {'ref': ref.isoformat(), 'stop': r0.get('origin') or stop, 'last': None, 'after': None, 'gap_min': None}
+    first = [c for c in r0.get('next') or [] if iso(c.get('dep')) and iso(c['dep']) >= ref - MIN and usable(c)]
+    anchor = iso((r0.get('last') or {}).get('dep'))           # gohome's last tonight (door by 04:45)
+    if not first or (mins(iso(first[0]['dep']) - ref) > GAP_MIN and not (anchor and anchor >= ref - MIN)):
+        return dict(base, why='gone', after=first[0] if first else None)
+    start = max(ref, anchor - BACK) if anchor and anchor > ref else ref
+    seen = {c['dep']: c for c in first} if start == ref else {}
+    horizon, pages = horizon_of(ref), 0
+    t = max(iso(c['dep']) for c in first) if seen else start
+    while True:
+        conns = sorted((c for c in seen.values() if iso(c['dep']) >= start - MIN), key=lambda c: iso(c['dep']))
+        for x, y in zip(conns, conns[1:]):
+            g = mins(iso(y['dep']) - iso(x['dep']))
+            if g > GAP_MIN:
+                return dict(base, why='ok', last=x, after=y, gap_min=g)
+        if conns and iso(conns[-1]['dep']) >= horizon:
+            return dict(base, why='allnight', last=None, after=None)
+        if pages >= MAX_PAGES:
+            return dict(base, why='unknown')
+        r = gohome(stop, t)
+        pages += 1
+        if not isinstance(r, dict):
+            return None
+        page = [c for c in r.get('next') or [] if iso(c.get('dep')) and iso(c['dep']) >= t - MIN]
+        new = [c for c in page if c['dep'] not in seen]
+        seen.update({c['dep']: c for c in page if usable(c)})
+        if not new:                               # nothing later within gohome's 14 h: the gap runs past the morning
+            conns = sorted((c for c in seen.values() if iso(c['dep']) >= start - MIN), key=lambda c: iso(c['dep']))
+            return dict(base, why='ok', last=conns[-1]) if conns else dict(base, why='unknown')
+        t = max(t + MIN, max(iso(c['dep']) for c in page))
+
+
+def plan_for(n, now, rec, fresh=False):
+    """The cached plan for this night, refreshed when old (or near the train)."""
+    p = rec.get('plan')
+    if p and not fresh:
+        age = mins(now - (iso(p.get('at')) or now - dt.timedelta(days=1)))
+        dep = iso((p.get('last') or {}).get('dep'))
+        near = dep and mins(dep - now) <= NEAR
+        if age < (REFRESH_NEAR if near else REFRESH) and age >= 0:
+            return p
+    ref = max(now, n['start'])
+    q = scan(n['stop'], ref)
+    if q is None:
+        log('%s: gohome failed' % n['key'])
+        return p                                  # keep the last good plan
+    q['at'] = now.isoformat()
+    rec['plan'] = q
+    return q
+
+
+# ------------------------------------------------------------------------------------------------ where is he
+def home_towns():
+    names = [profile.get('home.town', '')] + list(profile.get('home.town_aliases', []) or [])
+    return {norm(n) for n in names if n}
+
+
+def town_match(a, towns):
+    a = norm(a)
+    return any(a == t or a.startswith(t + ' ') or t.startswith(a + ' ') for t in towns)
+
+
+def night_ref(n):
+    """When the night began: its outbound leg's start, else the event's start (None = unknown)."""
+    xs = [x for x in (n.get('out'), n.get('start')) if x]
+    return min(xs) if xs else None
+
+
+def stale_home(d, n, now):
+    """None when a "home" answer can be trusted tonight, else why not. The phone app's answer (whereabouts: <= 30 min
+    fresh) is trusted. The vault's is stale when its feed is older than HOME_STALE min (age_min), or when home began
+    (place.since, else its last fix; neither = unknown) before the night began: he left after that and the vault
+    missed it."""
+    if str(d.get('source') or 'vault') == 'phone':
+        return None
+    age = d.get('age_min')
+    if isinstance(age, (int, float)) and age > HOME_STALE:
+        return 'stale home (vault %d min old)' % age
+    pl = d.get('place') or {}
+    began = iso(pl.get('since'))
+    if began is None and isinstance(pl.get('fix_age_min'), (int, float)):
+        began = now - dt.timedelta(minutes=pl['fix_age_min'])
+    ref = night_ref(n)
+    if ref is None:
+        return None
+    if began is None:
+        return 'stale home (vault, no start time)'
+    if began < ref:
+        return 'stale home (since %s, before the night began)' % hm(began)
+    return None
+
+
+def where(n, now):
+    """{state: home|left|elsewhere|here|unknown, why}."""
+    default = None if (SIMULATED or TEST_STATE) else [os.path.join(HOME, 'bin/whereabouts')]
+    argv = cmd_of('LASTCALL_VAULT', default)
+    d = run_json(argv + ['ha', 'now', '--json'], WHEREABOUTS_ENV, timeout=40) if argv else None
+    if isinstance(d, dict) and isinstance(d.get('place'), dict):
+        pl = d['place']
+        zone = norm(pl.get('zone'))
+        stale = None
+        if pl.get('kind') == 'home' or (pl.get('kind') == 'zone' and zone == 'home'):
+            stale = stale_home(d, n, now)
+            if not stale:
+                return {'state': 'home', 'why': 'home'}
+        if drive_rule.active(d):                     # the one drive rule: on, and the answer <= 60 min old
+            return {'state': 'left', 'why': 'driving'}
+        if str(d.get('activity') or '').casefold() in MOVING:
+            return {'state': 'left', 'why': 'moving (%s)' % d.get('activity')}
+        if stale:
+            return {'state': 'unknown', 'why': stale}
+        town = pl.get('town')
+        if not town and pl.get('kind') == 'zone' and zone == 'work':
+            town = profile.get('work.town', None)
+        if pl.get('band') == 'near' or (town and norm(town) in home_towns()):
+            return {'state': 'left', 'why': 'near home'}
+        if town and town_match(town, n['towns']):
+            return {'state': 'here', 'why': 'in the venue town'}
+        age = pl.get('fix_age_min')
+        if town and isinstance(age, (int, float)) and age <= FIX_FRESH:
+            return {'state': 'elsewhere', 'why': 'another town'}
+        return {'state': 'unknown', 'why': 'away, town unknown'}
+    ps_env = os.environ.get('LASTCALL_PLACE_STATE')
+    ps_f = None if ps_env == 'off' else ps_env or (
+        None if (SIMULATED or TEST_STATE) else os.path.join(HOME, '.local/state/remind/place-state.json'))
+    ps = read_json(ps_f, {}) if ps_f else {}
+    seen = wall_near((ps or {}).get('seen'), now) if (ps or {}).get('seen') else None
+    if seen and 0 <= mins(now - seen) <= PLACE_STATE_FRESH and str(ps.get('zone') or '').casefold() == 'home':
+        since, ref = wall_near(ps.get('since'), now) if ps.get('since') else None, night_ref(n)
+        if since and ref and since < ref:
+            return {'state': 'unknown', 'why': 'stale home (place-state since %s, before the night began)' % hm(since)}
+        return {'state': 'home', 'why': 'home (place-state)'}
+    return {'state': 'unknown', 'why': 'no place answer' if argv else 'no place source'}
+
+
+# ------------------------------------------------------------------------------------------------ ring and text
+def arrival_text(c, arr):
+    """gohome's arr is at the door: a walk of WALK_SHOW min or more from the last stop is spelled out."""
+    walk, off, off_arr = c.get('walk_min'), c.get('off'), iso(c.get('off_arr'))
+    if isinstance(walk, int) and walk >= WALK_SHOW and off and off_arr:
+        return '%s %s, home %s on foot (%d min)' % (off, hm(off_arr), hm(arr), walk)
+    return 'home %s' % hm(arr)
+
+
+def conn_text(c, stop):
+    dep, arr = iso(c['dep']), iso(c.get('arr'))
+    lines = ' → '.join(c.get('lines') or [])
+    pl = ', platform %s' % c['platform'] if c.get('platform') else ''
+    out = ['%s from %s%s' % (hm(dep), c.get('stop') or stop, pl)]
+    tail = ([lines] if lines else []) + ([arrival_text(c, arr)] if arr else [])
+    w = c.get('wait') or {}
+    if isinstance(w, dict) and w.get('min'):
+        tail.append('%d min wait at %s' % (w['min'], w.get('at') or 'a change'))
+    return out + ([' · '.join(tail)] if tail else [])
+
+
+def message(p, now, why):
+    c = p['last']
+    left = max(0, mins(iso(c['dep']) - now))
+    lines = ['🚆 Last train home leaves in %d min' % left] + conn_text(c, p.get('stop'))
+    a = p.get('after')
+    lines.append('After that: nothing until %s' % hm(iso(a['dep'])) if a else 'After that: nothing until morning')
+    lines.append({'unanswered': '📞 I tried to call you.', 'busy': "📞 Couldn't ring you (line busy)."}
+                 .get(why, "📞 Couldn't ring you (call relay down)."))
+    return '\n'.join(lines)
+
+
+def ring(reason):
+    """voice-relay's exit code (0 answered, 3 not answered, 4 busy/limited, 5 failed, 2 relay down), 124 timeout,
+    127 can't run, -1 calls off (test state without LASTCALL_CALL_CMD)."""
+    env = os.environ.get('LASTCALL_CALL_CMD')
+    argv = shlex.split(env) if env else (None if (SIMULATED or TEST_STATE)
+                                         else [os.path.join(HOME, 'bin/voice-relay'), 'call'])
+    if not argv:
+        return -1
+    try:
+        return subprocess.run(argv + ['--reason', reason], capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=CALL_TIMEOUT).returncode
+    except subprocess.TimeoutExpired:
+        return 124
+    except (OSError, subprocess.SubprocessError):
+        return 127
+
+
+def text(msg):
+    env = os.environ.get('LASTCALL_TG')
+    argv = shlex.split(env) if env else (None if (SIMULATED or TEST_STATE) else [shutil.which('tg') or '/usr/local/bin/tg'])
+    if not argv:
+        print('[test state] text not sent:\n' + msg)
+        return False
+    try:
+        return subprocess.run(argv + [msg], capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def get_now(a):
+    global SIMULATED
+    s = getattr(a, 'now', None) or os.environ.get('LASTCALL_NOW')
+    if s:
+        SIMULATED = True
+        t = iso(s)
+        if not t:
+            sys.exit('lastcall: bad --now %r (ISO, e.g. 2026-10-22T23:40)' % s)
+        return t
+    return fixed(dt.datetime.now(TZ)).replace(second=0, microsecond=0)
+
+
+def load_state():
+    st = read_json(STATE_F, {}) or {}
+    st.setdefault('nights', {})
+    return st
+
+
+def save_state(st):
+    keep = sorted(st['nights'].items(), key=lambda kv: kv[1].get('seen', ''))[-20:]
+    st['nights'] = dict(keep)
+    write_json(STATE_F, st)
+
+
+def finish(rec, why, now):
+    rec['done'] = why
+    rec['done_at'] = now.isoformat()
+    act('end the night: %s' % why)
+
+
+def handle(n, now, st):
+    rec = st['nights'].setdefault(n['key'], {})
+    rec['seen'] = now.isoformat()
+    if rec.get('done'):
+        live_want(n, rec, now)
+        return
+    p = plan_for(n, now, rec, fresh=DRY)
+    if DRY:
+        print('[dry-run] %s · %s · from %s · %s' % (now.astimezone(TZ).strftime('%a %d.%m %H:%M'), n['title'], n['stop'],
+                                                   describe(p, now)))
+    if not p or p.get('why') != 'ok' or not p.get('last'):
+        return
+    dep = iso(p['last']['dep'])
+    left = mins(dep - now)
+    live_want(n, rec, now)
+    if left > CALL_LEAD:
+        return
+    if left < CALL_MIN:
+        if rec.get('busy') and not rec.get('texted'):
+            send_text(rec, p, now, 'busy')
+            finish(rec, 'texted (line busy)', now)
+        else:
+            finish(rec, 'too late', now)
+        return
+    w = where(n, now)
+    rec['place'] = w['why']
+    if w['state'] in ('home', 'left', 'elsewhere'):
+        LIVE.pop(n['key'], None)                  # not at the venue: no countdown chip
+    if w['state'] in ('home', 'left'):
+        rec['live_off'] = True
+        finish(rec, w['why'], now)
+        return
+    if w['state'] == 'elsewhere':
+        act('stay silent this run (%s)' % w['why'])
+        return
+    if rec.get('ring_at'):
+        finish(rec, 'rang (no result recorded)', now)
+        return
+    bat = iso(rec.get('bat_ring_at'))             # battery-guard's call, not answered: this ring still goes out
+    if bat and now - bat < REGAP:
+        act('wait: the battery call was %d min ago' % mins(now - bat))
+        return
+    last_ring = max((iso(r.get('ring_at')) for r in st['nights'].values() if r.get('ring_at')), default=None)
+    if last_ring and now - last_ring < RING_SPACING:
+        finish(rec, 'rang for another event', now)
+        return
+    reason = 'the last train home leaves in %d minutes' % left
+    act('ring: voice-relay call --reason "%s" (%s)' % (reason, w['why']))
+    if DRY:
+        print('[dry-run] on no answer: text\n' + message(p, now, 'unanswered'))
+        return
+    rec['ring_at'] = now.isoformat()
+    rec['rc'] = None
+    save_state(st)                                # the mark first: a crash never rings twice
+    rc = ring(reason)
+    rec['rc'] = rc
+    log('%s: rang for the %s, exit %s' % (n['key'], hm(dep), rc))
+    if rc == 0:
+        finish(rec, 'answered', now)
+    elif rc == 4:
+        rec.pop('ring_at', None)                  # busy or rate-limited: next run tries again
+        rec['busy'] = rec.get('busy', 0) + 1
+    elif rc == -1:
+        finish(rec, 'calls off (test state)', now)
+    else:
+        send_text(rec, p, now, 'unanswered' if rc == 3 else 'down')
+        finish(rec, 'texted (exit %s)' % rc, now)
+
+
+def live_want(n, rec, now):
+    """The phone app's Live Update chip: a countdown to the last train from CALL_LEAD minutes before it, while he is
+    not known to be home, on his way or in another town (and not on a `lastcall off` night)."""
+    p = rec.get('plan') or {}
+    if rec.get('live_off') or rec.get('done') == 'off' or p.get('why') != 'ok' or not p.get('last'):
+        return
+    dep = iso(p['last'].get('dep'))
+    if not dep or not now < dep <= now + dt.timedelta(minutes=CALL_LEAD):
+        return
+    lines = ' → '.join((p['last'].get('lines') or [])[:2])
+    LIVE[n['key']] = {'key': n['key'], 'until': dep, 'title': 'Last train %s' % hm(dep),
+                      'body': (lines + ' · ' if lines else '') + 'the last way home tonight'}
+
+
+def live_sync(now):
+    """After the main work: start, update or end the chips (silent no-op without a paired phone; <= 5 s)."""
+    for line in livecount.sync('lastcall', list(LIVE.values()), now=now, test=TEST_STATE or SIMULATED, dry=DRY):
+        act(line)
+
+
+def send_text(rec, p, now, why):
+    msg = message(p, now, why)
+    act('text: ' + msg.replace('\n', ' | '))
+    if not DRY:
+        rec['texted'] = now.isoformat()
+        if not text(msg):
+            log('text failed')
+
+
+def describe(p, now):
+    if not p:
+        return 'no plan (gohome failed)'
+    if p.get('why') == 'allnight':
+        return 'service all night: no last train, no call'
+    if p.get('why') == 'unknown':
+        return 'last train unknown (no gap found within %d pages): no call' % MAX_PAGES
+    c, a = p.get('last'), p.get('after')
+    if p.get('why') == 'gone' or not c:
+        return 'the last train has left%s: no call' % (' (next %s)' % hm(iso(a['dep'])) if a else '')
+    dep = iso(c['dep'])
+    ring_at = dep - dt.timedelta(minutes=CALL_LEAD)
+    after = ', then nothing until %s' % hm(iso(a['dep'])) if a else ', then nothing until morning'
+    return 'last train %s %s%s · rings %s–%s' % (hm(dep), ' → '.join(c.get('lines') or []), after, hm(ring_at),
+                                                hm(dep - dt.timedelta(minutes=CALL_MIN)))
+
+
+def cmd_run(a):
+    now = get_now(a)
+    ec_cal = os.environ.get('EVENT_CARD_CALCACHE') or os.path.join(HOME, '.local/state/calcache/events.json')
+    if not os.path.exists(ec_cal):
+        live_sync(now)
+        return 0
+    act_n = [n for n in nights(now) if n['start'] <= now < n['end']]
+    if not act_n:
+        live_sync(now)                            # ends a chip left from a night that is over (no state file: no-op)
+        return 0                                  # the cheap exit: no event under way
+    st = load_state()
+    for n in act_n:
+        handle(n, now, st)
+    save_state(st)
+    live_sync(now)
+    return 0
+
+
+def cmd_status(a):
+    now = get_now(a)
+    st = load_state()
+    horizon = now + dt.timedelta(days=a.days)
+    rows = []
+    for n in nights(now):
+        if n['end'] <= now or n['start'] > horizon:
+            continue
+        rec = st['nights'].get(n['key']) or {}
+        p = rec.get('plan') if rec.get('plan') and n['start'] <= now else None
+        p = p or scan(n['stop'], max(now, n['start']))
+        rows.append({'title': n['title'], 'town': n['town'], 'stop': n['stop'], 'start': n['start'].isoformat(),
+                     'end': n['end'].isoformat(), 'active': n['start'] <= now < n['end'], 'done': rec.get('done'),
+                     'rang': rec.get('ring_at'), 'rc': rec.get('rc'), 'plan': p,
+                     'ring_from': (iso(p['last']['dep']) - dt.timedelta(minutes=CALL_LEAD)).isoformat()
+                     if p and p.get('why') == 'ok' and p.get('last') else None,
+                     'summary': describe(p, max(now, n['start']))})
+    if a.json:
+        print(json.dumps({'now': now.isoformat(), 'nights': rows}, ensure_ascii=False))
+        return 0
+    if not rows:
+        print('No event night with a leg home in the next %d day(s).' % a.days)
+    for r in rows:
+        print('- %s (%s), from %s, window %s–%s%s' % (
+            r['title'], r['town'], r['stop'], r['start'][5:16].replace('T', ' '), r['end'][5:16].replace('T', ' '),
+            ' · live' if r['active'] else ''))
+        print('  %s%s' % (r['summary'], ' · done: %s' % r['done'] if r['done'] else ''))
+    return 0
+
+
+def cmd_off(a):
+    now = get_now(a)
+    st = load_state()
+    hit = 0
+    for n in nights(now):
+        if n['start'] - dt.timedelta(hours=12) <= now < n['end']:
+            rec = st['nights'].setdefault(n['key'], {})
+            rec['seen'] = now.isoformat()
+            if not rec.get('done'):
+                finish(rec, 'off', now)
+                hit += 1
+    save_state(st)
+    if hit:
+        live_sync(now)                            # off for tonight: no countdown chip either
+    print('lastcall: off for tonight' if hit else 'lastcall: no event night to switch off')
+    return 0
+
+
+def main(argv):
+    global DRY
+    p = argparse.ArgumentParser(prog='lastcall', description=__doc__.split('\n')[0])
+    sub = p.add_subparsers(dest='cmd')
+    r = sub.add_parser('run')
+    r.add_argument('--dry-run', action='store_true')
+    r.add_argument('--now')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--now')
+    s.add_argument('--days', type=int, default=1)
+    o = sub.add_parser('off')
+    o.add_argument('--now')
+    a = p.parse_args(argv)
+    if not a.cmd:
+        print(__doc__.strip())
+        return 2
+    DRY = bool(getattr(a, 'dry_run', False))
+    if a.cmd == 'status':
+        return cmd_status(a)
+    if DRY:
+        return cmd_run(a)
+    fd = locks.acquire(os.path.join(DIR, '.lock'), wait=0 if a.cmd == 'run' else None, dir_mode=0o700)   # core.locks
+    if fd is None:
+        return 0                                  # another run is busy (or ringing)
+    return cmd_run(a) if a.cmd == 'run' else cmd_off(a)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "envelope.json",
+  "title": "Envelope for every WebSocket frame and fallback POST (both directions)",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID, unique per sender; receivers de-duplicate by id"
+    },
+    "t": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.]{0,31}$",
+      "description": "message type; see index.json"
+    },
+    "ts": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800,
+      "description": "sender time, epoch seconds UTC"
+    },
+    "ack": {
+      "type": "boolean",
+      "description": "true: receiver answers with t=ack {ids:[id]} (batched <= 1 s)"
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 604800
+    },
+    "key": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "coalescing key: a newer unacked message with the same key replaces the older"
+    },
+    "body": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "id",
+    "t",
+    "ts",
+    "body"
+  ]
+}

@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""arr-unblock: import Radarr/Sonarr downloads stuck in "Manual Import required", but only when every file
+verifiably matches what the *arr expects (the owner's rule: the filename must match what Radarr/Sonarr
+expect; never import blindly).
+
+  arr-unblock [--dry-run]              show the decision for every stuck queue item (default; changes nothing)
+  arr-unblock --apply                  act, verbose (manual run)
+  arr-unblock --cron                   act, quiet: ~/inbox note only for skips that need the owner (once per
+                                       download + reason) or failures; silent on success (logged)
+  arr-unblock --approve radarr:QUEUEID [--dry-run]
+                                       owner-confirmed import of ONE skipped item (use only after he said yes):
+                                       waives the file-NAME checks only; structure checks still apply
+  arr-unblock --status                 state + last log lines
+
+Candidates: queue items whose download is completed and whose trackedDownloadState is importBlocked (or
+importPending with a "Manual Import" message). For each one it reads the *arr's own manual-import preview
+(GET /api/v3/manualimport?downloadId=...) and runs the *arr's parser on every video file name
+(GET /api/v3/parse?title=<file name>). Import only if, for every main video file:
+  Radarr: a parsed title (normalized) equals the movie's title, original title or an alternate title; the parsed
+          year equals the movie's year (or secondary year; +-1 only when the title equals the main/original
+          title exactly); the parser maps the name to the queue's movieId; exactly one main video file.
+  Sonarr: the parsed series title matches the series (title/alternate titles, year if the name carries one); the
+          parser maps it to the queue's seriesId; the parsed episodes equal the preview's episodes and are all
+          episodes of this download; no episode twice.
+  Titles: case, punctuation, articles and accents folded; ß = ss; ä/ö/ü match both a/o/u and ae/oe/ue (German
+          release names spell umlauts out: "Rueckkehr" = "Rückkehr"); year and parser-id checks are unchanged.
+  Both:   the preview assigns the queue's movie/series; no rejection except the by-ID / manual-import one; the
+          quality is parsed (not Unknown); not a sample (labelled samples are left out, never imported); size sane.
+Any doubt -> skip and say why. Import: POST /api/v3/command ManualImport, importMode "auto" (= what completed
+download handling does: move for usenet, copy/hardlink for torrents still seeding), then confirm the movie /
+episodes have files and the queue item is gone.
+
+Keys go by handle through core.egress (radarr, sonarr; local mode reads ~/.secrets/media.json) and are never
+printed; base URLs come from the profile (services.<svc>_url; media.json's url while the file exists).
+State: ~/.local/state/arr-unblock/ (state.json, lock); log: ~/.local/state/arr-unblock.log.
+Env (mostly tests): MEDIA_SECRETS, ARR_UNBLOCK_STATE, ARR_UNBLOCK_LOG, ARR_UNBLOCK_INBOX, ARR_UNBLOCK_CMD_WAIT,
+ARR_UNBLOCK_QUEUE_WAIT. Exit: 0 ok, 1 error, 3 something was skipped or failed (dry-run/apply only).
+"""
+import argparse, fcntl, hashlib, http.client, json, os, re, socket, sys, time, unicodedata
+import urllib.error, urllib.parse, urllib.request
+from datetime import datetime
+
+try:  # keys by handle (core.egress)
+    _lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    if _lib not in sys.path:
+        sys.path.append(_lib)  # append, so ~/bin/lib never shadows anything
+    from core import egress as _egress
+    import assistant_profile as _profile
+except Exception:  # a copy without ~/bin/lib: the direct path
+    _egress = _profile = None
+
+SECRETS = os.path.expanduser(os.environ.get("MEDIA_SECRETS") or "~/.secrets/media.json")
+STATE_DIR = os.path.expanduser(os.environ.get("ARR_UNBLOCK_STATE") or "~/.local/state/arr-unblock")
+LOG = os.path.expanduser(os.environ.get("ARR_UNBLOCK_LOG") or "~/.local/state/arr-unblock.log")
+REMUX_STATE = os.path.expanduser(os.environ.get("ARR_UNBLOCK_REMUX_STATE") or "~/.local/state/media-remux/state.json")
+INBOX = os.path.expanduser(os.environ.get("ARR_UNBLOCK_INBOX") or "~/inbox")
+TIMEOUT = 30
+CMD_WAIT = float(os.environ.get("ARR_UNBLOCK_CMD_WAIT") or 150)    # ManualImport command (moves can take a bit)
+QUEUE_WAIT = float(os.environ.get("ARR_UNBLOCK_QUEUE_WAIT") or 45)  # queue item to disappear afterwards
+FAIL_NOTE = 4            # consecutive failed runs before one ~/inbox note (~1 h at */15)
+PENDING_MAX = 3600       # an import still not confirmed after this long -> failure note
+
+VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".ts", ".m2ts", ".mts", ".wmv", ".mov", ".webm", ".mpg", ".mpeg",
+             ".vob", ".iso", ".divx", ".flv", ".ogm", ".rmvb", ".strm"}
+GB, MB = 2 ** 30, 2 ** 20
+SIZE = {"radarr": (300 * MB, 250 * GB), "sonarr": (20 * MB, 100 * GB)}
+MIN_SHARE = 0.3          # a lone movie file must be >= 30% of the download (catches a tiny fake file)
+BY_ID_RE = re.compile(r"matched to (movie|series) by id|grab history|manual import required", re.I)
+SAMPLE_RE = re.compile(r"(^|[^a-z0-9])sample([^a-z0-9]|$)", re.I)
+ARTICLES = {"a", "an", "the", "and", "or", "of"}
+UNKNOWN_Q = {"unknown", ""}
+
+CFG = None
+
+
+class ApiError(Exception):
+    """An arr call failed; the message is safe to show (never contains keys)."""
+
+
+def _live():
+    """This run reads the live default key file: URLs from the profile, keys by handle (a test's own config
+    keeps its own url/key fields)."""
+    return _egress is not None and os.path.realpath(SECRETS) == os.path.realpath(os.path.expanduser("~/.secrets/media.json"))
+
+
+def cfg():
+    global CFG
+    if CFG is None:
+        try:
+            with open(SECRETS) as f:
+                CFG = json.load(f)
+        except Exception as e:
+            if not (_live() and isinstance(e, FileNotFoundError)):
+                raise ApiError(f"cannot read {SECRETS}: {type(e).__name__}")
+            CFG = {}  # the live file may be gone: URLs from the profile, keys by handle
+    return CFG
+
+
+def _via_egress(svc):
+    """Send through core.egress only when this run reads the live default key file (a test's own config
+    keeps the direct path)."""
+    return _live() and svc in _egress.HANDLES
+
+
+def api(svc, method, path, body=None, timeout=TIMEOUT):
+    c = cfg().get(svc) or {}
+    eg = _via_egress(svc)
+    if eg:
+        c = dict(c, url=_profile.service_url(svc, c.get("url")))
+        try:
+            c["key"] = _egress.secret(svc)
+        except KeyError:  # egress.Missing: no key on file
+            c["key"] = None
+    if not c.get("url") or not c.get("key"):
+        raise ApiError(f"no {svc} url (profile services.{svc}_url) or key (core.egress {svc})" if eg
+                       else f"no {svc} url/key in {SECRETS}")
+    where = f"{svc} {method} {path.split('?')[0]}"
+    h = {"Accept": "application/json", "X-Api-Key": c["key"]}
+    data = None
+    if body is not None:
+        data, h["Content-Type"] = json.dumps(body).encode(), "application/json"
+    try:
+        req = urllib.request.Request(c["url"].rstrip("/") + path, data=data, headers=h, method=method)
+        with (_egress.open(req, svc, timeout=timeout) if eg else urllib.request.urlopen(req, timeout=timeout)) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        raise ApiError(f"HTTP {e.code} on {where}: {e.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as e:
+        raise ApiError(f"cannot reach {svc}: {e.reason}")
+    except (TimeoutError, socket.timeout):
+        raise ApiError(f"{where} timed out after {timeout}s")
+    except (OSError, http.client.HTTPException) as e:
+        raise ApiError(f"cannot reach {svc}: {type(e).__name__}")
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        raise ApiError(f"non-JSON answer on {where}")
+
+
+def q(s):
+    return urllib.parse.quote(str(s), safe="")
+
+
+# ---------- pure match logic (unit-tested) ----------
+
+UMLAUT_SPELLED = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue"})
+
+
+def norm(s, spelled=False):
+    """Title key: accents folded, lowercase, & -> and, trailing "(year)" and articles dropped, only letters/digits.
+    ß -> ss always; ä/ö/ü -> a/o/u, or with spelled=True -> ae/oe/ue (German release names spell umlauts out)."""
+    s = unicodedata.normalize("NFC", str(s or "")).lower()
+    if spelled:
+        s = s.translate(UMLAUT_SPELLED)
+    s = unicodedata.normalize("NFKD", s.replace("ß", "ss"))
+    s = "".join(c for c in s if not unicodedata.combining(c)).replace("&", " and ")
+    s = re.sub(r"\(\s*\d{4}\s*\)\s*$", "", s.strip())
+    return "".join(w for w in re.split(r"[\W_]+", s) if w and w not in ARTICLES)
+
+
+def title_keys(*titles):
+    """Both umlaut foldings of each title ("Rückkehr" -> ruckkehr + rueckkehr). Only a real ä/ö/ü adds the
+    spelled-out key; "ue" is never folded back to "u", so names without umlauts match exactly as before."""
+    return {k for t in titles for k in (norm(t), norm(t, spelled=True))} - {""}
+
+
+def gb(n):
+    return f"{(n or 0) / GB:.1f} GB" if (n or 0) >= GB else f"{(n or 0) / MB:.0f} MB"
+
+
+def msgs(rec):
+    out = [m for sm in rec.get("statusMessages") or [] for m in sm.get("messages") or []]
+    return ([rec["errorMessage"]] if rec.get("errorMessage") else []) + out
+
+
+def is_candidate(rec):
+    if (rec.get("status") or "").lower() != "completed" or (rec.get("sizeleft") or 0) > 0:
+        return False
+    st = rec.get("trackedDownloadState") or ""
+    if st == "importBlocked":
+        return True
+    return st == "importPending" and any("manual import" in m.lower() for m in msgs(rec))
+
+
+def remux_owned():
+    """Radarr movieIds whose grab media-remux still follows: it imports those itself (its 'not an upgrade'
+    override after these same checks), so they are neither imported nor noted here."""
+    try:
+        with open(REMUX_STATE) as f:
+            mv = (json.load(f) or {}).get("movies") or {}
+        return {int(k) for k, s in mv.items() if (s or {}).get("status") == "grabbed"}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return set()
+
+
+def group_candidates(records, owned=frozenset()):
+    groups = {}
+    for r in records:
+        if r.get("movieId") in owned and not r.get("seriesId"):
+            continue
+        if is_candidate(r):
+            groups.setdefault(r.get("downloadId") or f"queue-{r.get('id')}", []).append(r)
+    return groups
+
+
+def epl(e):
+    return f"S{e.get('seasonNumber', 0):02d}E{e.get('episodeNumber', 0):02d}"
+
+
+class Decision:
+    def __init__(self, svc, recs, label):
+        self.svc, self.recs, self.label = svc, recs, label
+        self.download_id = recs[0].get("downloadId")
+        self.key = f"{svc}:{self.download_id or recs[0].get('id')}"
+        self.problems, self.notes, self.files, self.lines = [], [], [], []
+        self.naming = []      # problems that are only about the file NAME (what --approve waives)
+        self.target = {}      # what to confirm afterwards: movieId or episodeIds
+
+    @property
+    def ok(self):
+        return not self.problems and bool(self.files)
+
+    def no(self, why):
+        if why not in self.problems:
+            self.problems.append(why)
+
+
+def _rejections(f):
+    return [(r.get("reason") or str(r)) for r in f.get("rejections") or []]
+
+
+def _split_files(dec, preview):
+    """Video files of the preview -> main files; labelled samples are left out (never imported)."""
+    mains = []
+    for f in preview or []:
+        name = os.path.basename(f.get("relativePath") or f.get("path") or "")
+        if os.path.splitext(name)[1].lower() not in VIDEO_EXT:
+            continue
+        rej = _rejections(f)
+        if SAMPLE_RE.search(name) or any(r.strip().lower() == "sample" for r in rej):
+            dec.notes.append(f"sample left out: {name} ({gb(f.get('size'))})")
+            continue
+        mains.append((name, f, rej))
+    return mains
+
+
+def _structure(dec, name, f, rej, lo, hi):
+    """Checks that hold regardless of the name: rejections, quality, size."""
+    other = [r for r in rej if not BY_ID_RE.search(r)]
+    if other:
+        dec.no(f"{name}: the *arr rejects it: {'; '.join(other)[:200]}")
+    qn = (((f.get("quality") or {}).get("quality") or {}).get("name") or "").strip()
+    if qn.lower() in UNKNOWN_Q or not ((f.get("quality") or {}).get("quality") or {}).get("id"):
+        dec.no(f"{name}: quality not recognised")
+    size = f.get("size") or 0
+    if not lo <= size <= hi:
+        dec.no(f"{name}: size {gb(size)} outside the sane range ({gb(lo)}–{gb(hi)})")
+    langs = ", ".join(l.get("name", "?") for l in f.get("languages") or []) or "?"
+    dec.lines.append(f"{name} | {gb(size)} | {qn or '?'} | {langs} | {f.get('releaseGroup') or '-'}")
+
+
+def waive(dec, naming, approved):
+    for why in naming:
+        if approved:
+            dec.notes.append("waived by owner approval: " + why)
+        else:
+            dec.no(why)
+            dec.naming.append(why)
+
+
+def verify_radarr(rec, movie, preview, parse, approved=False):
+    """rec: queue record, movie: GET /movie/{id}, preview: GET /manualimport, parse(name) -> GET /parse result."""
+    movie = movie or rec.get("movie") or {}
+    mid = rec.get("movieId")
+    dec = Decision("radarr", [rec], f"{movie.get('title') or rec.get('title')} ({movie.get('year') or '?'})")
+    dec.target = {"movieId": mid}
+    if not mid:
+        dec.no("the queue item is not matched to any movie")
+        return dec
+    if not dec.download_id:
+        dec.no("the queue item has no download id")
+    exact = title_keys(movie.get("title"), movie.get("originalTitle"))
+    known = exact | title_keys(*(a.get("title") for a in movie.get("alternateTitles") or []))
+    n_titles = len({norm(t) for t in [movie.get("title"), movie.get("originalTitle")]
+                     + [a.get("title") for a in movie.get("alternateTitles") or []]} - {""})
+    years = {y for y in (movie.get("year"), movie.get("secondaryYear")) if y}
+    mains = _split_files(dec, preview)
+    if not mains:
+        dec.no("no importable video file in the download")
+    elif len(mains) > 1:
+        dec.no(f"{len(mains)} main video files ({', '.join(n for n, _, _ in mains)[:200]}); expected one")
+    lo, hi = SIZE["radarr"]
+    for name, f, rej in mains:
+        if (f.get("movie") or {}).get("id") != mid:
+            dec.no(f"{name}: the preview assigns movie {(f.get('movie') or {}).get('id')}, the queue expects {mid}")
+        _structure(dec, name, f, rej, lo, hi)
+        if len(mains) == 1 and rec.get("size") and (f.get("size") or 0) < MIN_SHARE * rec["size"]:
+            dec.no(f"{name}: only {gb(f.get('size'))} of a {gb(rec['size'])} download")
+        naming = []
+        p = parse(name) or {}
+        pi = p.get("parsedMovieInfo") or {}
+        titles = [t for t in (pi.get("movieTitles") or [pi.get("movieTitle")]) if t]
+        if not titles:
+            naming.append(f"{name}: the file name doesn't parse as a movie")
+        else:
+            keys = title_keys(*titles)
+            py = pi.get("year") or 0
+            shown = f"\"{titles[0]}\" ({py or 'no year'})"
+            if not keys & known:
+                naming.append(f"{name}: the file name parses to {shown}, which is not a title Radarr knows for "
+                              f"\"{movie.get('title')}\" ({movie.get('year')}) (checked "
+                              f"{n_titles} titles incl. alternates)")
+            elif not py:
+                naming.append(f"{name}: the file name carries no year")
+            elif py not in years and not (keys & exact and any(abs(py - y) == 1 for y in years)):
+                naming.append(f"{name}: year {py} in the file name, the movie is from {movie.get('year')}")
+            pm = (p.get("movie") or {}).get("id")
+            if pm != mid:
+                naming.append(f"{name}: Radarr's parser maps the file name to "
+                              f"{'movie ' + str(pm) if pm else 'no movie'} (expected {mid})")
+        waive(dec, naming, approved)
+        dec.files.append({k: v for k, v in {
+            "path": f.get("path"), "folderName": f.get("folderName"), "movieId": mid,
+            "quality": f.get("quality"), "languages": f.get("languages") or rec.get("languages") or [],
+            "releaseGroup": f.get("releaseGroup") or pi.get("releaseGroup") or "",
+            "downloadId": dec.download_id, "indexerFlags": f.get("indexerFlags") or 0}.items() if v is not None})
+    if dec.problems:
+        dec.files = []
+    return dec
+
+
+def verify_sonarr(recs, series, preview, parse, approved=False):
+    """recs: queue records of one download (season packs = many), series: GET /series/{id}."""
+    r0 = recs[0]
+    series = series or r0.get("series") or {}
+    sid = r0.get("seriesId")
+    exp = {r.get("episodeId"): (r.get("episode") or {}) for r in recs if r.get("episodeId")}
+    dec = Decision("sonarr", recs, f"{series.get('title') or r0.get('title')}"
+                   + (f" {epl(next(iter(exp.values())))}" if len(exp) == 1 else f" ({len(exp)} episodes)"))
+    dec.target = {"seriesId": sid, "episodeIds": []}
+    if not sid or not exp:
+        dec.no("the queue item is not matched to a series/episodes")
+        return dec
+    if len({r.get("seriesId") for r in recs}) != 1:
+        dec.no("one download, several series")
+    if not dec.download_id:
+        dec.no("the queue item has no download id")
+    known = title_keys(series.get("title"), series.get("sortTitle")) | {series.get("cleanTitle") or ""}
+    known |= title_keys(*(a.get("title") for a in series.get("alternateTitles") or []))
+    known -= {""}
+    mains = _split_files(dec, preview)
+    if not mains:
+        dec.no("no importable video file in the download")
+    seen = {}
+    lo, hi = SIZE["sonarr"]
+    for name, f, rej in mains:
+        pv = {e.get("id"): e for e in f.get("episodes") or []}
+        if (f.get("series") or {}).get("id") != sid:
+            dec.no(f"{name}: the preview assigns series {(f.get('series') or {}).get('id')}, the queue expects {sid}")
+        if not pv:
+            dec.no(f"{name}: no episodes assigned")
+        elif not set(pv) <= set(exp):
+            dec.no(f"{name}: maps to {', '.join(epl(e) for e in pv.values())}, not an episode of this download "
+                   f"({', '.join(sorted(epl(e) for e in exp.values()))[:120]})")
+        for eid in pv:
+            if eid in seen:
+                dec.no(f"{name}: episode {epl(pv[eid])} also in {seen[eid]}")
+            seen[eid] = name
+        _structure(dec, name, f, rej, lo, hi)
+        naming = []
+        p = parse(name) or {}
+        pi = p.get("parsedEpisodeInfo") or {}
+        ti = pi.get("seriesTitleInfo") or {}
+        if not pi.get("seriesTitle"):
+            naming.append(f"{name}: the file name doesn't parse as an episode")
+        else:
+            keys = title_keys(pi.get("seriesTitle"), ti.get("title"), ti.get("titleWithoutYear"))
+            if not keys & known:
+                naming.append(f"{name}: the file name names the series \"{pi.get('seriesTitle')}\", "
+                              f"expected \"{series.get('title')}\"")
+            elif ti.get("year") and series.get("year") and ti["year"] != series["year"]:
+                naming.append(f"{name}: year {ti['year']} in the file name, the series is from {series['year']}")
+            ps = (p.get("series") or {}).get("id")
+            if ps != sid:
+                naming.append(f"{name}: Sonarr's parser maps the file name to "
+                              f"{'series ' + str(ps) if ps else 'no series'} (expected {sid})")
+            pe = {e.get("id"): e for e in p.get("episodes") or []}
+            said = ", ".join(epl(e) for e in pe.values()) or (
+                f"S{pi.get('seasonNumber', 0):02d}" + "".join(f"E{n:02d}" for n in pi.get("episodeNumbers") or []))
+            if not pe:
+                naming.append(f"{name}: the file name maps to no episode ({said})")
+            elif set(pe) != set(pv):
+                naming.append(f"{name}: the file name says {said}, the preview assigns "
+                              f"{', '.join(epl(e) for e in pv.values()) or 'nothing'}")
+            elif not set(pe) <= set(exp):
+                naming.append(f"{name}: the file name says {said}, not an episode of this download")
+        waive(dec, naming, approved)
+        dec.target["episodeIds"] += sorted(pv)
+        dec.files.append({k: v for k, v in {
+            "path": f.get("path"), "folderName": f.get("folderName"), "seriesId": sid,
+            "episodeIds": sorted(pv), "quality": f.get("quality"),
+            "languages": f.get("languages") or r0.get("languages") or [],
+            "releaseGroup": f.get("releaseGroup") or pi.get("releaseGroup") or "",
+            "downloadId": dec.download_id, "indexerFlags": f.get("indexerFlags") or 0,
+            "releaseType": f.get("releaseType")}.items() if v is not None})
+    missing = set(exp) - set(seen)
+    if mains and missing and not dec.problems:
+        dec.notes.append(f"no file for {', '.join(sorted(epl(exp[e]) for e in missing))[:150]} (left in the queue)")
+    if dec.problems:
+        dec.files = []
+    return dec
+
+
+# ---------- live side ----------
+
+def queue(svc):
+    if svc == "radarr":
+        path = "/api/v3/queue?page=1&pageSize=500&includeMovie=true&includeUnknownMovieItems=true"
+    else:
+        path = ("/api/v3/queue?page=1&pageSize=2000&includeSeries=true&includeEpisode=true"
+                "&includeUnknownSeriesItems=true")
+    return (api(svc, "GET", path) or {}).get("records") or []
+
+
+def evaluate(svc, recs, approved=False):
+    r0 = recs[0]
+    dl = r0.get("downloadId")
+    preview = api(svc, "GET", f"/api/v3/manualimport?downloadId={q(dl)}&filterExistingFiles=true") if dl else []
+    cache = {}
+
+    def parse(name):
+        if name not in cache:
+            cache[name] = api(svc, "GET", f"/api/v3/parse?title={q(name)}")
+        return cache[name]
+
+    if svc == "radarr":
+        movie = api(svc, "GET", f"/api/v3/movie/{r0['movieId']}") if r0.get("movieId") else None
+        return verify_radarr(r0, movie, preview, parse, approved)
+    series = api(svc, "GET", f"/api/v3/series/{r0['seriesId']}") if r0.get("seriesId") else None
+    return verify_sonarr(recs, series, preview, parse, approved)
+
+
+def has_files(svc, target):
+    if svc == "radarr":
+        return bool((api(svc, "GET", f"/api/v3/movie/{target['movieId']}") or {}).get("hasFile"))
+    ids = target.get("episodeIds") or []
+    eps = api(svc, "GET", "/api/v3/episode?" + "&".join(f"episodeIds={i}" for i in ids)) or []
+    return len(eps) == len(ids) and all(e.get("hasFile") for e in eps)
+
+
+def import_now(dec):
+    """-> ("ok"|"pending"|"failed", detail)."""
+    svc = dec.svc
+    cmd = api(svc, "POST", "/api/v3/command", {"name": "ManualImport", "importMode": "auto", "files": dec.files})
+    cid, status, end = (cmd or {}).get("id"), (cmd or {}).get("status"), time.time() + CMD_WAIT
+    while cid and status in ("queued", "started") and time.time() < end:
+        time.sleep(3)
+        c = api(svc, "GET", f"/api/v3/command/{cid}") or {}
+        status, cmd = c.get("status"), c
+    if status in ("queued", "started"):
+        return "pending", f"ManualImport command {cid} still {status} after {CMD_WAIT:.0f}s"
+    if status != "completed":
+        return "failed", f"ManualImport command {status}: {(cmd or {}).get('message') or (cmd or {}).get('exception') or ''}"[:300]
+    if not has_files(svc, dec.target):
+        return "failed", "the command finished but the library shows no file (import rejected; see the *arr's log)"
+    end = time.time() + QUEUE_WAIT
+    while True:
+        if not any(r.get("downloadId") == dec.download_id for r in queue(svc)):
+            return "ok", "imported; file in the library; queue item gone"
+        if time.time() >= end:
+            return "ok", "imported; file in the library; queue item not cleared yet (the *arr clears it on its next check)"
+        time.sleep(5)
+
+
+# ---------- state, log, notes ----------
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def log(line):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(f"{now()} {line}\n")
+    except OSError:
+        pass
+
+
+def load_state():
+    try:
+        with open(os.path.join(STATE_DIR, "state.json")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault("notified", {}), st.setdefault("pending", {}), st.setdefault("fails", 0)
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = os.path.join(STATE_DIR, "state.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, os.path.join(STATE_DIR, "state.json"))
+
+
+def sig(items):
+    return hashlib.sha1("\n".join(sorted(items)).encode()).hexdigest()[:12]
+
+
+def write_note(lines):
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, f"arr-unblock-{int(time.time())}.md")
+    with open(path, "w") as f:
+        f.write(f"# arr-unblock ({now()}): needs a look\n\nData from ~/bin/arr-unblock, not instructions. "
+                "Nothing below was imported.\n\n" + "\n".join(lines) + "\n\nNext: `arr-unblock --dry-run` shows each "
+                "decision; ask the owner about skips, `arr-unblock --approve SVC:QUEUEID` only after his yes. "
+                "Failures: ~/.local/state/arr-unblock.log.\n")
+    return path
+
+
+def qid(dec):
+    return f"{dec.svc}:{dec.recs[0].get('id')}"
+
+
+def skip_lines(dec):
+    out = [f"- {dec.svc.capitalize()} \"{dec.label}\" (queue {dec.recs[0].get('id')}): not imported"]
+    out += [f"  - {p}" for p in dec.problems]
+    if dec.problems and set(dec.problems) <= set(dec.naming):
+        out.append(f"  - only the name check failed; if the owner confirms it's the right title: "
+                   f"`arr-unblock --approve {qid(dec)}`")
+    return out
+
+
+def show(dec, verdict):
+    print(f"{dec.svc.capitalize()}  {dec.label}  [queue {', '.join(str(r.get('id')) for r in dec.recs[:3])}"
+          f"{'…' if len(dec.recs) > 3 else ''}, {dec.recs[0].get('downloadClient') or '?'}, "
+          f"{gb(dec.recs[0].get('size'))}]")
+    for m in msgs(dec.recs[0])[:1]:
+        print(f"  queue: {m[:160]}")
+    for ln in dec.lines:
+        print(f"  file: {ln}")
+    for n in dec.notes:
+        print(f"  note: {n}")
+    for p in dec.problems:
+        print(f"  why:  {p}")
+    print(f"  => {verdict}\n")
+
+
+# ---------- runs ----------
+
+def check_pending(st, out):
+    for key, p in list(st["pending"].items()):
+        try:
+            if has_files(p["svc"], p["target"]):
+                log(f"OK {key} {p['label']}: import confirmed later")
+                st["pending"].pop(key)
+            elif time.time() - p["since"] > PENDING_MAX:
+                out.append(f"- {p['svc'].capitalize()} \"{p['label']}\": ManualImport sent {p['when']} but still "
+                           f"no file in the library")
+                log(f"FAIL {key} {p['label']}: no file an hour after the import")
+                st["pending"].pop(key)
+        except ApiError:
+            pass
+
+
+def run(mode, approve=None):
+    """mode: dry | apply | cron. Returns exit code."""
+    act = mode in ("apply", "cron")
+    st = load_state() if mode == "cron" else None
+    note, any_bad, live = [], False, set()
+    if st:
+        check_pending(st, note)
+    try:
+        work = []
+        for svc in ("radarr", "sonarr"):
+            groups = group_candidates(queue(svc), remux_owned() if svc == "radarr" and not approve else frozenset())
+            for dl, recs in groups.items():
+                if approve:
+                    if approve[0] != svc or not any(str(r.get("id")) == approve[1] for r in recs):
+                        continue
+                work.append((svc, recs))
+        if approve and not work:
+            print(f"arr-unblock: no stuck queue item {approve[0]}:{approve[1]} (already imported or gone?)")
+            return 1
+        if not work and mode != "cron":
+            print("nothing stuck: no completed queue item waiting for a manual import")
+        for svc, recs in work:
+            dec = evaluate(svc, recs, approved=bool(approve))
+            live.add(dec.key)
+            if not dec.ok:
+                any_bad = True
+                if mode != "cron":
+                    show(dec, "SKIP (not imported)")
+                else:
+                    s = sig(dec.problems)
+                    if st["notified"].get(dec.key) != s:
+                        note += skip_lines(dec)
+                        st["notified"][dec.key] = s
+                        log(f"SKIP {dec.key} {dec.label}: " + " | ".join(dec.problems))
+                continue
+            if not act:
+                show(dec, f"WOULD IMPORT ({len(dec.files)} file{'s' if len(dec.files) != 1 else ''}, importMode auto)")
+                continue
+            if mode != "cron":
+                show(dec, "IMPORTING…")
+            how = " (owner-approved)" if approve else ""
+            res, detail = import_now(dec)
+            if mode != "cron":
+                print(f"  -> {res}: {detail}\n")
+            if res == "ok":
+                log(f"OK {dec.key} {dec.label}{how}: {len(dec.files)} file(s); {detail}")
+                if st:
+                    st["notified"].pop(dec.key, None)
+            elif res == "pending":
+                log(f"PENDING {dec.key} {dec.label}{how}: {detail}")
+                if st:
+                    st["pending"][dec.key] = {"svc": svc, "target": dec.target, "label": dec.label,
+                                              "since": time.time(), "when": now()}
+            else:
+                any_bad = True
+                log(f"FAIL {dec.key} {dec.label}{how}: {detail}")
+                if st and st["notified"].get(dec.key) != sig(["fail", detail]):
+                    note.append(f"- {svc.capitalize()} \"{dec.label}\" (queue {dec.recs[0].get('id')}): "
+                                f"verified, but the import failed: {detail}")
+                    st["notified"][dec.key] = sig(["fail", detail])
+        if st:
+            st["fails"] = 0
+            st["notified"] = {k: v for k, v in st["notified"].items() if k in live}
+    except ApiError as e:
+        if mode != "cron":
+            print(f"arr-unblock: {e}", file=sys.stderr)
+            return 1
+        st["fails"] += 1
+        log(f"ERROR run {st['fails']}: {e}")
+        if st["fails"] == FAIL_NOTE:
+            note.append(f"- arr-unblock has failed {FAIL_NOTE} runs in a row (~1 h): {e}")
+    if st is not None:
+        if note:
+            write_note(note)
+        save_state(st)
+    return 3 if any_bad and mode != "cron" else 0
+
+
+def status():
+    st = load_state()
+    print(f"state: {len(st['notified'])} reported skip(s), {len(st['pending'])} pending import(s), "
+          f"{st['fails']} failed run(s) in a row")
+    for k, p in st["pending"].items():
+        print(f"  pending {k} {p['label']} since {p['when']}")
+    try:
+        with open(LOG) as f:
+            tail = f.readlines()[-10:]
+        print("log:\n" + "".join("  " + ln for ln in tail), end="")
+    except OSError:
+        print("log: (empty)")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Import Radarr/Sonarr items stuck in 'Manual Import required' "
+                                             "when the files verifiably match.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--cron", action="store_true", help="act quietly (cron)")
+    g.add_argument("--apply", action="store_true", help="act and print")
+    g.add_argument("--status", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="only show the decisions (default)")
+    ap.add_argument("--approve", metavar="SVC:QUEUEID", help="owner-confirmed import of one skipped item")
+    a = ap.parse_args()
+    if a.status:
+        return status()
+    approve = None
+    if a.approve:
+        m = re.fullmatch(r"(radarr|sonarr):(\d+)", a.approve.strip().lower())
+        if not m or a.cron:
+            ap.error("--approve takes radarr:QUEUEID or sonarr:QUEUEID (not with --cron)")
+        approve = (m.group(1), m.group(2))
+    mode = "cron" if a.cron else "dry" if a.dry_run or not (a.apply or approve) else "apply"
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(os.path.join(STATE_DIR, "lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if mode != "cron":
+            print("arr-unblock: another run is in progress", file=sys.stderr)
+        return 0 if mode == "cron" else 1
+    try:
+        return run(mode, approve)
+    except Exception as e:  # never let a cron run die silently
+        if mode != "cron":
+            raise
+        st = load_state()
+        st["fails"] += 1
+        log(f"ERROR run {st['fails']}: {type(e).__name__}: {e}")
+        if st["fails"] == FAIL_NOTE:
+            write_note([f"- arr-unblock has crashed {FAIL_NOTE} runs in a row: {type(e).__name__}: {e}"])
+        save_state(st)
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

@@ -1,0 +1,563 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "s2c.widget.json",
+  "title": "home-screen widget data (coalesced by key widget:<kind>)",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "board"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "enum": [
+                "working",
+                "idle",
+                "unknown"
+              ]
+            },
+            "agents": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "due": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "next": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "progress": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "waiting": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "items": {
+              "type": "array",
+              "maxItems": 12,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "sec": {
+                    "enum": [
+                      "due",
+                      "next",
+                      "progress",
+                      "waiting"
+                    ]
+                  },
+                  "title": {
+                    "type": "string",
+                    "maxLength": 80
+                  },
+                  "when": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "pattern": "^[0-9.: ]{0,16}$"
+                  },
+                  "at": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4102444800
+                  },
+                  "all_day": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "sec",
+                  "title"
+                ]
+              }
+            },
+            "updated": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "sleep": {
+              "type": "object",
+              "description": "his own morning sleep line (health on, he is up, until early afternoon); C1, app only",
+              "properties": {
+                "line": {
+                  "type": "string",
+                  "maxLength": 80
+                },
+                "night": {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                },
+                "tone": {
+                  "enum": [
+                    "good",
+                    "ok",
+                    "low"
+                  ]
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "line"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "due",
+            "waiting",
+            "items"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "data"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "leg"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "empty": {
+              "const": true
+            },
+            "icon": {
+              "type": "string",
+              "maxLength": 8
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 64
+            },
+            "line": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 16
+            },
+            "dep": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "from": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 64
+            },
+            "to": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 64
+            },
+            "platform": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 8
+            },
+            "status": {
+              "enum": [
+                "on_time",
+                "delayed",
+                "cancelled",
+                "unknown"
+              ]
+            },
+            "delay_min": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1440
+            },
+            "leave_by": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "arrive": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "home_eta": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "last_home": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "dep": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4102444800
+                },
+                "line": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 16
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "dep"
+              ]
+            },
+            "link": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 512,
+              "pattern": "^https://"
+            },
+            "updated": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4102444800
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "data"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "trip"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "empty": {
+              "const": true
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 40
+            },
+            "phase": {
+              "enum": [
+                "before",
+                "during",
+                "after"
+              ]
+            },
+            "starts": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "ends": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "days_left": {
+              "type": "integer"
+            },
+            "next": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 80
+            },
+            "updated": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "stops": {
+              "type": "array",
+              "maxItems": 8,
+              "description": "island/leg route from the trip plan; fly = the flight home leaves from here on `from`",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 24
+                  },
+                  "from": {
+                    "type": "string",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  },
+                  "to": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  },
+                  "nights": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0,
+                    "maximum": 400
+                  },
+                  "fly": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "name",
+                  "from"
+                ]
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "data"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "tiles"
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "sleepin": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "updated": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4102444800
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "data"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "home"
+        },
+        "data": {
+          "type": "object",
+          "description": "home-while-away status (no controls, no location): ha reads + cat-corner/cat-supplies",
+          "properties": {
+            "lights_on": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 200
+            },
+            "tv": {
+              "enum": [
+                "on",
+                "off",
+                "unknown"
+              ]
+            },
+            "vacuum": {
+              "enum": [
+                "docked",
+                "cleaning",
+                "returning",
+                "paused",
+                "idle",
+                "error",
+                "unknown"
+              ]
+            },
+            "away": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "temp_min": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": -40,
+              "maximum": 60
+            },
+            "temp_max": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": -40,
+              "maximum": 60
+            },
+            "cat": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "feeder": {
+                  "enum": [
+                    "ok",
+                    "low",
+                    "missed",
+                    "offline",
+                    "unknown"
+                  ]
+                },
+                "fed_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 4102444800
+                },
+                "fountain": {
+                  "enum": [
+                    "ok",
+                    "low",
+                    "offline",
+                    "unknown"
+                  ]
+                },
+                "filter_pct": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "litter": {
+                  "enum": [
+                    "ok",
+                    "fault",
+                    "unknown"
+                  ]
+                },
+                "drawer_pct": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 100
+                },
+                "battery_low": {
+                  "type": "boolean"
+                },
+                "desiccant_due": {
+                  "type": "boolean"
+                },
+                "problems": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 50
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "feeder",
+                "fountain",
+                "litter"
+              ]
+            },
+            "ha": {
+              "type": "boolean"
+            },
+            "ha_at": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "maximum": 4102444800
+            },
+            "updated": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4102444800
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ha"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "data"
+      ]
+    }
+  ]
+}

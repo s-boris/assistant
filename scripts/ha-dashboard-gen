@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""ha-dashboard-gen: build the owner's mobile Home Assistant dashboard from areas and entities.
+
+Creates/updates ONE storage dashboard (default url_path "home-mobile", title "Home") and never
+touches any other dashboard. Idempotent: rerun after adding lights or presence sensors.
+
+What it builds (one sections view, built-in cards only, no view badges):
+  top row   "Lights on" count (template helper) + "All lights off" (script.all_lights_off)
+            + "Warm & dim" (script.lights_warm_dim, only if HA has it; ha-apply writes it)
+  rooms     one section per area with lights, headed by a compact area card (room icon,
+            temperature + humidity, presence badge on the icon while someone is there,
+            one-tap room light toggle), then a row of that room's scene buttons
+            (tap = activate, hold = details) + one tile per light with a brightness
+            slider (tap = toggle, hold = details); unavailable lights/scenes stay hidden until back.
+            An area with a presence or temperature/humidity sensor but no lights gets a
+            header-only room section (shown while one of those sensors or its scenes is available).
+  scenes    every scene HA has, sorted by name; a scene whose area has no room section (or no
+            area) gets its button in a "Scenes" row under the top row
+  other     "Other lights": lights that have no area yet
+
+Dynamic without a rerun (built into the area card): presence badge, temperature, humidity and
+the room toggle pick up any new sensor/light assigned to an area that has a room section.
+A rerun is needed for: a new room section, a new light tile, a new scene.
+
+Usage:
+  ha-dashboard-gen              apply: create missing helpers/area icons, save if changed, verify
+  ha-dashboard-gen --dry-run    show the plan, write nothing
+  ha-dashboard-gen --print      print the generated dashboard JSON (writes nothing)
+  ha-dashboard-gen --force      overwrite although the dashboard was edited in the HA UI
+Options: --url-path P (default home-mobile)  --title T (default Home)
+         --no-helpers (don't create the script/template sensor)  --no-area-icons
+Exit: 0 ok/unchanged, 1 error, 2 refused (edited in the UI since the last run), 3 verify failed
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+
+HA_AUDIT = os.path.expanduser('~/bin/ha-audit')
+TOKEN_FILE = os.path.expanduser('~/.secrets/ha-admin-token')
+STATE_DIR = os.path.expanduser('~/.local/state/ha-dashboard-gen')
+PROTECTED = {'lovelace', 'map', 'dashboard-overview', 'home', 'energy', 'config', 'light',
+             'security', 'climate', 'maintenance'}
+
+SCRIPT_ID = 'all_lights_off'
+SCRIPT_CFG = {
+    'alias': 'All lights off',
+    'description': 'Turns off every light (used by the Home mobile dashboard).',
+    'icon': 'mdi:lightbulb-group-off-outline',
+    'mode': 'single',
+    'sequence': [{'action': 'light.turn_off', 'target': {'entity_id': 'all'}}],
+}
+WARM_SCRIPT = 'script.lights_warm_dim'  # optional top-row button; the script itself comes from ha-apply
+COUNT_NAME = 'Lights on'
+COUNT_TEMPLATE = ("{{ states.light | rejectattr('attributes.entity_id', 'defined')"
+                  " | selectattr('state', 'eq', 'on') | list | count }}")
+
+PRESENCE_CLASSES = ['occupancy', 'presence']
+HEADER_SENSORS = ['temperature', 'humidity']  # area card info line: averages per area
+HIDDEN_STATES = ['unavailable', 'unknown']
+
+# area name keyword -> icon (only used for areas without an icon); first match wins
+AREA_ICONS = [
+    (r'living|wohn|lounge|salon', 'mdi:sofa'),
+    (r'guest|gäste|gaeste', 'mdi:bed-outline'),
+    (r'bed|schlaf', 'mdi:bed'),
+    (r'kitchen|küche|kueche', 'mdi:countertop'),
+    (r'dining|esszimmer', 'mdi:table-chair'),
+    (r'office|büro|buero|study|arbeit', 'mdi:desk'),
+    (r'toilet|wc', 'mdi:toilet'),
+    (r'bath|bad|dusche|shower', 'mdi:shower'),
+    (r'hall|flur|gang|entr|corridor|diele', 'mdi:coat-rack'),
+    (r'stair|treppe', 'mdi:stairs'),
+    (r'balcon|balkon|terrace|terrasse|patio|veranda', 'mdi:balcony'),
+    (r'garden|garten', 'mdi:flower'),
+    (r'garage', 'mdi:garage'),
+    (r'laundry|wasch', 'mdi:washing-machine'),
+    (r'kid|kinder|child|nursery', 'mdi:teddy-bear'),
+    (r'storage|keller|basement|cellar|abstell', 'mdi:archive'),
+]
+# room order on the phone; unmatched areas follow, alphabetically
+AREA_ORDER = [r'living|wohn', r'kitchen|küche', r'bed|schlaf', r'office|büro', r'dining',
+              r'bath|bad|wc|toilet', r'hall|flur|entr', r'balcon|balkon|terrace|terrasse|garden']
+SHORT_MAKERS = {'Signify Netherlands B.V.': 'Hue', 'IKEA of Sweden': 'IKEA'}
+
+
+# ----------------------------------------------------------------------------- HA access
+def load_ha_audit():
+    ld = importlib.machinery.SourceFileLoader('ha_audit', HA_AUDIT)
+    spec = importlib.util.spec_from_loader('ha_audit', ld)
+    mod = importlib.util.module_from_spec(spec)
+    ld.exec_module(mod)
+    return mod
+
+
+WS_READ = {'get_states', 'get_config', 'config/area_registry/list', 'config/device_registry/list',
+           'config/entity_registry/list', 'config_entries/get', 'lovelace/dashboards/list',
+           'lovelace/config'}
+WS_WRITE = {'lovelace/dashboards/create', 'lovelace/config/save', 'config/area_registry/update'}
+
+
+def make_ws_guard(url_path):
+    def guard(msg_type, params):
+        if msg_type in WS_READ:
+            return
+        if msg_type not in WS_WRITE:
+            raise SystemExit(f'ha-dashboard-gen: websocket {msg_type!r} not allowed')
+        if msg_type.startswith('lovelace/') and params.get('url_path') != url_path:
+            raise SystemExit(f'ha-dashboard-gen: refusing to write dashboard {params.get("url_path")!r}')
+        if msg_type == 'config/area_registry/update' and set(params) != {'area_id', 'icon'}:
+            raise SystemExit('ha-dashboard-gen: area update may only set the icon')
+    return guard
+
+
+REST_POST_ALLOW = re.compile(
+    r'/api/config/script/config/' + SCRIPT_ID + r'|/api/config/config_entries/flow(?:/[0-9a-zA-Z]{8,64})?')
+
+
+def rest_post(base, token, path, body):
+    if not REST_POST_ALLOW.fullmatch(path):
+        raise SystemExit(f'ha-dashboard-gen: REST POST {path!r} not allowed')
+    req = urllib.request.Request(base.rstrip('/') + path, data=json.dumps(body).encode(), method='POST',
+                                 headers={'Authorization': 'Bearer ' + token,
+                                          'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read().decode() or 'null')
+
+
+# ----------------------------------------------------------------------------- helpers
+def natkey(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+def area_rank(name):
+    for i, pat in enumerate(AREA_ORDER):
+        if re.search(pat, name, re.I):
+            return (i, name.lower())
+    return (len(AREA_ORDER), name.lower())
+
+
+def icon_for_area(name):
+    for pat, icon in AREA_ICONS:
+        if re.search(pat, name, re.I):
+            return icon
+    return None
+
+
+def short_name(friendly, area_name):
+    n = friendly or ''
+    for long, short in SHORT_MAKERS.items():
+        if n.startswith(long):
+            n = short + n[len(long):]
+    if area_name and n.lower().startswith(area_name.lower()):
+        rest = n[len(area_name):].lstrip(' -:_')
+        if rest:
+            n = rest[0].upper() + rest[1:]
+    return n or friendly
+
+
+def visible_if_available(eid):
+    return {'condition': 'state', 'entity': eid, 'state_not': HIDDEN_STATES}
+
+
+def any_available(eids):
+    conds = [visible_if_available(e) for e in eids]
+    return conds if len(conds) == 1 else [{'condition': 'or', 'conditions': conds}]
+
+
+class Ctx:
+    def __init__(self, ws):
+        self.ws = ws
+        self.refresh()
+
+    def refresh(self):
+        ws = self.ws
+        self.areas = {a['area_id']: a for a in ws.call('config/area_registry/list')}
+        self.devices = {d['id']: d for d in ws.call('config/device_registry/list')}
+        self.ents = {e['entity_id']: e for e in ws.call('config/entity_registry/list')}
+        self.states = {s['entity_id']: s for s in ws.call('get_states')}
+
+    def area_of(self, eid):
+        e = self.ents.get(eid)
+        if not e:
+            return None
+        if e.get('area_id'):
+            return e['area_id']
+        d = self.devices.get(e.get('device_id'))
+        return d.get('area_id') if d else None
+
+    def usable(self, eid):
+        e = self.ents.get(eid)
+        return not (e and (e.get('disabled_by') or e.get('hidden_by') or e.get('entity_category')))
+
+
+# ----------------------------------------------------------------------------- helpers in HA
+def ensure_script(ctx, base, token, dry):
+    eid = 'script.' + SCRIPT_ID
+    if eid in ctx.states:
+        return eid, 'exists'
+    if dry:
+        return eid, 'would create'
+    rest_post(base, token, f'/api/config/script/config/{SCRIPT_ID}', SCRIPT_CFG)
+    for _ in range(20):
+        time.sleep(1)
+        if any(s['entity_id'] == eid for s in ctx.ws.call('get_states')):
+            return eid, 'created'
+    return None, 'created but not loaded (is scripts.yaml included?); button falls back to light.turn_off'
+
+
+def find_count_sensor(ctx):
+    for entry in ctx.ws.call('config_entries/get', domain='template'):
+        if entry.get('title') == COUNT_NAME:
+            for e in ctx.ents.values():
+                if e.get('config_entry_id') == entry['entry_id'] and e['entity_id'].startswith('sensor.'):
+                    return e['entity_id']
+    return None
+
+
+def ensure_count_sensor(ctx, base, token, dry):
+    eid = find_count_sensor(ctx)
+    if eid:
+        return eid, 'exists'
+    if dry:
+        return 'sensor.lights_on', 'would create (template helper)'
+    r = rest_post(base, token, '/api/config/config_entries/flow', {'handler': 'template', 'show_advanced_options': False})
+    fid = r['flow_id']
+    if r.get('type') == 'menu':
+        r = rest_post(base, token, f'/api/config/config_entries/flow/{fid}', {'next_step_id': 'sensor'})
+    if r.get('type') != 'form':
+        raise SystemExit(f'ha-dashboard-gen: template flow: unexpected step {r.get("type")}/{r.get("step_id")}')
+    keys = {f.get('name') for f in r.get('data_schema') or []}
+    data = {'name': COUNT_NAME, 'state': COUNT_TEMPLATE}
+    if 'state_class' in keys:
+        data['state_class'] = 'measurement'
+    data = {k: v for k, v in data.items() if k in keys}
+    r = rest_post(base, token, f'/api/config/config_entries/flow/{fid}', data)
+    if r.get('type') != 'create_entry':
+        raise SystemExit(f'ha-dashboard-gen: template flow did not create the sensor: {r.get("type")} {r.get("errors")}')
+    for _ in range(20):
+        time.sleep(1)
+        ctx.ents = {e['entity_id']: e for e in ctx.ws.call('config/entity_registry/list')}
+        eid = find_count_sensor(ctx)
+        if eid:
+            return eid, 'created'
+    return None, 'created but entity not found'
+
+
+def ensure_area_icons(ctx, dry):
+    done = []
+    for a in ctx.areas.values():
+        if a.get('icon'):
+            continue
+        icon = icon_for_area(a['name'])
+        if not icon:
+            continue
+        if not dry:
+            ctx.ws.call('config/area_registry/update', area_id=a['area_id'], icon=icon)
+            a['icon'] = icon
+        done.append(f"{a['name']} -> {icon}")
+    return done
+
+
+# ----------------------------------------------------------------------------- build
+def collect(ctx):
+    lights, presence = {}, {}
+    for eid, st in ctx.states.items():
+        dom = eid.split('.')[0]
+        if not ctx.usable(eid):
+            continue
+        attrs = st.get('attributes') or {}
+        if dom == 'light':
+            reg = ctx.ents.get(eid) or {}
+            if 'entity_id' in attrs or reg.get('platform') == 'group':
+                members = attrs.get('entity_id') or []
+                # a lamp made of bulbs: group shown as one tile when its member bulbs are hidden
+                if not (members and all((ctx.ents.get(m) or {}).get('hidden_by') for m in members)):
+                    continue  # other light groups: the room toggle covers them
+            lights.setdefault(ctx.area_of(eid), []).append(eid)
+        elif dom == 'binary_sensor':
+            reg = ctx.ents.get(eid) or {}
+            dc = reg.get('device_class') or reg.get('original_device_class') or attrs.get('device_class')
+            area = ctx.area_of(eid)
+            if dc in PRESENCE_CLASSES and area:
+                presence.setdefault(area, []).append(eid)
+    return lights, presence
+
+
+def collect_climate(ctx):
+    """Temperature/humidity sensors (the area card's info line) by area id."""
+    climate = {}
+    for eid, st in ctx.states.items():
+        if not eid.startswith('sensor.') or not ctx.usable(eid):
+            continue
+        reg = ctx.ents.get(eid) or {}
+        dc = reg.get('device_class') or reg.get('original_device_class') or (st.get('attributes') or {}).get('device_class')
+        area = ctx.area_of(eid)
+        if dc in HEADER_SENSORS and area:
+            climate.setdefault(area, []).append(eid)
+    return climate
+
+
+def collect_scenes(ctx):
+    """Every scene HA has (except disabled ones, which have no state), by area id (None = no area)."""
+    scenes = {}
+    for eid in ctx.states:
+        if eid.startswith('scene.') and not (ctx.ents.get(eid) or {}).get('disabled_by'):
+            scenes.setdefault(ctx.area_of(eid), []).append(eid)
+    return scenes
+
+
+def scene_buttons(ctx, eids):
+    """Compact scene buttons (icon + name, 4 per row), sorted by name; tap activates the scene."""
+    named = sorted((((ctx.states[e].get('attributes') or {}).get('friendly_name') or e), e) for e in eids)
+    named.sort(key=lambda t: natkey(t[0]))  # by name, ties by entity id
+    out = []
+    for name, eid in named:
+        icon = ((ctx.states[eid].get('attributes') or {}).get('icon')
+                or (ctx.ents.get(eid) or {}).get('icon') or 'mdi:palette')
+        out.append({'type': 'button', 'entity': eid, 'name': name, 'icon': icon,
+                    'show_name': True, 'show_icon': True, 'show_state': False,
+                    'tap_action': {'action': 'perform-action', 'perform_action': 'scene.turn_on',
+                                   'target': {'entity_id': eid}},
+                    'hold_action': {'action': 'more-info'},
+                    'grid_options': {'columns': 3, 'rows': 2},
+                    'visibility': [visible_if_available(eid)]})
+    return out
+
+
+def light_tile(ctx, eid, name):
+    st = ctx.states.get(eid) or {}
+    attrs = st.get('attributes') or {}
+    reg = ctx.ents.get(eid) or {}
+    tile = {'type': 'tile', 'entity': eid, 'name': name}
+    if not attrs.get('icon') and not reg.get('icon') and reg.get('platform') == 'wled':
+        tile['icon'] = 'mdi:led-strip-variant'
+    modes = attrs.get('supported_color_modes') or []
+    if any(mo != 'onoff' for mo in modes):
+        tile['features'] = [{'type': 'light-brightness'}]
+        tile['features_position'] = 'bottom'
+    tile['tap_action'] = {'action': 'toggle'}
+    tile['hold_action'] = {'action': 'more-info'}
+    tile['visibility'] = [visible_if_available(eid)]
+    return tile
+
+
+def light_tiles(ctx, eids, area_name):
+    named = [(short_name((ctx.states[e].get('attributes') or {}).get('friendly_name') or e, area_name), e)
+             for e in eids]
+    counts = {}
+    for n, _ in named:
+        counts[n] = counts.get(n, 0) + 1
+    out = []
+    for n, e in named:
+        if counts[n] > 1:
+            m = re.search(r'_(\d+)$', e)
+            n = f'{n} {m.group(1)}' if m else n
+        out.append((n, e))
+    out.sort(key=lambda t: natkey(t[0]))
+    return [light_tile(ctx, e, n) for n, e in out]
+
+
+def room_header(area_id, with_lights):
+    """Compact area card heading a room section: icon, name, temperature + humidity, a presence
+    badge on the icon while an occupancy/presence sensor of the area is on, and (rooms with
+    lights) the one-tap room light toggle."""
+    card = {'type': 'area', 'area': area_id, 'display_type': 'compact',
+            'alert_classes': PRESENCE_CLASSES, 'sensor_classes': HEADER_SENSORS}
+    if with_lights:
+        card['features'] = [{'type': 'area-controls', 'controls': ['light']}]
+        card['features_position'] = 'inline'
+    card['grid_options'] = {'columns': 12}
+    return card
+
+
+def room_areas(ctx, lights, presence, climate):
+    """Areas that get a room section, in phone order: every area with lights or a header sensor."""
+    areas = sorted(ctx.areas.values(), key=lambda a: area_rank(a['name']))
+    return [a for a in areas if lights.get(a['area_id']) or presence.get(a['area_id']) or climate.get(a['area_id'])]
+
+
+def build(ctx, title, count_eid, script_eid):
+    lights, presence = collect(ctx)
+    climate = collect_climate(ctx)
+    scenes = collect_scenes(ctx)
+    rooms = room_areas(ctx, lights, presence, climate)
+    room_ids = {a['area_id'] for a in rooms}
+
+    top = []
+    if count_eid:
+        top.append({'type': 'tile', 'entity': count_eid, 'name': 'Lights on', 'icon': 'mdi:lightbulb-group',
+                    'color': 'amber', 'grid_options': {'columns': 6}})
+    off_action = ({'action': 'perform-action', 'perform_action': 'script.turn_on', 'target': {'entity_id': script_eid}}
+                  if script_eid else
+                  {'action': 'perform-action', 'perform_action': 'light.turn_off', 'target': {'entity_id': 'all'}})
+    if script_eid:
+        top.append({'type': 'tile', 'entity': script_eid, 'name': 'All lights off',
+                    'icon': 'mdi:lightbulb-group-off-outline', 'hide_state': True, 'color': 'deep-orange',
+                    'tap_action': off_action, 'icon_tap_action': off_action, 'grid_options': {'columns': 6}})
+    else:
+        top.append({'type': 'button', 'name': 'All lights off', 'icon': 'mdi:lightbulb-group-off-outline',
+                    'show_state': False, 'tap_action': off_action, 'grid_options': {'columns': 6, 'rows': 1}})
+    if WARM_SCRIPT in ctx.states:
+        warm = {'action': 'perform-action', 'perform_action': 'script.turn_on', 'target': {'entity_id': WARM_SCRIPT}}
+        top.append({'type': 'tile', 'entity': WARM_SCRIPT, 'name': 'Warm & dim', 'icon': 'mdi:lightbulb-on-30',
+                    'hide_state': True, 'color': 'amber', 'tap_action': warm, 'icon_tap_action': warm,
+                    'grid_options': {'columns': 12}})
+    # scenes without a room section of their own: a row under the top row
+    loose = [e for area, eids in scenes.items() if area not in room_ids for e in eids]
+    if loose:
+        top.append({'type': 'heading', 'heading': 'Scenes', 'heading_style': 'subtitle',
+                    'icon': 'mdi:palette'})
+        top += scene_buttons(ctx, loose)
+    sections = [{'type': 'grid', 'cards': top}]
+
+    for a in rooms:
+        eids = lights.get(a['area_id']) or []
+        room_scenes = scenes.get(a['area_id'], [])
+        cards = [room_header(a['area_id'], bool(eids))]
+        cards += scene_buttons(ctx, room_scenes)
+        cards += light_tiles(ctx, eids, a['name'])
+        # rooms with lights: shown while a light is reachable; header-only rooms:
+        # while a presence or climate sensor or a scene is
+        shown = eids or sorted(presence.get(a['area_id'], []) + climate.get(a['area_id'], []), key=natkey) \
+            + sorted(room_scenes, key=natkey)
+        sections.append({'type': 'grid', 'cards': cards, 'visibility': any_available(shown)})
+
+    other = lights.get(None)
+    if other:
+        cards = [{'type': 'heading', 'heading': 'Other lights', 'heading_style': 'title',
+                  'icon': 'mdi:lightbulb-question-outline'}]
+        cards += light_tiles(ctx, other, None)
+        sections.append({'type': 'grid', 'cards': cards, 'visibility': any_available(other)})
+
+    view = {'title': title, 'path': 'home', 'icon': 'mdi:home', 'type': 'sections', 'max_columns': 3,
+            'sections': sections}
+    return {'title': title, 'views': [view]}
+
+
+# ----------------------------------------------------------------------------- verify
+def refs(obj, out):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == 'entity' and isinstance(v, str):
+                out['entities'].add(v)
+            elif k == 'entity_id':
+                for x in (v if isinstance(v, list) else [v]):
+                    if isinstance(x, str) and x != 'all':
+                        out['entities'].add(x)
+            elif k == 'area' and isinstance(v, str):
+                out['areas'].add(v)
+            else:
+                refs(v, out)
+    elif isinstance(obj, list):
+        for x in obj:
+            refs(x, out)
+    return out
+
+
+def verify(ctx, cfg):
+    r = refs(cfg, {'entities': set(), 'areas': set()})
+    missing = sorted(e for e in r['entities'] if e not in ctx.states)
+    missing += sorted('area:' + a for a in r['areas'] if a not in ctx.areas)
+    return r, missing
+
+
+def digest(cfg):
+    return hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()
+
+
+def presence_rooms(ctx):
+    """Names of the rooms whose header shows presence (for the run summary)."""
+    lights, presence = collect(ctx)
+    return [a['name'] for a in room_areas(ctx, lights, presence, collect_climate(ctx)) if presence.get(a['area_id'])]
+
+
+def summarize(cfg):
+    v = cfg['views'][0]
+    lines = []
+    for s in v['sections']:
+        c = s['cards']
+        head = c[0].get('area') or c[0].get('heading') or 'top row'
+        tiles = [x.get('name') for x in c if x.get('type') == 'tile' and x.get('entity', '').startswith('light.')]
+        extra = [x.get('name') for x in c if x.get('type') in ('tile', 'button')
+                 and not x.get('entity', '').startswith(('light.', 'scene.'))]
+        scn = [x.get('name') for x in c if x.get('entity', '').startswith('scene.')]
+        lines.append(f"section {head}: {', '.join(tiles + extra) or '(header only)'}" + (f"; scenes: {', '.join(scn)}" if scn else ''))
+    return lines
+
+
+# ----------------------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--url-path', default='home-mobile')
+    ap.add_argument('--title', default='Home')
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--print', dest='print_json', action='store_true')
+    ap.add_argument('--force', action='store_true')
+    ap.add_argument('--no-helpers', action='store_true')
+    ap.add_argument('--no-area-icons', action='store_true')
+    a = ap.parse_args(argv)
+    dry = a.dry_run or a.print_json
+    if a.url_path in PROTECTED or '-' not in a.url_path:
+        raise SystemExit(f'ha-dashboard-gen: url path {a.url_path!r} not allowed (needs a "-", not a built-in)')
+
+    m = load_ha_audit()
+    m.check_ws = make_ws_guard(a.url_path)
+    token = m.read_token(TOKEN_FILE)
+    base = m.DEFAULT_URL
+    ws = m.WSClient(base, token)
+    try:
+        ctx = Ctx(ws)
+        icons = [] if a.no_area_icons else ensure_area_icons(ctx, dry)
+        if a.no_helpers:
+            script_eid = 'script.' + SCRIPT_ID if 'script.' + SCRIPT_ID in ctx.states else None
+            count_eid, count_note, script_note = find_count_sensor(ctx), 'skipped', 'skipped'
+        else:
+            script_eid, script_note = ensure_script(ctx, base, token, dry)
+            count_eid, count_note = ensure_count_sensor(ctx, base, token, dry)
+        if not dry:
+            ctx.refresh()
+        cfg = build(ctx, a.title, count_eid, script_eid)
+        if a.print_json:
+            print(json.dumps(cfg, indent=1))
+            return 0
+
+        dashes = {d['url_path']: d for d in ws.call('lovelace/dashboards/list')}
+        exists = a.url_path in dashes
+        try:
+            live = ws.call('lovelace/config', url_path=a.url_path, force=False) if exists else None
+        except m.HAError:
+            live = None
+        os.makedirs(STATE_DIR, exist_ok=True)
+        state_file = os.path.join(STATE_DIR, a.url_path + '.json')
+        last = None
+        if os.path.exists(state_file):
+            with open(state_file) as fh:
+                last = json.load(fh).get('digest')
+        edited = live is not None and digest(live) != last
+        changed = live is None or digest(live) != digest(cfg)
+
+        print(f"dashboard /{a.url_path} ({'exists' if exists else 'new'}): {'changes' if changed else 'unchanged'}")
+        print(f"script: {script_eid or '-'} ({script_note}); count: {count_eid or '-'} ({count_note})")
+        if icons:
+            print(('would set' if dry else 'set') + ' area icons: ' + '; '.join(icons))
+        print(f"  presence in room headers: {', '.join(presence_rooms(ctx)) or '-'}")
+        for line in summarize(cfg):
+            print('  ' + line)
+        if dry:
+            if edited and changed:
+                print('note: live dashboard differs from the last generated one (edited in the UI?); apply needs --force')
+            return 0
+        if edited and changed and not a.force:
+            print('REFUSED: the live dashboard was changed outside this tool since the last run; '
+                  'check it, then rerun with --force to overwrite')
+            return 2
+
+        if not exists:
+            ws.call('lovelace/dashboards/create', url_path=a.url_path, title=a.title, icon='mdi:home',
+                    show_in_sidebar=True, require_admin=False)
+        if changed:
+            ws.call('lovelace/config/save', url_path=a.url_path, config=cfg)
+        back = ws.call('lovelace/config', url_path=a.url_path, force=False)
+        if digest(back) != digest(cfg):
+            print('VERIFY FAILED: saved config does not read back identically')
+            return 3
+        ctx.refresh()
+        r, missing = verify(ctx, back)
+        tmp = state_file + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump({'digest': digest(back), 'saved_at': time.strftime('%Y-%m-%d %H:%M:%S')}, fh)
+        os.replace(tmp, state_file)
+        print(f"verified: {len(r['entities'])} entities, {len(r['areas'])} areas referenced; "
+              f"missing: {', '.join(missing) if missing else 'none'}")
+        print(f"url: {base.rstrip('/')}/{a.url_path}/home")
+        return 3 if missing else 0
+    finally:
+        ws.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Stand-in for ~/bin/vault in the mail-migration-check tests. FAKE_MODE: old (no gmail.compare op), ok, running,
+fail, refused. Every call is appended to $FAKE_LOG as one JSON line (argv)."""
+import json
+import os
+import re
+import sys
+
+a = sys.argv[1:]
+with open(os.environ['FAKE_LOG'], 'a') as f:
+    f.write(json.dumps(a) + '\n')
+mode = os.environ.get('FAKE_MODE', 'ok')
+JID = 'abcdef0123456789'
+if a[:1] == ['--async']:
+    if mode == 'old':
+        sys.stderr.write('vault: op must be one of: answer, find, gmail.facts, gmail.get, gmail.search, llm.run '
+                         '(raw, secret, console and write routes can never be jobs)\n')
+        sys.exit(2)
+    if mode == 'refused':
+        sys.stderr.write("vault: no Gmail account 'nope' in the vault (accounts: main, personal)\n")
+        sys.exit(2)
+    print(JID)
+    sys.stderr.write(f'vault: job {JID} started (queued). Wait: vault job wait {JID} [--max 230]\n')
+    sys.exit(0)
+if a[:2] == ['job', 'wait']:
+    if mode == 'running':
+        sys.stderr.write(f'vault: job {a[2]} still running\n')
+        sys.exit(12)
+    if mode == 'fail':
+        sys.stderr.write(f'vault: job {a[2]} failed: Gmail IMAP failed\n')
+        sys.exit(3)
+    with open(os.environ['FAKE_RESULT']) as f:
+        res = json.load(f)
+    print(json.dumps({'id': a[2], 'op': 'gmail.compare', 'state': 'done', 'result': res}))
+    sys.exit(0)
+if a[:2] == ['gmail', 'search']:
+    y = int(re.search(r'after:(\d{4})', a[2]).group(1))
+    acc = a[a.index('--account') + 1]
+    if mode == 'old' and y == 2016 and acc == 'personal':
+        sys.stderr.write('vault: Gmail IMAP failed\n')
+        sys.exit(3)
+    n = {'main': 100 + y - 2000, 'personal': (0 if y < 2018 else 90)}.get(acc, 0)
+    print(json.dumps({'count': 1, 'total': n, 'hits': [{'ref': f'{acc}:1', 'from': 'Someone (x.example)'}]}))
+    sys.exit(0)
+sys.stderr.write('fake-vault: unexpected call\n')
+sys.exit(2)

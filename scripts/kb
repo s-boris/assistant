@@ -1,0 +1,234 @@
+#!/usr/local/bin/python3.13 -I
+"""kb: ask everything I know and built; cited sources from recall's index + the memory2 fact store (token-free).
+
+  kb ask "question" [-n 6] [--chat] [--since YYYY-MM-DD] [--json]
+      settled facts first (FACTS.md facts + done/declined ledger, auto-memory, reviewed auto facts), then the best
+      passages from my notes, reports, skills, agents, ~/bin script headers and ~/opt git logs, each with a
+      citation (path:line, repo@hash, chat/owner tg#ID). I compose the answer from these (skill kb) and quote the
+      citations; `recall --show ID -C 2` opens a passage. --chat adds conversation hits (owner turns, my replies).
+  kb eval [--engine kb|recall|facts|all] [-k 5] [--json] [--misses]
+      the labelled retrieval set (~/.config/memory2/eval.json, private, never synced): hit@1/3/5, MRR and latency
+      per engine (recall = plain `recall -n 10`; kb = facts + passages; facts = what the per-turn hook injects).
+Retrieval = recall's search_hits() (FTS5 + EmbeddingGemma fusion; the shared embedding server when up) +
+memory2_core.search(); max 2 passages per file; a passage equal to a returned fact's line is dropped.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import re
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
+sys.path.append(os.path.join(os.path.expanduser("~"), "bin", "lib"))
+import memory2_core as core  # noqa: E402
+
+RECALL_BIN = os.environ.get("MEMORY2_RECALL") or os.path.join(os.path.expanduser("~"), "bin", "recall")
+EVAL = os.environ.get("KB_EVAL") or os.path.join(core.CONF, "eval.json")
+_REC = None
+
+
+def rec():
+    global _REC
+    if _REC is None:
+        loader = importlib.machinery.SourceFileLoader("recall_mod", RECALL_BIN)
+        spec = importlib.util.spec_from_loader("recall_mod", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _REC = mod
+    return _REC
+
+
+def recall_db():
+    r = rec()
+    fresh = not os.path.exists(r.DB)
+    db = r.connect()
+    try:
+        if fresh or r.now() - float(r.meta(db, "last_index", "0")) > r.STALE_SECS:
+            r.index(db, block=fresh)
+    except Exception:
+        pass   # another indexer runs, or a refresh failed: search what is there
+    return db
+
+
+def qvec(q):
+    try:
+        return core.embed([core.query_text(q)], timeout=3)[0]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def passages(db, q, n, chat=False, since=None, lexical=False):
+    r = rec()
+    ns = argparse.Namespace(query=q, n=min(r.MAX_HITS, max(n * 2, 10)), src="all" if chat else "md", since=since,
+                            raw=False, lexical=lexical, by_date=False)
+    try:
+        hits = r.search_hits(db, ns)
+    except SystemExit:
+        return []
+    out, per = [], {}
+    terms = core.terms_of(q)
+    for id_, date, src, role, path, loc, snip in hits:
+        if per.get(path, 0) >= 2:
+            continue
+        per[path] = per.get(path, 0) + 1
+        row = db.execute("SELECT head, body FROM fts WHERE rowid=?", (id_,)).fetchone()
+        body = row[1] if row else snip
+        out.append(dict(id=id_, date=date, cite=r.where(path, src, role, loc), head=(row[0] if row else ""),
+                        text=core.focus(body, terms, 260)))
+        if len(out) >= n:
+            break
+    return out
+
+
+def facts(q, k=3, v=None):
+    if not os.path.exists(core.DB):
+        return []
+    con = core.connect(ro=True)
+    try:
+        hits = core.search(con, q, k=k, qvec=v)
+    finally:
+        con.close()
+    terms = core.terms_of(q)
+    return [dict(id=r["id"], label=core.label(r), cite=cite(r["source"]), text=core.focus(r["text"], terms, 260),
+                 cos=round(r["cos"], 3)) for _, r in hits]
+
+
+def cite(source):
+    """Fact sources in recall's form (paths relative to HOME): FACTS.md:N -> workspace/FACTS.md:N."""
+    s = source or "?"
+    return "workspace/" + s if s.startswith(("FACTS.md:", "FACTS.md ")) else s
+
+
+def ask(q, n=6, chat=False, since=None, lexical=False):
+    t0 = time.time()
+    db = recall_db()
+    v = None if lexical else qvec(q)
+    fs = facts(q, 3, v)
+    fcites = {f["cite"] for f in fs}
+    ps = [p for p in passages(db, q, n + len(fs), chat, since, lexical) if p["cite"] not in fcites][:n]
+    return dict(query=q, facts=fs, passages=ps, ms=int((time.time() - t0) * 1000))
+
+
+def render(res):
+    lines = ['kb: %d facts + %d passages for "%s" (%.1f s) · answer from these, cite them; recall --show ID -C 2'
+             % (len(res["facts"]), len(res["passages"]), res["query"], res["ms"] / 1000)]
+    for i, f in enumerate(res["facts"], 1):
+        lines.append("F%d [%s] %s (%s)" % (i, f["label"], f["text"], f["cite"]))
+    for p in res["passages"]:
+        lines.append("#%d %s %s  %s" % (p["id"], p["date"], p["cite"], p["text"]))
+    if not res["facts"] and not res["passages"]:
+        lines.append("no sources found: say so (don't guess); try other words or `recall --src all`")
+    return "\n".join(lines)
+
+
+def log_usage(ms, n, outcome):
+    try:
+        import usage
+        usage.log("bin.kb", "run", channel="session", ms=ms, outcome=outcome, attrs={"sources": n})
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ eval
+
+def rank_of(cites, expect):
+    for i, c in enumerate(cites, 1):
+        if any(c.startswith(e) or ("/" + e) in c or c.split(":")[0].endswith(e) or c.split("@")[0] == e
+               for e in expect):
+            return i
+    return None
+
+
+def summary(ranks, ms):
+    n = len(ranks) or 1
+    at = lambda k: round(sum(1 for r in ranks if r and r <= k) / n, 3)  # noqa: E731
+    s = sorted(ms) or [0]
+    return {"n": len(ranks), "hit@1": at(1), "hit@3": at(3), "hit@5": at(5),
+            "mrr": round(sum(1.0 / r for r in ranks if r) / n, 3), "p50_ms": s[len(s) // 2],
+            "p95_ms": s[min(len(s) - 1, int(len(s) * 0.95))]}
+
+
+def run_eval(engines, k=5, misses=False):
+    items = json.load(open(EVAL))["items"]
+    os.environ["USAGE"] = "off"              # eval runs are not usage
+    os.environ["MEMORY2_HOOK_NOLOG"] = "1"   # ... nor hook latency samples
+    db = recall_db()
+    r = rec()
+    out = {}
+    for eng in engines:
+        ranks, ms, miss, newr = [], [], [], []
+        pool = [i for i in items if i.get("fact")] if eng == "facts" else items
+        injected = []
+        for it in pool:
+            t0 = time.time()
+            if eng == "recall":
+                ns = argparse.Namespace(query=it["q"], n=10, src="all", since=None, raw=False, lexical=False,
+                                        by_date=False)
+                cites = [r.where(h[4], h[2], h[3], h[5]) for h in r.search_hits(db, ns)]
+                rk = rank_of(cites, it["expect"])
+            elif eng == "kb":
+                res = ask(it["q"], n=8)
+                cites = [f["cite"] for f in res["facts"]] + [p["cite"] for p in res["passages"]]
+                rk = rank_of(cites, it["expect"])
+            else:   # facts: exactly the hook's path (shared embedder, floor, k=4)
+                buf = io.StringIO()
+                os.environ["MEMORY2_HOOK_CWD"] = core.WORKSPACE
+                core.hook_main(io.StringIO(json.dumps({"prompt": it["q"], "cwd": core.WORKSPACE})), buf)
+                ctx = json.loads(buf.getvalue())["hookSpecificOutput"]["additionalContext"] if buf.getvalue() else ""
+                lines = [x for x in ctx.split("\n")[1:] if x.startswith("- ")]
+                injected.append(len(lines))
+                want = it["fact"] if isinstance(it["fact"], list) else [it["fact"]]
+                rk = next((i for i, x in enumerate(lines, 1) if any(w.lower() in x.lower() for w in want)), None)
+                cites = lines
+            ms.append(int((time.time() - t0) * 1000))
+            ranks.append(rk)
+            if it.get("new"):
+                newr.append(rk)
+            if misses and (rk is None or rk > 1):
+                miss.append({"q": it["q"], "rank": rk, "top": cites[:3]})
+        s = summary(ranks, ms)
+        if newr:
+            s["new_sources_hit@5"] = round(sum(1 for x in newr if x and x <= 5) / len(newr), 3)
+        if injected:
+            s["avg_lines_injected"] = round(sum(injected) / len(injected), 2)
+        if misses:
+            s["misses"] = miss
+        out[eng] = s
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="kb", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["ask", "eval"])
+    ap.add_argument("query", nargs="*")
+    ap.add_argument("-n", type=int, default=6)
+    ap.add_argument("-k", type=int, default=5)
+    ap.add_argument("--chat", action="store_true")
+    ap.add_argument("--since")
+    ap.add_argument("--lexical", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--engine", default="all", choices=["kb", "recall", "facts", "all"])
+    ap.add_argument("--misses", action="store_true")
+    a = ap.parse_args(argv)
+    if a.cmd == "eval":
+        eng = ["recall", "kb", "facts"] if a.engine == "all" else [a.engine]
+        res = run_eval(eng, a.k, a.misses)
+        print(json.dumps(res, ensure_ascii=False, indent=None if a.json else 1))
+        return 0
+    q = " ".join(a.query).strip()
+    if not q:
+        ap.error("a question is needed")
+    res = ask(q, max(1, min(a.n, 20)), a.chat, a.since, a.lexical)
+    n = len(res["facts"]) + len(res["passages"])
+    log_usage(res["ms"], n, "ok" if n else "empty")
+    print(json.dumps(res, ensure_ascii=False) if a.json else render(res))
+    return 0 if n else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

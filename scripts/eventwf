@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""eventwf: event windows as durable hub clocks: nights out, parties, drives and sleep-in mornings run their jobs
+only while the window is open, with no every-minute cron polling (token-free; no message of its own).
+
+  eventwf status [--json]                       per kind: the windows now and ahead, the hub's clocks
+  eventwf windows [--kind K] [--json]           the windows the scripts' own rules give now and within 26 h (read-only)
+  eventwf sync [--kind K] [--json]              start the hub clocks (workflow event.window) of the open and upcoming
+                                                windows of every kind; cancel the clocks whose window is gone or
+                                                moved. A hub schedule (registry job eventwf-sync, */5)
+  eventwf tick KIND KEY --at EPOCH [--json]     the clock's call each minute (= tool workflow.window): window gone ->
+                                                "gone"; over (or ended early) -> "done"; else "active" and the
+                                                registry jobs of KIND whose cron matches that minute, started detached
+                                                (ticks.jsonl keeps a row per tick)
+  eventwf open KIND KEY --minutes N             open a window from an event (a drive start from the phone adapter or
+                                                HA; any kind), now until N min (1-720) from now, then sync
+  eventwf fallback [--kind K] [--after S] [--json] [--cron]
+                                                the brain's own clock while the hub's is silent (registry keeper
+                                                eventwf-fallback: `keepers ensure`, every minute, no cron line of
+                                                its own). Per kind with a window open: healthy (the hub's
+                                                clock ticked the last slot) -> nothing; no tick for that slot -> one
+                                                /health probe: hub down -> it runs the due jobs itself; hub up -> it
+                                                waits until no tick for the kind's `every` + S (default 120: 3 min
+                                                for a night, 7 for a sleep-in morning) -> stale, it runs them. It
+                                                runs each job's latest due slot (within 2 min) through the ticks'
+                                                slot ledger, so a slot runs once whoever comes first (the hub
+                                                recovering late, a probe blip); it starts the jobs detached as a
+                                                tick does (ticks.jsonl rows with src fallback)
+  eventwf run-job NAME --slot EPOCH             (internal) one registry job as workflow.job runs it (cron's env, its
+                                                log, cron-fail's failure streak + usage row); a tick starts it
+Kinds and their registry jobs (core/schedules.toml, runs_on window):
+  night    event-card (*/2), lastcall (*/2), battery-guard (1-59/2); window = event-card's night (first leg - 90 min
+           until the later of 04:45 and the last leg's arrival + 15 min; rave-only nights from the day itself), kept
+           open while that night's recap is pinned; ended early when event-card closed the night (home) and no recap
+  party    party-tick (every minute, its own 55 s loop); window = party's state (started until its end + 10 min)
+  drive    drive-brief (every minute); windows = drive-watch's planned car trips (leave - 30 min until arrival + 30
+           min) and drives opened by an event (`eventwf open drive KEY --minutes N`: vault-events opens one per HA
+           drive start, the vault feed drive-brief reads, and shortens it at the drive's end)
+  sleepin  sleepin-flush (*/5); window = a guarded morning by sleepin's own rules (06:00 his time until the guard's end
+           + 15 min; a place-based guard from the moment sleepin sees it); done once it ended and the queue is empty
+The scripts are the authority: each one checks its own window (cheap exit outside), so a tick at the edge is
+harmless; the clock only decides when they are polled. Several windows of one kind, the hub's clock and the fallback
+never run a job twice for one slot: each claims it in the slot ledger first (ran.json).
+Files: ~/.local/state/eventwf/ (0700): ticks.jsonl (one row per tick: kind, key hash, slot, due jobs, decision; no
+titles; the fallback's rows carry src "fallback" + why hub-down | stale), clocks.json (started clocks), state.json
+(last sync counts), ran.json (last slot per job), opened.json, fallback.json (its last check).
+Env (tests): EVENTWF_STATE, EVENTWF_NOW (epoch), EVENTWF_WINDOWS (JSON file {kind: [{key, start, end,
+closed?}]} replacing the window sources), ASSISTANT_SCHEDULES (the registry), EVENTWF_SPAWN=inline (jobs in-process),
+EVENTWF_EVENT_CARD, EVENTWF_SLEEPIN, EVENTWF_PARTY_STATE, EVENTWF_DRIVE_WATCH, EVENTWF_LOGS (dir holding party/);
+HUB_URL / HUB_TOKEN_FILE (core.hub).
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+_here = os.path.dirname(os.path.realpath(__file__))
+try:
+    _pw_home = pwd.getpwuid(os.getuid()).pw_dir
+except KeyError:  # a uid without a passwd entry (the hub's CI runner): no real home's lib
+    _pw_home = '/nonexistent-home'
+for _lib in (os.path.join(_pw_home, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import jsonstate, locks, schedules  # noqa: E402
+
+HOME = os.path.expanduser('~')
+UTC = UTC
+STATE = os.environ.get('EVENTWF_STATE') or os.path.join(HOME, '.local/state/eventwf')
+TICKS = os.path.join(STATE, 'ticks.jsonl')
+CLOCKS = os.path.join(STATE, 'clocks.json')
+SYNC_STATE = os.path.join(STATE, 'state.json')
+RAN = os.path.join(STATE, 'ran.json')
+OPENED = os.path.join(STATE, 'opened.json')
+FALLBACK = os.path.join(STATE, 'fallback.json')
+LOCK = os.path.join(STATE, 'lock')
+LOGS = os.environ.get('EVENTWF_LOGS') or os.path.join(HOME, '.local/state')
+KINDS = {
+    'night': {'jobs': ('event-card', 'lastcall', 'battery-guard'), 'every': 60},
+    'party': {'jobs': ('party-tick',), 'every': 60},
+    'drive': {'jobs': ('drive-brief',), 'every': 60},
+    'sleepin': {'jobs': ('sleepin-flush',), 'every': 300},
+}
+HORIZON = 26 * 3600          # clocks exist for windows starting within this; the */5 sync adds the later ones
+SPAN_MAX = 48 * 3600         # the hub's limit for one window (event.window's EVW_SPAN_MAX)
+NIGHT_CAP = 20 * 3600        # a night's clock may run this long after its window (a pinned recap until the evening)
+KEEP_DAYS = 30
+WID_RE = re.compile(r'evw:(night|party|drive|sleepin):([0-9a-f]{12}):(\d{12})(?::[2-9])?')
+FB_AFTER = 120               # fallback: a clock silent for the kind's `every` + this is stale (hub up or not)
+FB_GRACE = 20                # a slot's hub tick lands by slot + this (event.window's EVW_PAD + the gateway)
+FB_LOOK = 120                # the fallback runs a job's latest due slot within this (a skipped keepers minute)
+
+
+class Fail(Exception):
+    pass
+
+
+# ------------------------------------------------------------------------------------------------ basics
+def now_ts():
+    v = os.environ.get('EVENTWF_NOW')
+    return float(v) if v else time.time()
+
+
+def registry():
+    return schedules.load()                             # ASSISTANT_SCHEDULES (tests) or the installed registry
+
+
+def home_tz():
+    try:
+        return ZoneInfo(registry().tz)
+    except Exception:
+        return UTC
+
+
+def load(path, default):
+    v = jsonstate.load(path, default)
+    return v if isinstance(v, type(default)) else default
+
+
+def save(path, obj):
+    jsonstate.save(path, obj, mode=0o600, dir_mode=0o700)
+
+
+def jl_append(path, row):
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps(row, ensure_ascii=False) + '\n').encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def jl_read(path, since=0.0):
+    out = []
+    try:
+        with open(path) as f:
+            for ln in f:
+                try:
+                    d = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and (d.get('t') or 0) >= since:
+                    out.append(d)
+    except OSError:
+        pass
+    return out
+
+
+def jl_tail(path, since=0.0, nbytes=256 << 10):
+    """jl_read of the file's last nbytes only (the fallback reads the recent ticks every minute)."""
+    try:
+        with open(path, 'rb') as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - nbytes))
+            lines = f.read().split(b'\n')
+    except OSError:
+        return []
+    out = []
+    for ln in lines[1:] if size > nbytes else lines:    # the first line of a tail may be cut
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and (d.get('t') or 0) >= since:
+            out.append(d)
+    return out
+
+
+def jl_prune(path):
+    try:
+        if os.path.getsize(path) < 1 << 20:
+            return
+        keep = jl_read(path, now_ts() - KEEP_DAYS * 86400)
+        tmp = path + '.tmp'
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.writelines(json.dumps(d, ensure_ascii=False) + '\n' for d in keep)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def khash(key):
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def wid_of(kind, key, start):
+    """The hub's canonical id (hubwf.window_wid): evw:<kind>:<12 hex of sha256(key)>:<start minute, UTC>."""
+    return f"evw:{kind}:{khash(key)}:{datetime.fromtimestamp(start, UTC).strftime('%Y%m%d%H%M')}"
+
+
+def cron_match(cron, ts, tz):
+    """Does the 5-field cron fire in the minute of instant ts (wall time in tz)? Day-of-month/-week as cron ORs them."""
+    w = datetime.fromtimestamp(ts, tz)
+    f = cron.split()
+    vals = [schedules._values(f[0], 0, 59), schedules._values(f[1], 0, 23), schedules._values(f[2], 1, 31),
+            schedules._values(f[3], 1, 12), schedules._values(f[4], 0, 7)]
+    if any(v is None for v in vals):
+        return False
+    mi, hr, dom, mon, dow = vals
+    dow = {0 if x == 7 else x for x in dow}
+    if w.minute not in mi or w.hour not in hr or w.month not in mon:
+        return False
+    wd = (w.weekday() + 1) % 7
+    star_dom, star_dow = f[2] == '*', f[4] == '*'
+    if star_dom or star_dow:
+        return (w.day in dom) and (wd in dow)
+    return w.day in dom or wd in dow
+
+
+def module(env, default, name):
+    path = os.environ.get(env) or os.path.join(HOME, 'bin', default)
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    return m
+
+
+def iso_ts(v):
+    try:
+        d = datetime.fromisoformat(str(v))
+    except (TypeError, ValueError):
+        return None
+    return (d if d.tzinfo else d.replace(tzinfo=home_tz())).timestamp()
+
+
+# ------------------------------------------------------------------------------------------------ window sources
+# Each returns [{key, start, end, cap, closed}] (epoch s), or None when the source could not be read (sync then
+# leaves that kind's clocks alone, and a tick fails open: the scripts gate themselves).
+
+def night_windows(t):
+    ec = module('EVENTWF_EVENT_CARD', 'event-card', 'eventwf_event_card')
+    now = datetime.fromtimestamp(t, ec.TZ)
+    events = ec.load_events()
+    nights = {}
+    for rc in (False, True):
+        for n in ec.find_nights(events, now, rave_check=rc):
+            nights.setdefault(n['key'], n)
+    st = ec.load_state()
+    rc = st.get('recap') if isinstance(st.get('recap'), dict) else {}
+    done = st.get('done') if isinstance(st.get('done'), dict) else {}
+    out = []
+    for key, n in nights.items():
+        start, end = n['start'].timestamp(), n['end'].timestamp()
+        recap = rc.get('night') == key and iso_ts(rc.get('until'))
+        if recap:
+            end = max(end, recap + 300)
+        if end <= t - 60:
+            continue
+        cap = min(start + SPAN_MAX, max(end, n['end'].timestamp() + NIGHT_CAP))
+        closed = key in done and not recap
+        out.append({'key': key, 'start': start, 'end': end, 'cap': cap, 'closed': bool(closed)})
+    return out
+
+
+def sleepin_windows(t):
+    si = module('EVENTWF_SLEEPIN', 'sleepin', 'eventwf_sleepin')
+    inp = si.Inputs()
+    now = datetime.fromtimestamp(t, UTC)
+    today = si.his(now).date()
+    v = si.verdict(now, inp)
+    queued = len(si.read_state(si.QUEUE, []))
+    out = []
+    for d in (today, today + timedelta(days=1)):
+        srcs = si.sources(d, inp, with_place=(d == today))
+        if not srcs or (inp.holds.get(d.isoformat()) or {}).get('off'):
+            continue
+        start = si.wall(d, si.START).timestamp()
+        until = si.guard_until(d, srcs).timestamp()
+        end = until + 900
+        over = v['date'] == d and (v['ended'] or t >= until) and not queued
+        out.append({'key': d.isoformat(), 'start': start, 'end': max(end, start + 60), 'cap': until + 3 * 3600,
+                    'closed': bool(over)})
+    if queued and not any(w['start'] <= t < w['cap'] for w in out):
+        out.append({'key': 'queue-' + today.isoformat(), 'start': t, 'end': t + 3600, 'cap': t + 3 * 3600,
+                    'closed': False})                     # held sends left over (retries): flush until empty
+    return out
+
+
+def party_windows(t):
+    p = os.environ.get('EVENTWF_PARTY_STATE') or os.path.join(LOGS, 'party', 'state.json')
+    st = load(p, {})
+    started, until = st.get('started'), st.get('until')
+    if not st or not isinstance(started, (int, float)) or not isinstance(until, (int, float)):
+        return []
+    end = until + 600
+    return [{'key': f'party-{int(started)}', 'start': float(started), 'end': end, 'cap': until + 3600,
+             'closed': False}] if end > t - 60 else []
+
+
+def plan_ts(day, hm_, t):
+    """drive-watch plan's times: day "Sat 24.10" + "HH:MM" (home wall time; the year is the one nearest to now),
+    or an ISO instant. -> epoch s or None."""
+    x = iso_ts(hm_) if hm_ and 'T' in str(hm_) else None
+    if x:
+        return x
+    m = re.search(r'(\d{1,2})\.(\d{1,2})', str(day or ''))
+    h = re.fullmatch(r'(\d{1,2}):(\d\d)', str(hm_ or ''))
+    if not m or not h:
+        return None
+    tz = home_tz()
+    y = datetime.fromtimestamp(t, tz).year
+    best = None
+    for yy in (y - 1, y, y + 1):
+        try:
+            c = datetime(yy, int(m[2]), int(m[1]), int(h[1]), int(h[2]), tzinfo=tz).timestamp()
+        except ValueError:
+            continue
+        if best is None or abs(c - t) < abs(best - t):
+            best = c
+    return best
+
+
+def drive_windows(t):
+    out = []
+    bin_ = os.environ.get('EVENTWF_DRIVE_WATCH') or os.path.join(HOME, 'bin', 'drive-watch')
+    p = subprocess.run([bin_, 'plan', '--days', '2', '--json'], capture_output=True, text=True, timeout=25,
+                       stdin=subprocess.DEVNULL, check=False)
+    if p.returncode != 0:
+        return None
+    trips = json.loads(p.stdout or '[]')
+    for x in trips if isinstance(trips, list) else []:
+        lv, ar = plan_ts(x.get('day'), x.get('leave'), t), plan_ts(x.get('day'), x.get('arrive'), t)
+        if not lv or not x.get('id'):
+            continue
+        ar = ar if ar and ar > lv else lv + 3600
+        key = 'trip-' + re.sub(r'[^A-Za-z0-9@._:+-]', '-', str(x['id']))[:100]
+        if ar + 1800 > t - 60:
+            out.append({'key': key, 'start': lv - 1800, 'end': ar + 1800, 'cap': ar + 3 * 3600, 'closed': False})
+    return out
+
+
+def opened_windows(kind, t):
+    rows = (load(OPENED, {}).get(kind) or {})
+    return [{'key': k, 'start': v['start'], 'end': v['end'], 'cap': v['end'] + 600, 'closed': False}
+            for k, v in rows.items() if isinstance(v, dict) and v.get('end', 0) > t - 60]
+
+
+SOURCES = {'night': night_windows, 'party': party_windows, 'drive': drive_windows, 'sleepin': sleepin_windows}
+
+
+def windows(kind, t):
+    """This kind's windows now and ahead, or None when its source failed."""
+    fake = os.environ.get('EVENTWF_WINDOWS')
+    try:
+        if fake:
+            rows = [dict({'cap': w['end'] + 600, 'closed': False}, **w) for w in load(fake, {}).get(kind) or []]
+        else:
+            rows = SOURCES[kind](t)
+    except Exception as e:                                # a broken source never cancels a clock
+        print(f'eventwf: {kind} windows: {type(e).__name__}', file=sys.stderr)
+        return None
+    if rows is None:
+        return None
+    seen = {w['key'] for w in rows}
+    return rows + [w for w in opened_windows(kind, t) if w['key'] not in seen]
+
+
+# ------------------------------------------------------------------------------------------------ the hub
+def hub_api(method, path, body=None, timeout=8.0):
+    from core import hub as corehub
+    return corehub.call(method, path, body, timeout=timeout)
+
+
+def hub_pending(kind):
+    """{wid: row} for the hub's pending event.window clocks of this kind."""
+    rows = hub_api('GET', f'/wf?name=event.window&status=PENDING&limit=100&prefix=evw:{kind}:').get('rows') or []
+    return {str(r.get('id')): r for r in rows if WID_RE.fullmatch(str(r.get('id') or ''))}
+
+
+def hub_start(kind, w):
+    """Start (or find) the window's clock: the canonical id, else :2-:9 after a cancelled one. -> (wid, status)."""
+    base = wid_of(kind, w['key'], w['start'])
+    end = min(w['cap'], w['start'] + SPAN_MAX)
+    args = {'kind': kind, 'key': w['key'], 'start': int(w['start']), 'end': int(end), 'every': KINDS[kind]['every']}
+    for wid in [base] + [f'{base}:{n}' for n in range(2, 10)]:
+        r = hub_api('POST', '/wf/start', {'name': 'event.window', 'id': wid, 'args': args})
+        st = r.get('status')
+        if st in ('PENDING', 'ENQUEUED', 'SUCCESS'):     # waiting or running, or it ran its window already
+            return wid, st
+    return None, 'CANCELLED'
+
+
+def base_of(wid):
+    m = WID_RE.fullmatch(wid)
+    return f'evw:{m[1]}:{m[2]}:{m[3]}' if m else wid
+
+
+def sync(kinds=None, quiet=False):
+    t = now_ts()
+    clocks = load(CLOCKS, {})
+    out = {}
+    for kind in kinds or KINDS:
+        res = {'started': 0, 'kept': 0, 'cancelled': 0}
+        try:
+            pend = hub_pending(kind)
+        except Exception as e:
+            res['error'] = f'hub: {type(e).__name__}'
+            out[kind] = res
+            continue
+        want = {}
+        wins = windows(kind, t)
+        if wins is None:
+            res['error'] = 'source unreadable: clocks left as they are'
+            out[kind] = res
+            continue
+        for w in wins:
+            if w['closed'] or w['start'] > t + HORIZON or min(w['cap'], w['start'] + SPAN_MAX) <= t:
+                continue
+            want[wid_of(kind, w['key'], w['start'])] = w
+        for wid in pend:
+            if base_of(wid) not in want:
+                try:
+                    hub_api('POST', f'/wf/{wid}/cancel')
+                    res['cancelled'] += 1
+                    clocks.pop(wid, None)
+                except Exception as e:
+                    res['error'] = f'cancel: {type(e).__name__}'
+        have = {base_of(w) for w in pend}
+        for base, w in want.items():
+            if base in have:
+                res['kept'] += 1
+                continue
+            try:
+                wid, st = hub_start(kind, w)
+            except Exception as e:
+                res['error'] = f'start: {type(e).__name__}'
+                continue
+            if wid and st != 'SUCCESS':
+                res['started'] += 1
+                clocks[wid] = {'kind': kind, 'k': khash(w['key']), 'start': int(w['start']), 'end': int(w['end'])}
+        out[kind] = res
+    clocks = {k: v for k, v in clocks.items() if v.get('end', 0) + 2 * SPAN_MAX > t}
+    save(CLOCKS, clocks)
+    st = load(SYNC_STATE, {})
+    st['sync'] = {'t': int(t), **out}
+    save(SYNC_STATE, st)
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ tick + jobs
+def job_entry(name):
+    e = registry().entry(name)
+    if e is None:
+        raise Fail(f'no registry job {name}')
+    return e
+
+
+def due_jobs(kind, at):
+    tz = home_tz()
+    return [j for j in KINDS[kind]['jobs'] if cron_match(job_entry(j).cron, at, tz)]
+
+
+def claim(jobs, at):
+    """The jobs not yet started for this slot or a later one: marks them. Several windows of one kind, the hub's
+    clock and the fallback share a slot; whoever claims first runs it. A lock still held after 10 s: nothing
+    claimed (a slot is skipped, never run twice)."""
+    with locks.hold(LOCK, wait=10, dir_mode=0o700) as fd:
+        if fd is None:
+            return []
+        ran = load(RAN, {})
+        mine = [j for j in jobs if ran.get(j, 0) < at]
+        for j in mine:
+            ran[j] = at
+        if mine:
+            save(RAN, ran)
+    return mine
+
+
+def spawn(job, at):
+    if os.environ.get('EVENTWF_SPAWN') == 'inline':
+        return run_job(job, at)
+    subprocess.Popen([os.path.realpath(__file__), 'run-job', job, '--slot', str(at)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, cwd=HOME)
+    return None
+
+
+def run_job(name, at):
+    """One registry job here, exactly as workflow.job runs it (cron's env and log files, cron-fail's
+    failure streak and usage row under the job's own name). -> exit code."""
+    from core import jobfail, watchjobs
+    j = watchjobs.runnable(name)
+    st = os.path.join(HOME, '.local', 'state')
+    err = j.err if j.err not in (None, 'out') else (None if j.err == 'out' else f'jobs/{name}.err')
+    for d in j.dirs + tuple(os.path.dirname(x) for x in (j.log, err) if x):
+        os.makedirs(os.path.join(st, d), exist_ok=True)
+    t0 = time.monotonic()
+    log = open(os.path.join(st, j.log), 'ab') if j.log else None
+    efile = open(os.path.join(st, err), 'ab' if j.err else 'wb') if err else None
+    try:
+        p = subprocess.run(watchjobs.argv(j, HOME), stdin=subprocess.DEVNULL,
+                           stdout=log if log is not None else subprocess.DEVNULL,
+                           stderr=efile if efile is not None else subprocess.STDOUT,
+                           env=dict(watchjobs.env(name, HOME), EVENTWF_SLOT=str(at)), cwd=HOME,
+                           timeout=j.timeout_s, check=False)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except OSError as e:
+        rc = 126 if isinstance(e, PermissionError) else 127
+    finally:
+        for f in (log, efile):
+            if f is not None:
+                f.close()
+    jobfail.usage_run(name, rc, after=j.after, ok=j.ok, ms=(time.monotonic() - t0) * 1000, src='eventwf')
+    jobfail.record(name, rc, after=j.after, ok=j.ok, cmd=' '.join(j.argv), err=f'~/.local/state/{err}' if err else '')
+    return rc
+
+
+def tick(kind, key, at):
+    t = now_ts()
+    row = {'t': round(t, 1), 'at': at, 'kind': kind, 'k': khash(key), 'late_s': round(t - at, 1)}
+    wins = windows(kind, t)
+    w = None if wins is None else next((x for x in wins if x['key'] == key), None)
+    if wins is not None and w is None:
+        dec = 'gone'
+    elif w is not None and (w['closed'] or t >= w['end']):
+        dec = 'done'
+    else:                                                 # open (or the source failed: fail open, the jobs gate)
+        dec = 'active'
+    due = due_jobs(kind, at) if dec == 'active' else []
+    if wins is None:
+        row['source'] = 'unreadable'
+    ran = claim(due, at) if due else []
+    for j in ran:
+        spawn(j, at)
+    out = dict(row, decision=dec, due=due, ran=ran)
+    jl_append(TICKS, out)
+    jl_prune(TICKS)
+    return out
+
+
+def open_window(kind, key, minutes):
+    t = now_ts()
+    with locks.hold(LOCK, wait=10, dir_mode=0o700):
+        d = load(OPENED, {})
+        rows = {k: v for k, v in (d.get(kind) or {}).items() if isinstance(v, dict) and v.get('end', 0) > t - 86400}
+        rows[key] = {'start': (rows.get(key) or {}).get('start', t), 'end': t + minutes * 60}
+        d[kind] = rows
+        save(OPENED, d)
+
+
+# ------------------------------------------------------------------------------------------------ the fallback
+def hub_up():
+    """One probe of the hub's /health (5 s), as hub-sentinel's: 200 with a JSON body = up; anything else = down."""
+    from core import http as corehttp
+    from core import hub as corehub
+    try:
+        with corehttp.open(corehub.url().rstrip('/') + '/health', timeout=5) as r:
+            code = getattr(r, 'status', 200)
+            json.loads(r.read(1 << 16) or b'null')
+        return code == 200
+    except Exception:                                     # no answer, a non-200, not JSON, no hub URL: down
+        return False
+
+
+def last_due(job, t, start, look):
+    """The latest minute slot at or before t, within look s and not before the window's first minute, at which the
+    job's cron fires (the registry's zone), or None."""
+    cron, tz = job_entry(job).cron, home_tz()
+    m = int(t // 60 * 60)
+    lo = max(m - look, int(start // 60 * 60))
+    return next((s for s in range(m, lo - 1, -60) if cron_match(cron, s, tz)), None)
+
+
+def fallback(kinds=None, after=FB_AFTER):
+    """The brain's own clock for each kind with a window open while the hub's clock for it is silent.
+    -> {kind: {state, ran}}; state idle | unreadable | healthy | lagging | hub-down | stale."""
+    t = now_ts()
+    out, recent, probe = {}, None, None
+    for kind in kinds or KINDS:
+        wins = windows(kind, t)
+        if wins is None:                                  # unknown windows: nothing runs (the hub's ticks fail open)
+            out[kind] = {'state': 'unreadable', 'ran': []}
+            continue
+        open_ = sorted((w for w in wins if w['start'] <= t < w['end'] and not w['closed']), key=lambda w: w['start'])
+        if not open_:
+            out[kind] = {'state': 'idle', 'ran': []}
+            continue
+        if recent is None:
+            recent = jl_tail(TICKS, t - 6 * 3600)
+        every, start = KINDS[kind]['every'], open_[0]['start']
+        last = max((r.get('t') or 0 for r in recent if r.get('kind') == kind and r.get('src') != 'fallback'
+                    and r.get('decision') == 'active'), default=0)
+        expected = (t - FB_GRACE) // every * every        # the latest slot whose hub tick should be in by now
+        if expected >= start and last >= expected:
+            state = 'healthy'
+        elif max(last, start) >= t - every - after:       # one tick late, or the window just opened: ask the hub
+            if probe is None:
+                probe = hub_up()
+            state = 'lagging' if probe else 'hub-down'
+        else:
+            state = 'stale'
+        res = {'state': state, 'ran': []}
+        if state in ('hub-down', 'stale'):
+            slots = {}
+            for j in KINDS[kind]['jobs']:
+                s = last_due(j, t, start, max(FB_LOOK, every - 60))
+                if s is not None:
+                    slots.setdefault(s, []).append(j)
+            for s, jobs in sorted(slots.items()):
+                ran = claim(jobs, s)
+                if not ran:
+                    continue
+                for j in ran:
+                    spawn(j, s)
+                jl_append(TICKS, {'t': round(t, 1), 'at': s, 'kind': kind, 'k': khash(open_[0]['key']),
+                                  'src': 'fallback', 'why': state, 'late_s': round(t - s, 1), 'decision': 'active',
+                                  'due': ran, 'ran': ran})
+                res['ran'] += ran
+        out[kind] = res
+    if out:
+        save(FALLBACK, {'t': int(t), 'kinds': out})
+        jl_prune(TICKS)
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ CLI
+def take(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            v = args[i + 1]
+            del args[i:i + 2]
+            return v
+        raise Fail(f'{flag} needs a value')
+    return None
+
+
+def kinds_arg(v, allow_all=True):
+    if v is None:
+        return None
+    if v == 'all' and allow_all:
+        return list(KINDS)
+    ks = [x for x in v.split(',') if x]
+    bad = [x for x in ks if x not in KINDS]
+    if bad or not ks:
+        raise Fail(f'--kind: one of {", ".join(KINDS)}' + (' or all' if allow_all else ''))
+    return ks
+
+
+def hm(ts):
+    return datetime.fromtimestamp(ts, home_tz()).strftime('%d.%m %H:%M')
+
+
+def cmd_status(js):
+    t = now_ts()
+    st = load(SYNC_STATE, {})
+    out = {'kinds': {}, 'sync': st.get('sync')}
+    for k in KINDS:
+        wins = windows(k, t)
+        rows = [{'k': khash(w['key']), 'start': hm(w['start']), 'end': hm(w['end']), 'closed': w['closed']}
+                for w in (wins or []) if w['start'] <= t + HORIZON]
+        out['kinds'][k] = {'jobs': list(KINDS[k]['jobs']), 'windows': rows}
+    try:
+        out['clocks'] = {k: len(hub_pending(k)) for k in KINDS}
+    except Exception as e:
+        out['clocks'] = f'hub: {type(e).__name__}'
+    out['fallback'] = load(FALLBACK, {}) or None
+    if js:
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    for k, v in out['kinds'].items():
+        clocks = out['clocks'].get(k) if isinstance(out['clocks'], dict) else out['clocks']
+        print(f"{k:8} jobs {', '.join(v['jobs'])} · clocks {clocks}")
+        for w in v['windows']:
+            print(f"         window {w['k']} {w['start']} → {w['end']}" + (' (closed)' if w['closed'] else ''))
+    if out['sync']:
+        print(f"last sync {hm(out['sync']['t'])}")
+    fb = out['fallback'] or {}
+    if fb.get('t'):
+        print(f"fallback {hm(fb['t'])}: " + ' · '.join(
+            f"{k} {v.get('state')}" + (f" (ran {', '.join(v['ran'])})" if v.get('ran') else '')
+            for k, v in (fb.get('kinds') or {}).items() if isinstance(v, dict)))
+    return 0
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+        return 0
+    cmd = args.pop(0)
+    js = '--json' in args
+    args = [a for a in args if a != '--json']
+    try:
+        if cmd == 'status':
+            return cmd_status(js)
+        if cmd == 'windows':
+            t = now_ts()
+            ks = kinds_arg(take(args, '--kind')) or list(KINDS)
+            out = {k: [dict(w, k=khash(w['key'])) for w in (windows(k, t) or []) if w['start'] <= t + HORIZON]
+                   for k in ks}
+            if js:
+                print(json.dumps({k: [{x: y for x, y in w.items() if x != 'key'} for w in v] for k, v in out.items()}))
+            else:
+                for k, v in out.items():
+                    for w in v:
+                        print(f"{k:8} {w['k']} {hm(w['start'])} → {hm(w['end'])}" + (' closed' if w['closed'] else ''))
+            return 0
+        if cmd == 'sync':
+            ks = kinds_arg(take(args, '--kind'))
+            with locks.hold(LOCK + '.sync', wait=0, dir_mode=0o700) as fd:
+                if fd is None:
+                    return 0                              # another sync runs
+                out = sync(ks)
+            if js:
+                print(json.dumps(out))
+            errs = [f'{k}: {v["error"]}' for k, v in out.items() if v.get('error')]
+            for e in errs:
+                print(f'eventwf sync: {e}', file=sys.stderr)
+            return 1 if errs and all('hub' in e for e in errs) else 0
+        if cmd == 'tick':
+            if len(args) < 2 or args[0] not in KINDS:
+                raise Fail('usage: eventwf tick KIND KEY --at EPOCH')
+            kind, key = args[0], args[1]
+            at = take(args, '--at')
+            if not at or not at.isdigit():
+                raise Fail('--at: the slot (epoch s)')
+            r = tick(kind, key, int(at))
+            print(json.dumps(r) if js else f"{kind}: {r['decision']} ({', '.join(r['ran']) or '-'})")
+            return 0
+        if cmd == 'open':
+            n = take(args, '--minutes')
+            if len(args) < 2 or args[0] not in KINDS or not re.fullmatch(r'[A-Za-z0-9@._:+-]{1,100}', args[1]):
+                raise Fail('usage: eventwf open KIND KEY --minutes N')
+            if not n or not n.isdigit() or not 1 <= int(n) <= 720:
+                raise Fail('--minutes: 1-720')
+            open_window(args[0], args[1], int(n))
+            sync([args[0]])
+            print(f'{args[0]} {khash(args[1])}: open for {n} min')
+            return 0
+        if cmd == 'fallback':
+            ks = kinds_arg(take(args, '--kind'))
+            a = take(args, '--after')
+            if a is not None and (not a.isdigit() or not 60 <= int(a) <= 900):
+                raise Fail('--after: 60-900 s')
+            with locks.hold(LOCK + '.fallback', wait=0, dir_mode=0o700) as fd:
+                if fd is None:
+                    return 0                              # the last minute's check still runs
+                out = fallback(ks, int(a) if a else FB_AFTER)
+            if js:
+                print(json.dumps(out))
+            elif '--cron' not in args:
+                for k, v in out.items():
+                    print(f"{k:8} {v['state']}" + (f": ran {', '.join(v['ran'])}" if v['ran'] else ''))
+            return 0
+        if cmd == 'run-job':
+            slot = take(args, '--slot')
+            if not args or not slot or not slot.isdigit():
+                raise Fail('usage: eventwf run-job NAME --slot EPOCH')
+            if args[0] not in {j for k in KINDS.values() for j in k['jobs']}:
+                raise Fail(f'run-job: {args[0]} is not an event-window job')
+            return run_job(args[0], int(slot))
+        raise Fail(f'unknown command {cmd!r} (eventwf --help)')
+    except Fail as e:
+        print(f'eventwf: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

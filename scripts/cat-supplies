@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""cat-supplies: food / litter / fountain-filter forecast for a trip, from Home Assistant history. Read-only on HA.
+
+Usage:
+  cat-supplies [--trip FROM:TO] [--days N] [--json]   the forecast card (default trip: cat-corner's next "trips" entry)
+  cat-supplies --shop [--assume-none] [--dry-run]     also put the missing lines on the shopping list (`shop add`)
+  cat-supplies mark filter|desiccant|litter [--at "YYYY-MM-DD HH:MM"]   he changed/topped it (the phone app's NFC
+                                                       cat-corner tags run this); `cat-supplies marks [--json]` lists them
+Marks (~/.local/state/cat-corner/marks.json, 0600; env CAT_SUPPLIES_MARKS): when the device counter in HA was not
+  reset after a marked change, the forecast uses the mark (filter % / desiccant days from the mark's date) and adds a
+  check line saying the counter still needs a reset in the vendor app.
+
+How: cat-corner's entity discovery + recorder history (the last --days, default 14) give
+  feeder grams/day (today's-feeding-weight counter increments), litter level %/day (drops; top-ups ignored),
+  waste drawer %/day (rises; emptyings ignored), fountain filter % now (+ the filter's rated days), feeder
+  desiccant days and backup battery. Need = rate x trip days x (1 + buffer).
+Stock: cat-autopilot's ledger (lib/catstock.py: his answers minus the use seen since) over the
+  config ~/.config/cat-corner/config.json "supplies": {"stock": {"litter_kg", "dry_food_kg", "drawer_bags",
+  "fountain_filters", "desiccant_packs", "wet_portions", "feeder_batteries"}, "buffer_pct": 20,
+  "litter_kg_per_pct": 0.045, "filter_days": 30, "wet_per_day": null, "drawer_change_pct": 80,
+  "litter_topup_band_pct": 30, "shop_note": "..."}. A missing stock value = unknown = a question, not a purchase.
+--shop adds only lines whose stock is known and short (--assume-none: unknown counts as 0) and skips lines
+  whose keywords are already on the list. --dry-run prints the `shop add` commands instead.
+Env (tests): everything cat-corner reads (HA_BIN, CAT_CORNER_CONFIG, CAT_CORNER_NOW, OWNER_TZ,
+  CAT_CORNER_HISTORY_FIXTURE), CAT_CORNER_BIN, SHOP_BIN.
+Exit: 0 ok, 1 HA unreachable / shop failed, 2 usage.
+"""
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import subprocess
+import sys
+
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+SHOP = os.environ.get('SHOP_BIN', 'shop')
+DEFAULTS = {'buffer_pct': 20, 'litter_kg_per_pct': 0.045, 'filter_days': 30, 'wet_per_day': None,
+            'drawer_change_pct': 80, 'litter_topup_band_pct': 30, 'desiccant_days': 14,
+            'shop_note': 'cat supplies for the trip'}
+KCAL_PER_G_DRY = 3.7        # typical dry kibble (assumed)
+EPS = dt.timedelta(seconds=1)
+
+
+def load_cc():
+    path = os.environ.get('CAT_CORNER_BIN') or next(
+        (p for p in (os.path.join(HERE, 'cat-corner'), os.path.join(HOME, 'bin', 'cat-corner')) if os.path.exists(p)))
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader('cat_corner_for_supplies', path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+class Usage(Exception):
+    pass
+
+
+def num(s):
+    try:
+        v = float(s)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def vals(ser):
+    return [(t, v) for t, s in ser if (v := num(s)) is not None]
+
+
+def span_days(ser, now):
+    return max((now - ser[0][0]).total_seconds() / 86400, 0) if ser else 0
+
+
+def counter_total(ser):
+    """Sum of a daily counter's increments (it resets to 0 at midnight or after a manual reset)."""
+    tot, prev = 0.0, None
+    for _, v in vals(ser):
+        if prev is not None:
+            tot += v - prev if v > prev else (v if v < prev and v > 0 else 0)
+        prev = v
+    return tot
+
+
+def drop_rate(ser, now, jump=5.0):
+    """Level falling over time; a rise > jump (a top-up) starts a new segment. -> (%/day, days) or (None, days)."""
+    v, days = vals(ser), span_days(ser, now)
+    if len(v) < 2 or days < 0.75:
+        return None, days
+    used = sum(max(a - b, 0) for (_, a), (_, b) in zip(v, v[1:]) if b - a <= jump)
+    return used / days, days
+
+
+def rise_rate(ser, now, empty=20.0):
+    """Fill level rising; a drop > empty (emptied) starts a new segment; net rise per segment. -> (%/day, days)."""
+    v, days = vals(ser), span_days(ser, now)
+    if len(v) < 2 or days < 0.75:
+        return None, days
+    total, seg0 = 0.0, v[0][1]
+    for (_, a), (_, b) in zip(v, v[1:]):
+        if a - b > empty:
+            total += max(a - seg0, 0)
+            seg0 = b
+    total += max(v[-1][1] - seg0, 0)
+    return total / days, days
+
+
+def fmt_d(d):
+    return f'{d.day:02d}.{d.month:02d}'
+
+
+def r1(x):
+    return None if x is None else round(x, 1)
+
+
+def forecast(cc, states, hist, ents, sup, stock, trip, now, tz):
+    f, t = trip
+    days = (t - f).days
+    k = 1 + sup['buffer_pct'] / 100
+    today = cc.local_day(now, tz)
+    items, checks, questions = [], [], []
+    st = lambda e: (states.get(e) or {}).get('state') if e else None
+
+    def item(key, label, need, unit, stock_key, line, note=''):
+        have = stock.get(stock_key)
+        if have is None:
+            status, short = 'unknown', need
+        else:
+            short = max(need - float(have), 0)
+            status = 'ok' if short <= 0 else 'short'
+        items.append({'key': key, 'label': label, 'need': need, 'unit': unit, 'stock': have, 'status': status,
+                      'short': round(short, 2), 'line': line, 'note': note})
+
+    out = {'trip': {'from': f.isoformat(), 'to': t.isoformat(), 'days': days, 'buffer_pct': sup['buffer_pct']},
+           'now': now.isoformat(), 'rates': {}, 'items': items, 'checks': checks, 'questions': questions}
+
+    # ---- feeder: dry food
+    fd = (ents.get('feeders') or [None])[0] or {}
+    ser = hist.get(fd.get('dispensed'), [])
+    g_day = counter_total(ser) / span_days(ser, now) if span_days(ser, now) >= 0.75 else None
+    per_meal = num(st(fd.get('next_feed').replace('next_feed_time', 'next_feed_quantity_weight'))) \
+        if fd.get('next_feed') else None
+    pet = (ents.get('pets') or [{}])[0]
+    wkg = None
+    if pet.get('weight') and num(st(pet['weight'])) is not None:
+        wkg = num(st(pet['weight'])) * cc.weight_factor(states, pet['weight'])
+    kcal_need = 70 * wkg ** 0.75 * 1.2 if wkg else None
+    share = (g_day * KCAL_PER_G_DRY / kcal_need) if (g_day and kcal_need) else None
+    out['rates']['feeder_g_day'] = r1(g_day)
+    out['rates']['feeder_days'] = r1(span_days(ser, now))
+    out['rates']['meal_g'] = per_meal
+    out['rates']['cat_kg'] = r1(wkg)
+    out['rates']['feeder_share_of_need'] = None if share is None else round(share, 2)
+    if g_day is not None:
+        need = round(g_day * days * k / 1000, 2)
+        item('dry_food', 'Dry food', need, 'kg', 'dry_food_kg', 'Dry cat food (kibble, the usual brand)',
+             'hopper' + (' low' if st(fd.get('food_low')) == 'on' else ' not low'))
+    if share is not None and share < 0.6:
+        wet = sup.get('wet_per_day')
+        if wet:
+            item('wet_food', 'Wet food', math.ceil(wet * days * k), 'portions', 'wet_portions',
+                 'Wet cat food portions (the usual)')
+        else:
+            questions.append(f'The feeder gives ~{g_day:.0f} g/day, about {share * 100:.0f} % of a {wkg:.1f} kg '
+                             'cat\'s daily need. What else does the cat eat (wet food per day)? The sitter will need '
+                             f'{days} days of it.')
+    # ---- litter
+    rb = ents.get('robot') or {}
+    lit_rate, lit_days = drop_rate(hist.get(rb.get('litter'), []), now)
+    out['rates']['litter_pct_day'] = r1(lit_rate)
+    out['rates']['litter_days'] = r1(lit_days)
+    out['rates']['litter_pct_now'] = num(st(rb.get('litter')))
+    if lit_rate:
+        pct = lit_rate * days * k
+        topups = math.ceil(lit_rate * days / sup['litter_topup_band_pct']) if lit_rate * days else 0
+        out['rates']['litter_topups'] = topups
+        item('litter', 'Litter', round(pct * sup['litter_kg_per_pct'], 1), 'kg', 'litter_kg',
+             'Clumping clay cat litter (Litter-Robot 4)', f'sitter tops up ~{topups}x')
+    # ---- waste drawer
+    dr_rate, dr_days = rise_rate(hist.get(rb.get('drawer'), []), now)
+    out['rates']['drawer_pct_day'] = r1(dr_rate)
+    out['rates']['drawer_pct_now'] = num(st(rb.get('drawer')))
+    if dr_rate:
+        end_pct = dr_rate * days * k
+        changes = max(math.ceil(end_pct / sup['drawer_change_pct']) - 1, 0)
+        out['rates']['drawer_end_pct'] = round(end_pct)
+        item('drawer_bags', 'Drawer bags', 1 + changes + 1, 'bags', 'drawer_bags',
+             'Litter-Robot 4 waste drawer liners',
+             f'empty on {fmt_d(f)} → ~{end_pct:.0f} % by {fmt_d(t)}; sitter changes {changes}x')
+    # ---- fountain filter
+    fo = (ents.get('fountains') or [None])[0] or {}
+    fkey = fo.get('key')
+    fid = f'sensor.{fkey}_filter_remaining' if fkey else None
+    frem = num(st(fid))
+    marks = load_marks()
+    if marks:
+        out['rates']['marks'] = {k: fmt_ts(v) for k, v in marks.items()}
+        frem, _ = apply_marks({k: v for k, v in marks.items() if k == 'filter'}, frem, None, None, sup['filter_days'],
+                              now.timestamp(), checks)
+    out['rates']['filter_pct_now'] = frem
+    if frem is not None:
+        per_day = 100 / sup['filter_days']
+        empty_on = today + dt.timedelta(days=math.ceil(frem / per_day))
+        changes, cur, d = [], frem, today
+        while d < f:                                  # changes before departure when it runs out
+            cur -= per_day
+            d += dt.timedelta(days=1)
+            if cur <= 0 and d < f:
+                changes.append(d)
+                cur = 100
+        if cur - per_day * days * k < 0:              # would not last the trip: fresh one on departure day
+            changes.append(f)
+        out['rates']['filter_empty_on'] = empty_on.isoformat()
+        out['rates']['filter_changes'] = [c.isoformat() for c in changes]
+        item('filter', 'Fountain filters', len(changes) + 1, 'filters', 'fountain_filters',
+             'PetKit Eversweet 3 Pro replacement filters', 'change on ' + ', '.join(fmt_d(c) for c in changes))
+    if st(f'binary_sensor.{fkey}_replace_filter') == 'on':
+        checks.append('Fountain says: replace the filter now')
+    # ---- feeder desiccant + backup battery
+    dkey = fd.get('key')
+    drem = num(st(f'sensor.{dkey}_desiccant_remaining_days')) if dkey else None
+    if drem is not None:
+        freq = num(st(f'number.{dkey}_desiccant_frequency')) or sup['desiccant_days']
+        if marks:
+            _, drem = apply_marks({k: v for k, v in marks.items() if k == 'desiccant'}, None, drem, freq,
+                                  sup['filter_days'], now.timestamp(), checks)
+        packs = (1 if drem <= (f - today).days else 0) + 1 + (1 if days * k > freq else 0)
+        out['rates']['desiccant_days_left'] = drem
+        item('desiccant', 'Desiccant packs', packs, 'packs', 'desiccant_packs',
+             'Desiccant packs (PETLIBRO Granary feeder)',
+             (f'overdue {-drem:.0f} d' if drem < 0 else f'{drem:.0f} d left') + f'; every {freq:.0f} d')
+    bat = st(f'sensor.{dkey}_battery_level') if dkey else None
+    out['rates']['feeder_battery'] = bat
+    if bat and bat.lower() in ('low', 'empty'):
+        item('batteries', 'Feeder backup batteries', 3, 'cells', 'feeder_batteries',
+             'D batteries x3 (feeder backup; check the type)', 'backup battery low: a power cut stops the meals')
+    if st(fo.get('water_low')) == 'on':
+        checks.append('Fountain is out of water now')
+    if not g_day or not lit_rate or not dr_rate:
+        checks.append('Some rates have < 1 day of history: rough until more days are recorded')
+    for it in items:
+        it['need'] = round(it['need'], 2) if isinstance(it['need'], float) else it['need']
+    return out
+
+
+ICON = {'dry_food': '🍽', 'wet_food': '🥫', 'litter': '🪣', 'drawer_bags': '🗑', 'filter': '💧',
+        'desiccant': '🧂', 'batteries': '🔋'}
+
+
+MARK_KINDS = ('filter', 'desiccant', 'litter')
+
+
+def marks_path():
+    return os.environ.get('CAT_SUPPLIES_MARKS') or os.path.join(HOME, '.local/state/cat-corner/marks.json')
+
+
+def load_marks():
+    try:
+        with open(marks_path()) as fh:
+            m = json.load(fh)
+        return {k: int(v) for k, v in m.items() if k in MARK_KINDS and isinstance(v, (int, float))}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def do_mark(kind, at):
+    if kind not in MARK_KINDS:
+        raise Usage('mark: filter, desiccant or litter')
+    m = load_marks()
+    m[kind] = int(at)
+    p = marks_path()
+    os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+    tmp = p + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as fh:
+        json.dump(m, fh)
+    os.replace(tmp, p)
+    return m
+
+
+def apply_marks(marks, frem, drem, freq, filter_days, now_ts, checks):
+    """A marked change newer than the HA counter's story -> the estimate from the mark (+ a reset-the-counter check)."""
+    def since(k):
+        return (now_ts - marks[k]) / 86400 if k in marks and marks[k] <= now_ts else None
+    d = since('filter')
+    if d is not None and d < filter_days:
+        est = max(0.0, round(100 - d * 100 / filter_days, 1))
+        if frem is None or frem < est - 15:
+            checks.append(f'Filter changed {fmt_ts(marks["filter"])} (tag), fountain counter still '
+                          f'{"unknown" if frem is None else f"{frem:g} %"}: reset it in the PetKit app')
+            frem = est
+    d = since('desiccant')
+    if d is not None and drem is not None and freq and d < freq and drem < freq - d - 2:
+        checks.append(f'Desiccant changed {fmt_ts(marks["desiccant"])} (tag), feeder counter still {drem:.0f} d: '
+                      f'reset it in the PETLIBRO app')
+        drem = round(freq - d, 1)
+    return frem, drem
+
+
+def fmt_ts(ts):
+    return dt.datetime.fromtimestamp(ts).strftime('%d.%m')
+
+
+def card(o):
+    tr, R = o['trip'], o['rates']
+    f, t = dt.date.fromisoformat(tr['from']), dt.date.fromisoformat(tr['to'])
+    hist_d = max(R.get('feeder_days') or 0, R.get('litter_days') or 0)
+    L = [f'🐾 Cat supplies · trip {fmt_d(f)}–{fmt_d(t)} ({tr["days"]} days, +{tr["buffer_pct"]} %)',
+         f'Rates from {hist_d:.1f} days of HA history{" (rough)" if hist_d < 7 else ""}', '']
+    rate = {'dry_food': f'~{R.get("feeder_g_day")} g/day', 'litter': f'−{R.get("litter_pct_day")} %/day',
+            'drawer_bags': f'+{R.get("drawer_pct_day")} %/day', 'filter': f'{R.get("filter_pct_now"):g} % left'
+            if R.get('filter_pct_now') is not None else ''}
+    for it in o['items']:
+        have = 'stock ?' if it['status'] == 'unknown' else \
+            f'have {float(it["stock"]):g} ' + ('✓' if it['status'] == 'ok' else '→ buy')
+        bits = [b for b in (rate.get(it['key'], ''), f'need {it["need"]:g} {it["unit"]}', have) if b]
+        L.append(f'{ICON.get(it["key"], "•")} {it["label"]}: ' + ' · '.join(bits))
+        if it.get('note'):
+            L.append(f'   {it["note"]}')
+        if it.get('on_list'):
+            L.append('   already on the shopping list ✓')
+    if R.get('marks'):
+        L.append('🏷 Tags: ' + ' · '.join(f'{k} {v}' for k, v in sorted(R['marks'].items())))
+    for c in o['checks']:
+        L.append(f'⚠ {c}')
+    if o['questions']:
+        L += ['', 'Ask him (not yet):'] + [f'• {q}' for q in o['questions']]
+    lines = shop_lines(o)
+    if lines:
+        L += ['', 'Shopping lines (dry run):'] + [f'• {ln["text"]} ({ln["why"]})' for ln in lines]
+    return '\n'.join(L)
+
+
+def stock_question(o):
+    unk = [f'{it["label"].lower()} ({it["need"]:g} {it["unit"]})' for it in o['items']
+           if it['status'] == 'unknown' and not it.get('on_list')]
+    if unk:
+        o['questions'].insert(0, 'What is at home of: ' + ', '.join(unk) + '? (need for the trip incl. buffer)')
+
+
+def shop_lines(o, assume_none=False):
+    out = []
+    for it in o['items']:
+        if it.get('on_list') or it['status'] == 'ok':
+            continue
+        if it['status'] == 'unknown' and not assume_none:
+            why = f'need {it["need"]:g} {it["unit"]}, stock unknown'
+        else:
+            why = f'buy {it["short"]:g} {it["unit"]}'
+        out.append({'key': it['key'], 'text': it['line'], 'qty': it['short'], 'unit': it['unit'], 'why': why,
+                    'add': it['status'] == 'short' or assume_none})
+    return out
+
+
+KEYWORDS = {'dry_food': ('kibble', 'dry cat food', 'trockenfutter'), 'wet_food': ('wet cat food', 'nassfutter'),
+            'litter': ('cat litter', 'clumping', 'katzenstreu'), 'drawer_bags': ('drawer liner', 'liners', 'waste bag'),
+            'filter': ('fountain filter', 'eversweet', 'petkit'), 'desiccant': ('desiccant',),
+            'batteries': ('d batteries', 'd cells', 'batterien')}
+
+
+def mark_on_list(o):
+    try:
+        r = subprocess.run([SHOP, 'list'], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        text = r.stdout.lower() if r.returncode == 0 else ''
+    except (OSError, subprocess.TimeoutExpired):
+        text = ''
+    for it in o['items']:
+        kws = KEYWORDS.get(it['key'], ())
+        it['on_list'] = any(k in text for k in kws)
+
+
+def do_shop(o, sup, assume_none, dry):
+    rc = 0
+    for ln in shop_lines(o, assume_none):
+        if not ln['add']:
+            continue
+        q = ln['qty']
+        whole = q and float(q).is_integer() and ln['unit'] != 'kg'     # shop --qty is a whole count
+        text = ln['text'] if whole or not q else f'{ln["text"]}, ~{q:g} {ln["unit"]}'
+        cmd = [SHOP, 'add', '--note', sup['shop_note']] + (['--qty', str(int(q))] if whole else []) + [text]
+        if dry:
+            print('would run: ' + ' '.join(json.dumps(c) if ' ' in c else c for c in cmd))
+            continue
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+        print(r.stdout.strip() or r.stderr.strip())
+        rc = rc or (1 if r.returncode else 0)
+    return rc
+
+
+def parse_trip(s):
+    try:
+        a, b = s.split(':')
+        f, t = dt.date.fromisoformat(a), dt.date.fromisoformat(b)
+    except ValueError:
+        raise Usage('--trip wants YYYY-MM-DD:YYYY-MM-DD')
+    if t <= f:
+        raise Usage('--trip: the end must be after the start')
+    return f, t
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] in (['mark'], ['marks']):
+        mp = argparse.ArgumentParser(prog='cat-supplies ' + argv[0])
+        if argv[0] == 'mark':
+            mp.add_argument('kind', choices=MARK_KINDS)
+            mp.add_argument('--at', help='YYYY-MM-DD HH:MM (default now)')
+        mp.add_argument('--json', action='store_true')
+        m = mp.parse_args(argv[1:])
+        try:
+            if argv[0] == 'mark':
+                at = dt.datetime.strptime(m.at, '%Y-%m-%d %H:%M').timestamp() if m.at else dt.datetime.now().timestamp()
+                marks = do_mark(m.kind, at)
+                print(json.dumps(marks) if m.json else f'marked: {m.kind} {fmt_ts(marks[m.kind])}')
+            else:
+                marks = load_marks()
+                print(json.dumps(marks) if m.json else
+                      '\n'.join(f'{k}: {fmt_ts(v)}' for k, v in sorted(marks.items())) or 'no marks')
+            return 0
+        except (Usage, ValueError) as e:
+            print(f'cat-supplies: {e}', file=sys.stderr)
+            return 2
+        except OSError as e:
+            print(f'cat-supplies: {type(e).__name__}', file=sys.stderr)
+            return 1
+    ap = argparse.ArgumentParser(prog='cat-supplies', description='Cat supplies forecast for a trip (read-only on HA).')
+    ap.add_argument('--trip', help='FROM:TO (YYYY-MM-DD:YYYY-MM-DD); default: the next cat-corner trip')
+    ap.add_argument('--days', type=int, default=14, help='history window in days (default 14)')
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--shop', action='store_true', help='add the missing lines to the shopping list')
+    ap.add_argument('--assume-none', action='store_true', help='with --shop: unknown stock counts as none')
+    ap.add_argument('--dry-run', action='store_true', help='with --shop: print the shop commands only')
+    a = ap.parse_args(argv)
+    try:
+        if not 1 <= a.days <= 60:
+            raise Usage('--days must be 1..60')
+        cc = load_cc()
+        now, tz = cc.now_dt(), cc.owner_tz()
+        user = cc.load_json(cc.CONFIG, {})
+        user = user if isinstance(user, dict) else {}
+        sup = dict(DEFAULTS)
+        sup.update({k: v for k, v in (user.get('supplies') or {}).items() if k in DEFAULTS})
+        stock = (user.get('supplies') or {}).get('stock') or {}
+        try:                                    # cat-autopilot's stock ledger (his answers minus use) wins
+            sys.path.insert(0, os.path.join(HERE, 'lib'))
+            import catstock
+            stock = catstock.values(stock)
+        except Exception:
+            pass
+        if a.trip:
+            trip = parse_trip(a.trip)
+        else:
+            today = cc.local_day(now, tz)
+            nxt = next((x for x in cc.cfg()['trips'] if x['to'] >= today), None)
+            if not nxt:
+                raise Usage('no upcoming trip in cat-corner config: pass --trip FROM:TO')
+            trip = (nxt['from'], nxt['to'])
+    except Usage as e:
+        print(f'cat-supplies: {e}', file=sys.stderr)
+        return 2
+    try:
+        states = cc.ha_states()
+        ents = cc.discover(states, cc.cfg()['entities'])
+        rb, fd = ents.get('robot') or {}, (ents.get('feeders') or [{}])[0]
+        ids = [rb.get('litter'), rb.get('drawer'), fd.get('dispensed')]
+        hist = cc.fetch_history(ids, now - dt.timedelta(days=a.days), now)
+    except cc.HAError as e:
+        print(f'cat-supplies: HA unreachable ({e})', file=sys.stderr)
+        return 1
+    o = forecast(cc, states, hist, ents, sup, stock, trip, now, tz)
+    mark_on_list(o)
+    stock_question(o)
+    o['shop_lines'] = shop_lines(o, a.assume_none)
+    print(json.dumps(o, ensure_ascii=False, indent=1) if a.json else card(o))
+    if a.shop:
+        return do_shop(o, sup, a.assume_none, a.dry_run)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,772 @@
+## rc 1
+## stdout
+Unraid Homesrv: 5 new issue(s)
+- [WARN] parity: 7 UDMA CRC errors (cable/connection)
+- [WARN] disk1: 58°C (warn 58, critical 60)
+- [WARN] Container Firefly-III exited with code 137
+- [WARN] VM Webserver 2 is paused
+- [WARN] Syslog: 1 new error line(s) (SATA link ×1): "Oct 12 10:59:01 Homesrv kernel: ata3.00: exception Emask 0x10"
+
+## stderr
+[no-send] would text the owner:
+🟠 Unraid Homesrv: 5 new issues
+• parity: 7 UDMA CRC errors (cable/connection)
+• disk1: 58°C (warn 58, critical 60)
+• Container Firefly-III exited with code 137
+• VM Webserver 2 is paused
+• Syslog: 1 new error line(s) (SATA link ×1): "Oct 12 10:59:01 Homesrv kernel: ata3.00: exception Emask 0x10"
+[no-send] would write an inbox note.
+
+## state.json
+{
+ "active": {
+  "btrfs:/var/lib/docker": {
+   "baseline": true,
+   "cat": "pool",
+   "last": 2832,
+   "level": "warn",
+   "ref": 2832,
+   "since": 1791785641.0,
+   "subject": "docker.img",
+   "title": "docker.img (btrfs) has lifetime error counters: write 2829, read 1, corruption 2 (total 2832)",
+   "unit": " in total"
+  },
+  "ctr:Firefly-III:exited:0001-01-01T00:00:00Z": {
+   "baseline": false,
+   "cat": "ctr",
+   "last": null,
+   "level": "warn",
+   "ref": null,
+   "since": 1791785701.0,
+   "subject": "Firefly-III",
+   "title": "Container Firefly-III exited with code 137",
+   "unit": ""
+  },
+  "smart:ST10000NM0016-1TT101_GE714JH8:199": {
+   "baseline": true,
+   "cat": "smart",
+   "last": 44,
+   "level": "warn",
+   "ref": 44,
+   "since": 1791785641.0,
+   "subject": "disk4",
+   "title": "disk4: 44 UDMA CRC errors (cable/connection)",
+   "unit": ""
+  },
+  "smart:ST16000NM001G-2KK103_ZL2CVXV3:199": {
+   "baseline": false,
+   "cat": "smart",
+   "last": 7,
+   "level": "warn",
+   "ref": 7,
+   "since": 1791785701.0,
+   "subject": "parity",
+   "title": "parity: 7 UDMA CRC errors (cable/connection)",
+   "unit": ""
+  },
+  "smart:WDC_WD100EZAZ-11TDBA0_2HC8HR6K:199": {
+   "baseline": true,
+   "cat": "smart",
+   "last": 1,
+   "level": "warn",
+   "ref": 1,
+   "since": 1791785641.0,
+   "subject": "disk5",
+   "title": "disk5: 1 UDMA CRC error (cable/connection)",
+   "unit": ""
+  },
+  "sys:cpu_temp": {
+   "baseline": true,
+   "cat": "temp",
+   "last": null,
+   "level": "warn",
+   "ref": null,
+   "since": 1791785641.0,
+   "subject": "cpu",
+   "title": "CPU is hot: 86\u00b0C",
+   "unit": ""
+  },
+  "temp:disk1": {
+   "baseline": false,
+   "cat": "temp",
+   "last": null,
+   "level": "warn",
+   "ref": null,
+   "since": 1791785701.0,
+   "subject": "disk1",
+   "title": "disk1: 58\u00b0C (warn 58, critical 60)",
+   "unit": ""
+  },
+  "vm:Webserver 2:paused": {
+   "baseline": false,
+   "cat": "vm",
+   "last": null,
+   "level": "warn",
+   "ref": null,
+   "since": 1791785701.0,
+   "subject": "Webserver 2",
+   "title": "VM Webserver 2 is paused",
+   "unit": ""
+  }
+ },
+ "baseline_at": 1791785641.0,
+ "boot_id": "db768638-cf2a-4067-9770-3d063347e83c",
+ "btime": 1791540070,
+ "containers": {
+  "EmbyServer": {
+   "exit": 0,
+   "finished": "0001-01-01T00:00:00Z",
+   "health": "",
+   "id": "d28c3e8399bb261e6336e2b789630bbb76a942631f6a16d2e777d50614e9f3b3",
+   "image": "emby/embyserver:latest",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T11:02:09.190131258Z",
+   "status": "running"
+  },
+  "Firefly-III": {
+   "exit": 137,
+   "finished": "0001-01-01T00:00:00Z",
+   "health": "healthy",
+   "id": "6286f284d042d0649b51794e60e56c1922ca0f7f52342f56dcd697eca1cd559a",
+   "image": "fireflyiii/core:latest",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-12T02:00:52.219364665Z",
+   "status": "exited"
+  },
+  "Firefly-III-Data-Importer": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:43.732407481Z",
+   "health": "healthy",
+   "id": "9c725cea8f08b7fbf999a64fef825519d9db774e27157e7b1fb75d589f7d061b",
+   "image": "fireflyiii/data-importer:latest",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:23.985074648Z",
+   "status": "running"
+  },
+  "HomeAssistant_inabox": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:33.758432166Z",
+   "health": "",
+   "id": "0da52b2bf5bf5c0d5e77b11fef1b279cbf53d5f1aa8824701eeab540b3bbe167",
+   "image": "spaceinvaderone/ha_inabox:latest",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:24.147952249Z",
+   "status": "running"
+  },
+  "JDownloader2": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:35.90615597Z",
+   "health": "",
+   "id": "1e9ffa3f4caa30451506d743e0d8ce2aa3e3d5f9e96083aa379a744d9baa6103",
+   "image": "jlesage/jdownloader-2",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:27.931375869Z",
+   "status": "running"
+  },
+  "Seerr": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:33.691573841Z",
+   "health": "",
+   "id": "28a75930dff2de32542e3e70ab83f3ce52da15a6153a9a85034b7fa6d63c3acd",
+   "image": "ghcr.io/seerr-team/seerr:latest",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:24.346123096Z",
+   "status": "running"
+  },
+  "bazarr": {
+   "exit": 0,
+   "finished": "2026-10-09T10:13:31.31108906Z",
+   "health": "",
+   "id": "47f7e52ea42ffbf6e2e660e38db25ba9cc27a947d02ecdef1cc450bc22a28f61",
+   "image": "linuxserver/bazarr",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:13:31.446202395Z",
+   "status": "running"
+  },
+  "binhex-prowlarr": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:34.164859162Z",
+   "health": "healthy",
+   "id": "d0b1bbeb286daea7771e76d1efe011106c7218f068b30f3fe81055135f0f67cf",
+   "image": "binhex/arch-prowlarr",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:27.162708437Z",
+   "status": "running"
+  },
+  "binhex-sabnzbd": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:33.710874265Z",
+   "health": "healthy",
+   "id": "5d1b05be6cf90b7a13af2e3dcbe99f041a0c65ea41746917ae12005e92ad013d",
+   "image": "binhex/arch-sabnzbd",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:27.742443623Z",
+   "status": "running"
+  },
+  "claude-bot": {
+   "self": true,
+   "status": "running",
+   "text": "Up 4 hours"
+  },
+  "claude-vault": {
+   "exit": 0,
+   "finished": "2026-10-12T02:00:37.556705287Z",
+   "health": "healthy",
+   "id": "1b3188bc4c1ab7f5adf0eb21f7b8667c1f6e0ee71c776326aff83942228354de",
+   "image": "claude-vault:local",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-12T02:00:52.091454749Z",
+   "status": "running"
+  },
+  "firefly-iii_postgresql17": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:33.676491567Z",
+   "health": "",
+   "id": "0df4a39f28ab17aabb0d91a2d027fe6640259138216bb6d889f36849a649d9a8",
+   "image": "postgres:17",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:24.506665765Z",
+   "status": "running"
+  },
+  "flaresolverr": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:33.667420782Z",
+   "health": "",
+   "id": "2f312039feb3c8ca3936ae107dce85ae0c807fc13617d2c85c43187c505ed071",
+   "image": "flaresolverr/flaresolverr",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:24.672412296Z",
+   "status": "running"
+  },
+  "iSponsorBlockTV": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:33.808832091Z",
+   "health": "",
+   "id": "46a0309c924b96ad014ffcbd1f19fe51bdb13e5bf9a316e76104c5b03ca66647",
+   "image": "ghcr.io/dmunozv04/isponsorblocktv:latest",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:24.833676797Z",
+   "status": "running"
+  },
+  "paperless-ngx": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:39.596499486Z",
+   "health": "healthy",
+   "id": "a3213e50698580b1ab6eb61a6246de1f746d9f8738cc2fab99e87ebb8d343e2f",
+   "image": "ghcr.io/paperless-ngx/paperless-ngx",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:24.976365345Z",
+   "status": "running"
+  },
+  "paperless_redis": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:33.751202818Z",
+   "health": "",
+   "id": "d32f4c829de0f847874dc98f0a71588a504d8d5cec3f24c6bdca12eab1ba870a",
+   "image": "redis",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:25.150961981Z",
+   "status": "running"
+  },
+  "radarr": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:36.787937625Z",
+   "health": "",
+   "id": "858a675aa253de4ebc208de78511069ea3cb25f996579d8249296363a8416c56",
+   "image": "lscr.io/linuxserver/radarr:latest",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:26.783751266Z",
+   "status": "running"
+  },
+  "sonarr": {
+   "exit": 0,
+   "finished": "0001-01-01T00:00:00Z",
+   "health": "",
+   "id": "55d767a4591ba69d5cc3c2c362bc78ad677111481bde62eb4d75abde140633bf",
+   "image": "linuxserver/sonarr",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-11T02:01:26.694847234Z",
+   "status": "running"
+  },
+  "tdarr": {
+   "exit": 0,
+   "finished": "0001-01-01T00:00:00Z",
+   "health": "",
+   "id": "34ccfcb387ae31cebc64a8df5ead14307cd08f86c041d39158b341c34e2f8eeb",
+   "image": "ghcr.io/haveagitgat/tdarr",
+   "oom": false,
+   "restarts": 0,
+   "started": "0001-01-01T00:00:00Z",
+   "status": "created"
+  },
+  "tracearr-supervised": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:34.722056395Z",
+   "health": "healthy",
+   "id": "8687d6dc3db4878e6ddb14dab578dbab37f7e9c0b51527ca4481e4308722e887",
+   "image": "ghcr.io/connorgallopo/tracearr:supervised",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:25.348798291Z",
+   "status": "running"
+  },
+  "transmission": {
+   "exit": 0,
+   "finished": "0001-01-01T00:00:00Z",
+   "health": "",
+   "id": "17a395a8d0e453aee7d2d4c3e53ad8c465de2d1bf020109fbb890b760851c01d",
+   "image": "linuxserver/transmission",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-10T10:26:45.939383424Z",
+   "status": "running"
+  },
+  "unifi-controller-reborn": {
+   "exit": 0,
+   "finished": "2026-10-09T09:41:37.244213361Z",
+   "health": "healthy",
+   "id": "ee62314049f889f6984528d40b8b2cf07d2fd276df532da19e769fe16afb7e77",
+   "image": "11notes/unifi:9.4.19-unraid",
+   "oom": false,
+   "restarts": 0,
+   "started": "2026-10-09T10:03:25.552670778Z",
+   "status": "running"
+  }
+ },
+ "host": "Homesrv",
+ "last_ok": 1791785701.0,
+ "last_run": 1791785701.0,
+ "notifications_seen": [
+  "Unraid_Disk_2_disk_utilization_1791770941.notify",
+  "Unraid_Disk_2_disk_utilization_1791769442.notify",
+  "Docker___Firefly_III_a2b5..7bd8_ticket.notify",
+  "Unraid_Disk_6_message_1791754321.notify",
+  "Unraid_Disk_6_temperature_1791752461.notify",
+  "Unraid_Disk_6_message_1791689521.notify",
+  "Unraid_Disk_6_temperature_1791686941.notify",
+  "Unraid_Disk_2_disk_utilization_1791683882.notify",
+  "Docker___tdarr_83c4..a3ae_ticket.notify",
+  "Docker___sonarr_dffc..fe0c_ticket.notify",
+  "Docker___Firefly_III_db24..03d5_ticket.notify",
+  "Unraid_Disk_6_message_1791646501.notify",
+  "Unraid_Disk_6_temperature_1791644041.notify",
+  "Unraid_Disk_6_message_1791608041.notify",
+  "Unraid_Disk_2_disk_utilization_1791602581.notify",
+  "Unraid_Disk_6_temperature_1791601501.notify",
+  "Unraid_Cache_disk_message_1791596641.notify",
+  "Unraid_Cache_disk_disk_utilization_1791593521.notify",
+  "System___Unraid_7.3.3_ticket.notify",
+  "Unraid_Disk_5_SMART_health_199_1791543841.notify"
+ ],
+ "notify_alerted": {
+  "alert|Unraid Disk 2 disk utilization|Disk # is low on space (#%)|WUH721414AL4204_L2LN36EA_35000cca28ecf588c (sde)": 1791770941,
+  "warning|Unraid Cache disk disk utilization|Cache disk is high on usage (#%)|WD_BLACK_SN850X_1000GB_13030C3F4G44 (nvme0n1)": 1791593521,
+  "warning|Unraid Disk 5 SMART health [199]|udma crc error count is #|WDC_WD100EZAZ-11TDBA0_2HC8HR6K (sdc)": 1791543841,
+  "warning|Unraid Disk 6 temperature|Disk # is hot (# C)|WDC_WD100EDAZ-11F3RA0_8HJZ0KAH (sda)": 1791752461
+ },
+ "notify_normals": {
+  "cache:space": [
+   1791596641
+  ],
+  "disk6:temp": [
+   1791608041,
+   1791646501,
+   1791689521,
+   1791754321
+  ]
+ },
+ "server_now": 1791785581,
+ "slots": {
+  "cache": "WD_BLACK_SN850X_1000GB_13030C3F4G44",
+  "data": "WD_BLACK_SN850X_2000GB_70323R4Q7359",
+  "disk1": "ST14000NM001G-2KJ103_PCK0MJHF",
+  "disk10": "WDC_WD40EFRX-68WT0N0_WD-WCC4E0020548",
+  "disk11": "WUH721414AL4204_B9BKG0AN_35000cca28ec3fb88",
+  "disk2": "WUH721414AL4204_L2LN36EA_35000cca28ecf588c",
+  "disk3": "ST16000NM002G_QF24CPFC1809A94998QD_35000c500af44fb0f",
+  "disk4": "ST10000NM0016-1TT101_GE714JH8",
+  "disk5": "WDC_WD100EZAZ-11TDBA0_2HC8HR6K",
+  "disk6": "WDC_WD100EDAZ-11F3RA0_8HJZ0KAH",
+  "disk7": "WDC_WD100EZAZ-11TDBA0_JEK6GSJN",
+  "disk8": "WDC_WD100EZAZ-11TDBA0_JEKEY6YZ",
+  "disk9": "ST10000NM0016-1TT101_ZA206FKS",
+  "parity": "ST16000NM001G-2KK103_ZL2CVXV3",
+  "parity2": ""
+ },
+ "smart": {
+  "ST10000NM0016-1TT101_GE714JH8": {
+   "attrs": {
+    "187": 0,
+    "197": 0,
+    "198": 0,
+    "199": 44,
+    "5": 0
+   },
+   "grown": null,
+   "health": "PASSED",
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk4",
+   "src": "live",
+   "temp": 40,
+   "uncorrected": null
+  },
+  "ST10000NM0016-1TT101_ZA206FKS": {
+   "attrs": {
+    "187": 0,
+    "197": 0,
+    "198": 0,
+    "199": 0,
+    "5": 0
+   },
+   "grown": null,
+   "health": null,
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk9",
+   "src": "cached 10-12 06:47",
+   "temp": 40,
+   "uncorrected": null
+  },
+  "ST14000NM001G-2KJ103_PCK0MJHF": {
+   "attrs": {
+    "187": 0,
+    "197": 0,
+    "198": 0,
+    "199": 0,
+    "5": 0
+   },
+   "grown": null,
+   "health": "PASSED",
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk1",
+   "src": "live",
+   "temp": 39,
+   "uncorrected": null
+  },
+  "ST16000NM001G-2KK103_ZL2CVXV3": {
+   "attrs": {
+    "187": 0,
+    "197": 0,
+    "198": 0,
+    "199": 7,
+    "5": 0
+   },
+   "grown": null,
+   "health": null,
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "parity",
+   "src": "cached 10-12 06:47",
+   "temp": 33,
+   "uncorrected": null
+  },
+  "ST16000NM002G_QF24CPFC1809A94998QD_35000c500af44fb0f": {
+   "attrs": {},
+   "grown": 0,
+   "health": "OK",
+   "nonmedium": 0,
+   "nvme": {},
+   "slot": "disk3",
+   "src": "live",
+   "temp": 35,
+   "uncorrected": 0
+  },
+  "WDC_WD100EDAZ-11F3RA0_8HJZ0KAH": {
+   "attrs": {
+    "197": 0,
+    "198": 0,
+    "199": 0,
+    "5": 0
+   },
+   "grown": null,
+   "health": null,
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk6",
+   "src": "cached 10-12 06:47",
+   "temp": 45,
+   "uncorrected": null
+  },
+  "WDC_WD100EZAZ-11TDBA0_2HC8HR6K": {
+   "attrs": {
+    "197": 0,
+    "198": 0,
+    "199": 1,
+    "5": 0
+   },
+   "grown": null,
+   "health": "PASSED",
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk5",
+   "src": "live",
+   "temp": 39,
+   "uncorrected": null
+  },
+  "WDC_WD100EZAZ-11TDBA0_JEK6GSJN": {
+   "attrs": {
+    "197": 0,
+    "198": 0,
+    "199": 0,
+    "5": 0
+   },
+   "grown": null,
+   "health": null,
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk7",
+   "src": "cached 10-12 06:47",
+   "temp": 40,
+   "uncorrected": null
+  },
+  "WDC_WD100EZAZ-11TDBA0_JEKEY6YZ": {
+   "attrs": {
+    "197": 0,
+    "198": 0,
+    "199": 0,
+    "5": 0
+   },
+   "grown": null,
+   "health": null,
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk8",
+   "src": "cached 10-12 06:47",
+   "temp": 40,
+   "uncorrected": null
+  },
+  "WDC_WD160EDFZ-11AFWA0_2KF2LFGG": {
+   "attrs": {
+    "197": 0,
+    "198": 0,
+    "199": 0,
+    "5": 0
+   },
+   "grown": null,
+   "health": "PASSED",
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "dev1",
+   "src": "live",
+   "temp": 43,
+   "uncorrected": null
+  },
+  "WDC_WD40EFRX-68WT0N0_WD-WCC4E0020548": {
+   "attrs": {
+    "197": 0,
+    "198": 0,
+    "199": 0,
+    "5": 0
+   },
+   "grown": null,
+   "health": null,
+   "nonmedium": null,
+   "nvme": {},
+   "slot": "disk10",
+   "src": "cached 10-12 06:47",
+   "temp": 42,
+   "uncorrected": null
+  },
+  "WD_BLACK_SN850X_1000GB_13030C3F4G44": {
+   "attrs": {},
+   "grown": null,
+   "health": "PASSED",
+   "nonmedium": null,
+   "nvme": {
+    "crit_temp_min": 0,
+    "critical_warning": 0,
+    "media_errors": 0,
+    "spare": 100,
+    "spare_threshold": 10,
+    "unsafe_shutdowns": 140,
+    "used": 32,
+    "warn_temp_min": 0
+   },
+   "slot": "cache",
+   "src": "live",
+   "temp": 58,
+   "uncorrected": null
+  },
+  "WD_BLACK_SN850X_2000GB_70323R4Q7359": {
+   "attrs": {},
+   "grown": null,
+   "health": "PASSED",
+   "nonmedium": null,
+   "nvme": {
+    "crit_temp_min": 0,
+    "critical_warning": 0,
+    "media_errors": 0,
+    "spare": 100,
+    "spare_threshold": 10,
+    "unsafe_shutdowns": 52,
+    "used": 3,
+    "warn_temp_min": 0
+   },
+   "slot": "data",
+   "src": "live",
+   "temp": 56,
+   "uncorrected": null
+  },
+  "WUH721414AL4204_B9BKG0AN_35000cca28ec3fb88": {
+   "attrs": {},
+   "grown": 0,
+   "health": "OK",
+   "nonmedium": 0,
+   "nvme": {},
+   "slot": "disk11",
+   "src": "live",
+   "temp": 41,
+   "uncorrected": 0
+  },
+  "WUH721414AL4204_L2LN36EA_35000cca28ecf588c": {
+   "attrs": {},
+   "grown": 0,
+   "health": "OK",
+   "nonmedium": 0,
+   "nvme": {},
+   "slot": "disk2",
+   "src": "live",
+   "temp": 43,
+   "uncorrected": 0
+  }
+ },
+ "ssh_alerted": false,
+ "ssh_failures": 0,
+ "sync": null,
+ "syslog_seen": [
+  "811153143affcdf2"
+ ],
+ "unraid_version": "7.3.2",
+ "version": 1,
+ "vms": {
+  "Home Assistant": "running",
+  "Pi-Hole": "running",
+  "Webserver 2": "paused",
+  "Win11-emby": "running"
+ }
+}
+## TODAY.md
+# Unraid health report: Homesrv
+2026-10-12 08:15 CEST · Unraid 7.3.2 · up 2d 20h (since 2026-10-09 12:01)
+
+**Status: 0 critical, 9 warning(s); new since last run: 5**
+
+## New since last run
+- **WARN** parity: 7 UDMA CRC errors (cable/connection)
+- **WARN** disk1: 58°C (warn 58, critical 60)
+- **WARN** Container Firefly-III exited with code 137
+- **WARN** VM Webserver 2 is paused
+- **WARN** Syslog: 1 new error line(s) (SATA link ×1): "Oct 12 10:59:01 Homesrv kernel: ata3.00: exception Emask 0x10"
+  - `Oct 12 10:59:01 Homesrv kernel: ata3.00: exception Emask 0x10`
+
+## Known issues (already reported or pre-existing)
+- **WARN** docker.img (btrfs) has lifetime error counters: write 2829, read 1, corruption 2 (total 2832) (baseline)
+- **WARN** disk4: 44 UDMA CRC errors (cable/connection) (baseline)
+- **WARN** disk5: 1 UDMA CRC error (cable/connection) (baseline)
+- **WARN** CPU is hot: 86°C (baseline)
+
+## Array
+- State: STARTED, 1 parity + 11 data disks; empty slot(s): parity2
+- Disabled / invalid / missing: 1 / 1 / 0 (= the empty parity2 slot; expected)
+- Capacity: 114 TB used of 122 TB (93.3%), 8.2 TB free (alerts below 3.0 TB, critical below 1.0 TB); disks alert on entering the 90/95/98% bands
+- Last parity check: finished 2026-09-08 12:34 after 1d 10h, 129 MB/s, 0 errors; 34 days ago
+- Schedule: yearly (cron `0 0 7 9 *`, server time); overdue after 366 + 7 = 373 days; would warn from 2027-09-16
+- Recent sync operations: 2026-06-02 recon D2 OK; 2026-06-04 recon D11 OK; 2026-06-08 check P cancelled; 2026-09-08 check P OK
+
+## Disks (temp limits: HDD 58/60°C, SSD/NVMe 65/75°C)
+
+| Disk | Dev | Model / serial | State | Temp | I/O err | SMART | Used |
+|---|---|---|---|---|---|---|---|
+| parity | sdm | ST16000NM001G-2KK103_ZL2CVXV3 | standby | – | 0 | realloc 0 · pend 0 · unc 0 · CRC 7 (cached 10-12 06:47) | – |
+| disk1 | sdl | ST14000NM001G-2KJ103_PCK0MJHF | active | 58°C | 0 | PASSED · realloc 0 · pend 0 · unc 0 · CRC 0 | 96.5% |
+| disk2 | sde | WUH721414AL4204_L2LN36EA_35000cca28ecf588c | active | 43°C | 0 | OK · grown 0 · uncorr 0 · non-med 0 | 96.7% |
+| disk3 | sdh | ST16000NM002G_QF24CPFC1809A94998QD_35000c500af44fb0f | active | 35°C | 0 | OK · grown 0 · uncorr 0 · non-med 0 | 94.5% |
+| disk4 | sdj | ST10000NM0016-1TT101_GE714JH8 | active | 39°C | 0 | PASSED · realloc 0 · pend 0 · unc 0 · CRC 44 | 94.3% |
+| disk5 | sdc | WDC_WD100EZAZ-11TDBA0_2HC8HR6K | active | 39°C | 0 | PASSED · realloc 0 · pend 0 · unc 0 · CRC 1 | 90.2% |
+| disk6 | sda | WDC_WD100EDAZ-11F3RA0_8HJZ0KAH | standby | – | 0 | realloc 0 · pend 0 · unc 0 · CRC 0 (cached 10-12 06:47) | 93.4% |
+| disk7 | sdd | WDC_WD100EZAZ-11TDBA0_JEK6GSJN | standby | – | 0 | realloc 0 · pend 0 · unc 0 · CRC 0 (cached 10-12 06:47) | 92.0% |
+| disk8 | sdg | WDC_WD100EZAZ-11TDBA0_JEKEY6YZ | standby | – | 0 | realloc 0 · pend 0 · unc 0 · CRC 0 (cached 10-12 06:47) | 92.2% |
+| disk9 | sdi | ST10000NM0016-1TT101_ZA206FKS | standby | – | 0 | realloc 0 · pend 0 · unc 0 · CRC 0 (cached 10-12 06:47) | 91.9% |
+| disk10 | sdb | WDC_WD40EFRX-68WT0N0_WD-WCC4E0020548 | standby | – | 0 | realloc 0 · pend 0 · unc 0 · CRC 0 (cached 10-12 06:47) | 80.7% |
+| disk11 | sdf | WUH721414AL4204_B9BKG0AN_35000cca28ec3fb88 | active | 41°C | 0 | OK · grown 0 · uncorr 0 · non-med 0 | 92.9% |
+| cache | nvme0n1 | WD_BLACK_SN850X_1000GB_13030C3F4G44 | active | 58°C | 0 | PASSED · warn 0x00 · media 0 · wear 32% · spare 100% | 7.8% |
+| data | nvme1n1 | WD_BLACK_SN850X_2000GB_70323R4Q7359 | active | 55°C | 0 | PASSED · warn 0x00 · media 0 · wear 3% · spare 100% | 23.7% |
+| dev1 | sdk | WDC_WD160EDFZ-11AFWA0_2KF2LFGG | active, unassigned, preclear running | 44°C | 0 | PASSED · realloc 0 · pend 0 · unc 0 · CRC 0 | – |
+
+## Pools, images and system filesystems
+
+| Name | FS | Used | Free | Size | Status / errors |
+|---|---|---|---|---|---|
+| cache | btrfs | 7.8% | 922 GB | 1.0 TB | ONLINE; btrfs errors: 0 |
+| data | btrfs | 23.7% | 1.5 TB | 2.0 TB | ONLINE; btrfs errors: 0 |
+| docker.img | btrfs | 59.2% | 21.2 GB | 53.7 GB | btrfs errors: write 2829, read 1, corruption 2 |
+| libvirt.img | btrfs | 1.0% | 946 MB | 1.1 GB | btrfs errors: 0 |
+| flash (/boot) | vfat | 19.1% | 12.8 GB | 15.8 GB | – |
+| /var/log (RAM) | tmpfs | 1.0% | 133 MB | 134 MB | – |
+| rootfs (RAM) | rootfs | 6.2% | 31.4 GB | 33.5 GB | – |
+| /run (RAM) | tmpfs | 2.1% | 131 MB | 134 MB | – |
+
+ZFS: no pools available
+
+## Containers (19/21 running, plus claude-bot)
+- Not running / unhealthy: Firefly-III (exited, exit 137), tdarr (created)
+- Health checks passing: 8; restart counts: all 0
+- Running: bazarr, binhex-prowlarr, binhex-sabnzbd, claude-vault, EmbyServer, Firefly-III-Data-Importer, firefly-iii_postgresql17, flaresolverr, HomeAssistant_inabox, iSponsorBlockTV, JDownloader2, paperless-ngx, paperless_redis, radarr, Seerr, sonarr, tracearr-supervised, transmission, unifi-controller-reborn
+
+## VMs (3/4 running)
+- Home Assistant (running), Webserver 2 (paused), Pi-Hole (running), Win11-emby (running)
+
+## Unraid notifications (20 unread, 20 archived since boot)
+- 2026-10-12 04:09 [alert] Unraid Disk 2 disk utilization: Disk 2 is low on space (97%)
+- 2026-10-12 03:44 [alert] Unraid Disk 2 disk utilization: Disk 2 is low on space (96%)
+- 2026-10-12 00:10 [normal] Docker - Firefly-III [a2b5..7bd8]: Version update a2b5..7bd8
+- 2026-10-11 23:32 [normal] Unraid Disk 6 message: Disk 6 returned to normal temperature
+- 2026-10-11 23:01 [warning] Unraid Disk 6 temperature: Disk 6 is hot (51  C)
+- 2026-10-11 05:32 [normal] Unraid Disk 6 message: Disk 6 returned to normal temperature
+- 2026-10-11 04:49 [warning] Unraid Disk 6 temperature: Disk 6 is hot (51  C)
+- 2026-10-11 03:58 [alert] Unraid Disk 2 disk utilization: Disk 2 is low on space (95%)
+- 2026-10-11 00:10 [normal] Docker - tdarr [83c4..a3ae]: Version update 83c4..a3ae
+- 2026-10-11 00:10 [normal] Docker - sonarr [dffc..fe0c]: Version update dffc..fe0c
+- 2026-10-11 00:10 [normal] Docker - Firefly-III [db24..03d5]: Version update db24..03d5
+- 2026-10-10 17:35 [normal] Unraid Disk 6 message: Disk 6 returned to normal temperature
+- 2026-10-10 16:54 [warning] Unraid Disk 6 temperature: Disk 6 is hot (51  C)
+- 2026-10-10 06:54 [normal] Unraid Disk 6 message: Disk 6 returned to normal temperature
+- 2026-10-10 05:23 [alert] Unraid Disk 2 disk utilization: Disk 2 is low on space (94%)
+
+## System
+- CPU: 13th Gen Intel(R) Core(TM) i9-13900K; load 5.38 / 4.35 / 4.03 on 32 threads
+- Temperatures: CPU 86°C (high 80), board 91°C
+- Memory: 25.7 GB available of 67.2 GB (38%); swap none configured
+- Syslog: 1 line(s) match the error patterns, 1 new
+- Preclear running on: /dev/sdk
+
+## Not checked / data gaps
+- SMART self-assessment (-H) skipped for 6 spun-down disk(s) so they stay asleep (parity, disk6, disk7, disk8, disk9, disk10); their attributes come from Unraid's cache, taken when they last spun.
+- VM vdisk fill levels are not visible from the host; only libvirt.img and the pools are checked.
+
+## runs.log
+TODAY-TS ok baseline new=0 crit=0 warn=4 resolved=0 0.0s
+TODAY-TS ok new=0 crit=0 warn=4 resolved=0 0.0s
+TODAY-TS ok new=5 crit=0 warn=9 resolved=0 0.0s
+
+## inbox
+(none)

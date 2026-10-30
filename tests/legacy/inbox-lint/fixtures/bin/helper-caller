@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Placeholder fixture: writes only through a helper that adds the marker."""
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import addlib
+
+addlib.add_note(os.path.expanduser("~/example-dir"), "example-helper", "example finding")

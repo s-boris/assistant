@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""media-remux: replace old remux files in Radarr with a reasonable encode.
+
+Candidates: movies on the profile "Default QP" (id 1; never "Best", id 8) released before (this year - 4),
+whose current file is Remux-1080p or Remux-2160p. Per movie, Radarr's interactive search
+(GET /api/v3/release?movieId=) and a pick: the best 2160p HDR encode (Bluray-2160p or WEBDL-2160p with the
+  profile's "HDR" custom format = HDR10 / HDR10+ / DV with HDR fallback / HLG / PQ, no "SDR" in the name, <= 30 GB).
+  Only that: never a 1080p encode, never SDR (4K HDR stays 4K HDR, just at a more reasonable size).
+  best = highest customFormatScore of the profile, then the smaller file. Kept rejections: any custom format the
+  profile scores <= -50000 (LQ, German LQ/Microsized, wrong language, German subbed, DV without HDR fallback,
+  Upscaled, SDR, BR-DISK, 3D, Extras ...), a language tier below the current file's (German DL stays German DL),
+  every Radarr rejection except the upgrade/cutoff ones (size limits, blocklist, unknown movie, unparsable ...),
+  usenet only (MEDIA_REMUX_PROTOCOLS), and it must save >= 4 GB and be <= 75 % of the current file.
+  The release must be THIS film: the interactive search returns releases "matched by Id" (indexers stamp the searched
+  IMDb/TMDB id on other films; 29.10: Extinction 2018 for Transformers: Age of Extinction 2014, Catch Me 2018 for
+  Catch Me If You Can 2002), so mappedMovieId proves nothing. Best first, at most 15 names: the name, parsed by
+  Radarr (GET /api/v3/parse), must carry a known title of the movie (main / original / alternate, or the parser maps
+  it to the movie) AND a year within +-1 (TMDB re-dating exemption): arr-mismatch's regrab check (regrab_ok, loaded
+  from ~/bin/arr-mismatch). No year, no parse or no arr-mismatch -> not picked (fails closed).
+  No such release -> the remux stays (state "no-release", re-checked after 30 days). A grab whose download failed
+  (incomplete upload; Radarr blocklists it) or vanished leaves the remux too: state "failed", re-tried after 30 days
+  (a refused or blocked import stays "failed" until someone looks).
+The grab is a normal Radarr grab (POST /api/v3/release guid + indexerId); Radarr imports it and moves the old
+remux to its recycle bin (/data/Movies/.recycle, emptied after 3 days). Movies are never deleted.
+
+Import: Radarr's import check compares the custom format score (all qualities sit in one group), so a pick that
+scores below the remux (typical for a lossy audio track) is blocked as "Not a Custom Format upgrade".
+--follow (every --cron tick) finds those queue items of its own grabs and imports them with Radarr's ManualImport
+command after arr-unblock's checks (title/year/parser/size/one main file), waiving only the upgrade rejection.
+A pick that scores above the remux is imported by Radarr itself (no check of ours in between), so --follow checks
+every new file: a name that clearly is another film (arr-mismatch's grab rule) -> state "wrong" (not "imported",
+not counted as freed; named in the morning note); the remux sits in Radarr's recycle bin for 3 days. Never deletes.
+
+  media-remux --plan [--limit N] [--movie ID] [--json]   read-only: candidates, pick per movie, GB saved
+                                                          (writes only ~/.local/state/media-remux/plan.json)
+  media-remux --run --max N [--movie ID] [--dry-run]      search + grab up to N movies now (gates as --cron
+                                                          except the time window and the night cap; its grabs
+                                                          count toward the night's cap only inside the window,
+                                                          outside it they are counted per day under 'outside')
+  media-remux --follow                                    grabbed -> imported / failed; blocked imports override
+  media-remux --status [--json]                           grabbed, imported, failed, no-release, GB freed
+  media-remux --cron                                      hub schedule tick (*/20): --follow always; inside
+                                                          00:30-06:00 one grab per tick, <= 15 per night; first
+                                                          tick after 06:30 -> ONE ~/inbox/media-remux-DATE.md line
+                                                          for the morning report (only when something happened)
+Gates for every grab: Radarr queue <= 10 items, the movie not already queued, the cache pool's live free space
+(unraid-capacity's collector) minus the queue's remaining bytes minus the release >= 100 GB and the pool < 90 %
+used; a gate failing stops the grabs of that tick.
+Off switch: touch ~/.config/media-remux/off (--cron and --run then grab nothing; --follow still finishes grabs).
+State ~/.local/state/media-remux/ (state.json, plan.json, actions.log). Exit 0 ok, 1 usage, 2 Radarr unreachable.
+Env (tests): MEDIA_REMUX_MEDIA (module with get/api/ApiError, default ~/bin/media), MEDIA_REMUX_UNBLOCK
+(default ~/bin/arr-unblock), MEDIA_REMUX_MISMATCH (default ~/bin/arr-mismatch), MEDIA_REMUX_STATE_DIR,
+MEDIA_REMUX_INBOX, MEDIA_REMUX_OFF, MEDIA_REMUX_NOW (epoch),
+MEDIA_REMUX_CACHE_FREE_GB + MEDIA_REMUX_CACHE_USED_PCT (skip the server probe), MEDIA_REMUX_NIGHT_MAX (15),
+MEDIA_REMUX_QUEUE_MAX (10), MEDIA_REMUX_CACHE_FLOOR_GB (100), MEDIA_REMUX_SEARCHES (searches per tick, 4).
+Tests: ~/opt/assistant/tests/legacy/media-remux/run.sh
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import sys
+import time
+from datetime import UTC, datetime, timedelta
+
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(HERE, 'lib')):
+    sys.path.insert(0, _lib)
+if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(HERE))
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+from core import jsonstate, locks  # noqa: E402
+
+
+def _env(name, default):
+    v = os.environ.get(name)
+    try:
+        return type(default)(v) if v not in (None, '') else default
+    except ValueError:
+        return default
+
+
+STATE_DIR = os.environ.get('MEDIA_REMUX_STATE_DIR') or f'{HOME}/.local/state/media-remux'
+STATE_F, PLAN_F = f'{STATE_DIR}/state.json', f'{STATE_DIR}/plan.json'
+LOG_F, LOCK_F = f'{STATE_DIR}/actions.log', f'{STATE_DIR}/lock'
+INBOX = os.environ.get('MEDIA_REMUX_INBOX') or f'{HOME}/inbox'
+OFF_F = os.environ.get('MEDIA_REMUX_OFF') or f'{HOME}/.config/media-remux/off'
+PROFILE_ID, BEST_PROFILE_ID = 1, 8
+REMUX = ('Remux-1080p', 'Remux-2160p')
+TIER_UHD = ('Bluray-2160p', 'WEBDL-2160p')   # the only replacements: 2160p HDR (never 1080p or SDR)
+GB = 1e9
+CAP_UHD = 30 * GB
+SDR_RE = re.compile(r'\bSDR\b', re.I)
+MIN_SAVE, MAX_SHARE = 4 * GB, 0.75
+BAD_CF = -50000          # a custom format the profile scores this low or lower is a hard no
+LANG_CF = 100000         # language tier custom formats (German DL, German + English, English, German Only)
+NIGHT_MAX = _env('MEDIA_REMUX_NIGHT_MAX', 15)
+QUEUE_MAX = _env('MEDIA_REMUX_QUEUE_MAX', 10)
+CACHE_FLOOR = _env('MEDIA_REMUX_CACHE_FLOOR_GB', 100.0) * GB
+CACHE_USED_MAX = 90.0
+SEARCHES = _env('MEDIA_REMUX_SEARCHES', 4)
+PROTOCOLS = set((os.environ.get('MEDIA_REMUX_PROTOCOLS') or 'usenet').split(','))
+NO_RELEASE_RETRY = 30 * 86400
+PLAN_REUSE = 14 * 86400  # a plan's no-release verdict spares the search this long
+LOST_AFTER = 48 * 3600   # a grab with no queue item, no import and no failure after this long = failed
+WIN_START, WIN_END, NOTE_AT = (0, 30), (6, 0), (6, 30)
+SEARCH_TIMEOUT = 180
+MATCH_TRY = 15           # release names parsed at most per movie (best first) for the this-film check
+IGNORE_REJ = re.compile(r'meets cutoff|equal or higher|not an upgrade|not a custom format upgrade|'
+                        r'custom format score.*(upgrade|improve)|upgrades? (are )?not allowed', re.I)
+UPGRADE_REJ = re.compile(r'not an upgrade|not a custom format upgrade|custom format.*(upgrade|score)|'
+                         r'equal or higher', re.I)
+IMPORT_STUCK = ('importBlocked', 'importPending')
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+def _sibling(env, name):
+    p = os.environ.get(env)
+    if p:
+        return p
+    own = os.path.join(HERE, name)
+    return own if os.path.isfile(own) else os.path.expanduser(f'~/bin/{name}')
+
+
+M = _load('media', _sibling('MEDIA_REMUX_MEDIA', 'media'))
+ApiError = M.ApiError
+TZ = getattr(M, 'ZRH', None) or UTC
+_AM = None
+
+
+def matcher():
+    """arr-mismatch's title/year rules (pick, grab_check, grab_reason, regrab_ok, names) as a module, loaded once;
+    None when it can't load (then nothing is picked: the check fails closed)."""
+    global _AM
+    if _AM is None:
+        try:
+            _AM = _load('arr_mismatch', _sibling('MEDIA_REMUX_MISMATCH', 'arr-mismatch'))
+        except Exception as e:  # noqa: BLE001  (no title check means no grab, never a crash)
+            log(f'title check unavailable (arr-mismatch): {type(e).__name__}: {e}')
+            _AM = False
+    return _AM or None
+
+
+def now():
+    v = os.environ.get('MEDIA_REMUX_NOW')
+    return float(v) if v else time.time()
+
+
+def local(ts=None):
+    return datetime.fromtimestamp(now() if ts is None else ts, TZ)
+
+
+def gb(n):
+    return f'{(n or 0) / GB:.1f} GB'
+
+
+def log(line):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG_F, 'a') as f:
+        f.write(f'{local().strftime("%Y-%m-%d %H:%M")} {line}\n')
+
+
+def load_state():
+    st = jsonstate.load(STATE_F, None) or {}
+    st.setdefault('movies', {})
+    st.setdefault('nights', {})
+    st.setdefault('outside', {})
+    return st
+
+
+def save_state(st):
+    jsonstate.save(STATE_F, st, mode=0o600, ensure_ascii=False, indent=1)
+
+
+# ----------------------------------------------------------------------------- Radarr reads
+def radarr(path, timeout=None):
+    return M.get('radarr', path, timeout=timeout)
+
+
+def profile():
+    p = radarr(f'/api/v3/qualityprofile/{PROFILE_ID}')
+    return {f['name']: f['score'] for f in p.get('formatItems') or []}
+
+
+def year_limit():
+    return local().year - 4  # released before this year (2026 -> <= 2021)
+
+
+def candidates(movies):
+    out = []
+    for m in movies:
+        mf = m.get('movieFile') or {}
+        qn = ((mf.get('quality') or {}).get('quality') or {}).get('name')
+        if (m.get('qualityProfileId') == PROFILE_ID and m.get('hasFile') and qn in REMUX
+                and 0 < (m.get('year') or 0) < year_limit()):
+            out.append({'id': m['id'], 'title': m.get('title') or '?', 'year': m.get('year'), 'quality': qn,
+                        'size': mf.get('size') or 0, 'file_id': mf.get('id')})
+    out.sort(key=lambda c: -c['size'])     # biggest remux first: the most space per grab
+    return out
+
+
+def cf_names(x):
+    return [c.get('name') for c in x.get('customFormats') or [] if c.get('name')]
+
+
+def lang_score(names, scores):
+    return max([scores.get(n, 0) for n in names if scores.get(n, 0) >= LANG_CF] or [0])
+
+
+def judge(r, cur, scores):
+    """-> (0, None) when acceptable, else (None, reason). Only a 2160p HDR encode is acceptable."""
+    qn = ((r.get('quality') or {}).get('quality') or {}).get('name')
+    size, names = r.get('size') or 0, cf_names(r)
+    if qn not in TIER_UHD:
+        return None, f'quality {qn} (2160p HDR only)'
+    tier, cap = 0, CAP_UHD
+    if 'HDR' not in names:
+        return None, 'no HDR'
+    if SDR_RE.search(r.get('title') or ''):
+        return None, 'SDR'
+    if r.get('protocol') not in PROTOCOLS:
+        return None, f'protocol {r.get("protocol")}'
+    bad = [n for n in names if scores.get(n, 0) <= BAD_CF]
+    if bad:
+        return None, 'custom format ' + ', '.join(bad)
+    if (r.get('customFormatScore') or 0) <= 0:
+        return None, 'score <= 0'
+    if lang_score(names, scores) < cur['lang']:
+        return None, 'language tier below the current file'
+    other = [x for x in r.get('rejections') or [] if not IGNORE_REJ.search(str(x))]
+    if other:
+        return None, 'radarr: ' + str(other[0])[:80]
+    if r.get('downloadAllowed') is False:
+        return None, 'download not allowed'
+    if r.get('mappedMovieId') not in (None, 0, cur['id']):
+        return None, 'mapped to another movie'
+    if size > cap:
+        return None, f'over {gb(cap)}'
+    if size > MAX_SHARE * cur['size'] or cur['size'] - size < MIN_SAVE:
+        return None, 'saves too little'
+    return tier, None
+
+
+def parse_name(name):
+    """Radarr's own parse of a release / file name; None when the name fits two library movies (HTTP 500
+    "Expected one movie, but found 2": unknown, not an error)."""
+    try:
+        return radarr(f'/api/v3/parse?title={M.q(name)}')
+    except ApiError as e:
+        if 'Expected one movie' in str(e) or 'MultipleMoviesFound' in str(e):
+            return None
+        raise
+
+
+def same_film(movie, name):
+    """Is the release name this movie? arr-mismatch's regrab check: a known title (main / original / alternate, or
+    Radarr's parser maps the name to the movie) AND a year within +-1 (TMDB re-dating exemption).
+    -> (True, None) or (False, why). Fails closed: no arr-mismatch, no parse or no year -> False."""
+    am = matcher()
+    if am is None:
+        return False, 'title check unavailable'
+    try:
+        rel = am.pick([(name, parse_name(name))])
+    except ApiError as e:
+        return False, f'name not parsed: {str(e)[:60]}'
+    if am.regrab_ok(movie, rel):
+        return True, None
+    if not rel:
+        return False, 'the name does not parse as a movie'
+    if not rel.get('year'):
+        return False, 'no year in the name'
+    return False, am.grab_reason(movie, rel, am.grab_check(movie, rel)) or 'title or year not this movie'
+
+
+def wrong_file(movie, mf):
+    """The new library file clearly is another film: its name (scene name, original path, library name; the first
+    that parses with a year) fails arr-mismatch's grab rule (year off, or an unknown title that another library
+    movie claims / that shares no word) -> why; else None (unknown counts as fine: Radarr's import stands)."""
+    am = matcher()
+    if am is None:
+        return None
+    rel = None
+    for n in am.names(mf)[:4]:
+        try:
+            rel = am.pick([(n, parse_name(n))])
+        except ApiError:
+            continue
+        if rel and rel.get('year'):
+            break
+    v = am.grab_check(movie, rel)
+    return f'{am.grab_reason(movie, rel, v)} ({rel["name"]})' if v['mismatch'] else None
+
+
+def pick(releases, cur, scores, same):
+    """Best acceptable release: judge() each, then best first (tier, score, size) the first whose name same(name)
+    accepts as this film (at most MATCH_TRY names). -> (release, None, wrong) or (None, reason, wrong);
+    wrong = [(name, why)] of the releases skipped as another film."""
+    ok, why, wrong, seen = [], {}, [], {}
+    for r in releases:
+        tier, reason = judge(r, cur, scores)
+        if reason:
+            why[reason.split(':')[0]] = why.get(reason.split(':')[0], 0) + 1
+        else:
+            ok.append((tier, -(r.get('customFormatScore') or 0), r.get('size') or 0, r))
+    ok.sort(key=lambda t: t[:3])
+    for *_k, r in ok:
+        name = (r.get('title') or '').strip()
+        if name not in seen:
+            if len(seen) >= MATCH_TRY:
+                why['title check limit'] = why.get('title check limit', 0) + 1
+                continue
+            seen[name] = same(name)
+        good, detail = seen[name]
+        if good:
+            return r, None, wrong
+        why['not this film'] = why.get('not this film', 0) + 1
+        if name not in (w[0] for w in wrong):
+            wrong.append((name, detail))
+    top = ', '.join(f'{k} {v}' for k, v in sorted(why.items(), key=lambda kv: -kv[1])[:3])
+    return None, (f'{len(releases)} releases, none fits ({top})' if releases else 'no releases found'), wrong
+
+
+def current_file(c):
+    f = radarr(f'/api/v3/moviefile/{c["file_id"]}') if c.get('file_id') else None
+    if not f:
+        fs = radarr(f'/api/v3/moviefile?movieId={c["id"]}') or []
+        f = fs[0] if fs else {}
+    return f
+
+
+def evaluate(c, scores):
+    """Live search for one candidate -> plan row (release or reason)."""
+    f = current_file(c)
+    cur = dict(c, score=f.get('customFormatScore') or 0, lang=lang_score(cf_names(f), scores))
+    rels = radarr(f'/api/v3/release?movieId={c["id"]}', timeout=SEARCH_TIMEOUT) or []
+    movie = radarr(f'/api/v3/movie/{c["id"]}') or {}     # the full record: alternate titles + release dates
+    r, reason, wrong = pick(rels, cur, scores, lambda name: same_film(movie, name))
+    row = {'id': c['id'], 'title': c['title'], 'year': c['year'], 'quality': c['quality'], 'size': c['size'],
+           'file_id': c['file_id'], 'score': cur['score'], 'checked': int(now())}
+    if wrong:
+        row['wrong'] = [{'title': n, 'why': (w or '')[:200]} for n, w in wrong[:3]]
+    if r is None:
+        return dict(row, reason=reason)
+    return dict(row, release={
+        'title': r.get('title'), 'guid': r.get('guid'), 'indexerId': r.get('indexerId'),
+        'indexer': r.get('indexer'), 'protocol': r.get('protocol'), 'size': r.get('size') or 0,
+        'quality': ((r.get('quality') or {}).get('quality') or {}).get('name'),
+        'score': r.get('customFormatScore') or 0, 'formats': cf_names(r)},
+        saved=c['size'] - (r.get('size') or 0), override=(r.get('customFormatScore') or 0) < cur['score'])
+
+
+def row_line(row):
+    head = f'{row["title"]} ({row["year"]}) {row["quality"]} {gb(row["size"])}'
+    rel = row.get('release')
+    skipped = ''.join(f'\n    not this film: {w["title"]} ({w["why"][:100]})' for w in row.get('wrong') or [])
+    if not rel:
+        return f'- {head}: keep ({row.get("reason")}){skipped}'
+    ov = ' [scores below the remux: import override]' if row.get('override') else ''
+    return f'- {head} -> {rel["quality"]} {gb(rel["size"])}, score {rel["score"]}, saves {gb(row["saved"])}{ov}\n' \
+           f'    {rel["title"]}{skipped}'
+
+
+# ----------------------------------------------------------------------------- gates
+def cache_space():
+    """(free bytes, used %) of the cache pool, live; None when unknown."""
+    if os.environ.get('MEDIA_REMUX_CACHE_FREE_GB'):
+        return float(os.environ['MEDIA_REMUX_CACHE_FREE_GB']) * GB, _env('MEDIA_REMUX_CACHE_USED_PCT', 50.0)
+    try:
+        u = _load('ucap', _sibling('MEDIA_REMUX_CAPACITY', 'unraid-capacity'))
+        raw, err = u.collect(u.SSH_HOST)
+        if err or not raw:
+            return None
+        smp = u.build_sample(raw)
+        smp = smp[0] if isinstance(smp, tuple) else smp
+        pool = ((smp or {}).get('pools') or {}).get('cache') or {}
+        if not pool.get('size'):
+            return None
+        return pool['free'], 100.0 * pool['used'] / pool['size']
+    except Exception as e:  # noqa: BLE001  (an unknown cache means no grab, never a crash)
+        log(f'cache probe failed: {type(e).__name__}: {e}')
+        return None
+
+
+def queue_records():
+    recs, page = [], 1
+    while True:
+        d = radarr(f'/api/v3/queue?page={page}&pageSize=200&includeMovie=false') or {}
+        recs += d.get('records') or []
+        if len(recs) >= (d.get('totalRecords') or 0) or not d.get('records'):
+            return recs
+        page += 1
+
+
+def gate(release_size, queue):
+    """None = go, else why not."""
+    if len(queue) > QUEUE_MAX:
+        return f'download queue holds {len(queue)} items (> {QUEUE_MAX})'
+    cs = cache_space()
+    if cs is None:
+        return 'cache pool free space unknown'
+    free, used = cs
+    if used >= CACHE_USED_MAX:
+        return f'cache pool {used:.0f} % used'
+    left = sum(r.get('sizeleft') or 0 for r in queue)
+    if free - left - release_size < CACHE_FLOOR:
+        return f'cache pool: {gb(free)} free - {gb(left)} queued - {gb(release_size)} < {gb(CACHE_FLOOR)} floor'
+    return None
+
+
+def night_key(ts=None):
+    d = local(ts)
+    return (d - timedelta(hours=12)).date().isoformat()   # the night of 28 -> 29 counts as 28
+
+
+def in_window(ts=None):
+    d = local(ts)
+    return WIN_START <= (d.hour, d.minute) < WIN_END
+
+
+def count_grab(st):
+    """The nightly cap counts grabs made inside the window, for that night. A --run outside the window (his
+    explicit 'start it now') is counted per day under 'outside' and never uses up a night's budget (30.10: a
+    daytime run of 30 at 11:37-12:37 on 29.10 put 17 grabs under the noon-to-noon key of the night 29 -> 30, which
+    then read 17/15 and grabbed nothing)."""
+    if in_window():
+        st['nights'].setdefault(night_key(), {'grabs': 0})['grabs'] += 1
+    else:
+        day = local().date().isoformat()
+        st['outside'][day] = st['outside'].get(day, 0) + 1
+
+
+# ----------------------------------------------------------------------------- grab
+RETRY_REASONS = ('download failed', 'gone from the queue')
+
+
+def retry_due(s):
+    """A failed download (incomplete upload, blocklisted by Radarr) or a vanished grab left the remux in place:
+    search again after NO_RELEASE_RETRY. Refused / blocked imports stay failed (a download waits in the queue)."""
+    return (str(s.get('reason') or '').startswith(RETRY_REASONS)
+            and now() - (s.get('failed_at') or 0) >= NO_RELEASE_RETRY)
+
+
+def grab_round(st, max_grabs, only=None, dry=False, cron=False):
+    """Search + grab up to max_grabs; returns (grabbed, lines)."""
+    lines, grabbed, searched = [], 0, 0
+    scores = profile()
+    movies = [radarr(f'/api/v3/movie/{only}')] if only else radarr('/api/v3/movie', timeout=120)
+    if only and movies[0].get('qualityProfileId') == BEST_PROFILE_ID:
+        return 0, ['movie is on profile Best: never touched']
+    cands = candidates(movies)
+    if only and not cands:
+        return 0, ['not a candidate (profile, year or file quality)']
+    plan = (jsonstate.load(PLAN_F, None) or {}).get('rows') or {}
+    queue = queue_records()
+    queued = {r.get('movieId') for r in queue}
+    for c in cands:
+        if grabbed >= max_grabs or (cron and searched >= SEARCHES):
+            break
+        s = st['movies'].get(str(c['id'])) or {}
+        if not only:
+            if s.get('status') in ('grabbed', 'imported', 'skipped', 'wrong'):
+                continue
+            if s.get('status') == 'failed' and not retry_due(s):
+                continue
+            if s.get('status') == 'no-release' and now() - s.get('checked', 0) < NO_RELEASE_RETRY:
+                continue
+            p = plan.get(str(c['id'])) or {}
+            if p.get('reason') and now() - p.get('checked', 0) < PLAN_REUSE:
+                continue
+        if c['id'] in queued:
+            lines.append(f'{c["title"]}: already in the download queue, skipped')
+            continue
+        why = gate(0, queue)
+        if why:
+            lines.append(f'stop: {why}')
+            break
+        searched += 1
+        row = evaluate(c, scores)
+        for w in [] if dry else row.get('wrong') or []:
+            log(f'NOT-THIS-FILM {c["id"]} {c["title"]} ({c["year"]}): skipped {w["title"]}: {w["why"]}')
+        if not row.get('release'):
+            lines.append(row_line(row))
+            if not dry:
+                st['movies'][str(c['id'])] = {'title': c['title'], 'year': c['year'], 'status': 'no-release',
+                                              'reason': row['reason'], 'checked': row['checked'],
+                                              'old_size': c['size'], 'old_quality': c['quality']}
+                log(f'NO-RELEASE {c["id"]} {c["title"]} ({c["year"]}): {row["reason"]}')
+            continue
+        rel = row['release']
+        why = gate(rel['size'], queue)
+        if why:
+            lines.append(f'stop: {why}')
+            break
+        lines.append(row_line(row))
+        if dry:
+            grabbed += 1
+            continue
+        M.api('radarr', 'POST', '/api/v3/release',
+              {'guid': rel['guid'], 'indexerId': rel['indexerId'], 'movieId': c['id']}, timeout=60)
+        grabbed += 1
+        queue.append({'movieId': c['id'], 'sizeleft': rel['size']})
+        st['movies'][str(c['id'])] = {
+            'title': c['title'], 'year': c['year'], 'status': 'grabbed', 'grabbed_at': int(now()),
+            'old_size': c['size'], 'old_quality': c['quality'], 'old_file_id': c['file_id'],
+            'old_score': row['score'], 'release': rel, 'override_needed': row['override']}
+        count_grab(st)
+        save_state(st)
+        log(f'GRAB {c["id"]} {c["title"]} ({c["year"]}) {c["quality"]} {gb(c["size"])} -> {rel["quality"]} '
+            f'{gb(rel["size"])} score {rel["score"]} (file {row["score"]}): {rel["title"]}')
+    return grabbed, lines
+
+
+# ----------------------------------------------------------------------------- follow
+def download_id(mid, s):
+    if s.get('download_id'):
+        return s['download_id']
+    hist = radarr(f'/api/v3/history/movie?movieId={mid}&eventType=1') or []
+    want = (s.get('release') or {}).get('title')
+    for h in sorted(hist, key=lambda h: h.get('date') or '', reverse=True):
+        if h.get('sourceTitle') == want and h.get('downloadId'):
+            s['download_id'] = h['downloadId']
+            return h['downloadId']
+    return None
+
+
+def override(rec, mid):
+    """ManualImport of a completed download Radarr blocked only as 'not an upgrade' -> (ok, detail)."""
+    au = _load('arr_unblock', _sibling('MEDIA_REMUX_UNBLOCK', 'arr-unblock'))
+    dl = rec.get('downloadId')
+    preview = M.get('radarr', f'/api/v3/manualimport?downloadId={M.q(dl)}&filterExistingFiles=true') or []
+    for f in preview:
+        f['rejections'] = [r for r in f.get('rejections') or []
+                           if not UPGRADE_REJ.search(str(r.get('reason') if isinstance(r, dict) else r))]
+    movie = radarr(f'/api/v3/movie/{mid}')
+    dec = au.verify_radarr(rec, movie, preview, lambda n: radarr(f'/api/v3/parse?title={M.q(n)}'))
+    if dec.problems:
+        return False, '; '.join(dec.problems)[:300]
+    res, detail = au.import_now(dec)
+    return res in ('ok', 'pending'), f'{res}: {detail}'
+
+
+def follow(st):
+    lines = []
+    for mid, s in st['movies'].items():
+        if s.get('status') != 'grabbed':
+            continue
+        m = radarr(f'/api/v3/movie/{mid}')
+        mf = m.get('movieFile') or {}
+        qn = ((mf.get('quality') or {}).get('quality') or {}).get('name')
+        if m.get('hasFile') and mf.get('id') != s.get('old_file_id') and qn not in REMUX:
+            bad = wrong_file(m, mf)
+            if bad:      # Radarr imported another film over the remux (a CF upgrade imports without our check)
+                s.update(status='wrong', wrong_at=int(now()), new_file_id=mf.get('id'), new_quality=qn,
+                         new_size=mf.get('size') or 0, reason=f'WRONG FILM imported: {bad}'[:300])
+                log(f'WRONG {mid} {s["title"]} ({s.get("year")}): {qn} {gb(mf.get("size"))} is another film: {bad}; '
+                    f'the remux is in Radarr\'s recycle bin (3 days); fix: blocklist the grab + a correct one')
+                lines.append(f'WRONG FILM imported for {s["title"]} ({s.get("year")}): {bad}')
+                continue
+            s.update(status='imported', imported_at=int(now()), new_size=mf.get('size') or 0,
+                     new_quality=qn, freed=(s.get('old_size') or 0) - (mf.get('size') or 0))
+            log(f'IMPORTED {mid} {s["title"]}: {qn} {gb(mf.get("size"))}, freed {gb(s["freed"])}')
+            lines.append(f'imported: {s["title"]} ({qn}, freed {gb(s["freed"])})')
+            continue
+        dl = download_id(int(mid), s)
+        recs = [r for r in radarr(f'/api/v3/queue/details?movieId={mid}') or []
+                if not dl or r.get('downloadId') == dl]
+        if recs:
+            r = recs[0]
+            state, status = r.get('trackedDownloadState') or '', (r.get('status') or '').lower()
+            msgs = ' | '.join(x for sm in r.get('statusMessages') or [] for x in sm.get('messages') or [])
+            if state in ('failed', 'failedPending') or status == 'failed':
+                s.update(status='failed', reason=f'download failed: {(r.get("errorMessage") or msgs)[:150]}',
+                         failed_at=int(now()))
+                log(f'FAILED {mid} {s["title"]}: {s["reason"]}')
+                lines.append(f'failed: {s["title"]}')
+            elif state in IMPORT_STUCK and status == 'completed' and not (r.get('sizeleft') or 0):
+                if not UPGRADE_REJ.search(msgs) and state == 'importPending':
+                    continue                       # Radarr is still on it
+                if s.get('override_tried', 0) >= 2:
+                    s.update(status='failed', reason='import still blocked after 2 override attempts',
+                             failed_at=int(now()))
+                    log(f'FAILED {mid} {s["title"]}: {s["reason"]}')
+                    lines.append(f'failed: {s["title"]} ({s["reason"]})')
+                    continue
+                s['override_tried'] = s.get('override_tried', 0) + 1
+                ok, detail = override(r, int(mid))
+                s['override'] = detail
+                log(f'OVERRIDE {mid} {s["title"]}: {"ok" if ok else "refused"}: {detail}')
+                lines.append(f'import override {"sent" if ok else "refused"}: {s["title"]}: {detail[:120]}')
+                if not ok:
+                    s.update(status='failed', reason=f'import blocked, override refused: {detail[:200]}',
+                             failed_at=int(now()))
+            continue
+        failed = [h for h in radarr(f'/api/v3/history/movie?movieId={mid}&eventType=4') or []
+                  if dl and h.get('downloadId') == dl]
+        if failed or now() - s.get('grabbed_at', now()) > LOST_AFTER:
+            s.update(status='failed', failed_at=int(now()),
+                     reason='download failed' if failed else 'gone from the queue without an import')
+            log(f'FAILED {mid} {s["title"]}: {s["reason"]}')
+            lines.append(f'failed: {s["title"]} ({s["reason"]})')
+    return lines
+
+
+# ----------------------------------------------------------------------------- status + note
+def summary(st, since=0):
+    c = {'grabbed': 0, 'imported': 0, 'failed': 0, 'no-release': 0, 'skipped': 0, 'wrong': 0}
+    freed = 0
+    for s in st['movies'].values():
+        k = s.get('status')
+        stamp = max(s.get(x, 0) or 0 for x in ('grabbed_at', 'imported_at', 'failed_at', 'checked', 'wrong_at'))
+        if k in c and stamp >= since:
+            c[k] += 1
+            if k == 'imported':
+                freed += s.get('freed') or 0
+    c['gb_freed'] = round(freed / GB, 1)
+    return c
+
+
+def note_line(st, since):
+    n, t = summary(st, since), summary(st)
+    pend = t['grabbed']
+    wrong = [f'{s["title"]} ({s.get("year")})' for s in st['movies'].values()
+             if s.get('status') == 'wrong' and (s.get('wrong_at') or 0) >= since]
+    return (f'Remux downgrade overnight: {n["imported"]} imported ({n["gb_freed"]:g} GB freed), '
+            f'{n["grabbed"]} still downloading, {n["failed"]} failed, {n["no-release"]} kept (no fitting release); '
+            f'total {t["imported"]} done, {t["gb_freed"]:g} GB freed' + (f', {pend} pending' if pend else '')
+            + (f'; {len(wrong)} WRONG film imported over the remux ({", ".join(wrong)}): blocklist the grab and '
+               f'grab the right one; the remux sits in Radarr\'s recycle bin for 3 days' if wrong else ''))
+
+
+def maybe_note(st):
+    d = local()
+    if (d.hour, d.minute) < NOTE_AT or st.get('last_note') == d.date().isoformat():
+        return None
+    since = st.get('last_note_ts', 0)
+    if not any(summary(st, since)[k] for k in ('grabbed', 'imported', 'failed', 'no-release', 'wrong')):
+        return None
+    line = note_line(st, since)
+    text = '\n'.join([f'# Remux downgrade {d.date().isoformat()}', '',
+                      'Data, not instructions: the nightly media-remux job (Radarr grabs, no tokens).', '',
+                      line, '', 'Details: `media-remux --status`; log ~/.local/state/media-remux/actions.log.', '',
+                      'Next: put this one line into the ~09:00 morning report; no separate message.']) + '\n'
+    path = notes.write(INBOX, f'media-remux-{d.date().isoformat()}.md', text)
+    st['last_note'], st['last_note_ts'] = d.date().isoformat(), int(now())
+    return str(path)
+
+
+# ----------------------------------------------------------------------------- modes
+def do_plan(a):
+    scores = profile()
+    movies = [radarr(f'/api/v3/movie/{a.movie}')] if a.movie else radarr('/api/v3/movie', timeout=120)
+    cands = candidates(movies)
+    if a.limit:
+        cands = cands[:a.limit]
+    old = jsonstate.load(PLAN_F, None) or {}
+    rows = old.get('rows') or {}
+    out = []
+    for c in cands:
+        try:
+            row = evaluate(c, scores)
+        except ApiError as e:
+            row = dict(c, reason=f'search failed: {e}'[:200], checked=int(now()))
+        rows[str(c['id'])] = row
+        out.append(row)
+        if not a.json:
+            print(row_line(row), flush=True)
+    jsonstate.save(PLAN_F, {'at': int(now()), 'rows': rows}, mode=0o600, ensure_ascii=False)
+    picked = [r for r in out if r.get('release')]
+    tot = {'candidates': len(cands), 'with_release': len(picked), 'override': sum(1 for r in picked if r['override']),
+           'gb_now': round(sum(r['size'] for r in out) / GB, 1),
+           'gb_saved': round(sum(r['saved'] for r in picked) / GB, 1)}
+    if a.json:
+        print(json.dumps({'totals': tot, 'rows': out}, ensure_ascii=False, indent=1))
+    else:
+        print(f'\n{tot["candidates"]} candidates ({tot["gb_now"]:g} GB of remux); {tot["with_release"]} with a fitting '
+              f'2160p HDR release ({tot["override"]} need the import override); saves {tot["gb_saved"]:g} GB')
+    return 0
+
+
+def do_status(a):
+    st = load_state()
+    c = summary(st)
+    c['tonight'] = st['nights'].get(night_key(), {}).get('grabs', 0)
+    c['outside_today'] = st['outside'].get(local().date().isoformat(), 0)
+    c['off'] = os.path.exists(OFF_F)
+    if a.json:
+        print(json.dumps({'totals': c, 'movies': st['movies']}, ensure_ascii=False, indent=1))
+        return 0
+    print(f'grabbed (pending) {c["grabbed"]} · imported {c["imported"]} · failed {c["failed"]} · '
+          f'no-release {c["no-release"]} · freed {c["gb_freed"]:g} GB · this night {c["tonight"]}/{NIGHT_MAX}'
+          + (f' · outside the window today {c["outside_today"]} (--run)' if c['outside_today'] else '')
+          + (f' · WRONG FILM {c["wrong"]}' if c['wrong'] else '') + (' · OFF' if c['off'] else ''))
+    for _mid, s in sorted(st['movies'].items(), key=lambda kv: -(kv[1].get('grabbed_at') or 0))[:15]:
+        if s.get('status') != 'no-release':
+            print(f'  {s["status"]:9} {s["title"]} ({s.get("year")}) {s.get("reason") or ""}'[:150])
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='media-remux', description='replace old remux files with encodes (Radarr)')
+    g = ap.add_mutually_exclusive_group(required=True)
+    for f in ('--plan', '--run', '--follow', '--status', '--cron'):
+        g.add_argument(f, action='store_true')
+    ap.add_argument('--max', type=int, default=0)
+    ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--movie', type=int)
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    a = ap.parse_args()
+    if a.run and a.max < 1:
+        ap.error('--run needs --max N (N >= 1)')
+    try:
+        if a.plan:
+            return do_plan(a)
+        if a.status:
+            return do_status(a)
+        with locks.hold(LOCK_F, wait=0) as fd:
+            if fd is None:
+                print('media-remux: another run holds the lock', file=sys.stderr)
+                return 0
+            st = load_state()
+            lines = follow(st)
+            if a.run and not a.dry_run and os.path.exists(OFF_F):
+                lines.append(f'off switch {OFF_F} is set: no grabs')
+            elif a.run:
+                n, more = grab_round(st, a.max, only=a.movie, dry=a.dry_run)
+                lines += more + [f'{"would grab" if a.dry_run else "grabbed"} {n}']
+            elif a.cron and not os.path.exists(OFF_F) and in_window():
+                left = NIGHT_MAX - st['nights'].get(night_key(), {}).get('grabs', 0)
+                if left > 0:
+                    lines += grab_round(st, 1, cron=True)[1]
+            if a.cron:
+                p = maybe_note(st)
+                if p:
+                    lines.append(f'note {p}')
+            cut = (local() - timedelta(days=30)).date().isoformat()
+            st['nights'] = {k: v for k, v in st['nights'].items() if k >= cut}
+            st['outside'] = {k: v for k, v in st['outside'].items() if k >= cut}
+            save_state(st)
+            if lines and not (a.cron and not any(not x.startswith('stop:') for x in lines)):
+                print('\n'.join(lines))
+            return 0
+    except ApiError as e:
+        print(f'media-remux: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

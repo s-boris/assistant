@@ -1,0 +1,43 @@
+#!/bin/sh
+# brain-commit "msg": snapshot my config/memory into the brain repo (see: brain help). Blocks on any secret.
+# After a successful snapshot it also starts codebase-sync in the background (sanitized export to the private
+# GitHub repo, profile key repos.private_code; failures -> one ~/inbox note). Skipped in tests (BRAIN_GIT_DIR/BRAIN_WORK_TREE
+# set) and when ~/.config/codebase-sync/off exists.
+# BRAIN_COMMIT_PRECHECK=1: first run `codebase-sync precheck` (scrub check + public-path gate, ~45 s) and warn on
+# stderr with its file:line rule labels if the sync would block. Warn only: never changes the exit code. Off by
+# default (too slow for every snapshot); test-all's codebase-precheck suite runs it on every test-all.
+# BRAIN_COMMIT_EVALS=1: before the snapshot, score the eval cases the change touches (`evals run --changed`, at most
+# 12 cases / 15 min) and warn on stderr when the score drops or cases newly fail. BRAIN_COMMIT_EVALS=bg: start that
+# run in the background after the snapshot (self-review reports the delta). Warn only: never blocks, never changes the
+# exit code. Off by default (minutes and model tokens per run).
+d=$(dirname "$(readlink -f "$0")")
+case "${1:-}" in
+  -h|--help) sed -n '2,12s/^# \{0,1\}//p' "$0"; exit 0 ;;
+  -*) echo "brain-commit: unknown option $1 (usage: brain-commit \"msg\")" >&2; exit 2 ;;
+esac
+evals_on=
+[ -z "${BRAIN_GIT_DIR:-}${BRAIN_WORK_TREE:-}" ] && [ -x "$d/evals" ] && evals_on=${BRAIN_COMMIT_EVALS:-}
+if [ "$evals_on" = 1 ]; then
+  timeout -k 10 1200 "$d/evals" run --changed --max-cases 12 --budget-min 15 --quiet --label brain-commit >/dev/null 2>&1
+  sj=$("$d/evals" summary --hours 1 --json 2>/dev/null); sl=$("$d/evals" summary --hours 1 2>/dev/null)
+  case "$sj" in
+    *'"regression": true'*) echo "brain-commit: WARNING: eval regression: $sl (evals report --failures)" >&2 ;;
+    *) [ -n "$sl" ] && [ "$sl" != "no eval run in the window" ] && echo "brain-commit: evals: $sl" >&2 ;;
+  esac
+fi
+"$d/brain" commit "$@"; rc=$?
+if [ "$rc" = 0 ] && [ "$evals_on" = bg ]; then
+  ( nohup timeout -k 10 1800 "$d/evals" run --changed --max-cases 12 --budget-min 15 --quiet --cron --label brain-commit \
+      >/dev/null 2>&1 & ) 2>/dev/null
+fi
+if [ "$rc" = 0 ] && [ -z "${BRAIN_GIT_DIR:-}${BRAIN_WORK_TREE:-}" ] && [ -x "$d/codebase-sync" ]; then
+  if [ "${BRAIN_COMMIT_PRECHECK:-0}" = 1 ]; then
+    out=$(timeout -k 5 300 "$d/codebase-sync" precheck 2>&1); prc=$?
+    if [ "$prc" != 0 ]; then
+      echo "brain-commit: WARNING: the next codebase-sync would block (precheck exit $prc):" >&2
+      printf '%s\n' "$out" | grep -E '^  [^ ]+:[0-9]+ |^  gate|^codebase-sync precheck:' | head -20 >&2
+    fi
+  fi
+  "$d/codebase-sync" --bg >/dev/null 2>&1 || true
+fi
+exit "$rc"

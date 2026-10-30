@@ -1,0 +1,555 @@
+#!/usr/local/bin/python3.13 -I
+"""assistant-publish: publish the harness repo (~/opt/assistant main) to its GitHub repo (profile repos.assistant)
+as neutral snapshots, after a privacy scan of everything each snapshot adds.
+
+  assistant-publish push [--cron] [--bg] [--dry-run]   one snapshot of main's tree on top of the published main
+                                     (a fast-forward, never --force). --bg: detach, run with --cron (`assistant land`)
+  assistant-publish push --replace [--dry-run]   start the published history over: ONE root commit of main's tree,
+                                     force-pushed over the remote's main (lease on the head it saw). Only with the
+                                     owner's OK: on GitHub the old commits stay reachable by id and in the repo's
+                                     Activity view; publishing into a new, empty repo needs no --replace at all
+  assistant-publish scan [--repo DIR] [--rev RANGE] [--no-identity]   the privacy scan of RANGE's commits (default:
+                                     all of main), as is: COMMIT PATH:LINE LABEL #HASH. Exit 3 on an unreviewed hit
+  assistant-publish allow HASH... --reason TEXT   mark scan hits as reviewed false positives (line hashes only)
+  assistant-publish status [--json]  the last run
+
+Published history = snapshots, never main's own commits. The first publish is one root commit of main's tree; each
+later one is one commit on top of the published main whose tree is main's tree at that moment. Author and committer
+are the neutral GitHub identity (publish.py AUTHOR: the handle + its noreply address); the message is generated from
+the change alone (files and lines changed per top-level directory), never from main's commit messages. The copy is
+built in a temp repo (main fetched from ~/opt/assistant, the published main fetched from the remote); only the new
+commit and the objects it adds are pushed, main's own commits are never reachable from it. ~/opt/assistant and its
+history are never changed.
+
+The snapshot chain: the root of the last first publish or --replace is recorded in the state dir (snapshot-root).
+A remote whose main does not descend from it is not built on: with no root recorded (the remote still holds the old
+full-history copy) push waits quietly (exit 0, status "replace pending") for `push --replace`; with a root recorded
+it blocks (exit 3, one note). An empty remote gets the root commit with a plain push. Lost the record? Write the
+published root's id (`git rev-list --max-parents=0` of the remote's main) to <state>/snapshot-root.
+
+Scan (file paths, commit ids and rule labels only, never a value; any unreviewed hit blocks the push): gitleaks on
+the new commit (the repo's .gitleaks.toml), and on every blob it adds plus its message and identity: secretscan,
+codebase-sync's scrub rules + Telegram allowFrom ids + PII detectors (e-mail, mobile, IBAN, AHV), the public-release
+denylist (private terms, disk serials, trip guards) + IBAN/card identifiers, and the canonical public-gate
+(whole-word and substring terms, LAN IPs, owner-date prose and quotes, coordinates). The first snapshot adds every
+blob of the tree, so it is a full-tree scan. A binary blob can't be checked: it blocks until allowed. Reviewed false
+positives: allow.txt in the config dir, one line hash (or blob id) per line with a reason. Under --cron a block or a
+failure writes ONE ~/inbox note per distinct problem and day.
+
+Config ~/.config/assistant-publish/ (allow.txt); state ~/.local/state/assistant-publish/ (last-run.json,
+snapshot-root, lock). Exit: 0 ok / nothing to do / replace pending, 3 blocked, 1 error, 2 usage.
+Env (tests): ASSISTANT_PUBLISH_SRC (repo), ASSISTANT_PUBLISH_URL (push URL), ASSISTANT_PUBLISH_CONF,
+ASSISTANT_PUBLISH_STATE, ASSISTANT_PUBLISH_INBOX, ASSISTANT_PUBLISH_CS (codebase-sync), ASSISTANT_PUBLISH_PUB
+(publish.py), ASSISTANT_PUBLISH_GATE (public-gate.py), ASSISTANT_PUBLISH_GATE_ALLOW, ASSISTANT_PUBLISH_GITLEAKS,
+ASSISTANT_PUBLISH_GITLEAKS_CONF (fallback config).
+Rollback: drop the land hook (ops/assistant.py publish_bg) and the cron line; the GitHub repo stays (deleting it
+needs the owner's OK).
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+E = os.environ.get
+HOME = os.path.expanduser("~")
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(HERE, "lib"), os.path.dirname(HERE)):
+    if os.path.isfile(os.path.join(_lib, "core", "notes.py")):
+        sys.path.insert(0, _lib)
+        break
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+from core import locks  # noqa: E402
+
+SRC = E("ASSISTANT_PUBLISH_SRC") or os.path.join(HOME, "opt/assistant")
+CONF = E("ASSISTANT_PUBLISH_CONF") or os.path.join(HOME, ".config/assistant-publish")
+STATE = E("ASSISTANT_PUBLISH_STATE") or os.path.join(HOME, ".local/state/assistant-publish")
+INBOX = E("ASSISTANT_PUBLISH_INBOX") or os.path.join(HOME, "inbox")
+CS = E("ASSISTANT_PUBLISH_CS") or os.path.join(HOME, "bin/codebase-sync")
+PUB = E("ASSISTANT_PUBLISH_PUB") or os.path.join(HOME, "jobs/public-release/publish.py")
+MIRROR = os.path.join(HOME, "opt/claude-bot-export")
+GATE = E("ASSISTANT_PUBLISH_GATE") or os.path.join(MIRROR, "tools/public-gate.py")
+GATE_ALLOW = E("ASSISTANT_PUBLISH_GATE_ALLOW") or os.path.join(MIRROR, "tools/pii-allowlist.txt")
+GITLEAKS = E("ASSISTANT_PUBLISH_GITLEAKS") or os.path.join(HOME, "jobs/tmp/release-audit/bin/gitleaks")
+GITLEAKS_CONF = E("ASSISTANT_PUBLISH_GITLEAKS_CONF") or os.path.join(MIRROR, ".gitleaks.toml")
+BRANCH = "main"
+GIT_ENV = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+
+
+class Fail(Exception):
+    pass
+
+
+def git(repo, *args, check=True, text=True, input=None, timeout=300, env=None):
+    r = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=text, input=input,
+                       timeout=timeout, env=dict(GIT_ENV, **(env or {})))
+    if check and r.returncode:
+        err = r.stderr if text else r.stderr.decode("utf-8", "replace")
+        raise Fail("git %s: %s" % (args[0], err.strip()[-300:]))
+    return r.stdout
+
+
+def load_mod(name, path):
+    if not os.path.isfile(path):
+        raise Fail("%s is missing: the scan can't run" % path)
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def line_hash(line):
+    return hashlib.sha1(line.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def read_allow():
+    out = set()
+    try:
+        with open(os.path.join(CONF, "allow.txt"), encoding="utf-8") as f:
+            for ln in f:
+                h = ln.split("#", 1)[0].strip()
+                if h:
+                    out.add(h)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def target_url():
+    if E("ASSISTANT_PUBLISH_URL"):
+        return E("ASSISTANT_PUBLISH_URL")
+    try:
+        sys.path.insert(0, os.path.join(HOME, "bin/lib"))
+        import assistant_profile  # noqa: E402
+        repo = assistant_profile.get("repos.assistant")
+    except Exception as e:
+        raise Fail("profile repos.assistant unreadable (%s)" % type(e).__name__)
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", str(repo)):
+        raise Fail("profile repos.assistant is not OWNER/NAME")
+    return "https://github.com/%s.git" % repo
+
+
+# ---------------------------------------------------------------- the scan
+class Scanner:
+    def __init__(self):
+        self.cs = load_mod("codebase_sync", CS)
+        self.pub = load_mod("publish_release", PUB)
+        self.rules, self.allow = self.cs.load_rules()
+        self.prules, _ = self.pub.load_rules()
+        self.handle = self.pub.HANDLE
+
+    def hits(self, text, deny):
+        """[(line, label)] of every detector but the public-gate (run once over a tree)."""
+        out = set()
+
+        def ln(pos):
+            return text.count("\n", 0, pos) + 1
+
+        for name, line in self.cs.secretscan.find(text):
+            out.add((line, "secret:" + name))
+        for r in self.rules:
+            for m in r.check_rx.finditer(text):
+                out.add((ln(m.start()), r.label))
+        for kind, _v, line, ok in self.cs.pii_hits(text, self.allow):
+            if not ok:
+                out.add((line, "pii:" + kind))
+        t2 = text.replace(self.handle, "")
+        for lab, rx in deny:
+            for m in rx.finditer(t2):
+                out.add((t2.count("\n", 0, m.start()) + 1, "deny:" + lab))
+        for h in self.pub.identifiers({"f": text}, MIRROR):
+            m = re.match(r"^f:(\d+) (\S+)$", h)
+            if m:
+                out.add((int(m.group(1)), "id:" + m.group(2)))
+        return out
+
+    def identity_hits(self, ident):
+        return bool(self.hits(ident, self.pub.denylist_rules(self.prules, [])))
+
+
+def blobs_of(repo, rng):
+    """{blob: (first commit, path)} for every blob the commits of rng add (all parents of a merge)."""
+    out, cur = {}, None
+    raw = git(repo, "log", "--reverse", "--raw", "--root", "--no-abbrev", "--no-renames", "-m", "--format=%x00%H",
+              rng)
+    for ln in raw.splitlines():
+        if ln.startswith("\0"):
+            cur = ln[1:]
+        elif ln.startswith(":") and "\t" in ln:
+            meta, path = ln.split("\t", 1)
+            parts = meta.split()
+            sha, mode = parts[3], parts[1]
+            if set(sha) != {"0"} and mode != "160000" and sha not in out:
+                out[sha] = (cur, path)
+    return out
+
+
+def scan(repo, rng, identity=True):
+    """[(commit, path, line, label, hash)] of every finding in the commits of rng (allow.txt not applied)."""
+    sc = Scanner()
+    rows = set()
+    tmp = tempfile.mkdtemp(prefix="apub-scan-", dir=E("TMPDIR"))
+    os.chmod(tmp, 0o700)
+    try:
+        items = []   # (commit, path, text)
+        for sha, (c, path) in sorted(blobs_of(repo, rng).items(), key=lambda x: (x[1][1], x[0])):
+            data = git(repo, "cat-file", "blob", sha, text=False)
+            p = os.path.join(tmp, "blob", sha[:2], sha, os.path.basename(path))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in (".gz", ".pdf") and sc.cs.decode_text(data) is None:
+                rows.add((c, path, 0, "binary:unchecked", sha[:16]))
+                continue
+            for label, text in sc.cs.texts_of(p):
+                if label != "pdf-raw":
+                    items.append((c, path, text))
+        log = git(repo, "log", "--format=%x00%H%x01%an <%ae>%x01%cn <%ce>%x01%B", rng)
+        for rec in log.split("\0")[1:]:
+            h, an, cn, body = rec.split("\x01", 3)
+            items.append((h, "<message>", body))
+            if identity:
+                items.append((h, "<identity>", an + "\n" + cn))
+        texts = {"%06d" % i: t for i, (_c, _p, t) in enumerate(items)}
+        serials = sorted(sc.pub.found_serials(texts) | set(sc.pub.real_serials()))
+        deny = sc.pub.denylist_rules(sc.prules, serials)
+        root = os.path.join(tmp, "tree")
+        for i, (c, path, text) in enumerate(items):
+            lines = text.split("\n")
+            for line, lab in sc.hits(text, deny):
+                rows.add((c, path, line, lab, line_hash(lines[line - 1] if 0 < line <= len(lines) else "")))
+            rel = os.path.join("%06d" % i, path if not path.startswith("<") else "commit-meta.txt")
+            fp = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(text)
+        denyf = os.path.join(tmp, "denylist.txt")
+        sc.pub.write_private(denyf, sc.pub.denylist_text(sc.prules, serials))
+        if not os.path.isfile(GATE):
+            raise Fail("public-gate %s is missing: the scan can't run" % GATE)
+        if items:
+            r = subprocess.run(["python3", "-I", GATE, "--root", root, "--denylist", denyf, "--ignore", sc.handle,
+                                "--allowlist", GATE_ALLOW, "--no-syntax"], capture_output=True, text=True,
+                               timeout=900, stdin=subprocess.DEVNULL)
+            summary = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.startswith("public-gate:")]
+            if r.returncode not in (0, 1) or not summary:
+                raise Fail("public-gate could not run (exit %d)" % r.returncode)
+            if not re.search(r", [1-9]\d* geo point", summary[-1]):
+                raise Fail("public-gate ran without geo points (no private places): the coordinate check is off")
+            for ln in r.stdout.splitlines():
+                m = re.match(r"^(\d{6})/(.+?):(\d+) (\S+)", ln)
+                if m:
+                    c, path, text = items[int(m.group(1))]
+                    lines = text.split("\n")
+                    n = int(m.group(3))
+                    rows.add((c, path, n, "gate:" + m.group(4), line_hash(lines[n - 1] if 0 < n <= len(lines) else "")))
+        rows |= gitleaks(repo, rng, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return sorted(rows, key=lambda r: (r[1], r[2], r[3], r[0]))
+
+
+def gitleaks(repo, rng, tmp):
+    if not os.access(GITLEAKS, os.X_OK):
+        raise Fail("gitleaks %s is missing: the scan can't run" % GITLEAKS)
+    conf = os.path.join(repo, ".gitleaks.toml")
+    conf = conf if os.path.isfile(conf) else GITLEAKS_CONF
+    rep = os.path.join(tmp, "gitleaks.json")
+    cmd = [GITLEAKS, "git", repo, "--log-opts=%s" % rng, "--redact=100", "--no-banner", "--log-level", "error",
+           "--exit-code", "0", "--report-format", "json", "--report-path", rep]
+    if os.path.isfile(conf):
+        cmd += ["--config", conf]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
+    try:
+        with open(rep) as f:
+            found = json.load(f) or []
+    except (OSError, ValueError):
+        raise Fail("gitleaks could not run (exit %d)" % r.returncode)
+    out = set()
+    for x in found:
+        c, path, n = x.get("Commit", "?"), x.get("File", "?"), int(x.get("StartLine") or 0)
+        lines = git(repo, "show", "%s:%s" % (c, path), check=False).split("\n")
+        out.add((c, path, n, "gitleaks:" + str(x.get("RuleID")), line_hash(lines[n - 1] if 0 < n <= len(lines) else "")))
+    return out
+
+
+def unreviewed(rows):
+    allow = read_allow()
+    return [r for r in rows if r[4] not in allow]
+
+
+def fmt(r):
+    return "%s %s:%d %s #%s" % (r[0][:12], r[1], r[2], r[3], r[4])
+
+
+# ---------------------------------------------------------------- the published copy
+def ok(repo, *args):
+    return subprocess.run(["git", "-C", repo] + list(args), capture_output=True, env=GIT_ENV).returncode == 0
+
+
+def message(work, old_tree, new_tree):
+    """The snapshot's neutral message, from the trees alone (never from main's commit messages)."""
+    if old_tree is None:
+        n = sum(1 for x in git(work, "ls-tree", "-r", "-z", "--name-only", new_tree).split("\0") if x)
+        return "Initial public snapshot\n\n%d files.\n" % n
+    dirs, files, add, dele = {}, 0, 0, 0
+    for ln in git(work, "diff-tree", "-r", "-z", "--numstat", "--no-renames", old_tree, new_tree).split("\0"):
+        parts = ln.split("\t")
+        if len(parts) != 3:
+            continue
+        files += 1
+        add += int(parts[0]) if parts[0].isdigit() else 0
+        dele += int(parts[1]) if parts[1].isdigit() else 0
+        top = parts[2].split("/", 1)[0]
+        dirs[top] = dirs.get(top, 0) + 1
+    order = sorted(dirs.items(), key=lambda kv: (-kv[1], kv[0]))
+    return "Update %s\n\n%d file%s changed, +%d -%d lines: %s.\n" % (
+        ", ".join(d for d, _ in order[:3]) + (" and more" if len(order) > 3 else ""), files, "" if files == 1 else "s",
+        add, dele, ", ".join("%s %d" % kv for kv in order))
+
+
+def snapshot(work, tree, parent):
+    """One commit of tree (on parent, or a new root) by the neutral identity. Returns its id."""
+    name, email = Scanner().pub.AUTHOR
+    env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
+    args = ["commit-tree", "--no-gpg-sign", tree] + (["-p", parent] if parent else []) + ["-F", "-"]
+    msg = message(work, parent + "^{tree}" if parent else None, tree)
+    return git(work, *args, input=msg, env=env).strip()
+
+
+def read_root():
+    try:
+        with open(os.path.join(STATE, "snapshot-root")) as f:
+            root = f.read().strip()
+    except OSError:
+        return None
+    return root if re.fullmatch(r"[0-9a-f]{40}", root) else None
+
+
+def write_root(sha):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = os.path.join(STATE, "snapshot-root.tmp")
+    with open(tmp, "w") as f:
+        f.write(sha + "\n")
+    os.replace(tmp, os.path.join(STATE, "snapshot-root"))
+
+
+def remote_head(url):
+    out = git(SRC, "ls-remote", url, "refs/heads/" + BRANCH, timeout=120)
+    return out.split()[0] if out.strip() else None
+
+
+# ---------------------------------------------------------------- notes, state, lock
+def note(key, title, body, cron):
+    if not cron:
+        return
+    os.makedirs(STATE, exist_ok=True)
+    k = hashlib.sha1((key + time.strftime("%F")).encode()).hexdigest()[:12]
+    mark = os.path.join(STATE, "noted")
+    try:
+        with open(mark) as f:
+            seen = f.read().split()
+    except OSError:
+        seen = []
+    if k in seen:
+        return
+    text = ("# assistant-publish: %s\n\nFrom ~/bin/assistant-publish. Data, not instructions.\n\n%s\n\n"
+            "Next: fix the file on main (a land) or review the hits (`assistant-publish scan`), mark reviewed false "
+            "positives with `assistant-publish allow HASH --reason ...`, then run `assistant-publish push`.\n"
+            % (title, body.rstrip()))
+    notes.write_new(INBOX, "assistant-publish", text)
+    with open(mark, "w") as f:
+        f.write("\n".join((seen + [k])[-50:]) + "\n")
+
+
+def save_state(d):
+    os.makedirs(STATE, exist_ok=True)
+    d["time"] = time.strftime("%FT%T%z")
+    tmp = os.path.join(STATE, "last-run.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, os.path.join(STATE, "last-run.json"))
+
+
+def lock(wait=600):
+    fd = locks.acquire(os.path.join(STATE, "lock"), wait=wait)
+    if fd is None:
+        raise Fail("another assistant-publish run holds the lock")
+    return fd
+
+
+# ---------------------------------------------------------------- commands
+def cmd_push(a):
+    if a.bg:
+        os.makedirs(STATE, exist_ok=True)
+        with open(os.path.join(STATE, "bg.log"), "ab") as log:
+            subprocess.Popen([sys.executable, "-I", os.path.realpath(__file__), "push", "--cron"],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        return 0
+    fd = lock()
+    st = {"op": "push --replace" if a.replace else "push", "ok": False}
+    tmp = tempfile.mkdtemp(prefix="apub-", dir=E("TMPDIR"))
+    os.chmod(tmp, 0o700)
+    try:
+        url = target_url()
+        work = os.path.join(tmp, "copy")
+        git(tmp, "init", "--quiet", work)
+        git(work, "fetch", "--quiet", "--no-tags", SRC, "+refs/heads/%s:refs/src/%s" % (BRANCH, BRANCH))
+        src_head = git(work, "rev-parse", "refs/src/" + BRANCH).strip()
+        tree = git(work, "rev-parse", src_head + "^{tree}").strip()
+        st["src"] = src_head[:12]
+        remote = remote_head(url)
+        st["remote"] = (remote or "")[:12]
+        parent = None
+        if remote and not a.replace:
+            root = read_root()
+            if not root:   # nothing fetched: the remote still holds the old history
+                st.update(ok=True, result="replace pending")
+                print("assistant-publish: the remote's %s is not the snapshot history yet, nothing pushed: it starts "
+                      "with `assistant-publish push --replace` (a force push: the owner's OK first)" % BRANCH)
+                return 0
+            git(work, "fetch", "--quiet", "--no-tags", url, "+refs/heads/%s:refs/pub/%s" % (BRANCH, BRANCH))
+            parent = git(work, "rev-parse", "refs/pub/" + BRANCH).strip()
+            if not ok(work, "merge-base", "--is-ancestor", root, parent):
+                st["result"] = "diverged"
+                msg = ("BLOCKED: GitHub's %s (%s) does not descend from the published snapshot root (%s): someone "
+                       "else pushed, or the root record is stale. Nothing pushed; `push --replace` needs the owner's "
+                       "OK." % (BRANCH, parent[:12], root[:12]))
+                print("assistant-publish: " + msg, file=sys.stderr)
+                note("diverged " + parent, "history diverged", msg, a.cron)
+                return 3
+            if git(work, "rev-parse", parent + "^{tree}").strip() == tree:
+                st.update(ok=True, result="up to date", head=parent[:12])
+                print("assistant-publish: up to date (%s)" % parent[:12])
+                return 0
+        head = snapshot(work, tree, parent)
+        st["head"] = head[:12]
+        rng = "%s..%s" % (parent, head) if parent else head
+        rows = unreviewed(scan(work, rng))
+        st["files"] = len(blobs_of(work, rng))
+        if rows:
+            st.update(result="blocked", hits=len(rows))
+            for r in rows:
+                print("  " + fmt(r), file=sys.stderr)
+            msg = "BLOCKED: %d unreviewed scan hit(s) in the snapshot of %s, nothing pushed:\n%s" % (
+                len(rows), src_head[:12], "\n".join("- " + fmt(r) for r in rows[:25]))
+            print("assistant-publish: BLOCKED (%d hits)" % len(rows), file=sys.stderr)
+            note("hits " + " ".join(sorted(r[4] for r in rows)), "push blocked by the privacy scan", msg, a.cron)
+            return 3
+        replacing = parent is None and remote is not None
+        what = "a force push over %s" % remote[:12] if replacing else (
+            "a fast-forward" if parent else "the first push (empty remote)")
+        if a.dry_run:
+            st.update(ok=True, result="dry run: clean")
+            print("assistant-publish: dry run, snapshot %s of main %s scanned clean (%d new blob(s)); would be %s; "
+                  "nothing pushed" % (head[:12], src_head[:12], st["files"], what))
+            return 0
+        if replacing:
+            git(work, "push", "--quiet", "--force-with-lease=refs/heads/%s:%s" % (BRANCH, remote), url,
+                "%s:refs/heads/%s" % (head, BRANCH))
+        else:
+            git(work, "push", "--quiet", url, "%s:refs/heads/%s" % (head, BRANCH))
+        if parent is None:
+            write_root(head)
+        st.update(ok=True, result="replaced" if replacing else "pushed")
+        print("assistant-publish: %s snapshot %s of main %s (%s)" % ("force-pushed" if replacing else "pushed",
+                                                                  head[:12], src_head[:12], what))
+        return 0
+    except (Fail, subprocess.TimeoutExpired, OSError, SystemExit) as e:
+        st["result"] = "error: %s" % e
+        print("assistant-publish: error: %s" % e, file=sys.stderr)
+        note("error " + str(e)[:120], "push failed", "The run failed, nothing pushed: %s" % str(e)[:300], a.cron)
+        return 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        save_state(st)
+        locks.release(fd)
+
+
+def cmd_scan(a):
+    repo = a.repo or SRC
+    rows = scan(repo, a.rev or BRANCH, identity=not a.no_identity)
+    allow = read_allow()
+    bad = 0
+    for r in rows:
+        ok = r[4] in allow
+        bad += not ok
+        print(("  allowed " if ok else "  ") + fmt(r))
+    print("assistant-publish scan %s: %d hit(s), %d reviewed, %d unreviewed" % (a.rev or BRANCH, len(rows),
+                                                                               len(rows) - bad, bad))
+    return 3 if bad else 0
+
+
+def cmd_allow(a):
+    if not a.reason.strip():
+        raise Fail("--reason must say why (no private values)")
+    for h in a.hashes:
+        if not re.fullmatch(r"[0-9a-f]{16}", h):
+            raise Fail("not a hit hash: %s" % h)
+    os.makedirs(CONF, mode=0o700, exist_ok=True)
+    p = os.path.join(CONF, "allow.txt")
+    have = read_allow()
+    with open(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", encoding="utf-8") as f:
+        for h in a.hashes:
+            if h not in have:
+                f.write("%s  # %s (%s)\n" % (h, a.reason.strip().replace("\n", " "), time.strftime("%F")))
+    print("assistant-publish: %d hash(es) allowed" % len(a.hashes))
+    return 0
+
+
+def cmd_status(a):
+    try:
+        with open(os.path.join(STATE, "last-run.json")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    if a.json:
+        print(json.dumps(st))
+    else:
+        print("assistant-publish: " + (", ".join("%s=%s" % kv for kv in sorted(st.items())) or "no run yet"))
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="assistant-publish", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("push")
+    p.add_argument("--cron", action="store_true")
+    p.add_argument("--bg", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--replace", action="store_true")
+    p = sub.add_parser("scan")
+    p.add_argument("--repo")
+    p.add_argument("--rev")
+    p.add_argument("--no-identity", action="store_true")
+    p = sub.add_parser("allow")
+    p.add_argument("hashes", nargs="+")
+    p.add_argument("--reason", required=True)
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    a = ap.parse_args(argv)
+    if a.cmd == "push" and a.replace and (a.cron or a.bg):
+        print("assistant-publish: --replace is the owner's call, never --cron or --bg", file=sys.stderr)
+        return 2
+    try:
+        return {"push": cmd_push, "scan": cmd_scan, "allow": cmd_allow, "status": cmd_status}[a.cmd](a)
+    except Fail as e:
+        print("assistant-publish: error: %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

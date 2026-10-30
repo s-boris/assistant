@@ -1,0 +1,1046 @@
+#!/usr/bin/env -S python3 -I
+"""drive-brief: a short call when he starts driving, only when there is something worth saying (token-free).
+
+  drive-brief tick [--cron]              cron, every minute: a new drive start -> decide within ~1 min -> call or skip
+  drive-brief now [--json]               what a drive starting now would get (no call, nothing recorded)
+  drive-brief replay [--days 7] [--calendar DIR] [--json]
+                                         his recent drives (vault HA drive events): when it would have called and
+                                         what it would have said (no calls; --calendar = a calcache dir with those
+                                         days, else the live cache; traffic = a proxy: the last leg's minutes vs
+                                         Waze's usual minutes)
+  drive-brief stats [--days 30] [--json] drives seen, briefings, answered rate, follow-up turns/tools, skip reasons
+  drive-brief status [--json]            mode, today's briefings, the current drive
+  drive-brief mode off|dry-run|live      kill switch / dry run (logs what it would say) / live (config "mode")
+
+Trigger: `whereabouts ha now` (consumer drive-brief, fresh only) says drive.active under core.drive's rule (the
+answer at most DRIVING_MAX_AGE_MIN, 60, min old; `driving`'s), drive.since at most max_start_age_min ago. Drives with a stop shorter than chain_gap_min form one chain: one decision per chain.
+Skip: mode off, on a trip abroad (tripclock), night (his local hours night_from..night_to), max_per_day briefings
+reached, an outbound call he declined or missed in the last declined_quiet_min (the hub relay's recent calls + the
+local call log). Content, most important first (no content -> no call):
+  event      the next timed calendar event within event_window_h (no travel leg; one with a train/bus/flight leg
+             before it is skipped): Waze minutes from here -> "you'd arrive HH:MM" (likely heading there) or
+             "leave by HH:MM"; an event without a town counts only within event_plain_min
+  traffic    Waze live - usual >= traffic_min on the likely route: the event's town; office weekday mornings from
+             home -> the work town; from the work zone/town in the evening or far from home -> home
+  reminders  his own timed reminders due during the drive (Waze minutes, else reminder_window_min)
+  parcel     a parcel entry on today's calendar; a parcel-station mail (sender and date only, vault metadata)
+             newer than his last stop in that town, when the likely route starts or ends in a parcel.via town
+  nav        right after the event line: "Want navigation to <title>?" when that event (with a town, not where he
+             is, not the home town) starts within nav_offer_h; his yes makes the relay's navigate tool open Maps on
+             his phone to that event's town (place next_event). Only while `phone open --help` works. Config
+             nav_offer (default on), nav_offer_h; DRIVE_BRIEF_NAV_OFFER=off
+  decisions  Waiting-on-you either/or items (decision-deck): alongside other content, or alone on a drive of
+             >= long_drive_min, at most decisions_alone_per_day a day
+Spoken text <= max_chars (the relay's cap), lowest priority dropped first. Delivery: `voice-relay call --reason
+"drive briefing" --say TEXT` (he can ask follow-ups; the call's fast-lane tools answer). Not answered -> nothing
+more. Log ~/.local/state/drive-brief/log.jsonl (decisions, outcomes, follow-up counts from the hub's call log:
+counts and tool names only); usage events under bin.drive-brief. Config ~/.config/drive-brief/config.json;
+DRIVE_BRIEF=off is the kill switch.
+Env (tests): DRIVE_BRIEF_CONFIG, DRIVE_BRIEF_STATE, DRIVE_BRIEF_NOW (ISO), DRIVE_BRIEF_WHERE (command printing the
+`vault ha now --json` schema), DRIVE_BRIEF_ROUTES (JSON file {"FROM|TO": {"live": M, "usual": M}}),
+DRIVE_BRIEF_CALL_CMD, DRIVE_BRIEF_DECK_CMD, DRIVE_BRIEF_MAIL (JSON file: list of ISO mail dates),
+DRIVE_BRIEF_CALLS_CMD (command printing `voice-hub calls --out` JSON, the hub's call log; off = not asked),
+DRIVE_BRIEF_REMIND_DIR, DRIVE_BRIEF_HA_EVENTS (JSONL of vault HA events),
+DRIVE_BRIEF_TODO_AT (command: TODO.md text at ISO time), DRIVE_BRIEF_NAV_OFFER (off|0 = no nav offer),
+DRIVE_BRIEF_PHONE_CMD (the phone CLI), CALCACHE_DIR, ASSISTANT_PROFILE.
+Tests: tests/legacy/drive-brief/run.sh in ~/opt/assistant (DRIVE_BRIEF_BIN=/copy).
+"""
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile as profile  # noqa: E402
+from core import drive as drive_rule  # noqa: E402
+
+try:
+    import tripclock  # noqa: E402
+except Exception:  # pragma: no cover
+    tripclock = None
+try:
+    from usage import log as _ulog  # noqa: E402
+except Exception:  # pragma: no cover
+    _ulog = None
+
+FEATURE = "bin.drive-brief"
+REASON = "drive briefing"
+CONFIG = os.environ.get("DRIVE_BRIEF_CONFIG") or os.path.join(HOME, ".config/drive-brief/config.json")
+STATE = os.environ.get("DRIVE_BRIEF_STATE") or os.path.join(HOME, ".local/state/drive-brief")
+DEFAULTS = {
+    "mode": "dry-run", "lang": "en", "night_from": 0, "night_to": 6, "max_per_day": 4, "declined_quiet_min": 30,
+    "chain_gap_min": 15, "max_start_age_min": 5, "traffic_min": 5, "event_window_h": 3, "event_plain_min": 60,
+    "arrive_early_min": 10, "reminder_window_min": 30, "long_drive_min": 20, "decisions_alone_per_day": 1,
+    "max_chars": 200, "call_timeout_s": 150, "followup_after_min": 10, "nav_offer": True, "nav_offer_h": 3,
+    "office": {"weekdays": [0, 1, 2, 3, 4], "morning": [6, 11], "evening": [15, 20]},
+    "parcel": {"mail_query": "", "town": "", "via": [], "max_age_days": 10, "cache_min": 120},
+}
+PHRASES = {
+    "en": {
+        "prefix": "Quick drive briefing.",
+        "eta": "{title} at {t} in {town}: Waze says {m} minutes{delay}, so you'd arrive around {eta}.",
+        "late": "{title} at {t} in {town}: Waze says {m} minutes{delay}, so you'd be about {late} minutes late.",
+        "leave": "{title} at {t} in {town}: leave by {leave}, Waze says {m} minutes{delay}.",
+        "plain": "Next up: {title} at {t}.",
+        "nav": "Want navigation to {title}?",
+        "delay": ", {d} more than usual",
+        "traffic": "Traffic to {town}: about {m} minutes, {d} more than usual.",
+        "traffic_home": "Traffic home: about {m} minutes, {d} more than usual.",
+        "rem1": "Reminder at {t}: {title}.",
+        "rem2": "Reminders at {t}: {title}, and at {t2}: {title2}.",
+        "parcel_cal": "On today's list: {title}.",
+        "parcel_mail": "A parcel may be waiting in {town}, on your way.",
+        "dec1": "One decision is waiting; say decisions if you want to do it now.",
+        "decn": "{n} decisions are waiting; say decisions to go through them.",
+    },
+    "de": {
+        "prefix": "Kurzes Fahrt-Briefing.",
+        "eta": "{title} um {t} in {town}: laut Waze {m} Minuten{delay}, Ankunft etwa {eta}.",
+        "late": "{title} um {t} in {town}: laut Waze {m} Minuten{delay}, also etwa {late} Minuten zu spät.",
+        "leave": "{title} um {t} in {town}: los um {leave}, laut Waze {m} Minuten{delay}.",
+        "plain": "Als Nächstes: {title} um {t}.",
+        "nav": "Soll ich die Navigation zu {title} starten?",
+        "delay": ", {d} mehr als üblich",
+        "traffic": "Verkehr nach {town}: etwa {m} Minuten, {d} mehr als üblich.",
+        "traffic_home": "Verkehr nach Hause: etwa {m} Minuten, {d} mehr als üblich.",
+        "rem1": "Erinnerung um {t}: {title}.",
+        "rem2": "Erinnerungen um {t}: {title}, und um {t2}: {title2}.",
+        "parcel_cal": "Heute auf der Liste: {title}.",
+        "parcel_mail": "In {town} wartet vielleicht ein Paket, liegt auf dem Weg.",
+        "dec1": "Eine Entscheidung ist offen; sag Entscheidungen, wenn du sie jetzt treffen willst.",
+        "decn": "{n} Entscheidungen sind offen; sag Entscheidungen, um sie durchzugehen.",
+    },
+}
+CALL_OUTCOME = {0: "answered", 3: "not_answered", 4: "busy_or_limited", 5: "failed", 2: "relay_down", None: "timeout"}
+
+
+# ---------------------------------------------------------------- basics
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(CONFIG) as fh:
+            user = json.load(fh)
+    except (OSError, ValueError):
+        user = {}
+    for k, v in (user if isinstance(user, dict) else {}).items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            cfg[k].update(v)
+        else:
+            cfg[k] = v
+    if (os.environ.get("DRIVE_BRIEF") or "").strip().lower() == "off":
+        cfg["mode"] = "off"
+    if (os.environ.get("DRIVE_BRIEF_NAV_OFFER") or "").strip().lower() in ("off", "0", "no", "false"):
+        cfg["nav_offer"] = False
+    if cfg.get("lang") not in PHRASES:
+        cfg["lang"] = "en"
+    return cfg
+
+
+def local(t):
+    if tripclock is not None:
+        try:
+            return tripclock.local(t)
+        except Exception:
+            pass
+    return t.astimezone()
+
+
+def now():
+    s = os.environ.get("DRIVE_BRIEF_NOW")
+    if s:
+        t = dt.datetime.fromisoformat(s)
+        return local(t if t.tzinfo else t.astimezone())
+    return local(dt.datetime.now().astimezone())
+
+
+def parse_ts(s, ref=None):
+    """ISO string (offset or not), 'YYYY-MM-DD HH:MM' (his wall clock) or epoch -> aware datetime; None if bad."""
+    if s is None or s == "":
+        return None
+    try:
+        if isinstance(s, (int, float)):
+            return local(dt.datetime.fromtimestamp(float(s)).astimezone())
+        t = dt.datetime.fromisoformat(str(s).replace(" ", "T") if len(str(s)) == 16 else str(s))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=(ref.tzinfo if ref is not None else now().tzinfo))
+    return local(t)
+
+
+def hm(t):
+    return t.strftime("%H:%M")
+
+
+def run(argv, timeout=30, env=None):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, **(env or {})))
+        return p.returncode, p.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+
+
+def cmd(env_name, default):
+    raw = os.environ.get(env_name)
+    return shlex.split(raw) if raw else list(default)
+
+
+def ulog(kind, outcome=None, attrs=None):
+    if _ulog is not None:
+        try:
+            _ulog(FEATURE, kind, channel="voice" if kind != "error" else "cron", outcome=outcome, attrs=attrs)
+        except Exception:
+            pass
+
+
+def norm(town):
+    return re.sub(r"\s+", " ", str(town or "")).strip().lower()
+
+
+def say_title(text, words=6):
+    """A title fit to speak: no emoji, links, brackets or tags; at most `words` words; private placeholders hidden."""
+    t = str(text or "")
+    if re.search(r"(?i)\[(?:private|redacted|masked)|withheld", t):
+        return "a private one"
+    t = re.sub(r"https?://\S+", "", t)
+    t = re.sub(r"\([^)]*\)|\[[^\]]*\]", "", t)
+    t = re.sub(r"[^\w\s'’&.,:-]", " ", t)
+    t = re.sub(r"\s+[-:,.]+\s+|\s*<>\s*", " ", t)
+    for sep in (". ", "; ", ": "):
+        i = t.find(sep)
+        if i > 10:
+            t = t[:i]
+    w = t.split()
+    return " ".join(w[:words]).strip(" ,.:;-") or "an item"
+
+
+# ---------------------------------------------------------------- state and log
+
+def state_path(*p):
+    return os.path.join(STATE, *p)
+
+
+def load_state():
+    try:
+        with open(state_path("state.json")) as fh:
+            st = json.load(fh)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(STATE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE, prefix=".state.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(st, fh, indent=1, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, state_path("state.json"))
+
+
+def append_log(rec):
+    os.makedirs(STATE, exist_ok=True)
+    p = state_path("log.jsonl")
+    with open(p, "a") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+    os.chmod(p, 0o600)
+
+
+def read_log(since=None):
+    out = []
+    try:
+        with open(state_path("log.jsonl")) as fh:
+            for ln in fh:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if since is None or (parse_ts(r.get("at")) or since) >= since:
+                    out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------- sources
+
+def where():
+    raw = os.environ.get("DRIVE_BRIEF_WHERE")
+    if raw:
+        rc, out = run(shlex.split(raw), timeout=45)
+        try:
+            return json.loads(out) if rc == 0 else None
+        except ValueError:
+            return None
+    try:
+        import whereabouts
+        return whereabouts.now(consumer="drive-brief", fresh_only=True)
+    except Exception:
+        return None
+
+
+_ROUTES = {}
+
+
+def route(frm, to):
+    """{'live', 'usual'} minutes between two towns (Waze via drive-watch), or None. Cached per run."""
+    if not frm or not to or norm(frm) == norm(to):
+        return None
+    key = "%s|%s" % (frm, to)
+    if key in _ROUTES:
+        return _ROUTES[key]
+    res = None
+    fake = os.environ.get("DRIVE_BRIEF_ROUTES")
+    if fake:
+        try:
+            with open(fake) as fh:
+                res = json.load(fh).get(key)
+        except (OSError, ValueError):
+            res = None
+    else:
+        rc, out = run([os.path.join(HOME, "bin/drive-watch"), "route", frm, to, "--json"], timeout=30)
+        try:
+            res = json.loads(out) if rc == 0 else None
+        except ValueError:
+            res = None
+    if not (isinstance(res, dict) and res.get("live") and res.get("usual")):
+        res = None
+    else:
+        res = {"live": float(res["live"]), "usual": float(res["usual"])}
+    _ROUTES[key] = res
+    return res
+
+
+def calendar(t, cal_dir=None):
+    """Today's calcache events (his day of t) as dicts, start/end parsed."""
+    env = {"CALCACHE_NOW": t.isoformat()}
+    if cal_dir:
+        env["CALCACHE_DIR"] = cal_dir
+    rc, out = run([os.path.join(HOME, "bin/calcache"), "show", "--days", "1", "--json"], timeout=20, env=env)
+    try:
+        evs = json.loads(out) if rc == 0 else []
+    except ValueError:
+        evs = []
+    res = []
+    for e in evs if isinstance(evs, list) else []:
+        s = parse_ts(e.get("start"), t) if not e.get("all_day") else None
+        day = (e.get("start") or "")[:10]
+        if e.get("all_day") and day != t.strftime("%Y-%m-%d"):
+            continue
+        if s is not None and s.date() != t.date():
+            continue
+        res.append(dict(e, _start=s, _end=parse_ts(e.get("end"), t) if s else None))
+    return res
+
+
+def reminders(t, until, include_fired=False):
+    """His own timed reminders due in [t, until]: [(at, title)] (place ones and the assistant's own skipped)."""
+    d = os.environ.get("DRIVE_BRIEF_REMIND_DIR") or os.path.join(HOME, ".local/state/remind")
+    items = []
+    for name in ("reminders.json",) + (("recent.json",) if include_fired else ()):
+        try:
+            with open(os.path.join(d, name)) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        for r in (data.values() if isinstance(data, dict) else data):
+            if not isinstance(r, dict) or r.get("owner") is not True or r.get("on"):
+                continue
+            at = parse_ts(r.get("at"), t)
+            if at is not None and t - dt.timedelta(minutes=1) <= at <= until:
+                items.append((at, say_title(r.get("text"), 7)))
+    seen, out = set(), []
+    for at, title in sorted(items):
+        if (at, title) not in seen:
+            seen.add((at, title))
+            out.append((at, title))
+    return out
+
+
+def todo_at(t):
+    """Path of a TODO.md as it was at t (brain history), or None."""
+    raw = os.environ.get("DRIVE_BRIEF_TODO_AT")
+    if raw:
+        rc, text = run(shlex.split(raw) + [t.isoformat()], timeout=20)
+    else:
+        rel = os.path.relpath(os.path.join(HOME, "workspace/TODO.md"), HOME)
+        git = ["git", "--git-dir", os.path.join(HOME, ".brain.git"), "--work-tree", HOME, "-C", HOME]
+        rc, rev = run(git + ["log", "-1", "--before=" + t.isoformat(), "--format=%H", "--", rel], timeout=20)
+        if rc != 0 or not rev.strip():
+            return None
+        rc, text = run(git + ["show", "%s:%s" % (rev.strip(), rel)], timeout=20)
+    if rc != 0 or not text:
+        return None
+    fd, p = tempfile.mkstemp(prefix="drive-brief-todo.", suffix=".md")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    return p
+
+
+def decisions(t=None):
+    """Count of Waiting-on-you either/or items (decision-deck); t = as of then (replay)."""
+    argv = cmd("DRIVE_BRIEF_DECK_CMD", [os.path.join(HOME, "bin/decision-deck"), "--json"])
+    tmp = todo_at(t) if t is not None else None
+    if t is not None and tmp is None:
+        return None
+    try:
+        rc, out = run(argv + (["--todo", tmp] if tmp else []), timeout=20)
+    finally:
+        if tmp:
+            os.unlink(tmp)
+    try:
+        items = json.loads(out).get("items") or [] if rc == 0 else []
+    except (ValueError, AttributeError):
+        return None
+    return sum(1 for i in items if isinstance(i, dict) and len(i.get("options") or []) >= 2)
+
+
+def parcel_mails(cfg, st=None):
+    """Dates of parcel-station mails (vault metadata: sender + date, never text), cached cache_min."""
+    fake = os.environ.get("DRIVE_BRIEF_MAIL")
+    if fake:
+        try:
+            with open(fake) as fh:
+                return [d for d in (parse_ts(x) for x in json.load(fh)) if d]
+        except (OSError, ValueError):
+            return []
+    q = (cfg.get("parcel") or {}).get("mail_query")
+    if not q:
+        return []
+    cache = (st or {}).get("parcel_mail") or {}
+    if cache.get("ts") and time.time() - cache["ts"] < 60 * float(cfg["parcel"].get("cache_min") or 120):
+        return [d for d in (parse_ts(x) for x in cache.get("dates") or []) if d]
+    for _ in range(2):
+        rc, out = run([os.path.join(HOME, "bin/vault"), "gmail", "search", "-n", "30", "--json", "--no-text"]
+                      + shlex.split(q), timeout=60)
+        if rc == 0:
+            break
+    try:
+        dates = [r.get("date") for r in json.loads(out).get("results") or [] if r.get("date")] if rc == 0 else None
+    except (ValueError, AttributeError):
+        dates = None
+    if dates is None:
+        return [d for d in (parse_ts(x) for x in cache.get("dates") or []) if d]
+    if st is not None:
+        st["parcel_mail"] = {"ts": time.time(), "dates": sorted(dates)[-5:]}
+    return [d for d in (parse_ts(x) for x in dates) if d]
+
+
+_HUB = {}
+
+
+def hub_calls():
+    """The calls that rang him, from the relay's call log in claude-hub-voice (`voice-hub calls --last 20 --out`:
+    voice.calls digests, metadata only, newest last): id, kind, start, end {reason, by, why, duration_s}, ring
+    [outcome, ring_s], outcome + answered, events {ev: count}, tools [[name, lane, error, handoff]]. None when the hub
+    does not answer. Once per run. DRIVE_BRIEF_CALLS_CMD = the command (off = not asked)."""
+    if "calls" in _HUB:
+        return _HUB["calls"]
+    calls = None
+    if os.environ.get("DRIVE_BRIEF_CALLS_CMD") not in ("off", "0"):
+        argv = cmd("DRIVE_BRIEF_CALLS_CMD", [os.path.join(HOME, "bin/voice-hub"), "calls", "--last", "20", "--out"])
+        rc, out = run(argv, timeout=45)
+        try:
+            got = json.loads(out).get("calls") if rc == 0 else None
+            calls = [c for c in got if isinstance(c, dict)] if isinstance(got, list) else None
+        except (ValueError, AttributeError):
+            calls = None
+    _HUB["calls"] = calls
+    return calls
+
+
+def hub_started(c, t_from, t_to):
+    s = c.get("start")
+    return isinstance(s, (int, float)) and t_from.timestamp() <= s <= t_to.timestamp()
+
+
+def hub_missed(c):
+    """An outbound Telegram call that rang and was not answered: the ring's own outcome (no_answer, declined, busy,
+    failed); a call that never rang (rate_limited, provider_failed, not_rung) or is still ringing is no decline."""
+    return c.get("kind") == "tg-out" and bool(c.get("ring")) and c.get("outcome") not in ("answered", None)
+
+
+def recent_declines(t, minutes):
+    """Outbound calls he declined or missed in the last `minutes`, from the hub's call log, one per call id."""
+    t_from = t - dt.timedelta(minutes=minutes)
+    missed = {c.get("id") or "hub-%s" % c.get("start") for c in hub_calls() or []
+              if hub_missed(c) and hub_started(c, t_from - dt.timedelta(minutes=1), t)}
+    return len(missed)
+
+
+# ---------------------------------------------------------------- the decision
+
+def here_town(place):
+    place = place or {}
+    if place.get("kind") == "home" or norm(place.get("zone")) == "home":
+        return profile.get("home.town")
+    if norm(place.get("zone")) == "work":
+        return place.get("town") or profile.get("work.town")
+    return place.get("town")
+
+
+def guess_destination(t, place, events, cfg):
+    """(town, why, event) for the likely trip, or (None, None, None)."""
+    home, work = profile.get("home.town"), profile.get("work.town")
+    here = here_town(place)
+    end = t + dt.timedelta(hours=float(cfg["event_window_h"]))
+    legs = [e for e in events if e.get("_start") and (e.get("flags") or {}).get("travel") in ("train", "bus", "flight")]
+    for e in events:
+        s = e.get("_start")
+        if not s or s <= t or s > end or (e.get("flags") or {}).get("travel") in ("train", "bus", "flight"):
+            continue
+        if any(t - dt.timedelta(minutes=30) <= l["_start"] <= s for l in legs):
+            continue                                   # he goes there by train/bus/plane, not by car
+        town = e.get("town")
+        if town and norm(town) not in ("online", norm(here)):
+            return town, "event", e
+        if not e.get("free") and s <= t + dt.timedelta(minutes=float(cfg["event_plain_min"])):
+            return None, "event_plain", e
+    o = cfg.get("office") or {}
+    h = t.hour + t.minute / 60.0
+    wd = t.weekday() in (o.get("weekdays") or [])
+    mo, ev = o.get("morning") or [6, 11], o.get("evening") or [15, 20]
+    if wd and mo[0] <= h < mo[1] and here and norm(here) == norm(home) and work:
+        return work, "office", None
+    if here and norm(here) != norm(home):
+        if (norm(here) == norm(work) or norm(place.get("zone")) == "work") and ev[0] <= h < ev[1]:
+            return home, "home", None
+        if (place or {}).get("band") in ("region", "far"):
+            return home, "home", None
+    return None, None, None
+
+
+def decide(c, cfg):
+    """c: t, place, events, reminders_fn(until), decisions (count|None), parcel_mail (town|None), declines,
+    day_calls, day_dec_alone, route_fn(frm, to). -> dict(call, why, text, dest, items, ...)."""
+    P = PHRASES[cfg["lang"]]
+    t = c["t"]
+    res = {"at": t.isoformat(timespec="minutes"), "call": False, "text": "", "items": [], "dest": None}
+    nf, nt = int(cfg["night_from"]), int(cfg["night_to"])
+    if (nf <= t.hour < nt) if nf <= nt else (t.hour >= nf or t.hour < nt):
+        return dict(res, why="night")
+    if tripclock is not None and c.get("check_trip", True):
+        try:
+            if tripclock.away(t):
+                return dict(res, why="on a trip")
+        except Exception:
+            pass
+    if c.get("day_calls", 0) >= int(cfg["max_per_day"]):
+        return dict(res, why="day cap")
+    if c.get("declines"):
+        return dict(res, why="declined a call recently")
+    here = here_town(c.get("place"))
+    dest, dwhy, ev = guess_destination(t, c.get("place"), c.get("events") or [], cfg)
+    res.update(dest=dest, dest_why=dwhy, here=here)
+    r = c["route_fn"](here, dest) if dest else None
+    if r:
+        res["route"] = {"live": round(r["live"]), "usual": round(r["usual"]), "proxy": bool(r.get("proxy"))}
+    parts = []                                         # (kind, text) in priority order
+    delay = round(r["live"] - r["usual"]) if r else 0
+    dtxt = P["delay"].format(d=delay) if delay >= int(cfg["traffic_min"]) else ""
+    if ev is not None and dwhy == "event" and r:
+        s = ev["_start"]
+        eta = t + dt.timedelta(minutes=r["live"])
+        title = say_title(ev.get("title"))
+        if eta >= s - dt.timedelta(minutes=60):       # he is most likely on his way there now
+            late = round((eta - s).total_seconds() / 60)
+            key = "late" if late >= 3 else "eta"
+            parts.append(("event", P[key].format(title=title, t=hm(s), town=dest, m=round(r["live"]), delay=dtxt,
+                                                 eta=hm(eta), late=late)))
+        else:
+            leave = s - dt.timedelta(minutes=r["live"] + float(cfg["arrive_early_min"]))
+            parts.append(("event", P["leave"].format(title=title, t=hm(s), town=dest, m=round(r["live"]),
+                                                     delay=dtxt, leave=hm(leave))))
+    elif ev is not None:
+        parts.append(("event", P["plain"].format(title=say_title(ev.get("title")), t=hm(ev["_start"]))))
+    if nav_offer(t, dest, dwhy, ev, cfg):
+        parts.append(("nav", P["nav"].format(title=say_title(ev.get("title")))))
+    if r and delay >= int(cfg["traffic_min"]) and not (ev is not None and dwhy == "event"):
+        key = "traffic_home" if norm(dest) == norm(profile.get("home.town")) else "traffic"
+        parts.append(("traffic", P[key].format(town=dest, m=round(r["live"]), d=delay)))
+    window = r["live"] if r else float(cfg["reminder_window_min"])
+    rems = c["reminders_fn"](t + dt.timedelta(minutes=window))
+    if len(rems) == 1:
+        parts.append(("reminders", P["rem1"].format(t=hm(rems[0][0]), title=rems[0][1])))
+    elif len(rems) > 1:
+        parts.append(("reminders", P["rem2"].format(t=hm(rems[0][0]), title=rems[0][1], t2=hm(rems[1][0]),
+                                                    title2=rems[1][1])))
+    for e in c.get("events") or []:
+        if "📦" in (e.get("title") or ""):
+            parts.append(("parcel", P["parcel_cal"].format(title=say_title(e.get("title")))))
+            break
+    pt = c.get("parcel_mail")
+    via = [norm(v) for v in ((cfg.get("parcel") or {}).get("via") or [])]
+    if pt and dest and (norm(dest) in via or norm(here) in via):     # the route between home and a via town
+        parts.append(("parcel", P["parcel_mail"].format(town=pt)))
+    n = c.get("decisions") or 0
+    long_drive = bool(r and r["live"] >= float(cfg["long_drive_min"]))
+    if n and (parts or (long_drive and c.get("day_dec_alone", 0) < int(cfg["decisions_alone_per_day"]))):
+        res["decisions_alone"] = not parts
+        parts.append(("decisions", P["dec1"] if n == 1 else P["decn"].format(n=n)))
+    if not parts:
+        return dict(res, why="nothing to say")
+    text, kept = compose(parts, P["prefix"], int(cfg["max_chars"]))
+    return dict(res, call=True, why="content", text=text, items=kept, chars=len(text))
+
+
+def nav_offer(t, dest, dwhy, ev, cfg):
+    """Offer navigation to the event he is likely driving to: located (a town that is not where he is, not home),
+    starting within nav_offer_h. The relay's navigate tool resolves "next_event" to that event's town."""
+    if not cfg.get("nav_offer") or ev is None or dwhy != "event" or not dest:
+        return False
+    if norm(dest) == norm(profile.get("home.town")):
+        return False
+    s = ev.get("_start")
+    if not (s and t < s <= t + dt.timedelta(hours=float(cfg.get("nav_offer_h") or 0))):
+        return False
+    return phone_open_ready()
+
+
+def phone_open_ready():
+    """The phone CLI has the `open` verb (the relay's navigate tool runs it)."""
+    rc, _ = run(cmd("DRIVE_BRIEF_PHONE_CMD", [os.path.join(HOME, "bin/phone")]) + ["open", "--help"], timeout=10)
+    return rc == 0
+
+
+def compose(parts, prefix, max_chars):
+    keep = list(parts)
+    while keep:
+        text = " ".join([prefix] + [p for _, p in keep])
+        if len(text) <= max_chars:
+            return text, [k for k, _ in keep]
+        if len(keep) == 1:
+            cut = text[:max_chars].rsplit(" ", 1)[0].rstrip(",;:") + "."
+            return cut, [keep[0][0]]
+        keep.pop()
+    return prefix, []
+
+
+# ---------------------------------------------------------------- live context
+
+def live_context(t, place, st, cfg, day_log):
+    def reminders_fn(until):
+        return reminders(t, until)
+    pt = None
+    pc = cfg.get("parcel") or {}
+    if pc.get("town") and pc.get("mail_query"):
+        refresh_parcel_stop(st, cfg)
+        mails = [m for m in parcel_mails(cfg, st) if m >= t - dt.timedelta(days=float(pc.get("max_age_days") or 10))]
+        last_stop = parse_ts(st.get("parcel_stop"))
+        if mails and (last_stop is None or max(mails) > last_stop):
+            pt = pc["town"]
+    return {"t": t, "place": place, "events": calendar(t), "reminders_fn": reminders_fn, "decisions": decisions(),
+            "parcel_mail": pt, "declines": recent_declines(t, float(cfg["declined_quiet_min"])),
+            "day_calls": sum(1 for r in day_log if r.get("kind") == "decision" and r.get("call")),
+            "day_dec_alone": sum(1 for r in day_log if r.get("kind") == "decision" and r.get("decisions_alone")),
+            "route_fn": route}
+
+
+def day_entries(t):
+    start = t.replace(hour=0, minute=0, second=0, microsecond=0)
+    return [r for r in read_log(start) if (parse_ts(r.get("at")) or start).date() == t.date()]
+
+
+def place_call(text, cfg):
+    argv = cmd("DRIVE_BRIEF_CALL_CMD", [os.path.join(HOME, "bin/voice-relay"), "call"])
+    rc, _ = run(argv + ["--reason", REASON, "--say", text], timeout=float(cfg["call_timeout_s"]))
+    return rc
+
+
+def hub_followup(at):
+    """(turns, tools, duration_s) of the briefing call from the hub's call log: the first outbound call that started
+    right after the decision (the digest carries no reason; one ring at a time, and drive-brief rings at once).
+    None = not there; "retry" = the hub did not answer."""
+    calls = hub_calls()
+    if calls is None:
+        return "retry"
+    mine = sorted((c for c in calls if c.get("kind") == "tg-out"
+                   and hub_started(c, at - dt.timedelta(seconds=10), at + dt.timedelta(minutes=3))),
+                  key=lambda c: c["start"])
+    if not mine:
+        return None
+    c = mine[0]
+    tools = [x[0] for x in c.get("tools") or [] if isinstance(x, list) and x and x[0] not in ("end_call", None)]
+    end = c.get("end") if isinstance(c.get("end"), dict) else {}
+    return int((c.get("events") or {}).get("him") or 0), tools, end.get("duration_s")
+
+
+def finalize_followups(st, t, cfg):
+    """For answered briefing calls older than followup_after_min: his turns + tools from the hub's call log
+    (counts)."""
+    keep = []
+    for p in st.get("pending") or []:
+        at = parse_ts(p.get("at"))
+        if at is None or t - at < dt.timedelta(minutes=float(cfg["followup_after_min"])):
+            keep.append(p)
+            continue
+        got = hub_followup(at)
+        if got == "retry" and t - at < dt.timedelta(minutes=45):
+            keep.append(p)
+            continue
+        if not got or got == "retry":
+            append_log({"kind": "followup", "at": p["at"], "chain": p.get("chain"), "found": False})
+            continue
+        turns, tools, dur = got
+        if dur is None and t - at < dt.timedelta(minutes=45):
+            keep.append(p)
+            continue
+        rec = {"kind": "followup", "at": p["at"], "chain": p.get("chain"), "found": True, "turns": turns,
+               "tools": len(tools), "tool_names": sorted(set(tools))[:8], "duration_s": dur}
+        append_log(rec)
+        ulog("invoke", outcome="followup" if (turns > 1 or tools) else "no_followup",
+             attrs={"turns": turns, "tools": len(tools), "navigate": "navigate" in tools})
+    st["pending"] = keep
+
+
+def cmd_tick(args, cfg):
+    if cfg["mode"] == "off":
+        return 0
+    os.makedirs(STATE, exist_ok=True)
+    lockf = open(state_path("tick.lock"), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    st = load_state()
+    t = now()
+    finalize_followups(st, t, cfg)
+    w = where()
+    if not isinstance(w, dict):
+        save_state(st)
+        return 0
+    place = w.get("place") or {}
+    drive = w.get("drive") if isinstance(w.get("drive"), dict) else {}
+    active = drive_rule.active(w)          # the one drive rule (core.drive): on, and the answer <= 60 min old
+    cur = st.get("cur") or {}
+    if not active:
+        save_state(st)
+        return 0
+    since = parse_ts(drive.get("since"), t) or t
+    last = parse_ts(cur.get("last_active"))
+    if cur.get("since") == since.isoformat(timespec="minutes") or (last and since <= last):
+        cur["last_active"] = t.isoformat(timespec="minutes")       # the same drive (or a source switch)
+        st["cur"] = cur
+        save_state(st)
+        return 0
+    same_chain = bool(last and since - last <= dt.timedelta(minutes=float(cfg["chain_gap_min"])))
+    new = {"since": since.isoformat(timespec="minutes"), "last_active": t.isoformat(timespec="minutes"),
+           "chain": cur.get("chain") if same_chain else since.isoformat(timespec="minutes")}
+    if same_chain and cur.get("decided"):
+        new["decided"] = cur["decided"]
+        st["cur"] = new
+        save_state(st)
+        return 0
+    st["cur"] = new
+    base = {"kind": "decision", "chain": new["chain"], "drive_since": new["since"], "mode": cfg["mode"],
+            "source": w.get("source")}
+    if t - since > dt.timedelta(minutes=float(cfg["max_start_age_min"])):
+        new["decided"] = "late"
+        append_log(dict(base, at=t.isoformat(timespec="minutes"), call=False, why="noticed late"))
+        save_state(st)
+        return 0
+    res = decide(live_context(t, place, st, cfg, day_entries(t)), cfg)
+    new["decided"] = "call" if res["call"] else res["why"]
+    save_state(st)                                     # marked before ringing: a crash never rings twice
+    rec = dict(base, **{k: v for k, v in res.items() if k != "t"})
+    if res["call"] and cfg["mode"] == "live":
+        t0 = time.time()
+        rc = place_call(res["text"], cfg)
+        rec.update(call_rc=rc, outcome=CALL_OUTCOME.get(rc, "rc_%s" % rc), call_s=round(time.time() - t0, 1))
+        ulog("notify_sent", outcome=rec["outcome"], attrs={"items": len(res["items"]), "nav": "nav" in res["items"]})
+        if rc == 0:
+            ulog("notify_opened", outcome="answered")
+            st.setdefault("pending", []).append({"at": res["at"], "chain": new["chain"]})
+        elif rc in (3,):
+            ulog("ignored", outcome="not_answered")
+        else:
+            ulog("error", outcome=rec["outcome"])
+        save_state(st)
+    elif res["call"]:
+        rec["outcome"] = "dry_run"
+    append_log(rec)
+    return 0
+
+
+# ---------------------------------------------------------------- replay
+
+def ha_events(since=0):
+    """Vault HA events (structured flags) after cursor `since` -> (events, next cursor)."""
+    f = os.environ.get("DRIVE_BRIEF_HA_EVENTS")
+    if f:
+        with open(f) as fh:
+            evs = [json.loads(ln) for ln in fh if ln.strip()]
+        evs = [e for e in evs if (e.get("cursor") or 0) > since]
+        return evs, max([e.get("cursor") or 0 for e in evs] or [since])
+    out, c = [], since
+    for _ in range(60):
+        rc, raw = run([os.path.join(HOME, "bin/vault"), "events", "--source", "homeassistant", "--since", str(c),
+                       "--max", "500", "--json"], timeout=90)
+        try:
+            d = json.loads(raw) if rc == 0 else {}
+        except ValueError:
+            d = {}
+        evs = d.get("events") or []
+        out.extend(evs)
+        nc = max([e.get("cursor") or 0 for e in evs] or [c])
+        if not evs or not d.get("more") or nc <= c:
+            break
+        c = nc
+    return out, c
+
+
+def parcel_stops(evs, town):
+    """When a drive ended in `town` (the zone event nearest the drive end, within 10 min, names the town)."""
+    zones = [(parse_ts(e.get("ts")), (e.get("ha") or {}).get("town")) for e in evs if e.get("label") == "zone"]
+    out = []
+    for e in evs:
+        if e.get("label") != "drive" or (e.get("ha") or {}).get("state") != "end":
+            continue
+        te = parse_ts(e.get("ts"))
+        near = sorted((abs((tz - te).total_seconds()), i, tw) for i, (tz, tw) in enumerate(zones)
+                      if tz and te and abs((tz - te).total_seconds()) <= 600)
+        if near and norm(near[0][2]) == norm(town):
+            out.append(te)
+    return out
+
+
+def refresh_parcel_stop(st, cfg):
+    """Live: new vault HA events since the stored cursor -> st["parcel_stop"] (his last stop in the parcel town)."""
+    town = (cfg.get("parcel") or {}).get("town")
+    if not town:
+        return
+    evs, cur = ha_events(int(st.get("ha_cursor") or 0))
+    keep = [e for e in (st.get("ha_tail") or []) if isinstance(e, dict)] + \
+        [{k: e.get(k) for k in ("ts", "label", "cursor")} | {"ha": {"state": (e.get("ha") or {}).get("state"),
+                                                                     "town": (e.get("ha") or {}).get("town")}}
+         for e in evs if e.get("label") in ("drive", "zone")]
+    stops = parcel_stops(keep, town)
+    if stops:
+        last = max(stops)
+        prev = parse_ts(st.get("parcel_stop"))
+        if prev is None or last > prev:
+            st["parcel_stop"] = last.isoformat(timespec="minutes")
+    st["ha_cursor"] = cur
+    st["ha_tail"] = keep[-6:]                          # a drive end and its zone event may straddle two reads
+
+
+def drive_chains(evs, gap_min):
+    segs, start = [], None
+    for e in sorted(evs, key=lambda e: e.get("ts") or ""):
+        if e.get("label") != "drive":
+            continue
+        st = (e.get("ha") or {}).get("state")
+        ts = parse_ts(e.get("ts"))
+        if st == "start":
+            start = ts
+        elif st == "end" and start is not None:
+            segs.append((start, ts))
+            start = None
+    if start is not None:
+        segs.append((start, None))
+    chains = []
+    for s, e in segs:
+        if chains and chains[-1]["end"] and s - chains[-1]["end"] <= dt.timedelta(minutes=gap_min):
+            chains[-1]["segs"].append((s, e))
+            chains[-1]["end"] = e
+        else:
+            chains.append({"start": s, "end": e, "segs": [(s, e)]})
+    return chains
+
+
+def zone_place(e):
+    h = e.get("ha") or {}
+    return {"kind": h.get("place"), "zone": h.get("zone"), "band": h.get("band"), "town": h.get("town")}
+
+
+def cmd_replay(args, cfg):
+    t_now = now()
+    evs, _ = ha_events()
+    zones = sorted([(parse_ts(e.get("ts")), zone_place(e)) for e in evs if e.get("label") == "zone"],
+                   key=lambda x: x[0])
+    pc = cfg.get("parcel") or {}
+    mails = parcel_mails(cfg) if pc.get("town") and pc.get("mail_query") else []
+    stops = parcel_stops(evs, pc["town"]) if pc.get("town") else []
+    rows, calls_by_day, dec_by_day = [], {}, {}
+    for ch in drive_chains(evs, float(cfg["chain_gap_min"])):
+        if ch["start"] < t_now - dt.timedelta(days=args.days):
+            continue
+        t = ch["start"] + dt.timedelta(minutes=1)
+        before = [p for ts, p in zones if ts <= ch["start"]]
+        place = before[-1] if before else {}
+        after = [p for ts, p in zones if ch["end"] and ch["end"] - dt.timedelta(minutes=5) <= ts <= ch["end"]
+                 + dt.timedelta(minutes=15)]
+        arrived = here_town(after[0]) if after else None
+        last_leg = ch["segs"][-1]
+        leg_min = round((last_leg[1] - last_leg[0]).total_seconds() / 60) if last_leg[1] else None
+
+        def route_fn(frm, to, _arr=arrived, _leg=leg_min):
+            r = route(frm, to)
+            if not r:
+                return None
+            if _arr and _leg and norm(_arr) == norm(to):
+                return {"live": max(float(_leg), 1.0), "usual": r["usual"], "proxy": True}
+            return {"live": r["usual"], "usual": r["usual"], "proxy": True}
+
+        pt = None
+        if pc.get("town"):
+            recent = [m for m in mails if t - dt.timedelta(days=float(pc.get("max_age_days") or 10)) <= m <= t]
+            last_stop = max([s for s in stops if s <= t] or [None], key=lambda x: x or t - dt.timedelta(days=999))
+            if recent and (last_stop is None or max(recent) > last_stop):
+                pt = pc["town"]
+        day = t.date()
+        c = {"t": t, "place": place, "events": calendar(t, args.calendar),
+             "reminders_fn": lambda until, _t=t: reminders(_t, until, include_fired=True),
+             "decisions": decisions(t), "parcel_mail": pt,
+             "declines": recent_declines(t, float(cfg["declined_quiet_min"])),
+             "day_calls": calls_by_day.get(day, 0), "day_dec_alone": dec_by_day.get(day, 0), "route_fn": route_fn}
+        res = decide(c, cfg)
+        if res["call"]:
+            calls_by_day[day] = calls_by_day.get(day, 0) + 1
+            dec_by_day[day] = dec_by_day.get(day, 0) + (1 if res.get("decisions_alone") else 0)
+        drive_min = sum(round(((e or s) - s).total_seconds() / 60) for s, e in ch["segs"])
+        rows.append({"start": ch["start"].strftime("%a %d.%m %H:%M"), "legs": len(ch["segs"]), "drive_min": drive_min,
+                     "from": here_town(place), "to_guess": res.get("dest"), "why_dest": res.get("dest_why"),
+                     "arrived": arrived, "route": res.get("route"), "call": res["call"], "why": res["why"],
+                     "items": res.get("items"), "text": res.get("text"), "decisions": c["decisions"]})
+    if args.json:
+        print(json.dumps({"rows": rows, "drives": len(rows), "calls": sum(1 for r in rows if r["call"])},
+                         ensure_ascii=False, indent=1))
+        return 0
+    for r in rows:
+        print("%s  %s min/%d leg%s  %s -> %s (%s)  %s" % (
+            r["start"], r["drive_min"], r["legs"], "" if r["legs"] == 1 else "s", r["from"] or "?",
+            r["to_guess"] or "?", r["why_dest"] or "-", ("CALL: " + r["text"]) if r["call"] else "skip: " + r["why"]))
+    print("%d drives, %d briefings" % (len(rows), sum(1 for r in rows if r["call"])))
+    return 0
+
+
+# ---------------------------------------------------------------- reports
+
+def cmd_now(args, cfg):
+    t = now()
+    w = where() or {}
+    st = load_state()
+    res = decide(live_context(t, w.get("place") or {}, st, cfg, day_entries(t)), cfg)
+    res.pop("t", None)
+    res["source"] = w.get("source")
+    if args.json:
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+    else:
+        print(("would call: " + res["text"]) if res["call"] else "no call: " + res["why"])
+    return 0
+
+
+def cmd_stats(args, cfg):
+    since = now() - dt.timedelta(days=args.days)
+    log = read_log(since)
+    dec = [r for r in log if r.get("kind") == "decision"]
+    calls = [r for r in dec if r.get("call")]
+    live = [r for r in calls if r.get("mode") == "live" and r.get("outcome") != "dry_run"]
+    answered = [r for r in live if r.get("outcome") == "answered"]
+    fu = [r for r in log if r.get("kind") == "followup" and r.get("found")]
+    chains = {}
+    for r in calls:
+        chains[r.get("chain")] = chains.get(r.get("chain"), 0) + 1
+    why = {}
+    for r in dec:
+        if not r.get("call"):
+            why[r.get("why")] = why.get(r.get("why"), 0) + 1
+    out = {"days": args.days, "mode": cfg["mode"], "drives": len(dec), "briefings": len(calls),
+           "dry_run": sum(1 for r in calls if r.get("outcome") == "dry_run"), "calls": len(live),
+           "answered": len(answered), "answered_rate": round(len(answered) / len(live), 2) if live else None,
+           "followup_calls": sum(1 for r in fu if r.get("turns", 0) > 1 or r.get("tools")),
+           "avg_turns": round(sum(r.get("turns", 0) for r in fu) / len(fu), 1) if fu else None,
+           "avg_tools": round(sum(r.get("tools", 0) for r in fu) / len(fu), 1) if fu else None,
+           "max_per_drive": max(chains.values()) if chains else 0, "skips": why,
+           "nav_offers": sum(1 for r in answered if "nav" in (r.get("items") or [])),
+           "nav_taken": sum(1 for r in fu if "navigate" in (r.get("tool_names") or []))}
+    if args.json:
+        print(json.dumps(out, indent=1))
+    else:
+        print("drive-brief %s, last %d days: %d drives, %d briefings (%d dry-run), %d calls, answered %s, "
+              "follow-ups %d (avg turns %s, tools %s), max per drive %d, nav offers %d (taken %d)" % (
+                  out["mode"], args.days, out["drives"], out["briefings"], out["dry_run"], out["calls"],
+                  out["answered_rate"], out["followup_calls"], out["avg_turns"], out["avg_tools"],
+                  out["max_per_drive"], out["nav_offers"], out["nav_taken"]))
+        if why:
+            print("skips: " + ", ".join("%s %d" % kv for kv in sorted(why.items(), key=lambda kv: -kv[1])))
+    return 0
+
+
+def cmd_status(args, cfg):
+    t = now()
+    st = load_state()
+    today = [r for r in day_entries(t) if r.get("kind") == "decision"]
+    out = {"mode": cfg["mode"], "lang": cfg["lang"], "today_decisions": len(today),
+           "today_briefings": sum(1 for r in today if r.get("call")), "max_per_day": cfg["max_per_day"],
+           "current": st.get("cur"), "pending_followups": len(st.get("pending") or []),
+           "last": today[-1] if today else None}
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        print("mode %s · today %d briefing(s) of %d drive(s) (max %d) · current %s" % (
+            out["mode"], out["today_briefings"], out["today_decisions"], out["max_per_day"],
+            (st.get("cur") or {}).get("since") or "-"))
+        if out["last"]:
+            r = out["last"]
+            print("last: %s %s" % (r.get("at"), ("call: " + (r.get("text") or "")) if r.get("call") else
+                                   "skip: " + str(r.get("why"))))
+    return 0
+
+
+def cmd_mode(args, cfg):
+    try:
+        with open(CONFIG) as fh:
+            user = json.load(fh)
+    except (OSError, ValueError):
+        user = {}
+    user["mode"] = args.value
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CONFIG), prefix=".config.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(user, fh, indent=1, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+    print("drive-brief mode: %s" % args.value)
+    return 0
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="drive-brief", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="verb", required=True)
+    s = sub.add_parser("tick")
+    s.add_argument("--cron", action="store_true")
+    s = sub.add_parser("now")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("replay")
+    s.add_argument("--days", type=float, default=7)
+    s.add_argument("--calendar")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("stats")
+    s.add_argument("--days", type=float, default=30)
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    s = sub.add_parser("mode")
+    s.add_argument("value", choices=("off", "dry-run", "live"))
+    args = p.parse_args(argv)
+    cfg = load_config()
+    return {"tick": cmd_tick, "now": cmd_now, "replay": cmd_replay, "stats": cmd_stats, "status": cmd_status,
+            "mode": cmd_mode}[args.verb](args, cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

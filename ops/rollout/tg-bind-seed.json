@@ -1,0 +1,223 @@
+{
+ "comment": "Every 0.1.22 compat-table entry (the plugin's instant.json + the built-in /status, callbacks.json) as a tg-bind row, in menu order. Load with `tg-bind import ops/rollout/tg-bind-seed.json` (idempotent). Menu lines and toasts come from the tools registry (schemas/tools.toml).",
+ "rows": [
+  {
+   "kind": "command",
+   "key": "status",
+   "tool": "tg-status.show",
+   "note": true,
+   "forward": true,
+   "why": "/status shows the status board at once, no brain turn; a failure goes to me as his message (0.1.6 built-in)"
+  },
+  {
+   "kind": "command",
+   "key": "bills",
+   "tool": "tg-cmd.bills",
+   "note": true,
+   "why": "/bills: open and upcoming bills, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "queue",
+   "tool": "tg-cmd.queue",
+   "note": true,
+   "why": "/queue: what's downloading in Sonarr/Radarr, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "space",
+   "tool": "tg-cmd.space",
+   "note": true,
+   "why": "/space: server disk space and the fill-up forecast, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "reminders",
+   "tool": "tg-cmd.reminders",
+   "note": true,
+   "why": "/reminders: his upcoming reminders, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "list",
+   "tool": "tg-cmd.list",
+   "note": true,
+   "why": "/list: his lists, HA shopping list first, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "shop",
+   "tool": "tg-cmd.shop",
+   "note": true,
+   "why": "/shop: the shopping plan by shop, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "parcels",
+   "tool": "tg-cmd.parcels",
+   "note": true,
+   "why": "/parcels: the parcels card; '/parcels picked' marks a station pickup, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "gym",
+   "tool": "tg-cmd.gym",
+   "note": true,
+   "why": "/gym: the next gym session and the coach views, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "cat",
+   "tool": "tg-cmd.cat",
+   "note": true,
+   "why": "/cat: the cat week card, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "train",
+   "tool": "tg-cmd.train",
+   "note": true,
+   "why": "/train: the next train legs with live status, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "gohome",
+   "tool": "tg-cmd.gohome",
+   "note": true,
+   "why": "/gohome: the way home: next connections and the last one tonight, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "rave",
+   "tool": "tg-cmd.rave",
+   "note": true,
+   "why": "/rave: upcoming shows and lineups of his artists, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "trip",
+   "tool": "tg-cmd.trip",
+   "note": true,
+   "why": "/trip: the next trip card, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "warranty",
+   "tool": "tg-cmd.warranty",
+   "note": true,
+   "why": "/warranty: what is still under warranty, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "back",
+   "tool": "tg-cmd.back",
+   "note": true,
+   "why": "/back: the catch-up card after time away, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "week",
+   "tool": "tg-cmd.week",
+   "note": true,
+   "why": "/week: the week ahead, one line per day, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "pack",
+   "tool": "tg-cmd.pack",
+   "note": true,
+   "why": "/pack: the packing list for the next event, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "vibe",
+   "tool": "tg-cmd.vibe",
+   "note": true,
+   "why": "/vibe: library picks for a mood, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "finish",
+   "tool": "tg-cmd.finish",
+   "note": true,
+   "why": "/finish: started shows, closest to the end first, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "doctor",
+   "tool": "tg-cmd.doctor",
+   "note": true,
+   "why": "/doctor: why a media request isn't on Emby yet, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "party",
+   "tool": "tg-cmd.party",
+   "note": true,
+   "why": "/party: party lights on, off or status, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "crate",
+   "tool": "tg-cmd.crate",
+   "note": true,
+   "why": "/crate: saves the playing track to the crate, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "usage",
+   "tool": "tg-cmd.usage",
+   "note": true,
+   "why": "/usage: feature usage of the last 30 days, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "sleep",
+   "tool": "tg-cmd.sleep",
+   "note": true,
+   "why": "/sleep: sleep and energy, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "waiting",
+   "tool": "waiting-card",
+   "note": true,
+   "why": "/waiting: what's waiting on him, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "night",
+   "tool": "night-log",
+   "note": true,
+   "why": "/night: what I did overnight, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "command",
+   "key": "traces",
+   "tool": "traces.brief",
+   "note": true,
+   "why": "/traces: cost, reply speed and errors of the last 24 h, answered at once by the adapter; I get a short note"
+  },
+  {
+   "kind": "button",
+   "key": "call:talk",
+   "tool": "talk-button",
+   "note": false,
+   "why": "📞 Talk under the board and on event cards rings him at once through the voice relay"
+  },
+  {
+   "kind": "prefix",
+   "key": "rm:",
+   "tool": "remind.press",
+   "note": false,
+   "why": "reminder buttons (snooze, done) act at once without a brain turn"
+  },
+  {
+   "kind": "button",
+   "key": "vf:fixed",
+   "tool": "ha-autopilot-watch.fixed",
+   "note": false,
+   "why": "Fixed on the vacuum fault card resumes the daily runs at once"
+  }
+ ]
+}

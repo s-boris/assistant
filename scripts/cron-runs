@@ -1,0 +1,95 @@
+#!/usr/local/bin/python3.13 -I
+# managed: ~/opt/assistant — edit there, deploy with assistant land
+"""cron-runs: the cron jobs' run log (cron-fail's runs-YYYYMMDD.jsonl) for Phoenix and a quick look (cron-back, 29.10).
+
+  cron-runs export [--quiet]          new runs -> one span each ("cron.<job>", rc, ms, error when failed) to the local
+                                      OTLP receiver (127.0.0.1:4318, `traces otel`, forwarded to Phoenix); prunes run
+                                      files older than 8 days. Cron: */5 under cron-fail (tag assistant:cron-runs).
+  cron-runs stats [--hours 24] [--job NAME] [--json]   runs, failures, p50/p95 ms and the last run per job
+  cron-runs last NAME                 the newest run of one job (exit 1 when none in 8 days)
+
+Exit: 0 ok · 1 export refused by the receiver (rows kept for the next run) / no run · 2 usage.
+Off switch for the export: ~/.config/assistant/cron-runs-export-off. Library: core.cronruns.
+Tests: tests/core/test_cronruns.py.
+"""
+import argparse
+import json
+import os
+import pwd
+import sys
+import time
+
+sys.dont_write_bytecode = True
+_here = os.path.dirname(os.path.realpath(__file__))
+try:
+    _home = pwd.getpwuid(os.getuid()).pw_dir
+except KeyError:  # a uid with no passwd entry (the CI runner under a clean env): HOME
+    _home = os.environ.get('HOME') or os.path.expanduser('~')
+for _lib in (os.path.join(_home, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))
+from core import cronruns  # noqa: E402
+
+
+def pct(v, q):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(q * len(v)))] if v else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='cron-runs', description=__doc__.split('\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    e = sub.add_parser('export')
+    e.add_argument('--quiet', action='store_true')
+    s = sub.add_parser('stats')
+    s.add_argument('--hours', type=float, default=24)
+    s.add_argument('--job')
+    s.add_argument('--json', action='store_true')
+    la = sub.add_parser('last')
+    la.add_argument('name')
+    a = ap.parse_args(argv)
+    if a.cmd == 'export':
+        if cronruns.off():
+            print('cron-runs export: off (~/.config/assistant/cron-runs-export-off)') if not a.quiet else None
+            return 0
+        sent, pending = cronruns.export()
+        if not a.quiet or pending:
+            print(f'cron-runs export: {sent} span(s) sent, {pending} kept for the next run',
+                  file=sys.stderr if pending else sys.stdout)
+        return 1 if pending else 0
+    now = time.time()
+    if a.cmd == 'last':
+        rows = [r for r in cronruns.runs(now - cronruns.KEEP_DAYS * 86400, now) if r['job'] == a.name]
+        if not rows:
+            print(f'{a.name}: no run in {cronruns.KEEP_DAYS} days')
+            return 1
+        r = rows[-1]
+        print(f"{a.name}: {time.strftime('%F %T', time.localtime(r['ts']))} rc {r['rc']} "
+              f"{'ok' if r['ok'] else 'FAILED'} {r['ms']} ms")
+        return 0
+    rows = cronruns.runs(now - a.hours * 3600, now)
+    per = {}
+    for r in rows:
+        if a.job and r['job'] != a.job:
+            continue
+        p = per.setdefault(r['job'], {'runs': 0, 'failed': 0, 'ms': [], 'last': 0, 'last_rc': 0})
+        p['runs'] += 1
+        p['failed'] += 0 if r['ok'] else 1
+        p['ms'].append(r['ms'])
+        p['last'], p['last_rc'] = r['ts'], r['rc']
+    out = {j: {'runs': p['runs'], 'failed': p['failed'], 'p50_ms': pct(p['ms'], .5), 'p95_ms': pct(p['ms'], .95),
+               'last': p['last'], 'last_rc': p['last_rc']} for j, p in sorted(per.items())}
+    if a.json:
+        print(json.dumps(out, indent=1))
+        return 0
+    print(f'{len(rows)} cron runs in {a.hours:g} h, {sum(p["failed"] for p in out.values())} failed, {len(out)} jobs')
+    for j, p in out.items():
+        print(f"  {j:28} {p['runs']:5} runs {p['failed']:3} failed  p95 {p['p95_ms']:7} ms  last "
+              f"{time.strftime('%H:%M', time.localtime(p['last']))} rc {p['last_rc']}")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

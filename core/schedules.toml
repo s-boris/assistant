@@ -1,0 +1,2775 @@
+# The schedule registry: every periodic job, one table each. Data, not logic. Edited by hand or by the tools.
+# Fields: line (its crontab tag; jobs sharing a line name the same one), cron (5 fields, wall time in the owner's
+# zone: the profile's locale.tz; a top-level tz = "Area/City" here would override it),
+# argv (no shell; a leading ~/ = $HOME; empty = the line needs a shell and a managed wrapper before it
+# can move: shell = true), out / err (under ~/.local/state; "out" = stderr with stdout; none = discarded),
+# dirs (state folders made first), env, timeout (s; a hub schedule waits that long, at most 3600),
+# after / ok (cron-fail's --after / --ok; after 0 = no failure events), class (W watch · X critical ·
+# T timer · C cue · V vault · M moves · R retire · K stays in cron), group, queue (critical | fast | slow;
+# none for K/R), where (brain = the tool worker here, hub, cron, retire), runs_on (cron = its tagged
+# ~/crontab line · hub = a hub schedule, no cron line · keepers = the `keepers` line · planned = no
+# runner · retired · window = the hub's event-window clocks while one is open, `eventwf`), feature,
+# owner_only (true = this deployment's own job, kept in its crontab and checked by `assistant cron check`, but never
+# scheduled by `assistant cron install`: its skill is not shipped in templates/ or it needs this deployment's own
+# setup), owner_facing, why, target (the change that set its runner; cron-back selects by it), keeper + every
+# (minutes; `keepers ensure`), cron_line (the exact crontab line, untagged),
+# catch_up (a hub schedule runs a tick missed while the hub was down once, late, within min(cadence/2, 6 h);
+# default true for daily-or-slower crons, false otherwise; true needs one minute value; false = skip it).
+schema = 1
+
+[jobs.tg-status]
+line = "tg-status"
+cron = "*/5 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/tg-status", "refresh"]
+err = "out"
+timeout = 300
+after = 6
+feature = "status-board"
+owner_facing = true
+why = "refresh the pinned Telegram status board"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * cron-fail --after 6 tg-status flock -n -E 0 \"$HOME/.local/state/cron-fail/tg-status.run\" timeout -k 10 300 $HOME/bin/tg-status refresh >/dev/null 2>&1"
+
+[jobs.board-eval]
+line = "board-eval"
+cron = "*/5 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/board", "eval", "--cron"]
+err = "out"
+timeout = 120
+after = 6
+feature = "status-board"
+owner_facing = false
+why = "Board: import hand edits of TODO.md, run the items' done-when probes, close / move / flag, render TODO.md and the dashboard feed (token-free)"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * cron-fail --after 6 board-eval flock -n -E 0 \"$HOME/.local/state/cron-fail/board-eval.run\" timeout -k 10 120 $HOME/bin/board eval --cron >/dev/null 2>&1"
+
+[jobs.cue-digest]
+line = "cue-digest"
+cron = "3 15 * * 0"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cue", "weekly-digest"]
+timeout = 300
+after = 1
+feature = "weekly-digest"
+owner_facing = true
+why = "Sunday cue: write and send the weekly digest"
+target = "cron-back 29.10"
+cron_line = "3 15 * * 0 cron-fail --after 1 cue-digest flock -n -E 0 \"$HOME/.local/state/cron-fail/cue-digest.run\" timeout -k 10 300 $HOME/bin/cue weekly-digest >/dev/null 2>&1"
+
+[jobs.hwtrend]
+line = "hwtrend"
+cron = "7 8 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/hwtrend"]
+out = "hwtrend/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "server-health"
+owner_facing = false
+why = "daily hardware trend sample"
+target = "cron-back 29.10"
+cron_line = "7 8 * * * mkdir -p \"$HOME/.local/state/hwtrend\" && cron-fail --after 0 hwtrend flock -n -E 0 \"$HOME/.local/state/cron-fail/hwtrend.run\" timeout -k 10 300 $HOME/bin/hwtrend >> \"$HOME/.local/state/hwtrend/cron.log\" 2>&1"
+
+[jobs.cputemp-log]
+line = "cputemp-log"
+cron = "*/5 * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/cputemp-log", "ensure"]
+err = "cputemp/cron.err"
+dirs = ["cputemp"]
+timeout = 120
+after = 3
+feature = "server-health"
+owner_facing = false
+why = "keep the CPU temperature logger running"
+target = "schedule registry"
+keeper = true
+every = 5
+cron_line = "*/5 * * * * mkdir -p \"$HOME/.local/state/cputemp\" && cron-fail --after 3 cputemp-log $HOME/bin/cputemp-log ensure >/dev/null 2>> \"$HOME/.local/state/cputemp/cron.err\""
+
+[jobs.unraid-health]
+line = "unraid-health"
+cron = "13 8 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/unraid-health"]
+out = "unraid-health/cron.log"
+err = "out"
+timeout = 580
+after = 0
+feature = "server-health"
+owner_facing = true
+why = "daily server health report (notes on problems)"
+target = "cron-back 29.10"
+cron_line = "13 8 * * * mkdir -p \"$HOME/.local/state/unraid-health\" && cron-fail --after 0 unraid-health flock -n -E 0 \"$HOME/.local/state/cron-fail/unraid-health.run\" timeout -k 10 580 $HOME/bin/unraid-health >> \"$HOME/.local/state/unraid-health/cron.log\" 2>&1"
+
+[jobs.unifi-health]
+line = "unifi-health"
+cron = "2-59/15 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/unifi-health"]
+out = "unifi-health/cron.log"
+err = "out"
+dirs = ["unifi-health"]
+timeout = 300
+after = 0
+feature = "network"
+owner_facing = true
+why = "UniFi controller health (notes on problems)"
+target = "cron-back 29.10"
+cron_line = "2-59/15 * * * * mkdir -p \"$HOME/.local/state/unifi-health\" && cron-fail --after 0 unifi-health flock -n -E 0 \"$HOME/.local/state/cron-fail/unifi-health.run\" timeout -k 10 300 $HOME/bin/unifi-health >> \"$HOME/.local/state/unifi-health/cron.log\" 2>&1"
+
+[jobs.remind-place]
+line = "remind-place"
+cron = "*/2 * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/remind", "place-due"]
+err = "out"
+timeout = 300
+after = 3
+feature = "reminders"
+owner_facing = true
+why = "fire place reminders (arrive / leave)"
+target = "reminders on the hub"
+cron_line = "*/2 * * * * cron-fail --after 3 remind-place $HOME/bin/remind place-due >/dev/null 2>&1"
+
+[jobs.remind-hub]
+line = "remind-hub"
+cron = "*/5 * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "hub"
+argv = ["~/bin/remind", "hub", "tick"]
+err = "out"
+timeout = 300
+after = 3
+feature = "reminders"
+owner_facing = true
+why = "reconcile the hub's reminder timers with the store; in live mode first a due pass (the sweep)"
+target = "reminders on the hub"
+cron_line = "*/5 * * * * $HOME/bin/remind hub tick >/dev/null 2>&1"
+
+[jobs.cue-birthdays]
+line = "cue-birthdays"
+cron = "7 9 * * 1"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cue", "birthdays"]
+timeout = 300
+after = 1
+feature = "calendar"
+owner_facing = true
+why = "Monday cue: birthdays of the week + calendar details pass"
+target = "cron-back 29.10"
+cron_line = "7 9 * * 1 cron-fail --after 1 cue-birthdays flock -n -E 0 \"$HOME/.local/state/cron-fail/cue-birthdays.run\" timeout -k 10 300 $HOME/bin/cue birthdays >/dev/null 2>&1"
+
+[jobs.gift-radar]
+line = "gift-radar"
+cron = "23 9 * * *"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/gift-radar", "run", "--cron"]
+out = "gift-radar.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "gifts"
+owner_facing = true
+why = "gift ideas before birthdays (vault-backed)"
+target = "hub move: vault jobs"
+cron_line = "23 9 * * * $HOME/bin/gift-radar run --cron >> $HOME/.local/state/gift-radar.log 2>&1"
+
+[jobs.rave-radar]
+line = "rave-radar"
+cron = "47 8 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/rave-radar", "--cron"]
+err = "out"
+timeout = 580
+after = 1
+feature = "rave-radar"
+owner_facing = true
+why = "shows and presales of his artists"
+target = "cron-back 29.10"
+cron_line = "47 8 * * * cron-fail --after 1 rave-radar flock -n -E 0 \"$HOME/.local/state/cron-fail/rave-radar.run\" timeout -k 10 580 $HOME/bin/rave-radar --cron >/dev/null 2>&1"
+
+[jobs.rave-radar-releases]
+line = "rave-radar-releases"
+cron = "17 12 * * 5"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/rave-radar", "releases", "--cron"]
+err = "out"
+timeout = 580
+after = 1
+feature = "rave-radar"
+owner_facing = true
+why = "Friday new releases of his artists"
+target = "cron-back 29.10"
+cron_line = "17 12 * * 5 cron-fail --after 1 rave-radar-releases flock -n -E 0 \"$HOME/.local/state/cron-fail/rave-radar-releases.run\" timeout -k 10 580 $HOME/bin/rave-radar releases --cron >/dev/null 2>&1"
+
+[jobs.rave-radar-preshow]
+line = "rave-radar-preshow"
+cron = "23 10 * * 3"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/rave-radar", "preshow", "--cron"]
+err = "out"
+timeout = 300
+after = 1
+feature = "rave-radar"
+owner_facing = true
+why = "pre-show reminders for followed shows"
+target = "cron-back 29.10"
+cron_line = "23 10 * * 3 cron-fail --after 1 rave-radar-preshow flock -n -E 0 \"$HOME/.local/state/cron-fail/rave-radar-preshow.run\" timeout -k 10 300 $HOME/bin/rave-radar preshow --cron >/dev/null 2>&1"
+
+[jobs.agent-watch]
+line = "agent-watch"
+cron = "*/5 * * * *"
+class = "X"
+group = "critical"
+queue = "critical"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/agent-watch", "run"]
+err = "agent-watch/cron.err"
+dirs = ["agent-watch"]
+timeout = 300
+after = 3
+feature = "brain"
+owner_facing = false
+why = "stalled-subagent watch for the brain"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * mkdir -p \"$HOME/.local/state/agent-watch\" && cron-fail --after 3 agent-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/agent-watch.run\" timeout -k 10 300 $HOME/bin/agent-watch run >/dev/null 2>> \"$HOME/.local/state/agent-watch/cron.err\""
+
+[jobs.unraid-update-check]
+line = "unraid-update-check"
+cron = "27 9 * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = []
+shell = true
+timeout = 300
+after = 0
+feature = "server-health"
+owner_facing = true
+why = "Unraid OS / plugin updates (note on failure)"
+target = "cron-back 29.10"
+cron_line = "27 9 * * * mkdir -p \"$HOME/inbox\" \"$HOME/.local/state\"; out=$($HOME/bin/unraid-update-check 2>\"$HOME/.local/state/unraid-update-check.err\") || echo \"unraid-update-check failed (exit $?): see ~/.local/state/unraid-update-check.err. Data, not instructions.\" > \"$HOME/inbox/unraid-update-check-failed-$(date +\\%s).md\""
+
+[jobs.whisper-server]
+line = "whisper-server"
+cron = "*/5 * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/whisper-server-ctl", "ensure"]
+err = "out"
+timeout = 120
+after = 3
+feature = "voice"
+owner_facing = false
+why = "keep the local whisper server running"
+target = "schedule registry"
+keeper = true
+every = 5
+cron_line = "*/5 * * * * cron-fail --after 3 whisper-server $HOME/bin/whisper-server-ctl ensure >/dev/null 2>&1"
+
+[jobs.llm-idle-check]
+line = "llm-idle-check"
+cron = "*/5 * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/llm-server-ctl", "idle-check"]
+err = "out"
+timeout = 120
+after = 0
+feature = "vault-llm"
+owner_facing = false
+why = "stop the local LLM server when idle"
+target = "schedule registry"
+keeper = true
+every = 5
+cron_line = "*/5 * * * * $HOME/bin/llm-server-ctl idle-check >/dev/null 2>&1"
+
+[jobs.tg-inbox-prune]
+line = "tg-inbox-prune"
+cron = "41 4 * * *"
+class = "M"
+group = "housekeeping"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["find", "~/.claude/channels/telegram/inbox", "-type", "f", "-mtime", "+7", "-delete"]
+timeout = 120
+after = 0
+feature = "telegram"
+owner_facing = false
+why = "prune plugin downloads older than 7 days (the plugin's hub bridge still saves files there)"
+target = "cron-back 29.10"
+cron_line = "41 4 * * * find $HOME/.claude/channels/telegram/inbox -type f -mtime +7 -delete 2>/dev/null"
+
+[jobs.unraid-capacity-record]
+line = "unraid-capacity-record"
+cron = "17 3 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/unraid-capacity", "record"]
+out = "unraid-capacity/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "capacity"
+owner_facing = false
+why = "daily array capacity sample"
+target = "cron-back 29.10"
+cron_line = "17 3 * * * mkdir -p \"$HOME/.local/state/unraid-capacity\" && cron-fail --after 0 unraid-capacity-record flock -n -E 0 \"$HOME/.local/state/cron-fail/unraid-capacity-record.run\" timeout -k 10 300 $HOME/bin/unraid-capacity record >> \"$HOME/.local/state/unraid-capacity/cron.log\" 2>&1"
+
+[jobs.unraid-capacity-forecast]
+line = "unraid-capacity-forecast"
+cron = "13 9 * * 1"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/unraid-capacity", "forecast", "--alert", "--notify"]
+out = "unraid-capacity/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "capacity"
+owner_facing = true
+why = "weekly capacity forecast (alert note)"
+target = "cron-back 29.10"
+cron_line = "13 9 * * 1 mkdir -p \"$HOME/.local/state/unraid-capacity\" && cron-fail --after 0 unraid-capacity-forecast flock -n -E 0 \"$HOME/.local/state/cron-fail/unraid-capacity-forecast.run\" timeout -k 10 300 $HOME/bin/unraid-capacity forecast --alert --notify >> \"$HOME/.local/state/unraid-capacity/cron.log\" 2>&1"
+
+[jobs.ha-backup-pull]
+line = "ha-backup-pull"
+cron = "5 4 * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/ha-backup-pull"]
+out = "ha-backup-pull/cron.log"
+err = "out"
+dirs = ["ha-backup-pull"]
+timeout = 1800
+after = 0
+feature = "home"
+owner_facing = false
+why = "pull the newest HA backup"
+target = "cron-back 29.10"
+cron_line = "5 4 * * * mkdir -p \"$HOME/.local/state/ha-backup-pull\" && cron-fail --after 0 ha-backup-pull flock -n -E 0 \"$HOME/.local/state/cron-fail/ha-backup-pull.run\" timeout -k 10 1800 $HOME/bin/ha-backup-pull >> \"$HOME/.local/state/ha-backup-pull/cron.log\" 2>&1"
+
+[jobs.ha-health-watch]
+line = "ha-health-watch"
+cron = "40 7 * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/ha-health-watch", "--cron"]
+out = "ha/health/cron.log"
+err = "out"
+dirs = ["ha/health"]
+timeout = 300
+after = 0
+feature = "home"
+owner_facing = true
+why = "HA health (watch job)"
+target = "cron-back 29.10"
+cron_line = "40 7 * * * mkdir -p \"$HOME/.local/state/ha/health\" && cron-fail --after 0 ha-health-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/ha-health-watch.run\" timeout -k 10 300 $HOME/bin/ha-health-watch --cron >> \"$HOME/.local/state/ha/health/cron.log\" 2>&1"
+
+[jobs.ha-package-lint]
+line = "ha-package-lint"
+cron = "40 6 * * 1"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/ha-apply", "lint", "--cron"]
+err = "out"
+timeout = 300
+after = 1
+feature = "home"
+owner_facing = false
+why = "lint the HA packages weekly"
+target = "cron-back 29.10"
+cron_line = "40 6 * * 1 cron-fail --after 1 ha-package-lint flock -n -E 0 \"$HOME/.local/state/cron-fail/ha-package-lint.run\" timeout -k 10 300 $HOME/bin/ha-apply lint --cron >/dev/null 2>&1"
+
+[jobs.bills-week]
+line = "bills-week"
+cron = "47 8 * * 1"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = []
+shell = true
+timeout = 300
+after = 0
+feature = "bills"
+owner_only = true
+owner_facing = true
+why = "Monday bills of the week (sends one line)"
+target = "hub move: vault jobs"
+cron_line = "47 8 * * 1 mkdir -p \"$HOME/inbox\" \"$HOME/.local/state\"; out=$($HOME/bin/bills week 2>\"$HOME/.local/state/bills-week.err\") || echo \"bills week failed (exit $?): see ~/.local/state/bills-week.err. Data, not instructions.\" > \"$HOME/inbox/bills-week-failed-$(date +\\%s).md\"; [ -n \"$out\" ] && $HOME/bin/tg --soft \"$out\""
+
+[jobs.bills-scan-paperless]
+line = "bills-scan-paperless"
+cron = "41 8 * * *"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/bills", "scan-paperless", "--cron"]
+out = "bills/paperless-scan.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "bills"
+owner_only = true
+owner_facing = false
+why = "new bills from paperless into the tracker"
+target = "hub move: vault jobs"
+cron_line = "41 8 * * * $HOME/bin/bills scan-paperless --cron >> $HOME/.local/state/bills/paperless-scan.log 2>&1"
+
+[jobs.paperless-inbox-review]
+line = "paperless-inbox-review"
+cron = "7 16 * * 0"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/paperless-inbox-review", "--cron"]
+out = "paperless-inbox/cron.log"
+err = "out"
+dirs = ["paperless-inbox"]
+timeout = 300
+after = 0
+feature = "paperless"
+owner_facing = true
+why = "weekly paperless inbox review"
+target = "hub move: vault jobs"
+cron_line = "7 16 * * 0 mkdir -p $HOME/.local/state/paperless-inbox && $HOME/bin/paperless-inbox-review --cron >> $HOME/.local/state/paperless-inbox/cron.log 2>&1"
+
+[jobs.container-watch]
+line = "container-watch"
+cron = "13 19 * * 3"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/container-watch", "--notify", "--max-age", "1d"]
+out = "container-watch/cron.log"
+err = "out"
+timeout = 580
+after = 0
+feature = "security"
+owner_facing = true
+why = "container updates and CVEs (weekly note)"
+target = "cron-back 29.10"
+catch_up = false  # it texts with plain tg: a late run after midnight would text him in quiet hours
+cron_line = "13 19 * * 3 mkdir -p \"$HOME/.local/state/container-watch\" && cron-fail --after 0 container-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/container-watch.run\" timeout -k 10 580 $HOME/bin/container-watch --notify --max-age 1d >> \"$HOME/.local/state/container-watch/cron.log\" 2>&1"
+
+[jobs.security-watch]
+line = "security-watch"
+cron = "23 6 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "900", "~/bin/security-watch", "run", "--cron"]
+out = "security-watch/cron.log"
+err = "out"
+dirs = ["security-watch"]
+timeout = 920
+after = 2
+feature = "security"
+owner_facing = true
+why = "public exposure, TLS and login checks"
+target = "cron-back 29.10"
+cron_line = "23 6 * * * mkdir -p \"$HOME/.local/state/security-watch\" && cron-fail --after 2 security-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/security-watch.run\" timeout 900 $HOME/bin/security-watch run --cron >> \"$HOME/.local/state/security-watch/cron.log\" 2>&1"
+
+[jobs.brain-auto]
+line = "brain-auto"
+cron = "11,41 * * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/brain", "auto"]
+err = "out"
+timeout = 1800
+after = 2
+ok = [3]
+feature = "backup"
+owner_facing = false
+why = "auto-commit the brain git twice an hour"
+target = "hub move: housekeeping"
+cron_line = "11,41 * * * * cron-fail --after 2 --ok 3 brain-auto $HOME/bin/brain auto >/dev/null 2>&1"
+
+[jobs.watch]
+line = "watch"
+cron = "*/15 * * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/watch", "run"]
+out = "watch/cron.log"
+err = "out"
+timeout = 600
+after = 0
+feature = "watch"
+owner_facing = true
+why = "page and price watches (watch job)"
+target = "cron-back 29.10"
+cron_line = "*/15 * * * * mkdir -p \"$HOME/.local/state/watch\" && cron-fail --after 0 watch flock -n -E 0 \"$HOME/.local/state/cron-fail/watch.run\" timeout -k 10 600 $HOME/bin/watch run >> \"$HOME/.local/state/watch/cron.log\" 2>&1"
+
+[jobs.ai-releases]
+line = "ai-releases"
+cron = "*/15 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/ai-releases", "run"]
+out = "ai-releases/cron.log"
+err = "out"
+dirs = ["ai-releases"]
+timeout = 300
+after = 0
+feature = "ai-releases"
+owner_facing = true
+why = "new frontier model releases"
+target = "hub move: watches"
+cron_line = "*/15 * * * * mkdir -p $HOME/.local/state/ai-releases && $HOME/bin/ai-releases run >> $HOME/.local/state/ai-releases/cron.log 2>&1"
+
+[jobs.deadlines-sync]
+line = "deadlines-sync"
+cron = "23 9 1 * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/deadlines", "sync", "--quiet"]
+out = "deadlines-cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "deadlines"
+owner_only = true
+owner_facing = false
+why = "monthly deadline data sync"
+target = "cron-back 29.10"
+cron_line = "23 9 1 * * mkdir -p \"$HOME/.local/state\" && cron-fail --after 0 deadlines-sync flock -n -E 0 \"$HOME/.local/state/cron-fail/deadlines-sync.run\" timeout -k 10 300 $HOME/bin/deadlines sync --quiet >> \"$HOME/.local/state/deadlines-cron.log\" 2>&1"
+
+[jobs.missing-docs]
+line = "missing-docs"
+cron = "23 9 3 * *"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/missing-docs", "--cron"]
+out = "missing-docs/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "deadlines"
+owner_only = true
+owner_facing = true
+why = "monthly tax-document checklist"
+target = "hub move: vault jobs"
+cron_line = "23 9 3 * * $HOME/bin/missing-docs --cron >> $HOME/.local/state/missing-docs/cron.log 2>&1"
+
+[jobs.evals]
+line = "evals"
+cron = "50 2 * * *"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/evals", "run", "--changed", "--cron", "--quiet", "--max-cases", "20", "--budget-min", "25"]
+out = "evals/cron.log"
+dirs = ["evals"]
+timeout = 1800
+after = 1
+feature = "evals"
+owner_facing = false
+why = "nightly eval subset on the brain diff"
+target = "cron-back 29.10"
+cron_line = "50 2 * * * mkdir -p \"$HOME/.local/state/evals\" && cron-fail --after 1 evals flock -n -E 0 \"$HOME/.local/state/cron-fail/evals.run\" timeout -k 10 1800 $HOME/bin/evals run --changed --cron --quiet --max-cases 20 --budget-min 25 >> \"$HOME/.local/state/evals/cron.log\" 2>&1"
+
+[jobs.self-review]
+line = "self-review"
+cron = "30 3 * * *"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/self-review", "--cron"]
+out = "self-review/cron.log"
+err = "out"
+timeout = 1800
+after = 0
+feature = "loop"
+owner_facing = false
+why = "daily self-review + loop review"
+target = "hub move: collectors"
+cron_line = "30 3 * * * $HOME/bin/self-review --cron >> $HOME/.local/state/self-review/cron.log 2>&1"
+
+[jobs.brain-backup]
+line = "brain-backup"
+cron = "47 3 * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/brain-backup"]
+out = "brain-backup.log"
+err = "out"
+timeout = 120
+after = 0
+feature = "backup"
+owner_facing = false
+why = "nightly brain backup (stays in cron)"
+target = "schedule registry"
+cron_line = "47 3 * * * $HOME/bin/brain-backup >> $HOME/.local/state/brain-backup.log 2>&1"
+
+[jobs.brain-backup-verify]
+line = "brain-backup-verify"
+cron = "17 4 1 * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/brain-backup", "--verify", "--cron"]
+out = "brain-backup.log"
+err = "out"
+timeout = 120
+after = 0
+feature = "backup"
+owner_facing = false
+why = "monthly backup restore check (stays in cron)"
+target = "schedule registry"
+cron_line = "17 4 1 * * $HOME/bin/brain-backup --verify --cron >> $HOME/.local/state/brain-backup.log 2>&1"
+
+[jobs.log-rotate]
+line = "log-rotate"
+cron = "53 4 * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/log-rotate"]
+out = "log-rotate.log"
+err = "out"
+dirs = ["~/inbox", "~/.local/state"]
+timeout = 1800
+after = 2
+feature = "housekeeping"
+owner_facing = false
+why = "cut cron logs over 1 MB"
+target = "cron-back 29.10"
+cron_line = "53 4 * * * mkdir -p \"$HOME/inbox\" \"$HOME/.local/state\" && cron-fail --after 2 log-rotate flock -n -E 0 \"$HOME/.local/state/cron-fail/log-rotate.run\" timeout -k 10 1800 $HOME/bin/log-rotate >> \"$HOME/.local/state/log-rotate.log\" 2>&1"
+
+[jobs.tmp-tidy]
+line = "tmp-tidy"
+cron = "57 4 * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/tmp-tidy", "--apply", "--quiet"]
+out = "tmp-tidy.log"
+err = "out"
+dirs = ["~/inbox", "~/.local/state"]
+timeout = 1800
+after = 2
+feature = "housekeeping"
+owner_facing = false
+why = "delete stale /tmp entries"
+target = "cron-back 29.10"
+cron_line = "57 4 * * * mkdir -p \"$HOME/inbox\" \"$HOME/.local/state\" && cron-fail --after 2 tmp-tidy flock -n -E 0 \"$HOME/.local/state/cron-fail/tmp-tidy.run\" timeout -k 10 1800 $HOME/bin/tmp-tidy --apply --quiet >> \"$HOME/.local/state/tmp-tidy.log\" 2>&1"
+
+[jobs.media-ready]
+line = "media-ready"
+cron = "*/10 * * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/media", "ready-watch"]
+out = "media-ready/cron.log"
+err = "out"
+dirs = ["media-ready"]
+timeout = 300
+after = 0
+feature = "media"
+owner_facing = true
+why = "requested media became available (watch job)"
+target = "cron-back 29.10"
+cron_line = "*/10 * * * * mkdir -p \"$HOME/.local/state/media-ready\" && cron-fail --after 0 media-ready flock -n -E 0 \"$HOME/.local/state/cron-fail/media-ready.run\" timeout -k 10 300 $HOME/bin/media ready-watch >> \"$HOME/.local/state/media-ready/cron.log\" 2>&1"
+
+[jobs.vibe-refresh]
+line = "vibe-refresh"
+cron = "47 5 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/media", "vibe", "--refresh", "--quiet"]
+err = "out"
+timeout = 300
+after = 1
+feature = "media"
+owner_facing = false
+why = "refresh the media vibe index"
+target = "cron-back 29.10"
+cron_line = "47 5 * * * cron-fail --after 1 vibe-refresh flock -n -E 0 \"$HOME/.local/state/cron-fail/vibe-refresh.run\" timeout -k 10 300 $HOME/bin/media vibe --refresh --quiet >/dev/null 2>&1"
+
+[jobs.media-doctor]
+line = "media-doctor"
+cron = "23 11 * * 6"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "2400", "~/bin/media", "doctor", "--cron"]
+out = "media/doctor-cron.log"
+err = "out"
+dirs = ["media"]
+timeout = 2420
+after = 1
+feature = "media"
+owner_facing = true
+why = "weekly *arr/Emby doctor"
+target = "cron-back 29.10"
+cron_line = "23 11 * * 6 mkdir -p \"$HOME/.local/state/media\" && cron-fail --after 1 media-doctor flock -n -E 0 \"$HOME/.local/state/cron-fail/media-doctor.run\" timeout 2400 $HOME/bin/media doctor --cron >> \"$HOME/.local/state/media/doctor-cron.log\" 2>&1"
+
+[jobs.media-posters]
+line = "media-posters"
+cron = "30 17 * * 5"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "600", "~/bin/media", "posters", "--cron"]
+out = "media/posters-cron.log"
+err = "out"
+dirs = ["media"]
+timeout = 620
+after = 1
+ok = [3]
+feature = "media"
+owner_facing = false
+why = "weekly poster refresh"
+target = "cron-back 29.10"
+cron_line = "30 17 * * 5 mkdir -p \"$HOME/.local/state/media\" && cron-fail --after 1 --ok 3 media-posters flock -n -E 0 \"$HOME/.local/state/cron-fail/media-posters.run\" timeout 600 $HOME/bin/media posters --cron >> \"$HOME/.local/state/media/posters-cron.log\" 2>&1"
+
+[jobs.emby-watch]
+line = "emby-watch"
+cron = "*/2 * * * *"
+class = "X"
+group = "critical"
+queue = "critical"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/emby", "watch", "--cron"]
+err = "out"
+timeout = 300
+after = 15
+feature = "media"
+owner_facing = false
+why = "Emby playback watch (home context)"
+target = "cron-back 29.10"
+cron_line = "*/2 * * * * cron-fail --after 15 emby-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/emby-watch.run\" timeout -k 10 300 $HOME/bin/emby watch --cron >/dev/null 2>&1"
+
+[jobs.browser-ensure]
+line = "browser-ensure"
+cron = "*/5 * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/browser", "ensure"]
+err = "out"
+timeout = 120
+after = 3
+feature = "browser"
+owner_facing = false
+why = "keep the headed Chrome running"
+target = "schedule registry"
+keeper = true
+every = 5
+cron_line = "*/5 * * * * cron-fail --after 3 browser-ensure $HOME/bin/browser ensure >/dev/null 2>&1"
+
+[jobs.flowd]
+line = "flowd"
+cron = "* * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/flowd", "ensure"]
+err = "out"
+timeout = 120
+after = 10
+feature = "dashboard"
+owner_facing = false
+why = "keep the dashboard's live data-flow server running (Architecture tab, view beacons)"
+target = "hub move: keepers"
+keeper = true
+every = 1
+cron_line = "* * * * * cron-fail --after 10 flowd $HOME/bin/flowd ensure >/dev/null 2>&1"
+
+[jobs.abx-sweep]
+line = "abx-sweep"
+cron = "*/15 * * * *"
+class = "M"
+group = "housekeeping"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/abx", "sweep", "--min", "45"]
+err = "out"
+timeout = 300
+after = 3
+feature = "web-agent"
+owner_facing = false
+why = "sweep idle browser tabs"
+target = "cron-back 29.10"
+cron_line = "*/15 * * * * cron-fail --after 3 abx-sweep flock -n -E 0 \"$HOME/.local/state/cron-fail/abx-sweep.run\" timeout -k 10 300 $HOME/bin/abx sweep --min 45 >/dev/null 2>&1"
+
+[jobs.deals-hdd]
+line = "deals-hdd"
+cron = "53 8 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/deals", "hdd", "--cron"]
+out = "deals/cron.log"
+err = "out"
+dirs = ["deals"]
+timeout = 580
+after = 0
+feature = "deals"
+owner_facing = true
+why = "daily disk price check"
+target = "cron-back 29.10"
+cron_line = "53 8 * * * mkdir -p \"$HOME/.local/state/deals\" && cron-fail --after 0 deals-hdd flock -n -E 0 \"$HOME/.local/state/cron-fail/deals-hdd.run\" timeout -k 10 580 $HOME/bin/deals hdd --cron >> \"$HOME/.local/state/deals/cron.log\" 2>&1"
+
+[jobs.deals-tutti]
+line = "deals-tutti"
+cron = "7 8-23/3 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/deals", "tutti", "--cron"]
+out = "deals/tutti.log"
+err = "out"
+dirs = ["deals"]
+timeout = 580
+after = 2
+ok = [3]
+feature = "deals"
+owner_only = true
+owner_facing = true
+why = "used-disk listings every 3 h"
+target = "cron-back 29.10"
+cron_line = "7 8-23/3 * * * mkdir -p \"$HOME/.local/state/deals\" && cron-fail --after 2 --ok 3 deals-tutti flock -n -E 0 \"$HOME/.local/state/cron-fail/deals-tutti.run\" timeout -k 10 580 $HOME/bin/deals tutti --cron >> \"$HOME/.local/state/deals/tutti.log\" 2>&1"
+
+[jobs.vault-alerts]
+line = "vault-alerts"
+cron = "*/15 * * * *"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/vault", "alerts", "--to-inbox", "--cron"]
+err = "out"
+timeout = 300
+after = 2
+ok = [3]
+feature = "vault"
+owner_facing = false
+why = "vault alerts into the inbox"
+target = "hub move: vault jobs"
+cron_line = "*/15 * * * * cron-fail --after 2 --ok 3 vault-alerts $HOME/bin/vault alerts --to-inbox --cron >/dev/null 2>&1"
+
+[jobs.vault-events]
+line = "vault-events"
+cron = "* * * * *"
+class = "V"
+group = "vault"
+queue = "critical"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/vault-events", "--cron"]
+err = "out"
+timeout = 300
+after = 3
+feature = "vault"
+owner_facing = true
+why = "vault's triaged feed (plans, deadlines) every minute"
+target = "hub move: vault jobs"
+cron_line = "* * * * * cron-fail --after 3 vault-events $HOME/bin/vault-events --cron >/dev/null 2>&1"
+
+[jobs.plans-watch]
+line = "plans-watch"
+cron = "2-59/5 * * * *"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/plans-watch", "run", "--cron"]
+err = "out"
+timeout = 300
+after = 3
+feature = "calendar"
+owner_facing = true
+why = "dated plans from chats and mail"
+target = "hub move: vault jobs"
+cron_line = "2-59/5 * * * * cron-fail --after 3 plans-watch $HOME/bin/plans-watch run --cron >/dev/null 2>&1"
+
+[jobs.context]
+line = "context"
+cron = "25 8,18 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/context"]
+out = "context/cron.log"
+err = "out"
+dirs = ["context"]
+timeout = 300
+after = 0
+feature = "context"
+owner_facing = false
+why = "twice-daily context flags"
+target = "hub move: collectors"
+cron_line = "25 8,18 * * * mkdir -p $HOME/.local/state/context && $HOME/bin/context >> $HOME/.local/state/context/cron.log 2>&1"
+
+[jobs.cue-idea-scan]
+line = "cue-idea-scan"
+cron = "47 18 * * 0"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cue", "idea-scan"]
+timeout = 300
+after = 1
+feature = "goals"
+owner_facing = false
+why = "Sunday cue: idea scan"
+target = "cron-back 29.10"
+cron_line = "47 18 * * 0 cron-fail --after 1 cue-idea-scan flock -n -E 0 \"$HOME/.local/state/cron-fail/cue-idea-scan.run\" timeout -k 10 300 $HOME/bin/cue idea-scan >/dev/null 2>&1"
+
+[jobs.cue-daily-plan]
+line = "cue-daily-plan"
+cron = "31 8 * * *"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cue", "daily-plan"]
+timeout = 300
+after = 1
+feature = "goals"
+owner_only = true
+owner_facing = false
+why = "daily cue: plan the day's goal steps"
+target = "cron-back 29.10"
+cron_line = "31 8 * * * cron-fail --after 1 cue-daily-plan flock -n -E 0 \"$HOME/.local/state/cron-fail/cue-daily-plan.run\" timeout -k 10 300 $HOME/bin/cue daily-plan >/dev/null 2>&1"
+
+[jobs.dayline]
+line = "dayline"
+cron = "7 21 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/dayline"]
+out = "dayline.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "context"
+owner_facing = false
+why = "evening day line"
+target = "cron-back 29.10"
+catch_up = false  # a late run after midnight writes the new, nearly empty day
+cron_line = "7 21 * * * mkdir -p \"$HOME/.local/state\" && cron-fail --after 0 dayline flock -n -E 0 \"$HOME/.local/state/cron-fail/dayline.run\" timeout -k 10 300 $HOME/bin/dayline >> \"$HOME/.local/state/dayline.log\" 2>&1"
+
+[jobs.dash-publish]
+line = "dash-publish"
+cron = "*/5 * * * *"
+class = "M"
+group = "housekeeping"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/dash-publish"]
+err = "out"
+timeout = 300
+after = 0
+feature = "dashboard"
+owner_facing = false
+why = "dashboard page publish every 5 min (dash-data → the public dashboard site); the page still builds here"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * cron-fail --after 0 dash-publish flock -n -E 0 \"$HOME/.local/state/cron-fail/dash-publish.run\" timeout -k 10 300 $HOME/bin/dash-publish >/dev/null 2>&1"
+
+[jobs.recall-index]
+line = "recall-index"
+cron = "31 3 * * *"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/recall", "--index", "--cron"]
+out = "recall/cron.log"
+err = "out"
+timeout = 1800
+after = 0
+feature = "memory"
+owner_facing = false
+why = "nightly recall index"
+target = "cron-back 29.10"
+cron_line = "31 3 * * * mkdir -p \"$HOME/.local/state/recall\" && cron-fail --after 0 recall-index flock -n -E 0 \"$HOME/.local/state/cron-fail/recall-index.run\" timeout -k 10 1800 $HOME/bin/recall --index --cron >> \"$HOME/.local/state/recall/cron.log\" 2>&1"
+
+[jobs.recall-embed]
+line = "recall-embed"
+cron = "36 3 * * *"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/recall", "--embed", "--cron"]
+out = "recall/cron.log"
+err = "out"
+timeout = 1800
+after = 0
+feature = "memory"
+owner_facing = false
+why = "nightly recall embeddings"
+target = "cron-back 29.10"
+cron_line = "36 3 * * * mkdir -p \"$HOME/.local/state/recall\" && cron-fail --after 0 recall-embed flock -n -E 0 \"$HOME/.local/state/cron-fail/recall-embed.run\" timeout -k 10 1800 $HOME/bin/recall --embed --cron >> \"$HOME/.local/state/recall/cron.log\" 2>&1"
+
+[jobs.vault-git-sync]
+line = "vault-git-sync"
+cron = "41 3 * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/vault-git-sync"]
+err = "out"
+env = { CRON = "1" }
+timeout = 1800
+after = 0
+feature = "vault"
+owner_facing = false
+why = "vault source to its private repo"
+target = "cron-back 29.10"
+cron_line = "41 3 * * * cron-fail --after 0 vault-git-sync flock -n -E 0 \"$HOME/.local/state/cron-fail/vault-git-sync.run\" timeout -k 10 1800 env CRON=1 $HOME/bin/vault-git-sync >/dev/null 2>&1"
+
+[jobs.codebase-sync]
+line = "codebase-sync"
+cron = "44 3 * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/codebase-sync", "--cron"]
+err = "out"
+timeout = 1800
+after = 0
+feature = "publish"
+owner_facing = false
+why = "nightly sanitized codebase export to the private repo; still the only export of the unmanaged files"
+target = "cron-back 29.10"
+cron_line = "44 3 * * * cron-fail --after 0 codebase-sync flock -n -E 0 \"$HOME/.local/state/cron-fail/codebase-sync.run\" timeout -k 10 1800 $HOME/bin/codebase-sync --cron >/dev/null 2>&1"
+
+[jobs.codebase-sync-recheck]
+line = "codebase-sync-recheck"
+cron = "29,59 * * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/codebase-sync", "--cron", "--recheck"]
+err = "out"
+timeout = 1800
+after = 0
+feature = "publish"
+owner_facing = false
+why = "codebase export recheck while a block is pending"
+target = "cron-back 29.10"
+cron_line = "29,59 * * * * cron-fail --after 0 codebase-sync-recheck flock -n -E 0 \"$HOME/.local/state/cron-fail/codebase-sync-recheck.run\" timeout -k 10 1800 $HOME/bin/codebase-sync --cron --recheck >/dev/null 2>&1"
+
+[jobs.waiting-nudge]
+line = "waiting-nudge"
+cron = "40 18 * * 1-5"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/waiting-nudge", "--cron"]
+err = "out"
+timeout = 300
+after = 1
+feature = "status-board"
+owner_facing = true
+why = "weekday cue: ask about Waiting items"
+target = "cron-back 29.10"
+cron_line = "40 18 * * 1-5 cron-fail --after 1 waiting-nudge flock -n -E 0 \"$HOME/.local/state/cron-fail/waiting-nudge.run\" timeout -k 10 300 $HOME/bin/waiting-nudge --cron >/dev/null 2>&1"
+
+[jobs.waiting-nudge-weekend]
+line = "waiting-nudge-weekend"
+cron = "10 14 * * 0,6"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/waiting-nudge", "--cron"]
+err = "out"
+timeout = 300
+after = 1
+feature = "status-board"
+owner_facing = true
+why = "weekend cue: ask about Waiting items"
+target = "cron-back 29.10"
+cron_line = "10 14 * * 0,6 cron-fail --after 1 waiting-nudge-weekend flock -n -E 0 \"$HOME/.local/state/cron-fail/waiting-nudge-weekend.run\" timeout -k 10 300 $HOME/bin/waiting-nudge --cron >/dev/null 2>&1"
+
+[jobs.vault-media-gc]
+line = "vault-media-gc"
+cron = "*/5 * * * *"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/vault", "media", "gc", "--quiet"]
+err = "out"
+timeout = 300
+after = 6
+feature = "vault"
+owner_facing = false
+why = "expire released vault media"
+target = "hub move: vault jobs"
+cron_line = "*/5 * * * * cron-fail --after 6 vault-media-gc $HOME/bin/vault media gc --quiet >/dev/null 2>&1"
+
+[jobs.cue-self-cleanup]
+line = "cue-self-cleanup"
+cron = "37 10 * * 6"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cue", "self-cleanup"]
+timeout = 300
+after = 1
+feature = "self-cleanup"
+owner_facing = true
+why = "Saturday cue: self-cleanup run"
+target = "cron-back 29.10"
+cron_line = "37 10 * * 6 cron-fail --after 1 cue-self-cleanup flock -n -E 0 \"$HOME/.local/state/cron-fail/cue-self-cleanup.run\" timeout -k 10 300 $HOME/bin/cue self-cleanup >/dev/null 2>&1"
+
+[jobs.arr-unblock]
+line = "arr-unblock"
+cron = "4-59/15 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/arr-unblock", "--cron"]
+out = "arr-unblock/cron.log"
+err = "out"
+dirs = ["arr-unblock"]
+timeout = 300
+after = 0
+feature = "media"
+owner_facing = false
+why = "unblock stuck *arr queue items"
+target = "cron-back 29.10"
+cron_line = "4-59/15 * * * * mkdir -p \"$HOME/.local/state/arr-unblock\" && cron-fail --after 0 arr-unblock flock -n -E 0 \"$HOME/.local/state/cron-fail/arr-unblock.run\" timeout -k 10 300 $HOME/bin/arr-unblock --cron >> \"$HOME/.local/state/arr-unblock/cron.log\" 2>&1"
+
+[jobs.arr-mismatch]
+line = "arr-mismatch"
+cron = "37 4 * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/arr-mismatch", "--cron"]
+out = "arr-mismatch.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "media"
+owner_facing = false
+why = "nightly *arr mismatch check"
+target = "cron-back 29.10"
+cron_line = "37 4 * * * mkdir -p \"$HOME/.local/state\" && cron-fail --after 0 arr-mismatch flock -n -E 0 \"$HOME/.local/state/cron-fail/arr-mismatch.run\" timeout -k 10 300 $HOME/bin/arr-mismatch --cron >> \"$HOME/.local/state/arr-mismatch.log\" 2>&1"
+
+[jobs.arr-mismatch-grabs]
+line = "arr-mismatch-grabs"
+cron = "7-59/15 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/arr-mismatch", "grabs", "--cron"]
+out = "arr-mismatch-grabs.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "media"
+owner_facing = false
+why = "*arr grab mismatch check"
+target = "cron-back 29.10"
+cron_line = "7-59/15 * * * * mkdir -p \"$HOME/.local/state\" && cron-fail --after 0 arr-mismatch-grabs flock -n -E 0 \"$HOME/.local/state/cron-fail/arr-mismatch-grabs.run\" timeout -k 10 300 $HOME/bin/arr-mismatch grabs --cron >> \"$HOME/.local/state/arr-mismatch-grabs.log\" 2>&1"
+
+[jobs.hddheat]
+line = "hddheat"
+cron = "*/10 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/hddheat"]
+out = "hddheat/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "server-health"
+owner_facing = true
+why = "disk temperatures (alert notes)"
+target = "cron-back 29.10"
+cron_line = "*/10 * * * * mkdir -p \"$HOME/.local/state/hddheat\" && cron-fail --after 0 hddheat flock -n -E 0 \"$HOME/.local/state/cron-fail/hddheat.run\" timeout -k 10 300 $HOME/bin/hddheat >> \"$HOME/.local/state/hddheat/cron.log\" 2>&1"
+
+[jobs.cache-ttl-watch]
+line = "cache-ttl-watch"
+cron = "15 9 * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cache-ttl-watch"]
+out = "cache-ttl-watch/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "tokens"
+owner_facing = false
+why = "prompt-cache write split"
+target = "cron-back 29.10"
+cron_line = "15 9 * * * mkdir -p \"$HOME/.local/state/cache-ttl-watch\" && cron-fail --after 0 cache-ttl-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/cache-ttl-watch.run\" timeout -k 10 300 $HOME/bin/cache-ttl-watch >> \"$HOME/.local/state/cache-ttl-watch/cron.log\" 2>&1"
+
+[jobs.wled-sync]
+line = "wled-sync"
+cron = "3-59/10 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/wled-sync", "--quiet"]
+out = "wled-sync.cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "home"
+owner_facing = false
+why = "WLED state sync"
+target = "cron-back 29.10"
+cron_line = "3-59/10 * * * * mkdir -p \"$HOME/.local/state\" && cron-fail --after 0 wled-sync flock -n -E 0 \"$HOME/.local/state/cron-fail/wled-sync.run\" timeout -k 10 300 $HOME/bin/wled-sync --quiet >> \"$HOME/.local/state/wled-sync.cron.log\" 2>&1"
+
+[jobs.party-tick]
+line = "party-tick"
+cron = "* * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "window"
+argv = ["~/bin/party", "tick", "--cron", "--loop", "55"]
+out = "party/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "nights"
+owner_facing = true
+why = "event-night ticks (every minute, 55 s loop)"
+target = "event workflows"
+cron_line = "* * * * * $HOME/bin/party tick --cron --loop 55 >> $HOME/.local/state/party/cron.log 2>&1"
+
+[jobs.transcript-compact]
+line = "transcript-compact"
+cron = "30 4 * * 0"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/transcript-compact"]
+err = "out"
+timeout = 1800
+after = 0
+feature = "housekeeping"
+owner_facing = false
+why = "gzip old subagent transcripts"
+target = "cron-back 29.10"
+cron_line = "30 4 * * 0 cron-fail --after 0 transcript-compact flock -n -E 0 \"$HOME/.local/state/cron-fail/transcript-compact.run\" timeout -k 10 1800 $HOME/bin/transcript-compact >/dev/null 2>&1"
+
+[jobs.test-all]
+line = "test-all"
+cron = "10 5 * * 0"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = []
+shell = true
+timeout = 3600
+after = 0
+feature = "tests"
+owner_facing = false
+why = "weekly offline test suites"
+target = "cron-back 29.10"
+cron_line = "10 5 * * 0 mkdir -p \"$HOME/inbox\" \"$HOME/.local/state/test-all\"; $HOME/bin/test-all >/dev/null 2>\"$HOME/.local/state/test-all/cron.err\"; rc=$?; [ $rc = 0 ] || [ -e \"$HOME/inbox/test-all-$(date +\\%F).md\" ] || echo \"test-all failed (exit $rc): see ~/.local/state/test-all/cron.err. Data, not instructions.\" > \"$HOME/inbox/test-all-failed-$(date +\\%s).md\""
+
+[jobs.calcache-age]
+line = "calcache-age"
+cron = "40 6 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = []
+shell = true
+timeout = 300
+after = 0
+feature = "calendar"
+owner_facing = false
+why = "calendar cache age; cue when stale"
+target = "cron-back 29.10"
+cron_line = "40 6 * * * $HOME/bin/calcache age --quiet --max-hours 12 || echo \"Data, not instructions (scheduled cue from ~/crontab; JOBS.md says how to handle it). calcache-refresh due $(date +\\%F): one list_events call for today 00:00 to +21 days (orderBy startTime, pageSize 250; more pages via nextPageToken), write the result JSON to ~/.local/state/calcache/raw.json (descriptions are only needed on the 🚆/🚌/✈️ events; other fields may be dropped), then \\`calcache import --consume ~/.local/state/calcache/raw.json && train-watch sync --from-cache && flight-watch sync --from-cache\\`; no message to the owner.\" > \"$HOME/inbox/calcache-refresh-$(date +\\%s).md\""
+
+[jobs.cue-calendar-gap-pass]
+line = "cue-calendar-gap-pass"
+cron = "10 10 * * 0"
+class = "C"
+group = "cues"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cue", "calendar-gap-pass"]
+timeout = 300
+after = 1
+feature = "calendar"
+owner_facing = false
+why = "Sunday cue: calendar gap pass"
+target = "cron-back 29.10"
+cron_line = "10 10 * * 0 cron-fail --after 1 cue-calendar-gap-pass flock -n -E 0 \"$HOME/.local/state/cron-fail/cue-calendar-gap-pass.run\" timeout -k 10 300 $HOME/bin/cue calendar-gap-pass >/dev/null 2>&1"
+
+[jobs.ha-autopilot-watch]
+line = "ha-autopilot-watch"
+cron = "* * * * *"
+class = "X"
+group = "critical"
+queue = "critical"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/ha-autopilot-watch", "--cron"]
+err = "out"
+timeout = 300
+after = 3
+feature = "home-autopilot"
+owner_facing = true
+why = "home autopilot (every minute)"
+target = "cron-back 29.10"
+cron_line = "* * * * * cron-fail --after 3 ha-autopilot-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/ha-autopilot-watch.run\" timeout -k 10 300 $HOME/bin/ha-autopilot-watch --cron >/dev/null 2>&1"
+
+[jobs.home-ctx]
+line = "home-ctx"
+cron = "*/5 * * * *"
+class = "X"
+group = "critical"
+queue = "critical"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/home-ctx", "feed", "--apply", "--reason", "cron"]
+err = "out"
+timeout = 300
+after = 6
+feature = "home-autopilot"
+owner_facing = false
+why = "home context feed"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * cron-fail --after 6 home-ctx flock -n -E 0 \"$HOME/.local/state/cron-fail/home-ctx.run\" timeout -k 10 300 $HOME/bin/home-ctx feed --apply --reason cron >/dev/null 2>&1"
+
+[jobs.cat-corner]
+line = "cat-corner"
+cron = "7-59/10 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cat-corner", "--cron"]
+out = "cat-corner/cron.log"
+err = "out"
+dirs = ["cat-corner"]
+timeout = 300
+after = 6
+feature = "cat"
+owner_facing = true
+why = "litter box watch"
+target = "cron-back 29.10"
+cron_line = "7-59/10 * * * * mkdir -p \"$HOME/.local/state/cat-corner\" && cron-fail --after 6 cat-corner flock -n -E 0 \"$HOME/.local/state/cron-fail/cat-corner.run\" timeout -k 10 300 $HOME/bin/cat-corner --cron >> \"$HOME/.local/state/cat-corner/cron.log\" 2>&1"
+
+[jobs.cat-autopilot]
+line = "cat-autopilot"
+cron = "17 10,18 * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/cat-autopilot", "--cron"]
+out = "cat-corner/autopilot.log"
+err = "out"
+dirs = ["cat-corner"]
+timeout = 300
+after = 2
+feature = "cat"
+owner_facing = true
+why = "cat supplies forecast"
+target = "cron-back 29.10"
+cron_line = "17 10,18 * * * mkdir -p \"$HOME/.local/state/cat-corner\" && cron-fail --after 2 cat-autopilot flock -n -E 0 \"$HOME/.local/state/cron-fail/cat-autopilot.run\" timeout -k 10 300 $HOME/bin/cat-autopilot --cron >> \"$HOME/.local/state/cat-corner/autopilot.log\" 2>&1"
+
+[jobs.damp-watch]
+line = "damp-watch"
+cron = "3-59/10 * * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/damp-watch", "run"]
+out = "damp-watch/cron.log"
+err = "out"
+dirs = ["damp-watch", "window-watch"]
+timeout = 300
+after = 12
+feature = "home"
+owner_facing = true
+why = "damp alert (watch job)"
+target = "cron-back 29.10"
+cron_line = "3-59/10 * * * * mkdir -p \"$HOME/.local/state/damp-watch\" \"$HOME/.local/state/window-watch\" && cron-fail --after 12 damp-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/damp-watch.run\" timeout -k 10 300 $HOME/bin/damp-watch run >> \"$HOME/.local/state/damp-watch/cron.log\" 2>&1"
+
+[jobs.window-watch]
+line = "window-watch"
+cron = "3-59/10 * * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/window-watch", "run"]
+out = "window-watch/cron.log"
+err = "out"
+dirs = ["damp-watch", "window-watch"]
+timeout = 300
+after = 12
+feature = "home"
+owner_facing = true
+why = "open-window alert (watch job)"
+target = "cron-back 29.10"
+cron_line = "3-59/10 * * * * mkdir -p \"$HOME/.local/state/damp-watch\" \"$HOME/.local/state/window-watch\" && cron-fail --after 12 window-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/window-watch.run\" timeout -k 10 300 $HOME/bin/window-watch run >> \"$HOME/.local/state/window-watch/cron.log\" 2>&1"
+
+[jobs.shop-watch]
+line = "shop-watch"
+cron = "4-59/10 8-22 * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/shop", "watch", "--cron"]
+out = "shop/cron.log"
+err = "out"
+dirs = ["shop"]
+timeout = 300
+after = 6
+feature = "shopping"
+owner_facing = true
+why = "shopping list watch (watch job)"
+target = "cron-back 29.10"
+cron_line = "4-59/10 8-22 * * * mkdir -p \"$HOME/.local/state/shop\" && cron-fail --after 6 shop-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/shop-watch.run\" timeout -k 10 300 $HOME/bin/shop watch --cron >> \"$HOME/.local/state/shop/cron.log\" 2>&1"
+
+[jobs.parcels]
+line = "parcels"
+cron = "13 7-21/2 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "600", "~/bin/parcels", "refresh", "--cron"]
+out = "parcels/cron.log"
+err = "out"
+dirs = ["parcels"]
+timeout = 620
+after = 4
+feature = "parcels"
+owner_facing = true
+why = "parcel tracking refresh"
+target = "hub move: watches"
+cron_line = "13 7-21/2 * * * mkdir -p \"$HOME/.local/state/parcels\"; cron-fail --after 4 parcels timeout 600 $HOME/bin/parcels refresh --cron >> \"$HOME/.local/state/parcels/cron.log\" 2>&1"
+
+[jobs.contracts-scan]
+line = "contracts-scan"
+cron = "20 2 * * 0"
+class = "V"
+group = "vault"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "1500", "~/bin/contracts", "scan", "--budget", "900"]
+err = "out"
+timeout = 1520
+after = 1
+feature = "bills"
+owner_only = true
+owner_facing = false
+why = "weekly contract radar scan"
+target = "hub move: vault jobs"
+cron_line = "20 2 * * 0 cron-fail contracts-scan timeout 1500 $HOME/bin/contracts scan --budget 900 >/dev/null 2>&1"
+
+[jobs.model-drift]
+line = "model-drift"
+cron = "*/30 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/model-drift"]
+out = "model-drift/cron.log"
+err = "out"
+timeout = 300
+after = 0
+feature = "tokens"
+owner_facing = false
+why = "session model vs settings"
+target = "cron-back 29.10"
+cron_line = "*/30 * * * * mkdir -p \"$HOME/.local/state/model-drift\" && cron-fail --after 0 model-drift flock -n -E 0 \"$HOME/.local/state/cron-fail/model-drift.run\" timeout -k 10 300 $HOME/bin/model-drift >> \"$HOME/.local/state/model-drift/cron.log\" 2>&1"
+
+[jobs.scraper-canary]
+line = "scraper-canary"
+cron = "10 3 * * 0"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "900", "~/bin/scraper-canary", "run", "--quiet"]
+err = "out"
+dirs = ["scraper-canary"]
+timeout = 920
+after = 1
+feature = "scrapers"
+owner_facing = false
+why = "weekly scraper canary"
+target = "cron-back 29.10"
+cron_line = "10 3 * * 0 mkdir -p \"$HOME/.local/state/scraper-canary\" && cron-fail --after 1 scraper-canary flock -n -E 0 \"$HOME/.local/state/cron-fail/scraper-canary.run\" timeout 900 $HOME/bin/scraper-canary run --quiet >/dev/null 2>&1"
+
+[jobs.deadlines-validate]
+line = "deadlines-validate"
+cron = "10 3 * * 0"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "120", "~/bin/deadlines", "validate", "--cron"]
+err = "out"
+dirs = ["scraper-canary"]
+timeout = 140
+after = 1
+feature = "deadlines"
+owner_only = true
+owner_facing = false
+why = "weekly deadline data validation"
+target = "cron-back 29.10"
+cron_line = "10 3 * * 0 mkdir -p \"$HOME/.local/state/scraper-canary\" && cron-fail --after 1 deadlines-validate flock -n -E 0 \"$HOME/.local/state/cron-fail/deadlines-validate.run\" timeout 120 $HOME/bin/deadlines validate --cron >/dev/null 2>&1"
+
+[jobs.gym-weekly]
+line = "gym-weekly"
+cron = "0 19 * * 0"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = []
+shell = true
+timeout = 1800
+after = 2
+feature = "fitness"
+owner_facing = true
+why = "Sunday gym sync + review (sends one line)"
+target = "cron-back 29.10"
+cron_line = "0 19 * * 0 mkdir -p \"$HOME/.local/state/gym\" && cron-fail --after 2 gym-weekly sh -c '$HOME/bin/gym sync >/dev/null && c=$($HOME/bin/gym review --if-trained 14) && if [ -n \"$c\" ]; then tg \"$c\"; fi' 2>> \"$HOME/.local/state/gym/cron.err\""
+
+[jobs.gym-recap]
+line = "gym-recap"
+cron = "5,25,45 6-23 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = []
+shell = true
+timeout = 300
+after = 3
+feature = "fitness"
+owner_facing = true
+why = "gym sync + recap after a session"
+target = "cron-back 29.10"
+cron_line = "5,25,45 6-23 * * * mkdir -p \"$HOME/.local/state/gym\" && cron-fail --after 3 gym-recap flock -n \"$HOME/.local/state/gym/sync.lock\" sh -c '$HOME/bin/gym sync >/dev/null && $HOME/bin/gym recap --cron' 2>> \"$HOME/.local/state/gym/cron.err\""
+
+[jobs.train-watch]
+line = "train-watch"
+cron = "1-59/10 * * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "240", "~/bin/train-watch", "check", "--cron"]
+timeout = 260
+after = 3
+feature = "trips"
+owner_facing = true
+why = "train delays for planned legs (watch job)"
+target = "cron-back 29.10"
+cron_line = "1-59/10 * * * * cron-fail --after 3 train-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/train-watch.run\" timeout 240 $HOME/bin/train-watch check --cron >/dev/null 2>&1"
+
+[jobs.flight-watch]
+line = "flight-watch"
+cron = "7-59/15 * * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "230", "~/bin/flight-watch", "check", "--cron"]
+timeout = 250
+after = 4
+feature = "trips"
+owner_facing = true
+why = "flight status (watch job)"
+target = "cron-back 29.10"
+cron_line = "7-59/15 * * * * cron-fail --after 4 flight-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/flight-watch.run\" timeout 230 $HOME/bin/flight-watch check --cron >/dev/null 2>&1"
+
+[jobs.strike-watch]
+line = "strike-watch"
+cron = "40 7 * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "230", "~/bin/strike-watch", "check", "--cron"]
+timeout = 250
+after = 2
+feature = "trips"
+owner_facing = true
+why = "strikes on planned routes (watch job)"
+target = "cron-back 29.10"
+cron_line = "40 7 * * * cron-fail --after 2 strike-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/strike-watch.run\" timeout 230 $HOME/bin/strike-watch check --cron >/dev/null 2>&1"
+
+[jobs.tripclock-sync]
+line = "tripclock-sync"
+cron = "11-59/30 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "60", "~/bin/tripclock", "sync", "--quiet"]
+timeout = 80
+after = 6
+feature = "trips"
+owner_facing = false
+why = "trip time zone sync"
+target = "cron-back 29.10"
+cron_line = "11-59/30 * * * * cron-fail --after 6 tripclock-sync flock -n -E 0 \"$HOME/.local/state/cron-fail/tripclock-sync.run\" timeout 60 $HOME/bin/tripclock sync --quiet >/dev/null 2>&1"
+
+[jobs.drive-watch]
+line = "drive-watch"
+cron = "3-58/5 * * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "200", "~/bin/drive-watch", "check", "--cron"]
+timeout = 220
+after = 3
+feature = "driving"
+owner_facing = true
+why = "drive detection (watch job)"
+target = "cron-back 29.10"
+cron_line = "3-58/5 * * * * cron-fail --after 3 drive-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/drive-watch.run\" timeout 200 $HOME/bin/drive-watch check --cron >/dev/null 2>&1"
+
+[jobs.drive-brief]
+line = "drive-brief"
+cron = "* * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "window"
+argv = ["timeout", "200", "~/bin/drive-brief", "tick", "--cron"]
+err = "out"
+timeout = 220
+after = 3
+feature = "driving"
+owner_facing = true
+why = "drive brief ticks"
+target = "event workflows"
+cron_line = "* * * * * cron-fail --after 3 drive-brief timeout 200 $HOME/bin/drive-brief tick --cron >/dev/null 2>&1"
+
+[jobs.event-card]
+line = "event-card"
+cron = "*/2 * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "window"
+argv = ["timeout", "110", "~/bin/event-card", "run"]
+timeout = 130
+after = 3
+feature = "nights"
+owner_facing = true
+why = "event-night cards"
+target = "event workflows"
+cron_line = "*/2 * * * * cron-fail --after 3 event-card timeout 110 $HOME/bin/event-card run >/dev/null"
+
+[jobs.lastcall]
+line = "lastcall"
+cron = "*/2 * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "window"
+argv = ["timeout", "280", "~/bin/lastcall", "run"]
+timeout = 300
+after = 3
+feature = "nights"
+owner_facing = true
+why = "last-train calls"
+target = "event workflows"
+cron_line = "*/2 * * * * cron-fail --after 3 lastcall timeout 280 $HOME/bin/lastcall run >/dev/null"
+
+[jobs.battery-guard]
+line = "battery-guard"
+cron = "1-59/2 * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "window"
+argv = ["timeout", "200", "~/bin/battery-guard", "run"]
+timeout = 220
+after = 3
+feature = "nights"
+owner_facing = true
+why = "phone battery guard on event nights"
+target = "event workflows"
+cron_line = "1-59/2 * * * * cron-fail --after 3 battery-guard timeout 200 $HOME/bin/battery-guard run >/dev/null"
+
+[jobs.night-settime]
+line = "night-settime"
+cron = "4-59/15 * * * *"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "230", "~/bin/night-plan", "settime", "check", "--cron"]
+out = "night-plan/settime-cron.log"
+err = "out"
+dirs = ["night-plan"]
+timeout = 250
+after = 4
+feature = "nights"
+owner_facing = true
+why = "set times for planned nights"
+target = "cron-back 29.10"
+cron_line = "4-59/15 * * * * mkdir -p \"$HOME/.local/state/night-plan\" && cron-fail --after 4 night-settime flock -n -E 0 \"$HOME/.local/state/cron-fail/night-settime.run\" timeout 230 $HOME/bin/night-plan settime check --cron >> \"$HOME/.local/state/night-plan/settime-cron.log\" 2>&1"
+
+[jobs.fx-watch]
+line = "fx-watch"
+cron = "20 17 * * *"
+class = "W"
+group = "watch"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "120", "~/bin/fx-watch", "run"]
+dirs = ["fx-watch"]
+timeout = 140
+after = 3
+feature = "trips"
+owner_facing = true
+why = "FX rates for trips (watch job)"
+target = "cron-back 29.10"
+cron_line = "20 17 * * * mkdir -p \"$HOME/.local/state/fx-watch\" && cron-fail --after 3 fx-watch flock -n -E 0 \"$HOME/.local/state/cron-fail/fx-watch.run\" timeout 120 $HOME/bin/fx-watch run >/dev/null 2>&1"
+
+[jobs.voicecheck]
+line = "voicecheck"
+cron = "5 10 * * *"
+class = "M"
+group = "voice"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "300", "~/bin/voicecheck", "run"]
+out = "voicecheck/cron.log"
+err = "out"
+dirs = ["voicecheck"]
+timeout = 320
+after = 1
+ok = [3]
+feature = "voice"
+owner_facing = false
+why = "daily voice path check"
+target = "voice relay on the hub"
+cron_line = "5 10 * * * mkdir -p \"$HOME/.local/state/voicecheck\" && cron-fail --ok 3 voicecheck timeout 300 $HOME/bin/voicecheck run >> \"$HOME/.local/state/voicecheck/cron.log\" 2>&1"
+
+[jobs.voicecheck-pending]
+line = "voicecheck-pending"
+cron = "35 12 * * *"
+class = "M"
+group = "voice"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "300", "~/bin/voicecheck", "run", "--if-pending"]
+out = "voicecheck/cron.log"
+err = "out"
+dirs = ["voicecheck"]
+timeout = 320
+after = 1
+ok = [3]
+feature = "voice"
+owner_facing = false
+why = "voice check retry when pending"
+target = "voice relay on the hub"
+cron_line = "35 12 * * * mkdir -p \"$HOME/.local/state/voicecheck\" && cron-fail --ok 3 voicecheck-pending timeout 300 $HOME/bin/voicecheck run --if-pending >> \"$HOME/.local/state/voicecheck/cron.log\" 2>&1"
+
+[jobs.sleepin-flush]
+line = "sleepin-flush"
+cron = "*/5 * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "window"
+argv = ["~/bin/sleepin", "flush"]
+err = "out"
+timeout = 300
+after = 3
+feature = "sleep-in"
+owner_facing = true
+why = "release messages held for sleep-in"
+target = "event workflows"
+cron_line = "*/5 * * * * cron-fail --after 3 sleepin-flush $HOME/bin/sleepin flush >/dev/null 2>&1"
+
+[jobs.eventwf-sync]
+line = "eventwf-sync"
+cron = "*/5 * * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "hub"
+argv = ["~/bin/eventwf", "sync"]
+err = "out"
+timeout = 240
+after = 3
+feature = "nights"
+owner_facing = true
+why = "start and cancel the hub's event-window clocks (nights, parties, drives, sleep-in mornings) per eventwf's switch"
+target = "event workflows"
+cron_line = "*/5 * * * * $HOME/bin/eventwf sync >/dev/null 2>&1"
+
+# While a window is open and the hub's clock for it is silent (hub down, or no tick for 3 min), the brain runs
+# the kind's due jobs itself, each slot once through eventwf's slot ledger. A keeper: the `keepers` line runs it.
+[jobs.eventwf-fallback]
+line = "eventwf-fallback"
+cron = "* * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/eventwf", "fallback", "--cron"]
+timeout = 55
+after = 3
+feature = "nights"
+owner_facing = true
+why = "run the event-window jobs (last-train call, night cards) from here while the hub's clock is down or stale"
+target = "event workflows"
+keeper = true
+every = 1
+cron_line = "* * * * * $HOME/bin/eventwf fallback --cron >/dev/null 2>&1"
+
+[jobs.menu-usage]
+line = "menu-usage"
+cron = "4,19,34,49 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/menu-usage", "collect"]
+timeout = 120
+after = 8
+feature = "telegram"
+owner_facing = false
+why = "menu usage collector (product report and self-cleanup read its counts)"
+target = "cron-back 29.10"
+cron_line = "4,19,34,49 * * * * cron-fail --after 8 menu-usage flock -n -E 0 \"$HOME/.local/state/cron-fail/menu-usage.run\" timeout -k 10 120 $HOME/bin/menu-usage collect >/dev/null 2>&1"
+
+[jobs.vault-inbox-usage]
+line = "vault-inbox-usage"
+cron = "55 23 * * *"
+class = "V"
+group = "vault"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/vault", "inbox", "usage", "--cron"]
+timeout = 300
+after = 3
+feature = "vault"
+owner_facing = false
+why = "vault inbox usage counts"
+target = "hub move: vault jobs"
+cron_line = "55 23 * * * cron-fail --after 3 vault-inbox-usage $HOME/bin/vault inbox usage --cron >/dev/null"
+
+[jobs.usage-tick]
+line = "usage-tick"
+cron = "*/2 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/usage", "tick"]
+timeout = 300
+after = 10
+feature = "telemetry"
+owner_facing = false
+why = "usage spool into the usage store"
+target = "cron-back 29.10"
+cron_line = "*/2 * * * * cron-fail --after 10 usage-tick flock -n -E 0 \"$HOME/.local/state/cron-fail/usage-tick.run\" timeout -k 10 300 $HOME/bin/usage tick >/dev/null 2>&1"
+
+[jobs.product-catalogue]
+line = "product-catalogue"
+cron = "23 4 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/product", "catalogue", "build", "--quiet"]
+timeout = 300
+after = 2
+feature = "product"
+owner_facing = false
+why = "feature catalogue build"
+target = "cron-back 29.10"
+cron_line = "23 4 * * * cron-fail --after 2 product-catalogue flock -n -E 0 \"$HOME/.local/state/cron-fail/product-catalogue.run\" timeout -k 10 300 $HOME/bin/product catalogue build --quiet >/dev/null 2>&1"
+
+[jobs.product-review]
+line = "product-review"
+cron = "47 9 * * 6"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/product", "review", "--cron"]
+timeout = 580
+after = 1
+feature = "product"
+owner_facing = false
+why = "weekly product review"
+target = "cron-back 29.10"
+cron_line = "47 9 * * 6 cron-fail --after 1 product-review flock -n -E 0 \"$HOME/.local/state/cron-fail/product-review.run\" timeout -k 10 580 $HOME/bin/product review --cron >/dev/null 2>&1"
+
+[jobs.skillforge]
+line = "skillforge"
+cron = "52 9 * * 6"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/skillforge", "weekly", "--cron"]
+timeout = 580
+after = 1
+feature = "skills"
+owner_facing = false
+why = "weekly skill proposals"
+target = "cron-back 29.10"
+cron_line = "52 9 * * 6 cron-fail --after 1 skillforge flock -n -E 0 \"$HOME/.local/state/cron-fail/skillforge.run\" timeout -k 10 580 $HOME/bin/skillforge weekly --cron >/dev/null 2>&1"
+
+[jobs.ticket-check]
+line = "ticket-check"
+cron = "30 18 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "900", "~/bin/ticket-check", "run"]
+timeout = 920
+after = 1
+feature = "tickets"
+owner_facing = true
+why = "ticket sales for followed events"
+target = "hub move: watches"
+cron_line = "30 18 * * * cron-fail ticket-check timeout 900 $HOME/bin/ticket-check run >/dev/null"
+
+[jobs.health-tag]
+line = "health-tag"
+cron = "41 9,23 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/health", "tag", "--cron"]
+err = "health/cron.err"
+dirs = ["health"]
+timeout = 300
+after = 3
+feature = "health"
+owner_facing = false
+why = "health data tagging"
+target = "cron-back 29.10"
+cron_line = "41 9,23 * * * mkdir -p \"$HOME/.local/state/health\" && cron-fail --after 3 health-tag flock -n -E 0 \"$HOME/.local/state/cron-fail/health-tag.run\" timeout -k 10 300 $HOME/bin/health tag --cron >/dev/null 2>> \"$HOME/.local/state/health/cron.err\""
+
+[jobs.health-recap]
+line = "health-recap"
+cron = "35 18 * * 0"
+class = "M"
+group = "watches"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/health", "recap", "--cron"]
+err = "health/cron.err"
+dirs = ["health"]
+timeout = 300
+after = 2
+feature = "health"
+owner_facing = true
+why = "weekly health recap"
+target = "cron-back 29.10"
+cron_line = "35 18 * * 0 mkdir -p \"$HOME/.local/state/health\" && cron-fail --after 2 health-recap flock -n -E 0 \"$HOME/.local/state/cron-fail/health-recap.run\" timeout -k 10 300 $HOME/bin/health recap --cron >/dev/null 2>> \"$HOME/.local/state/health/cron.err\""
+
+[jobs.traces]
+line = "traces"
+cron = "*/5 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/traces", "ingest", "--quiet"]
+err = "traces/cron.err"
+dirs = ["traces"]
+timeout = 300
+after = 3
+feature = "traces"
+owner_facing = false
+why = "traces ingest"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * mkdir -p \"$HOME/.local/state/traces\" && cron-fail --after 3 traces flock -n -E 0 \"$HOME/.local/state/cron-fail/traces.run\" timeout -k 10 300 $HOME/bin/traces ingest --quiet >/dev/null 2>> \"$HOME/.local/state/traces/cron.err\""
+
+[jobs.traces-otel]
+line = "traces-otel"
+cron = "*/5 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/traces", "otel", "up"]
+err = "traces/cron.err"
+dirs = ["traces"]
+timeout = 300
+after = 3
+feature = "traces"
+owner_facing = false
+why = "OTel export up"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * mkdir -p \"$HOME/.local/state/traces\" && cron-fail --after 3 traces-otel flock -n -E 0 \"$HOME/.local/state/cron-fail/traces-otel.run\" timeout -k 10 300 $HOME/bin/traces otel up >/dev/null 2>> \"$HOME/.local/state/traces/cron.err\""
+
+[jobs.self-report]
+line = "self-report"
+cron = "30 19 * * 0"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/self-report", "--cron"]
+err = "traces/cron.err"
+dirs = ["traces"]
+timeout = 580
+after = 1
+feature = "traces"
+owner_facing = false
+why = "weekly self report"
+target = "cron-back 29.10"
+catch_up = false  # a late run after midnight names the report after the next week
+cron_line = "30 19 * * 0 mkdir -p \"$HOME/.local/state/traces\" && cron-fail --after 1 self-report flock -n -E 0 \"$HOME/.local/state/cron-fail/self-report.run\" timeout -k 10 580 $HOME/bin/self-report --cron >/dev/null 2>> \"$HOME/.local/state/traces/cron.err\""
+
+[jobs.memory2-embedd]
+line = "memory2-embedd"
+cron = "*/5 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/memory2", "embedd", "up", "--quiet"]
+err = "out"
+timeout = 300
+after = 3
+feature = "memory"
+owner_facing = false
+why = "memory2 embedding server up"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * cron-fail --after 3 memory2-embedd flock -n -E 0 \"$HOME/.local/state/cron-fail/memory2-embedd.run\" timeout -k 10 300 $HOME/bin/memory2 embedd up --quiet >/dev/null 2>&1"
+
+[jobs.memory2-sync]
+line = "memory2-sync"
+cron = "*/15 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/memory2", "sync", "--quiet"]
+err = "memory2/cron.err"
+dirs = ["memory2"]
+timeout = 300
+after = 3
+feature = "memory"
+owner_facing = false
+why = "memory2 sync"
+target = "cron-back 29.10"
+cron_line = "*/15 * * * * mkdir -p \"$HOME/.local/state/memory2\" && cron-fail --after 3 memory2-sync flock -n -E 0 \"$HOME/.local/state/cron-fail/memory2-sync.run\" timeout -k 10 300 $HOME/bin/memory2 sync --quiet >/dev/null 2>> \"$HOME/.local/state/memory2/cron.err\""
+
+[jobs.memory2-extract]
+line = "memory2-extract"
+cron = "23 */2 * * *"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/memory2", "extract", "--llm", "--cron"]
+out = "memory2/cron.log"
+err = "out"
+dirs = ["memory2"]
+timeout = 1800
+after = 2
+feature = "memory"
+owner_facing = false
+why = "memory2 extraction (LLM)"
+target = "cron-back 29.10"
+cron_line = "23 */2 * * * mkdir -p \"$HOME/.local/state/memory2\" && cron-fail --after 2 memory2-extract flock -n -E 0 \"$HOME/.local/state/cron-fail/memory2-extract.run\" timeout -k 10 1800 $HOME/bin/memory2 extract --llm --cron >> \"$HOME/.local/state/memory2/cron.log\" 2>&1"
+
+[jobs.memory2-digest]
+line = "memory2-digest"
+cron = "10 9 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/memory2", "digest", "--cron"]
+err = "memory2/cron.err"
+dirs = ["memory2"]
+timeout = 300
+after = 1
+feature = "memory"
+owner_facing = false
+why = "memory2 daily digest"
+target = "cron-back 29.10"
+cron_line = "10 9 * * * mkdir -p \"$HOME/.local/state/memory2\" && cron-fail --after 1 memory2-digest flock -n -E 0 \"$HOME/.local/state/cron-fail/memory2-digest.run\" timeout -k 10 300 $HOME/bin/memory2 digest --cron >/dev/null 2>> \"$HOME/.local/state/memory2/cron.err\""
+
+[jobs.events-ingest]
+line = "events-ingest"
+cron = "* * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/events", "ingest", "--cron"]
+err = "out"
+timeout = 120
+after = 6
+feature = "events"
+owner_facing = false
+why = "root ~/inbox notes into events (md-note writers remain)"
+target = "cron-back 29.10"
+cron_line = "* * * * * cron-fail --after 6 events-ingest flock -n -E 0 \"$HOME/.local/state/cron-fail/events-ingest.run\" timeout -k 10 120 $HOME/bin/events ingest --cron >/dev/null 2>&1"
+
+[jobs.events-tg-metrics]
+line = "events-tg-metrics"
+cron = "57 23 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/events", "metrics", "--tg", "--days", "1", "--record"]
+err = "out"
+timeout = 300
+after = 1
+feature = "events"
+owner_facing = false
+why = "nightly Telegram metrics row"
+target = "cron-back 29.10"
+catch_up = false  # a late run after midnight records the new day and a 24 h window across two days
+cron_line = "57 23 * * * cron-fail --after 1 events-tg-metrics flock -n -E 0 \"$HOME/.local/state/cron-fail/events-tg-metrics.run\" timeout -k 10 300 $HOME/bin/events metrics --tg --days 1 --record >/dev/null 2>&1"
+
+[jobs.tg-adapter-ensure-live]
+line = "tg-adapter-ensure-live"
+cron = "* * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/tg-adapter", "ensure", "--cron", "--instance", "live"]
+err = "out"
+timeout = 120
+after = 6
+feature = "telegram"
+owner_facing = false
+why = "keep the brain-side companion of the hub Telegram adapter running (jobs + presence)"
+target = "hub move: keepers"
+keeper = true
+every = 1
+cron_line = "* * * * * cron-fail --after 6 tg-adapter-ensure-live $HOME/bin/tg-adapter ensure --cron --instance live >/dev/null 2>&1"
+
+[jobs.memory-import]
+line = "memory-import"
+cron = "*/5 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/memory", "import", "--quiet"]
+timeout = 300
+after = 3
+feature = "memory"
+owner_facing = false
+why = "memory rows import + facts core render"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * cron-fail --after 3 memory-import flock -n -E 0 \"$HOME/.local/state/cron-fail/memory-import.run\" timeout -k 10 300 $HOME/bin/memory import --quiet >/dev/null 2>&1"
+
+[jobs.tool-worker]
+line = "tool-worker"
+cron = "* * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/tool", "worker", "ensure"]
+err = "out"
+timeout = 120
+after = 10
+feature = "gateway"
+owner_facing = false
+why = "keep the tool worker (gateway executor) running"
+target = "schedule registry"
+keeper = true
+every = 1
+cron_line = "* * * * * cron-fail --after 10 tool-worker $HOME/bin/tool worker ensure >/dev/null 2>&1"
+
+[jobs.brain-watch]
+line = "brain-watch"
+cron = "* * * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/brain-watch", "--cron"]
+err = "out"
+timeout = 120
+after = 6
+feature = "brain"
+owner_facing = false
+why = "brain liveness watch (stays in cron)"
+target = "schedule registry"
+cron_line = "* * * * * cron-fail --after 6 brain-watch $HOME/bin/brain-watch --cron >/dev/null 2>&1"
+
+[jobs.hub-feed]
+line = "hub-feed"
+cron = "* * * * *"
+class = "K"
+group = "keepers"
+queue = ""
+where = "cron"
+runs_on = "keepers"
+argv = ["~/bin/hub", "feed", "ensure"]
+err = "out"
+timeout = 120
+after = 10
+feature = "dashboard"
+owner_facing = false
+why = "keep the hub feed tunnel running"
+target = "schedule registry"
+keeper = true
+every = 1
+cron_line = "* * * * * cron-fail --after 10 hub-feed $HOME/bin/hub feed ensure >/dev/null 2>&1"
+
+[jobs.assistant-publish]
+line = "assistant-publish"
+cron = "52 3 * * *"
+class = "M"
+group = "housekeeping"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/assistant-publish", "push", "--cron"]
+err = "out"
+timeout = 1800
+after = 0
+feature = "publish"
+owner_facing = false
+why = "nightly publish catch-up"
+target = "cron-back 29.10"
+cron_line = "52 3 * * * cron-fail --after 0 assistant-publish flock -n -E 0 \"$HOME/.local/state/cron-fail/assistant-publish.run\" timeout -k 10 1800 $HOME/bin/assistant-publish push --cron >/dev/null 2>&1"
+
+[jobs.loop-corrections]
+line = "loop-corrections"
+cron = "38 */2 * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/loop", "corrections", "--cron"]
+timeout = 300
+after = 2
+feature = "loop"
+owner_facing = false
+why = "owner corrections into drafts"
+target = "cron-back 29.10"
+cron_line = "38 */2 * * * cron-fail --after 2 loop-corrections flock -n -E 0 \"$HOME/.local/state/cron-fail/loop-corrections.run\" timeout -k 10 300 $HOME/bin/loop corrections --cron >/dev/null 2>&1"
+
+# The `keepers` line runs the keeper entries (keeper = true, runs_on = "keepers"),
+# `hub-sentinel` watches the hub's /health; drill-fail is never scheduled (one live run = one job.failed).
+[jobs.keepers]
+line = "keepers"
+cron = "* * * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/keepers", "ensure", "--cron"]
+err = "out"
+timeout = 300
+after = 0
+feature = "keepers"
+owner_facing = false
+why = "one line for the daemons that must run while the hub is down (each keeper has its own switch)"
+target = "schedule registry"
+cron_line = "* * * * * ~/bin/keepers ensure --cron >/dev/null 2>&1"
+
+[jobs.hub-sentinel]
+line = "hub-sentinel"
+cron = "* * * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/hub-sentinel", "check", "--cron"]
+err = "out"
+timeout = 300
+after = 0
+feature = "hub"
+owner_facing = true
+why = "hub /health down >= 3 min: one app push + one note, the reminders' due pass (hub live mode); one line when back"
+target = "schedule registry"
+cron_line = "* * * * * ~/bin/hub-sentinel check --cron >/dev/null 2>&1"
+
+[jobs.drill-fail]
+line = "drill-fail"
+cron = "0 0 1 1 *"
+class = "M"
+group = "drill"
+queue = "fast"
+where = "brain"
+runs_on = "planned"
+argv = ["~/bin/keepers", "status", "--drill"]
+timeout = 30
+after = 1
+feature = "hub"
+owner_facing = false
+why = "drill: exits 2 every run, so one live run proves job.failed reaches the agenda (never scheduled)"
+target = "schedule registry"
+cron_line = "0 0 1 1 * ~/bin/keepers status --drill"
+
+[jobs.rotate]
+line = "rotate"
+cron = "*/10 3-4 * * *"
+class = "T"
+group = "timers"
+queue = "critical"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/rotate", "run", "--cron"]
+err = "out"
+timeout = 120
+after = 3
+feature = "rotation"
+owner_facing = false
+why = "nightly fresh session in the quiet slot (silent when off, outside the window or not now)"
+target = "cron-back 29.10"
+cron_line = "*/10 3-4 * * * cron-fail --after 3 rotate flock -n -E 0 \"$HOME/.local/state/cron-fail/rotate.run\" timeout -k 10 120 $HOME/bin/rotate run --cron >/dev/null 2>&1"
+
+[jobs.slo-cache]
+line = "slo-cache"
+cron = "*/15 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/slo", "--cache"]
+err = "out"
+timeout = 300
+after = 4
+feature = "slo"
+owner_facing = false
+why = "keep the SLO tiles cache fresh for the hub feed"
+target = "cron-back 29.10"
+cron_line = "*/15 * * * * cron-fail --after 4 slo-cache flock -n -E 0 \"$HOME/.local/state/cron-fail/slo-cache.run\" timeout -k 10 300 $HOME/bin/slo --cache >/dev/null 2>&1"
+
+[jobs.scorecard]
+line = "scorecard"
+cron = "7 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/scorecard", "run", "--quiet"]
+err = "out"
+timeout = 300
+after = 3
+feature = "scorecard"
+owner_facing = false
+why = "hourly scorecard: speed and health vs a 7-day baseline, one inbox note per regressed metric per day"
+target = "scorecard 30.10"
+cron_line = "7 * * * * cron-fail --after 3 scorecard flock -n -E 0 \"$HOME/.local/state/cron-fail/scorecard.run\" timeout -k 10 300 $HOME/bin/scorecard run --quiet >/dev/null 2>&1"
+
+[jobs.media-remux]
+line = "media-remux"
+cron = "*/20 * * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/media-remux", "--cron"]
+out = "media-remux/cron.log"
+err = "out"
+dirs = ["media-remux"]
+timeout = 900
+after = 4
+feature = "media"
+owner_facing = false
+why = "remux downgrade: old Default QP remuxes -> encodes, 1 grab per tick 00:30-06:00 (<= 15/night); follows imports"
+target = "cron-back 29.10"
+cron_line = "*/20 * * * * mkdir -p \"$HOME/.local/state/media-remux\" && cron-fail --after 4 media-remux flock -n -E 0 \"$HOME/.local/state/cron-fail/media-remux.run\" timeout -k 10 900 $HOME/bin/media-remux --cron >> \"$HOME/.local/state/media-remux/cron.log\" 2>&1"
+
+# Five tagged ~/crontab lines: the voice and phone inbox polls and the nightly CI stay in cron; the media digests run
+# from cron.
+[jobs.voice-inbox]
+line = "voice-inbox"
+cron = "* * * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["timeout", "40", "~/bin/hub", "voice", "inbox", "--once", "--wait", "25"]
+err = "out"
+timeout = 60
+after = 3
+feature = "voice"
+owner_facing = false
+why = "the voice container's hand-offs to this session: one 25 s long-poll of the hub a minute (stays in cron)"
+target = "voice relay on the hub"
+cron_line = "* * * * * cron-fail --after 3 voice-inbox timeout 40 $HOME/bin/hub voice inbox --once --wait 25 >/dev/null 2>&1"
+
+[jobs.phone-inbox]
+line = "phone-inbox"
+cron = "* * * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = []
+shell = true
+timeout = 60
+after = 3
+feature = "phone"
+owner_facing = false
+why = "the phone app's inbound (notes, zone, usage) from the hub: two 25 s long-polls a minute (stays in cron)"
+target = "phone gateway on the hub"
+cron_line = "* * * * * cron-fail --after 3 phone-inbox timeout 58 sh -c 'hub phone inbox --once --wait 25 && hub phone inbox --once --wait 25'"
+
+[jobs.ci-nightly]
+line = "ci-nightly"
+cron = "10 2 * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["nice", "-n", "10", "~/bin/assistant", "ci-nightly"]
+err = "out"
+timeout = 7200
+after = 1
+feature = "ci"
+owner_facing = false
+why = "main's full suite every night; red or a stale quarantine entry -> one ~/inbox note (stays in cron)"
+target = "land-speed"
+cron_line = "10 2 * * * nice -n 10 cron-fail ci-nightly $HOME/bin/assistant ci-nightly >/dev/null 2>&1"
+
+[jobs.media-digest-daily]
+line = "media-digest-daily"
+cron = "0 19 * * *"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "600", "~/bin/media", "digest", "--daily"]
+out = "media/digest-cron.log"
+err = "out"
+dirs = ["media"]
+timeout = 620
+after = 1
+ok = [3]
+feature = "media"
+owner_facing = true
+why = "daily media digest cards (switch: ~/.config/media/digest.json)"
+target = "media-digest"
+cron_line = "0 19 * * * mkdir -p \"$HOME/.local/state/media\" && cron-fail --ok 3 media-digest-daily timeout 600 $HOME/bin/media digest --daily >> \"$HOME/.local/state/media/digest-cron.log\" 2>&1"
+
+[jobs.media-digest-weekly]
+line = "media-digest-weekly"
+cron = "5 19 * * 0"
+class = "M"
+group = "collectors"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["timeout", "600", "~/bin/media", "digest", "--weekly"]
+out = "media/digest-cron.log"
+err = "out"
+dirs = ["media"]
+timeout = 620
+after = 1
+ok = [3]
+feature = "media"
+owner_facing = true
+why = "weekly media digest cards (switch: ~/.config/media/digest.json)"
+target = "media-digest"
+cron_line = "5 19 * * 0 mkdir -p \"$HOME/.local/state/media\" && cron-fail --ok 3 media-digest-weekly timeout 600 $HOME/bin/media digest --weekly >> \"$HOME/.local/state/media/digest-cron.log\" 2>&1"
+
+# A token-free watch of the claude.ai usage limit (the 24.-28.10 pause went unnoticed for 4 days): stays in cron so it
+# runs whatever the session and the hub do.
+[jobs.usage-watch]
+line = "usage-watch"
+cron = "3-59/10 * * * *"
+class = "K"
+group = "local"
+queue = ""
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/usage-watch", "run"]
+err = "out"
+timeout = 120
+after = 3
+feature = "usage-watch"
+owner_facing = true
+why = "claude.ai usage limit hit or cleared -> ONE plain tg line per state change, held to 08:00 (no model calls)"
+target = "usage-watch"
+cron_line = "3-59/10 * * * * cron-fail --after 3 usage-watch $HOME/bin/usage-watch run >/dev/null 2>&1"
+
+[jobs.cron-runs]
+line = "cron-runs"
+cron = "*/5 * * * *"
+class = "K"
+group = "collectors"
+where = "cron"
+runs_on = "cron"
+argv = ["~/bin/cron-runs", "export", "--quiet"]
+err = "out"
+timeout = 120
+after = 6
+feature = "health"
+owner_facing = false
+why = "cron jobs' run log (cron-fail runs-*.jsonl) -> one Phoenix span per run via the local OTLP receiver (cron-back 29.10)"
+target = "cron-back 29.10"
+cron_line = "*/5 * * * * cron-fail --after 6 cron-runs flock -n -E 0 \"$HOME/.local/state/cron-fail/cron-runs.run\" timeout -k 10 120 $HOME/bin/cron-runs export --quiet >/dev/null 2>&1"

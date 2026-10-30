@@ -1,0 +1,34 @@
+#!/usr/local/bin/python3.13 -I
+# managed: ~/opt/assistant — edit there, deploy with assistant land
+"""hub-mcp-headers: the headersHelper of the brain's MCP entry `hub` over HTTP.
+
+Claude Code runs it when it connects to http://claude-hub:8701/mcp and sends the JSON object it prints as request
+headers: {"Authorization": "Bearer <the brain's hub token>"}. The token stays in its file (HUB_TOKEN_FILE, default
+~/.secrets/hub-token) and in Claude Code's memory; it never lands in settings or ~/.claude.json. Refuses to print
+to a terminal (exit 2): its output is for Claude Code only. Exit 1: no token. Stdlib only.
+"""
+
+import json
+import os
+import sys
+
+
+def main() -> int:
+    if sys.stdout.isatty():
+        print("hub-mcp-headers: prints a secret header for Claude Code; not on a terminal", file=sys.stderr)
+        return 2
+    p = os.environ.get("HUB_TOKEN_FILE") or os.path.join(os.path.expanduser("~"), ".secrets", "hub-token")
+    try:
+        with open(p, encoding="utf-8") as f:
+            tok = f.read(4096).strip()
+    except OSError:
+        tok = ""
+    if not tok:
+        print("hub-mcp-headers: no hub token", file=sys.stderr)
+        return 1
+    sys.stdout.write(json.dumps({"Authorization": f"Bearer {tok}"}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

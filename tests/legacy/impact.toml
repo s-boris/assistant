@@ -1,0 +1,9 @@
+# Extra files a legacy suite exercises that legacy_select (ops/assistant.py) can't see by itself: shell `source`,
+# files read at run time under a computed name, a module loaded through an env var. A plain repo path is followed
+# through its imports; a glob (*, ?, [) only matches changed paths. A change to this file runs every suite.
+# Found by: a suite red on main after a land that skipped it (`assistant legacy-main` notes it).
+[suites]
+letter = ["scripts/_admindesk", "scripts/pdfform"]
+battery-guard = ["scripts/lastcall"]
+ha-avail = ["scripts/ha-audit"]
+browser = ["scripts/browser-hub"]

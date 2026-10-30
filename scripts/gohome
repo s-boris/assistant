@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""gohome: the next connections home from where he is now, plus the last one tonight (instant /gohome in tg-cmd).
+
+  gohome [STOP] [--json]
+
+Card (<= 8 lines): a head line (from where, and why), the next 3 connections door to door (departure stop, platform,
+lines, changes, arrival at the door) and the last connection tonight, each with its SBB Mobile app link at the end of
+the line (stop names only: the app can't resolve a free-text address). When the last one is among the next 3, that
+line says "🌙 last" instead; when it has left already, the card says so. Already home: "You're home 🏠".
+
+Where from, first match wins:
+  1. STOP, the argument (a stop or town name; "home" or the home town means you're home)
+  2. home: `whereabouts ha now --json` (the phone app when <= 30 min fresh, else `vault ha now`) says zone home
+  3. a calendar event (calcache) under way or ended in the last 3 h (not a travel leg, not in the home town): the
+     start stop of its planned 🚆/🚌 leg home, else the private venue map (night-plan's venues.json: venue name or
+     alias in the title), else the event's town (its main station)
+  4. the town from that same answer (an HA zone without a town: the profile's work.town for zone "Work")
+  5. none: asks for `/gohome <stop>`
+Last tonight = the latest-leaving connection that reaches the door by 04:45 (the night gap; weekend night lines count),
+from one arrive-by search. Waits >= 30 min at a change are shown. Read-only: nothing is stored or sent.
+
+Home is door to door (lib/home_place: the profile's address, never in code): `arr` is at the door, the final walk
+included; --json also gives each connection's last stop (`off`, `off_arr`) and that walk (`walk_min`).
+--json is always JSON: no origin = "origin": null (with "near" when he is in the home town), a stop or town the
+timetable doesn't know = "origin": null + "unknown_stop": the name (else null).
+Exit 0 = a card (also "where are you?" and "no connection found"), 1 = the transport API failed (one line on stderr),
+2 = usage.
+Env (tests): GOHOME_API (else ROUTE_API, else transport.opendata.ch), GOHOME_NOW ("YYYY-MM-DD HH:MM", Zurich),
+GOHOME_PLACE / GOHOME_CALCACHE (a JSON file shaped like `whereabouts ha now --json` / `calcache show --json`, or "off"),
+GOHOME_VENUES (else NIGHT_PLAN_VENUES, else ~/.config/night-plan/venues.json), ASSISTANT_PROFILE, HOME_PLACE_GEO,
+HOME_PLACE_CACHE. Tests: ~/opt/assistant/tests/legacy/gohome.
+"""
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+import assistant_profile as profile  # noqa: E402
+import home_place  # noqa: E402
+from sbb import sbb_link  # noqa: E402
+
+TZ = profile.tz()
+API = os.environ.get('GOHOME_API') or os.environ.get('ROUTE_API') or 'https://transport.opendata.ch/v1'
+UA = 'gohome/1.0 (personal trip planner)'
+NEXT_N, EVENT_GRACE, LEG_AFTER, WAIT_SHOW = 3, dt.timedelta(hours=3), dt.timedelta(hours=8), 30
+NIGHT_END = dt.time(4, 45)          # the night gap: the last connection tonight reaches the door by then
+MIN = dt.timedelta(minutes=1)
+BUS_CATS = {'B', 'BN', 'BUS', 'NFB', 'KB', 'EXB', 'BP'}
+TRAM_CATS = {'T', 'TN', 'TRAM'}
+ASK = "📍 Where are you? Neither the calendar nor your phone says.\nSend /gohome <stop>, e.g. a station name."
+
+
+class Fail(Exception):
+    pass
+
+
+def now():
+    s = os.environ.get('GOHOME_NOW')
+    if s:
+        return dt.datetime.strptime(s, '%Y-%m-%d %H:%M').replace(tzinfo=TZ)
+    return dt.datetime.now(TZ).replace(second=0, microsecond=0)
+
+
+def norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode()
+    return ' '.join(re.findall(r'[a-z0-9]+', s.lower()))
+
+
+# ------------------------------------------------------------------------------------------------ inputs
+def read_json(env, cmd, timeout):
+    """JSON from the env file (tests), None when env is "off", else from cmd; None on any failure."""
+    src = os.environ.get(env)
+    try:
+        if src == 'off':
+            return None
+        if src:
+            with open(src) as f:
+                return json.load(f)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def place():
+    d = read_json('GOHOME_PLACE', ['whereabouts', 'ha', 'now', '--json', '--for', 'gohome', '--fresh-only'], 8)
+    return d if isinstance(d, dict) else {}
+
+
+def events(t):
+    env = {**os.environ, 'CALCACHE_NOW': (t - dt.timedelta(days=1)).isoformat()}
+    src = os.environ.get('GOHOME_CALCACHE')
+    if src is None:
+        try:
+            p = subprocess.run(['calcache', 'show', '--days', '3', '--json'], capture_output=True, text=True, timeout=8,
+                               stdin=subprocess.DEVNULL, env=env)
+            d = json.loads(p.stdout) if p.returncode == 0 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            d = None
+    else:
+        d = read_json('GOHOME_CALCACHE', [], 1)
+    out = []
+    for e in d if isinstance(d, list) else []:
+        try:
+            out.append({**e, '_s': dt.datetime.fromisoformat(e['start']), '_e': dt.datetime.fromisoformat(e['end'])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def venues():
+    path = os.environ.get('GOHOME_VENUES') or os.environ.get('NIGHT_PLAN_VENUES') or \
+        os.path.expanduser('~/.config/night-plan/venues.json')
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def venue_stop(title, town):
+    t = f' {norm(title)} '
+    for name, v in venues().items():
+        if not isinstance(v, dict) or not v.get('stop'):
+            continue
+        if v.get('town') and town and norm(v['town']) not in norm(town):
+            continue
+        if any(norm(k) and f' {norm(k)} ' in t for k in [name, *(v.get('aliases') or [])]):
+            return v['stop']
+    return None
+
+
+def homeish(s):
+    return str(s or '').strip().casefold() == 'home' or home_place.is_home(s)
+
+
+def event_origin(t, evs):
+    """(stop, title) of the event under way or ended <= 3 h ago (latest start first), else None."""
+    cands = [e for e in evs if not e.get('all_day') and not (e.get('flags') or {}).get('travel') and not e.get('train')
+             and e['_s'] <= t <= e['_e'] + EVENT_GRACE]
+    for e in sorted(cands, key=lambda e: e['_s'], reverse=True):
+        legs = sorted((g for g in evs if isinstance(g.get('train'), dict) and homeish(g['train'].get('to'))
+                       and g['train'].get('from') and not homeish(g['train']['from'])
+                       and e['_s'] <= g['_s'] <= e['_e'] + LEG_AFTER), key=lambda g: g['_s'])
+        town = None if homeish(e.get('town')) else e.get('town')
+        stop = (legs[0]['train']['from'] if legs else None) or venue_stop(e.get('title'), e.get('town')) or town
+        if stop:
+            return stop, str(e.get('title') or 'event').strip()
+    return None
+
+
+def place_town(p):
+    pl = p.get('place') if isinstance(p.get('place'), dict) else {}
+    town = pl.get('town')
+    if not town and pl.get('kind') == 'zone' and str(pl.get('zone') or '').strip().casefold() == 'work':
+        town = profile.get('work.town', None)
+    return str(town).strip() if town else None, pl.get('fix_age_min')
+
+
+# ------------------------------------------------------------------------------------------------ connections
+def api(path, params):
+    url = f'{API}/{path}?{urllib.parse.urlencode(params)}'
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': UA}), timeout=8) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            why = json.load(e)['errors'][0]['message']
+        except Exception:
+            why = f'HTTP {e.code}'
+        raise Fail(f'transport API error: {why}')
+    except (OSError, ValueError) as e:
+        raise Fail(f'transport API unreachable or broken: {getattr(e, "reason", e)}')
+
+
+def ts(s):
+    try:
+        return dt.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S%z').astimezone(TZ) if s else None
+    except (TypeError, ValueError):
+        return None
+
+
+def line_name(j):
+    cat, num = (j.get('category') or '').strip(), (j.get('number') or '').strip()
+    if cat.upper() in BUS_CATS:
+        return f'Bus {num}'.strip()
+    if cat.upper() in TRAM_CATS:
+        return f'Tram {num}'.strip()
+    if not num or (num.isdigit() and len(num) >= 4) or num == cat:
+        return cat or '?'
+    return f'{cat}{num}' if num.isdigit() else f'{cat} {num}'
+
+
+def stname(x):
+    x = x or {}
+    return (x.get('station') or {}).get('name') or (x.get('location') or {}).get('name') or ''
+
+
+def conn(c):
+    dep, arr = ts((c.get('from') or {}).get('departure')), ts((c.get('to') or {}).get('arrival'))
+    rides = []
+    for s in c.get('sections') or []:
+        j, d, a = s.get('journey'), s.get('departure') or {}, s.get('arrival') or {}
+        rd, ra = ts(d.get('departure')), ts(a.get('arrival'))
+        if j and rd and ra:
+            rides.append({'line': line_name(j), 'dep': rd, 'arr': ra, 'from': stname(d), 'at': stname(a),
+                          'platform': d.get('platform') or None})
+    if not dep or not arr or not rides:
+        return None
+    waits = [{'at': b['from'] or a['at'], 'min': int((b['dep'] - a['arr']).total_seconds() // 60)}
+             for a, b in zip(rides, rides[1:])]
+    big = max(waits, key=lambda w: w['min'], default=None)
+    walk = max(0, int((arr - rides[-1]['arr']).total_seconds() // 60))   # the last mile: final stop -> the door
+    return {'dep': dep, 'arr': arr, 'rides': rides, 'changes': len(rides) - 1,
+            'wait': big if big and big['min'] >= WAIT_SHOW else None, 'walk': walk}
+
+
+def search(origin, home, when, arrive=False, limit=6):
+    p = {'from': origin, 'to': home, 'date': when.date().isoformat(), 'time': when.strftime('%H:%M'), 'limit': limit}
+    if arrive:
+        p['isArrivalTime'] = 1
+    out = [c for c in map(conn, api('connections', p).get('connections') or []) if c]
+    # the Swiss timetable answers far-off stops with other days' connections: keep that night's only
+    return [c for c in out if abs(((c['arr'] if arrive else c['dep']) - when).total_seconds()) <= 14 * 3600]
+
+
+def pareto(cs):
+    """Drop connections that leave earlier yet arrive no earlier than a later one; sorted by departure."""
+    best = {}
+    for c in cs:
+        if c['dep'] not in best or (c['arr'], c['changes']) < (best[c['dep']]['arr'], best[c['dep']]['changes']):
+            best[c['dep']] = c
+    out, low = [], None
+    for c in sorted(best.values(), key=lambda c: c['dep'], reverse=True):
+        if low is None or c['arr'] < low:
+            out.append(c)
+            low = c['arr']
+    return out[::-1]
+
+
+def words(s):
+    return set(norm(s).split())
+
+
+def stop_name(q):
+    """The timetable's station for a typed stop or town name, None when nothing sensibly matches (the API would
+    otherwise route from whatever it guesses)."""
+    want = {w for w in words(q) if len(w) >= 2}
+    best, score = None, 0
+    for st in (api('locations', {'query': q, 'type': 'station'}).get('stations') or [])[:5]:
+        name = str(st.get('name') or '').strip()
+        have = words(name)
+        n = sum(1 for w in want if w in have or any(h.startswith(w) or w.startswith(h)
+                                                    for h in have if min(len(h), len(w)) >= 4))
+        if name and n > score:
+            best, score = name, n
+    return best
+
+
+def plan(origin, t):
+    home = home_place.query('home')
+    nxt = pareto([c for c in search(origin, home, t) if c['dep'] >= t - MIN])[:NEXT_N]
+    cut = dt.datetime.combine(t.date() + dt.timedelta(days=0 if t.time() < NIGHT_END else 1), NIGHT_END, TZ)
+    night = [c for c in search(origin, home, cut, arrive=True) if c['arr'] <= cut]
+    last = max(night, key=lambda c: (c['dep'], -c['arr'].timestamp()), default=None)
+    return nxt, last
+
+
+# ------------------------------------------------------------------------------------------------ card
+def hm(x):
+    return x.strftime('%H:%M')
+
+
+def link(c):
+    r0, r1 = c['rides'][0], c['rides'][-1]
+    return sbb_link(r0['from'], r1['at'], r0['dep'], r0['dep'])
+
+
+def conn_line(c, tag=''):
+    r0 = c['rides'][0]
+    lines = [r['line'] for r in c['rides']]
+    lines = ' › '.join(lines[:3] + (['…'] if len(lines) > 3 else []))
+    ch = 'direct' if not c['changes'] else f"{c['changes']} change{'s' if c['changes'] > 1 else ''}"
+    pl = f" Pl. {r0['platform']}" if r0['platform'] else ''
+    wait = f" · ⏳ {c['wait']['min']} min at {c['wait']['at']}" if c['wait'] else ''
+    return f"{hm(r0['dep'])} {r0['from']}{pl} · {lines} · {ch} → 🏠 {hm(c['arr'])}{wait}{tag} {link(c)}"
+
+
+def same(a, b):
+    return bool(a and b) and (a['rides'][0]['dep'], a['rides'][0]['from']) == (b['rides'][0]['dep'], b['rides'][0]['from'])
+
+
+def card(r):
+    if r['home']:
+        return "You're home 🏠"
+    if r.get('near'):
+        return f"🏠 You're in {r['near']}, close to home.\nFor a bus or train: /gohome <stop>."
+    if not r['origin']:
+        return ASK
+    head = f"🏠 Home from {r['label']} · {hm(r['now'])}"
+    nxt, last = r['next'], r['last']
+    if not nxt and not last:
+        return f"{head}\nNo connection home found from {r['origin']}.\nCheck the stop name: /gohome <stop>."
+    out = [head]
+    last_shown = False
+    for c in nxt:
+        tag = ' · 🌙 last' if same(c, last) else ''
+        last_shown = last_shown or bool(tag)
+        out.append(conn_line(c, tag))
+    if last and not last_shown:
+        if last['rides'][0]['dep'] < r['now']:
+            out.append(f"🌙 The last one home by {hm(NIGHT_END)} left at {hm(last['rides'][0]['dep'])}.")
+        elif not nxt or last['dep'] > nxt[-1]['dep']:
+            out.append('🌙 Last tonight: ' + conn_line(last))
+    elif not last and nxt:
+        out.append('🌙 No later connection home before the morning.')
+    return '\n'.join(out)
+
+
+def resolve(arg, t):
+    r = {'home': False, 'origin': None, 'label': None, 'source': None, 'now': t, 'next': [], 'last': None}
+    if arg:
+        if homeish(arg):
+            return {**r, 'home': True}
+        return {**r, 'origin': arg, 'label': arg, 'source': 'argument'}
+    p = place()
+    if isinstance(p.get('place'), dict) and p['place'].get('kind') == 'home':
+        return {**r, 'home': True, 'source': 'phone'}
+    ev = event_origin(t, events(t))
+    if ev:
+        return {**r, 'origin': ev[0], 'label': f'{ev[1]} ({ev[0]}, calendar)', 'source': 'calendar'}
+    town, age = place_town(p)
+    if town:
+        if homeish(town):
+            return {**r, 'near': town, 'source': 'phone'}
+        old = f', {age // 60} h old' if isinstance(age, int) and age >= 120 else ''
+        src = 'vault' if p.get('source') == 'vault' else 'phone'
+        return {**r, 'origin': town, 'label': f'{town} ({src}{old})', 'source': 'phone'}
+    return r
+
+
+def as_json(r):
+    def cj(c):
+        return c and {'dep': c['dep'].isoformat(), 'arr': c['arr'].isoformat(), 'changes': c['changes'],
+                      'stop': c['rides'][0]['from'], 'platform': c['rides'][0]['platform'],
+                      'lines': [x['line'] for x in c['rides']], 'wait': c['wait'], 'link': link(c),
+                      'off': c['rides'][-1]['at'], 'off_arr': c['rides'][-1]['arr'].isoformat(), 'walk_min': c['walk']}
+    return {'home': r['home'], 'near': r.get('near'), 'origin': r['origin'], 'source': r['source'],
+            'unknown_stop': r.get('unknown_stop'), 'now': r['now'].isoformat(), 'next': [cj(c) for c in r['next']],
+            'last': cj(r['last'])}
+
+
+def main(argv):
+    if any(a in ('-h', '--help') for a in argv):
+        print(__doc__.strip())
+        return 0
+    js = '--json' in argv
+    args = [a for a in argv if a != '--json']
+    if len(args) > 1 or any(a.startswith('--') for a in args):
+        print('usage: gohome [STOP] [--json]', file=sys.stderr)
+        return 2
+    arg = ' '.join(args[0].split()) if args else None
+    t = now()
+    r = resolve(arg, t)
+    if r['origin']:
+        try:
+            stop = stop_name(r['origin'])
+            if not stop:
+                if js:
+                    print(json.dumps(as_json({**r, 'origin': None, 'unknown_stop': r['origin']}), ensure_ascii=False,
+                                     indent=1))
+                else:
+                    print(f"🚏 No stop called “{r['origin']}” found.\nSend /gohome <stop> with the station name.")
+                return 0
+            if r['source'] == 'argument':
+                r['label'] = stop
+            r['origin'] = stop
+            r['next'], r['last'] = plan(r['origin'], t)
+        except Fail as e:
+            print(f'gohome: {e}', file=sys.stderr)
+            return 1
+    print(json.dumps(as_json(r), ensure_ascii=False, indent=1) if js else card(r))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

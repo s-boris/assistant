@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.geo.response.json",
+  "title": "GET /v1/geo/<pack> (mTLS; ETag/If-None-Match -> 304). Offline place pack for place.town/place.stop, computed on the phone: towns = centroid of their stops (3 decimals), stops = public stop positions (4 decimals). Fetch on connect and daily.",
+  "type": "object",
+  "properties": {
+    "pack": {
+      "enum": [
+        "ch"
+      ]
+    },
+    "built": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tz": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "towns": {
+      "type": "array",
+      "maxItems": 5000,
+      "items": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "prefixItems": [
+          {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90
+          },
+          {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180
+          }
+        ],
+        "items": false
+      }
+    },
+    "stops": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "array",
+        "minItems": 3,
+        "maxItems": 3,
+        "prefixItems": [
+          {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90
+          },
+          {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180
+          }
+        ],
+        "items": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "pack",
+    "towns",
+    "stops"
+  ]
+}

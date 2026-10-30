@@ -1,0 +1,71 @@
+#!/usr/bin/env -S python3 -I
+"""drive-update: tell the owner something while he drives, in his decided order (token-free, one attempt each).
+
+  drive-update "TEXT" [--lang de] [--dry-run] [--json]
+
+  1. `voice-relay call --reason TEXT`: a call (his decided channel while driving). Exit 0 = he answered: done.
+  2. Missed/declined/busy/rate-limited (any other exit): `phone car TEXT --wait 20` = an Android Auto message in the
+     phone app (Android Auto reads it aloud; he can reply by voice into the app chat). Exit 0 = delivered: done.
+  3. App offline / no ack / refused by the lock-screen lint: `voice-say TEXT` (a short Telegram voice note).
+TEXT: short and spoken-friendly; the car message is linted like the lock screen (no links, amounts, identifiers or
+5+ digit runs; <= 80 chars counts as safe), so keep details for Telegram. Telegram text goes out as usual (my job).
+Prints one line (JSON with --json): via call|car|voice_note|none and each step's exit code.
+Exit: 0 delivered somewhere, 1 every step failed, 2 usage.
+Env (tests): VOICE_RELAY_BIN, PHONE_BIN, VOICE_SAY_BIN; DRIVE_UPDATE_CAR=0 skips step 2.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+
+
+def tool(env, name):
+    return os.environ.get(env) or os.path.join(HOME, "bin", name)
+
+
+def run(argv, timeout):
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=timeout).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog="drive-update")
+    p.add_argument("text")
+    p.add_argument("--lang")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    text = " ".join(a.text.split())
+    if not text or len(text) > 600:
+        print("drive-update: TEXT must be 1..600 chars", file=sys.stderr)
+        return 2
+    steps = [("call", [tool("VOICE_RELAY_BIN", "voice-relay"), "call", "--reason", text], 120)]
+    if os.environ.get("DRIVE_UPDATE_CAR", "1") != "0":
+        steps.append(("car", [tool("PHONE_BIN", "phone"), "car", text, "--wait", "20"], 60))
+    steps.append(("voice_note", [tool("VOICE_SAY_BIN", "voice-say")] + (["--lang", a.lang] if a.lang else []) + [text], 120))
+    res = {"via": "none", "steps": []}
+    for name, argv_, timeout in steps:
+        if a.dry_run:
+            res["steps"].append({"step": name, "argv": argv_[:2]})
+            continue
+        rc = run(argv_, timeout)
+        res["steps"].append({"step": name, "exit": rc})
+        if rc == 0:
+            res["via"] = name
+            break
+    if a.json:
+        print(json.dumps(res))
+    else:
+        print("drive-update: " + ("dry run: " + " -> ".join(s["step"] for s in res["steps"]) if a.dry_run else
+                                  "via %s (%s)" % (res["via"], ", ".join("%s %s" % (s["step"], s["exit"]) for s in res["steps"]))))
+    return 0 if a.dry_run or res["via"] != "none" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

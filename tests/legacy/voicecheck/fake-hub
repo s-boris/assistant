@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fake `hub` for voicecheck tests: `hub voice|phone status --json` from $VC_FAKE/hub<part>.json, exit from
+# hub<part>.rc (hubvoice.*, hubphone.*).
+printf '%s\n' "$*" >> "$VC_FAKE/hub.log"
+case "$*" in
+  "voice status --json") p=voice ;;
+  "phone status --json") p=phone ;;
+  *) exit 2 ;;
+esac
+[ -f "$VC_FAKE/hub$p.json" ] && cat "$VC_FAKE/hub$p.json"
+exit "$(cat "$VC_FAKE/hub$p.rc" 2>/dev/null || echo 0)"

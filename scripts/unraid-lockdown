@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+"""unraid-lockdown: prove the owner's SSH lockdown works (plan ~/reports/security/vault-lockdown-plan-2026-10-13.md,
+files ~/opt/unraid-lockdown, tests ~/opt/unraid-lockdown-tests/run.sh).
+
+  unraid-lockdown status      mode (root|verbs), installed dispatcher vs my reviewed copy, collector drift
+  unraid-lockdown preflight   needs a root key (before an install): runs my local dispatcher on the server
+                              (emulate; read-only verbs only, nothing installed) and compares every verb with the
+                              root-key path (same sections, same containers, same pretrip lists, same Emby rows)
+  unraid-lockdown verify      after an install or reinstall: a harmless gate first (the forced command must answer
+                              and refuse a non-verb), then every must-FAIL case of section D and every must-work
+                              verb and script (3.4: smb-shares, users, wg-status print no key or hash);
+                              then the owner's rights verbs: hello = package version + sha,
+                              the read-only listings and vm-info (one VM) must work, and must-DENY probes that
+                              change nothing (the vault/assistant as targets, credential file names, injection
+                              strings, http and lookalike ISO hosts, raw XML, vm-stop / vm-autostart off of a
+                              critical VM without --confirm; never an OK reference, --confirm or --force) must
+                              be refused before the verb acts.
+                              Prints a short proof for the owner; full report in
+                              ~/reports/security/lockdown-verify-YYYY-MM-DD.md. Exit 0 = all good.
+Never prints secrets: vault log lines are only counted; the stdout of a probe or listing is never shown.
+Dispatcher verbs: the list its `hello` prints (read-only ones, backup-store, the owner's rights verbs); anything
+else is refused.
+Installed copy vs my package (~/opt/unraid-lockdown/RELEASES, written by its build):
+  same sha256                    -> "= the copy you reviewed"
+  an OLDER release of mine       -> "package newer than server; reinstall pending": not a failure (exit 0 when the
+                                    rest passes); verbs the installed copy lacks are skipped, not failed
+  a sha256 I never built         -> FAIL (exit 1)
+  no dispatcher answering hello  -> "not locked yet (install pending)", exit 2, nothing else tried
+Nothing runs verify or status on a cron: run them by hand after an install or reinstall.
+"""
+import datetime as dt
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, "bin")
+LD = os.environ.get("UNRAID_LOCKDOWN_DIR") or os.path.join(HOME, "opt", "unraid-lockdown")   # tests: a staged package
+LOCAL_CBC = os.environ.get("UNRAID_LOCKDOWN_DISPATCHER") or os.path.join(LD, "server", "claude-bot-cmd")
+US = os.path.join(BIN, "unraid-ssh")
+HOST = os.environ.get("UNRAID_SSH_HOST", "unraid")
+SSHCFG = os.environ.get("UNRAID_LOCKDOWN_SSH_CONFIG")          # tests: a throwaway sshd
+SSH0 = ["ssh"] + (["-F", SSHCFG] if SSHCFG else [])
+SSH = SSH0 + ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+CFG = ["-F", SSHCFG] if SSHCFG else []
+REPORT_DIR = os.environ.get("UNRAID_LOCKDOWN_REPORT_DIR") or os.path.join(HOME, "reports", "security")
+RELEASES = os.environ.get("UNRAID_LOCKDOWN_RELEASES") or os.path.join(LD, "RELEASES")
+results = []          # (section, ok, text)
+notes = []            # shown above the final line (e.g. reinstall pending)
+
+
+def rec(section, ok, text):
+    results.append((section, bool(ok), text))
+    print(("  ok   " if ok else "  FAIL ") + text, flush=True)
+    return ok
+
+
+def sh(cmd, inp=None, timeout=120, env=None):
+    e = dict(os.environ, **(env or {}))
+    try:
+        p = subprocess.run(cmd, input=inp, capture_output=True, timeout=timeout, env=e)
+        return p.returncode, p.stdout, p.stderr.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return 124, b"", "timeout"
+
+
+def ssh_raw(remote, inp=b"", timeout=60, extra=()):
+    return sh(SSH + list(extra) + [HOST] + ([remote] if remote is not None else []), inp=inp, timeout=timeout)
+
+
+def verb(req, inp=b"", mode=None, timeout=300):
+    env = {"UNRAID_LOCKDOWN_MODE": mode} if mode else None
+    return sh([US, "--host", HOST, "run", *req.split()], inp=inp, timeout=timeout, env=env)
+
+
+def local_sha():
+    with open(LOCAL_CBC, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def releases():
+    """[(version, sha256)] oldest first, as the build recorded them."""
+    try:
+        with open(RELEASES) as f:
+            return [tuple(ln.split()[:2]) for ln in f if len(ln.split()) >= 2]
+    except OSError:
+        return []
+
+
+def classify(installed_sha):
+    """same | older (a release of mine, not the current package) | unknown"""
+    if installed_sha == local_sha():
+        return "same"
+    shas = [s for _, s in releases()]
+    return "older" if installed_sha in shas else "unknown"
+
+
+def package_version():
+    m = re.search(rb"^CBC_VERSION=(\S+)$", open(LOCAL_CBC, "rb").read(), re.M)
+    return m.group(1).decode() if m else "?"
+
+
+PENDING = "package newer than server; reinstall pending"
+
+
+def sections(out, marker):
+    return [ln.split()[1] for ln in out.decode("utf-8", "replace").splitlines() if ln.startswith(marker)]
+
+
+def load(name):
+    ld = importlib.machinery.SourceFileLoader(name.replace("-", "_"), os.path.join(BIN, name))
+    sp = importlib.util.spec_from_loader(ld.name, ld)
+    m = importlib.util.module_from_spec(sp)
+    ld.exec_module(m)
+    return m
+
+
+# ------------------------------------------------------------------------------------------------ status
+def cmd_status():
+    print(subprocess.run([US, "status"], capture_output=True, text=True).stdout.rstrip())
+    r = subprocess.run([os.path.join(LD, "build"), "--check"], capture_output=True, text=True)
+    print("collectors: " + r.stdout.strip())
+    rc, out, _ = ssh_raw("hello", timeout=40)
+    m = re.match(r"claude-bot-cmd (\S+) sha256=([0-9a-f]{64})", out.decode("utf-8", "replace"))
+    if m:
+        kind = classify(m.group(2))
+        print(f"installed dispatcher: v{m.group(1)} sha256 {m.group(2)[:12]}… " + {
+            "same": "= my reviewed copy",
+            "older": f"(an older release): {PENDING} (package v{package_version()} {local_sha()[:12]}…)",
+            "unknown": "is NOT a release of mine (~/opt/unraid-lockdown/RELEASES): ask the owner what is installed"}[kind])
+    else:
+        print("installed dispatcher: none (my key is not locked yet; install pending)")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ preflight
+def cmd_preflight():
+    print("preflight: verbs over a root key (emulate), compared with the root-key path; read-only")
+    rc, out, _ = ssh_raw("hello", timeout=40)
+    if out.startswith(b"claude-bot-cmd "):
+        print("my key is already locked: use `unraid-lockdown verify`")
+        return 2
+    E = "emulate"
+    rc, out, err = verb("hello", mode=E)
+    rec("pre", rc == 0 and out.startswith(b"claude-bot-cmd "), "dispatcher runs on the server (emulate)")
+    # version
+    rc1, a, _ = ssh_raw("cat /etc/unraid-version")
+    rc2, b, _ = verb("version", mode=E)
+    rec("pre", rc2 == 0 and a == b and b"version=" in b, "version = legacy")
+    # health / capacity: root-key collectors vs verbs
+    uh, uc, cw, hh = load("unraid-health"), load("unraid-capacity"), load("container-watch"), load("hddheat")
+    for name, script, v, marker, end in (("health", uh.collector_script(), "health", "=====UH ", "=====UH end"),
+                                         ("capacity", uc.COLLECTOR, "capacity", "=====UC ", "=====UC end"),
+                                         ("heat", hh.COLLECTOR, "heat", "=====HH ", "=====HH end")):
+        rc1, a, _ = ssh_raw("bash -s", inp=script.encode(), timeout=300)
+        rc2, b, _ = verb(v, mode=E)
+        drop = {"smartctl", "smart_cache"}          # spin state may change between the two reads
+        sa = [s for s in sections(a, marker) if s not in drop]
+        sb = [s for s in sections(b, marker) if s not in drop]
+        rec("pre", rc2 == 0 and end.encode() in b and sa == sb,
+            f"{name}: same {len(sb)} sections as legacy" + ("" if sa == sb else f" (legacy {len(sa)})"))
+    # containers: same containers; env/history only without claude-vault
+    rc1, a, _ = ssh_raw("bash -s", inp=cw.COLLECTOR.encode(), timeout=300)
+    rc2, b, _ = verb("containers", mode=E)
+
+    def sec(o, s):
+        t = o.decode("utf-8", "replace")
+        m = re.search(r"^@@" + s + r"\n(.*?)(?=^@@)", t, re.S | re.M)
+        return (m.group(1) if m else "").splitlines()
+    names = lambda o: sorted(re.findall(r'"name":"(/[^"]+)"', "\n".join(sec(o, "containers"))))
+    env_a = sorted(x for x in sec(a, "env") if not x.startswith("/claude-vault"))
+    rec("pre", rc2 == 0 and b"@@end" in b and names(a) == names(b) and env_a == sorted(sec(b, "env"))
+        and not any(x.startswith("/claude-vault") for x in sec(b, "env")),
+        f"containers: same {len(names(b))} containers, same env lines minus claude-vault's")
+    # pretrip: pretrip-check's collector through the verb = the root-key path (the two HA counts may move between reads)
+    pc = load("pretrip-check")
+    rc1, a, _ = ssh_raw("bash -s", inp=pc.EXTRA_COLLECTOR.encode(), timeout=120)
+    rc2, b, _ = verb("pretrip", mode=E, timeout=120)
+    xa, xb = (pc.parse_extra(o.decode("utf-8", "replace")) for o in (a, b))
+    same = all(xa[k] == xb[k] for k in ("autostart", "ab_plugins", "ab_dirs"))
+    rec("pre", rc2 == 0 and b"@@end" in b and same,
+        f"pretrip: same autostart list ({len(xb['autostart'])}), backup plugins ({len(xb['ab_plugins'])}) and "
+        f"backup folders ({len(xb['ab_dirs'])}) as legacy")
+    # cputemp: the verb's loop = the raw loop (same topology line, same sample fields; values move between reads)
+    ct = load("cputemp-log")
+    rc1, a, _ = ssh_raw("bash -c " + shlex.quote(ct.REMOTE), inp=b"s\n", timeout=60)
+    rc2, b, _ = verb("cputemp", inp=b"s\n", mode=E, timeout=60)
+    la, lb = (o.decode("utf-8", "replace").splitlines() for o in (a, b))
+    keys = lambda ls: [kv.split("=")[0] for ln in ls if ln.startswith("S ") for kv in ln.split()[1:]]
+    rec("pre", rc2 == 0 and len(lb) == 2 and la[:1] == lb[:1] and keys(la) == keys(lb) and lb[0].startswith("T "),
+        "cputemp: same topology line and sample fields as the raw /sys loop")
+    # dl-creds is gone: the dispatcher must refuse it like any unknown verb
+    rc, out, err = verb("dl-creds", mode=E, timeout=60)
+    rec("pre", refused(rc, out, err), "dl-creds: removed (refused, nothing printed)")
+    # emby: media's split queries through the verb = the root-key combined query
+    md = load("media")
+    try:
+        md.EMBY_SQL = md.EMBY_SQL_ROOT
+        h1 = md.emby_history()
+        md.EMBY_SQL = md.EMBY_SQL_VERBS
+        os.environ["UNRAID_LOCKDOWN_MODE"] = E
+        h2 = md.emby_history()
+        os.environ.pop("UNRAID_LOCKDOWN_MODE", None)
+        c1 = (len(h1["plays"]), len(h1["items"]), len(h1["eps"]))
+        c2 = (len(h2["plays"]), len(h2["items"]), len(h2["eps"]))
+        rec("pre", c1 == c2 and c2[1] > 0, f"emby-sql: media's split queries = legacy rows (plays/items/episodes {c2})")
+    except Exception as e:
+        os.environ.pop("UNRAID_LOCKDOWN_MODE", None)
+        rec("pre", False, f"emby-sql: {type(e).__name__}: {str(e)[:120]}")
+    # backups (read-only: list + cat through brain-backup --verify)
+    rc1, a, _ = ssh_raw("ls -lh /mnt/user/backup/claude-bot")
+    rc2, b, _ = verb("backup-list", mode=E)
+    rec("pre", rc2 == 0 and a == b, "backup-list = legacy")
+    rc, out, err = sh([os.path.join(BIN, "brain-backup"), "--verify"], timeout=600, env={"UNRAID_LOCKDOWN_MODE": E})
+    rec("pre", rc == 0, "brain-backup --verify via backup-list + backup-cat: " + (out.decode().strip().splitlines() or ["?"])[-1][:80])
+    for v, want in (("vault-ps", b"claude-vault"), ("vault-logs 3", b""), ("vault-deployed", b"")):
+        rc, out, _ = verb(v, mode=E)
+        rec("pre", rc == 0 and want in out, f"{v} works ({len(out.splitlines())} line(s), not shown)")
+    return summary("preflight", write=False)
+
+
+# ------------------------------------------------------------------------------------------------ verify
+MUST_FAIL = [
+    ("D2", "id; bash -lc uname", b""),
+    ("D3", "docker exec claude-vault sh", b""),
+    ("D4", "docker inspect claude-vault", b""),
+    ("D5", "cat /mnt/user/appdata/claude-vault/.env", b""),
+    ("D6", "ls /var/lib/docker/volumes/claude-vault_data/_data", b""),
+    ("D7", "docker run --rm -v claude-vault_data:/d alpine cat /d/state/console.key", b""),
+    ("D9", "docker restart claude-vault", b""),
+    ("D9", "docker compose down", b""),
+    ("D10", "docker compose -f /mnt/user/appdata/claude-vault/docker-compose.yml build", b""),
+    ("D10", "rsync --server -vlogDtpre.iLsfxCIvu . /mnt/user/appdata/claude-vault/", b""),
+    ("D11", "backup-store ../../etc/x", b""),
+    ("D11", "backup-store evil.sh", b""),
+    ("D11", "backup-cat /etc/shadow", b""),
+    ("D11", "backup-store claude-bot-2020-01-01.tar.gz", b""),
+    ("D12", "emby-sql playback", b"ATTACH 'file:/mnt/user/appdata/claude-vault/x.db' AS x"),
+    ("D12", "emby-sql playback", b"SELECT 1; DROP TABLE PlaybackActivity"),
+    ("D12", "emby-sql library", b"SELECT readfile('/mnt/user/appdata/claude-vault/.env')"),
+    ("D12", "emby-sql playback", b".shell id"),
+    ("--", "nsenter -t 1 -m -u -n -i sh", b""),
+    ("--", "cat /proc/1/root/etc/shadow", b""),
+    ("v2", "dl-creds", b""),                      # must stay refused (downloader keys)
+]
+
+
+def refused(rc, out, err):
+    return rc != 0 and "claude-bot-cmd: rejected" in err and not out
+
+
+# The owner's rights verbs: must-DENY probes that change nothing. Each is refused by the dispatcher before it acts:
+# by the character filter (; $ < > : / ' are outside [A-Za-z0-9._ -]), or by a name/host/OK check that runs before
+# any docker, virsh, curl or file access (vm-stop, vm-autostart: only the read-only virsh list/domstate/domname run
+# before the critical-VM refusal). No probe carries an OK reference, --confirm or --force (probe_safe enforces that).
+# vm-autostart is probed only as "off" of a critical VM (refused twice over: no --confirm, no OK) or with
+# characters the filter refuses; vm-detach-iso only with refused characters.
+ZERO_SHA = "0" * 64
+RIGHTS_DENY = [  # (verb, request, refusal reason it must give)
+    ("docker-restart", "docker-restart claude-vault", r"off limits"),
+    ("docker-restart", "docker-restart claude-bot", r"off limits"),
+    ("docker-update", "docker-update claude-bot", r"needs the owner's OK|needs his tap|off limits"),
+    ("appdata-get", "appdata-get claude-vault .env", r"off limits"),
+    ("appdata-get", "appdata-get radarr apikey.xml", r"looks like a credential file"),
+    ("appdata-get", "appdata-get sonarr .ssh id_ed25519", r"looks like a credential file"),
+    ("userscript-run", "userscript-run backup;id", r"characters outside"),
+    ("userscript-run", "userscript-run x$(id)", r"characters outside"),
+    ("iso-fetch", f"iso-fetch http://releases.ubuntu.com/24.04/probe.iso {ZERO_SHA}", r"characters outside"),
+    ("iso-fetch", f"iso-fetch releases.ubuntu.com.invalid 24.04 probe.iso {ZERO_SHA}", r"not on the ISO host list"),
+    ("vm-create", "vm-create <domain type='kvm'><name>probe</name></domain>", r"characters outside"),
+    ("vm-stop", "vm-stop {critical}", r"is critical|no VM named"),
+    ("vm-autostart", "vm-autostart {critical} off", r"is critical|no VM named"),
+    ("vm-autostart", "vm-autostart x;id on", r"characters outside"),
+    ("vm-detach-iso", "vm-detach-iso x$(id)", r"characters outside"),
+    ("hub-restart", "hub-restart claude-vault", r"the hub's containers only"),     # 3.6: never the vault or the bot
+    ("hub-restart", "hub-restart claude-bot", r"the hub's containers only"),
+    ("hub-recreate", "hub-recreate claude-vault", r"the hub's containers only"),
+    ("kit-install", "kit-install 000000000000", r"needs his tap"),
+]
+CRITICAL_VM = re.compile(r"home[ ._-]?assistant|hass|haos|pi[ ._-]?hole", re.I)   # = the dispatcher's CRITICAL_VM_RE
+PROTECTED = re.compile(r"claude[-_](vault|bot)", re.I)                          # = its PROTECT_RE
+
+
+def probe_safe(req):
+    """A must-DENY probe never carries what could let a write verb act: an OK reference, --confirm, --force,
+    a docker-restart/update target outside the vault and the assistant, an ISO host that could resolve, a VM
+    probe that is not a critical-VM refusal, or a vm-autostart / vm-detach-iso the character filter would pass."""
+    w = req.split()
+    if any(re.fullmatch(r"ok-[0-9a-f]{12}", x) or x.startswith("-") for x in w[1:]):
+        return False
+    if w[0] in ("docker-restart", "docker-update") and not (len(w) == 2 and PROTECTED.search(w[1])):
+        return False
+    if w[0] == "iso-fetch" and not (":" in req or w[1].endswith(".invalid")):
+        return False
+    if w[0] == "vm-stop" and not CRITICAL_VM.search(" ".join(w[1:])):
+        return False
+    outside = bool(re.search(r"[^A-Za-z0-9._ -]", req))      # refused by the character filter before any verb runs
+    if w[0] == "vm-autostart" and not (outside or (len(w) >= 3 and w[-1] == "off" and CRITICAL_VM.search(" ".join(w[1:-1])))):
+        return False
+    if w[0] == "vm-detach-iso" and not outside:
+        return False
+    if w[0] in ("hub-restart", "hub-recreate") and not (len(w) == 2 and PROTECTED.search(w[1])):
+        return False
+    if w[0] == "kit-install" and not (len(w) == 2 and re.fullmatch(r"0{12}", w[1])):   # never with an ap- word
+        return False
+    return w[0] in {v for v, _, _ in RIGHTS_DENY}
+
+
+def tsv(out, n):
+    """the lines of a tab-separated listing, None if any line has not exactly n fields"""
+    rows = [ln.split("\t") for ln in out.decode("utf-8", "replace").splitlines() if ln]
+    return rows if all(len(r) == n for r in rows) else None
+
+
+def critical_vm_names(rows):
+    """the VMs vm-list flags critical whose names are safe probe targets (at most 3), else the default name;
+    -> [(name, reason the refusal must give)]: a listed critical VM must be refused as critical"""
+    names = [r[0] for r in rows or [] if r[3] == "critical" and CRITICAL_VM.search(r[0])
+             and re.fullmatch(r"[A-Za-z0-9._ -]{1,64}", r[0]) and r[0] == " ".join(r[0].split())
+             and probe_safe(f"vm-stop {r[0]}")]
+    return [(n, r"is critical") for n in names[:3]] or [("Home Assistant", r"is critical|no VM named")]
+
+
+def vm_info_target(rows):
+    """the first VM vm-list shows whose name is safe to send as words (vm-info only reads)"""
+    for r in rows or []:
+        if re.fullmatch(r"[A-Za-z0-9._ -]{1,64}", r[0]) and r[0] == " ".join(r[0].split()) and \
+                not any(x.startswith("-") or re.fullmatch(r"ok-[0-9a-f]{12}", x) for x in r[0].split()):
+            return r[0]
+    return None
+
+
+def vm_info_ok(out, name):
+    """vm-info's shape: key<TAB>value lines with name/state/vcpus/ram/autostart/iso, this VM, no paths or XML"""
+    rows = tsv(out, 2)
+    keys = {r[0]: r[1] for r in rows or []}
+    return bool(rows) and {"name", "state", "vcpus", "ram", "autostart", "iso"} <= set(keys) and \
+        keys["name"] == name and keys["autostart"] in ("on", "off", "?") and b"/" not in out and b"<" not in out
+
+
+def rights_checks(has, kind, version, sha):
+    """must WORK: the read-only rights verbs; must DENY: the probes above (vm-list first: it names the target)."""
+    print("rights verbs, must WORK (read-only):")
+    skip = lambda v: bool(has) and v not in has
+
+    def work(v, ok, text):
+        if skip(v):
+            rec("info", True, f"{v}: not in the installed dispatcher ({PENDING}), skipped")
+            return None
+        rc, out, err = ssh_raw(text, timeout=120)
+        good = rc == 0 and bool(ok(out))
+        rec("work", good, f"{text} ({len(out.splitlines())} line(s), content not shown)"
+            + ("" if good else f"  (rc {rc})"))
+        return out if good else None
+
+    if kind == "same":
+        rec("work", version == package_version() and sha == local_sha(),
+            f"hello: v{version} (package v{package_version()}), sha256 {'=' if sha == local_sha() else '!='} local build")
+    else:
+        rec("info", True, f"hello: v{version} vs package v{package_version()}: see the gate line")
+    vml = work("vm-list", lambda o: tsv(o, 4) is not None and all(
+        re.fullmatch(r"[0-9a-f-]{36}", r[2]) and r[3] in ("", "critical") for r in tsv(o, 4)), "vm-list")
+    target = vm_info_target(tsv(vml, 4)) if vml is not None else None
+    if target:
+        work("vm-info", lambda o: vm_info_ok(o, target), f"vm-info {target}")
+    elif not skip("vm-info"):
+        if skip("vm-list"):
+            rec("info", True, "vm-info: no vm-list to name a VM, skipped")
+        elif vml is None:
+            rec("work", False, "vm-info: not tried (vm-list failed)")
+        else:
+            rec("info", True, "vm-info: no VM with a plain name to read, skipped")
+    work("iso-list", lambda o: o.startswith(b"# "), "iso-list")
+    work("plugin-list", lambda o: tsv(o, 3) is not None, "plugin-list")
+    work("userscript-list", lambda o: tsv(o, 3) is not None, "userscript-list")
+    work("rights-log", lambda o: len(o.splitlines()) <= 5, "rights-log 5")
+    dl = work("docker-list", lambda o: tsv(o, 3) is not None and all(
+        r[2] in ("ok", "off-limits", "not-unraid-managed") for r in tsv(o, 3)), "docker-list")
+    if dl is not None:
+        rows = tsv(dl, 3)
+        prot = [r for r in rows if PROTECTED.search(r[0])]
+        rec("work", any("claude-vault" in r[0] for r in prot) and all(r[2] == "off-limits" for r in prot),
+            f"docker-list: the vault and the assistant are off-limits ({len(prot)} container(s))")
+    print("rights verbs, must DENY (each refused before it acts; nothing sent could succeed):")
+    probes = []
+    for v, req, why in RIGHTS_DENY:
+        probes += ([(v, req.replace("{critical}", n), w) for n, w in critical_vm_names(tsv(vml, 4) if vml else None)]
+                   if "{critical}" in req else [(v, req, why)])
+    for v, req, why in probes:
+        if skip(v):
+            rec("info", True, f"{v}: not in the installed dispatcher ({PENDING}), skipped")
+            continue
+        if not probe_safe(req):
+            rec("fail", False, f"{req[:70]}: not a safe probe, not sent")
+            continue
+        rc, out, err = ssh_raw(req, timeout=60)
+        reason = next((ln for ln in err.splitlines() if ln.startswith("claude-bot-cmd: ")), "")
+        good = refused(rc, out, err) and re.search(why, reason)
+        rec("fail", good, f"{req[:70]} -> refused" + ("" if good else
+            f"  (rc {rc}, {len(out)} bytes out: not shown; {reason[:90] or 'no refusal line'})"))
+
+
+def cmd_verify(scripts=True):
+    print(f"SSH lockdown verify {dt.datetime.now():%Y-%m-%d %H:%M} (my key -> {HOST})")
+    subprocess.run([US, "mode", "--refresh"], capture_output=True, timeout=90)   # scripts switch to verbs now
+    # gate: harmless probes first; nothing dangerous is sent unless the forced command is really there
+    rc, out, err = ssh_raw("hello", timeout=40)
+    hello = out.decode("utf-8", "replace")
+    m = re.match(r"claude-bot-cmd (\S+) sha256=([0-9a-f]{64})", hello)
+    if not m:
+        print("  the forced command did not answer `hello`: my key is NOT locked yet (install pending).",
+              "Nothing else was tried.")
+        return 2
+    vm = re.search(r"^verbs: (.*)$", hello, re.M)
+    has = set(vm.group(1).split()) if vm else set()
+    rc2, out2, err2 = ssh_raw("true", timeout=40)
+    if not refused(rc2, out2, err2):
+        print("  `true` was not refused: unexpected; stopping before any must-FAIL probe.")
+        return 2
+    kind = classify(m.group(2))
+    rec("gate", kind != "unknown", f"dispatcher v{m.group(1)} sha256 {m.group(2)[:12]}… " + {
+        "same": "= the copy you reviewed",
+        "older": f"= my older release: {PENDING} (package v{package_version()} {local_sha()[:12]}…)",
+        "unknown": "is NOT a release of mine (not in ~/opt/unraid-lockdown/RELEASES): ask the owner"}[kind])
+    if kind == "older":
+        notes.append(f"{PENDING}: the server runs v{m.group(1)}, my package is v{package_version()} "
+                     "(checklist steps 1-2 again; until then the newer verbs are skipped)")
+    print("must FAIL (my key):")
+    rc, out, err = ssh_raw(None, timeout=40)
+    rec("fail", refused(rc, out, err) and "no command" in err, "D1 `ssh unraid` (no command) -> no shell")
+    rc, out, err = sh(SSH0 + ["-tt", "-o", "BatchMode=yes", HOST, "hello"], inp=b"", timeout=40)
+    rec("fail", "PTY allocation request failed" in err, "D1 `ssh -tt unraid` -> no pty")
+    for tag, req, inp in MUST_FAIL:
+        rc, out, err = ssh_raw(req, inp=inp, timeout=60)
+        rec("fail", refused(rc, out, err), f"{tag} {req[:60]}{' <<< ' + inp.decode()[:40] if inp else ''}"
+            + ("" if refused(rc, out, err) else f"  (rc {rc}, {len(out)} bytes out: not shown)"))
+    # forwarding (restrict; the server also has AllowTcpForwarding no)
+    p = subprocess.Popen(SSH + ["-N", "-L", "127.0.0.1:18322:127.0.0.1:22", HOST], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.PIPE)
+    time.sleep(3)
+    rc, out, err = sh(["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/18322; timeout 4 head -c 7 <&3"], timeout=10)
+    p.kill()
+    rec("fail", not out.startswith(b"SSH-"), "D8 ssh -L 127.0.0.1:18322:127.0.0.1:22 -> no tunnel")
+    rc, out, err = sh(SSH + ["-N", "-o", "ExitOnForwardFailure=yes", "-R", "127.0.0.1:0:127.0.0.1:22", HOST], timeout=20)
+    rec("fail", rc not in (0, 124) and "forwarding failed" in err.lower(), "D8 ssh -R -> refused")
+    rc, out, err = sh(SSH0 + ["-o", "BatchMode=yes", "-W", "127.0.0.1:22", HOST], inp=b"", timeout=20)
+    rec("fail", not out.startswith(b"SSH-"), "D8 ssh -W 127.0.0.1:22 -> refused")
+    rc, out, err = sh(["sftp", *CFG, "-o", "BatchMode=yes", "-b", "-", HOST], inp=b"ls /\n", timeout=30)
+    rec("fail", rc != 0, "D10 sftp -> refused")
+    rc, out, err = sh(["scp", *CFG, "-o", "BatchMode=yes", f"{HOST}:/etc/hostname", "/dev/null"], timeout=30)
+    rec("fail", rc != 0, "D10 scp -> refused")
+    # pinned to verbs: tests the client's refusal and can never send a restart, whatever the probe says
+    rc, out, err = sh([os.path.join(BIN, "vault"), "admin", "restart"], timeout=120, env={"UNRAID_LOCKDOWN_MODE": "verbs"})
+    rec("fail", rc == 2, "D10 vault admin restart -> refused (deploys are the owner's)")
+    print("must WORK (verbs):")
+    checks = [("version", lambda o: b"version=" in o), ("health", lambda o: b"=====UH end" in o),
+              ("capacity", lambda o: b"=====UC end" in o), ("heat", lambda o: b"=====HH end" in o),
+              ("containers", lambda o: b"@@end" in o),
+              ("pretrip", lambda o: b"@@ab_dirs" in o and b"@@end" in o),
+              ("backup-list", lambda o: b"claude-bot-" in o), ("vault-ps", lambda o: b"claude-vault" in o),
+              ("vault-logs 3", lambda o: True), ("vault-deployed", lambda o: bool(o.strip())),
+              ("fcp", lambda o: o.startswith(b"# source=") or o == b"no results\n"),
+              # 3.4: no key (44-char base64), no NT hash (32 hex) in what they print
+              ("smb-shares", lambda o: o.startswith(b"# smb=") and not re.search(rb"[0-9A-Fa-f]{32}", o)),
+              ("users", lambda o: o.startswith(b"# users=") and not re.search(rb"[0-9A-Fa-f]{32}|:[0-9]+:", o)),
+              ("wg-status", lambda o: o.startswith(b"# wireguard: ") and not re.search(rb"[A-Za-z0-9+/]{42,43}=", o)),
+              ("cputemp", lambda o: re.fullmatch(rb"T emax=\S* pcpus=\S* topo=\S*\nS ts=[0-9.]+ pkg=.*\n", o))]
+    for v, good in checks:
+        if has and v.split()[0] not in has:
+            rec("info", True, f"{v}: not in the installed dispatcher ({PENDING}), skipped")
+            continue
+        rc, out, err = ssh_raw(v, inp=b"s\n" if v == "cputemp" else b"", timeout=300)
+        rec("work", rc == 0 and bool(good(out)), f"{v} ({len(out.splitlines())} line(s), content not shown)")
+    rc, out, err = ssh_raw("containers", timeout=300)
+    t = out.decode("utf-8", "replace")
+    envsec = re.search(r"^@@env\n(.*?)^@@images", t, re.S | re.M)
+    rec("work", '"name":"/claude-vault"' in t and not (envsec and "/claude-vault" in envsec.group(1))
+        and "Mounts" not in t and "VAULT_TOKEN" not in t, "D4 containers: claude-vault listed without Env/Mounts")
+    for db in ("playback", "library"):
+        rc, out, err = ssh_raw(f"emby-sql {db}", inp=b"SELECT count(*) FROM sqlite_master;", timeout=120)
+        rec("work", rc == 0 and out.strip(b"\x1e\n").isdigit(), f"emby-sql {db}: read-only SELECT works")
+    rights_checks(has, kind, m.group(1), m.group(2))
+    print("must WORK (my scripts):" if scripts else "must WORK (my scripts): skipped (--no-scripts)")
+    scripts = [] if not scripts else [(["unraid-health", "--dry-run"], (0, 1)), (["unraid-capacity", "forecast", "--live"], (0,)),
+               (["hwtrend", "--dry-run"], (0, 1)), (["container-watch", "--dry-run"], (0, 1)),
+               (["hddheat", "--dry-run"], (0, 1)), (["pretrip-check", "--json", "--no-verify"], (0, 1)),
+               (["brain-backup"], (0,)), (["brain-backup", "--list"], (0,)),
+               (["brain-backup", "--verify"], (0,)), (["vault", "admin", "ps"], (0,)), (["vault", "status"], (0,))]
+    for argv, okrc in scripts:
+        rc, out, err = sh([os.path.join(BIN, argv[0]), *argv[1:]], timeout=600)
+        rec("work", rc in okrc, f"{' '.join(argv)} (exit {rc})")
+    rec("info", True, "13-14 (vault approvals, part C): inside the vault, not an SSH matter")
+    rec("info", True, f"your laptop key: I can't test it - please run `ssh root@{server_name()}` from the laptop once")
+    return summary("verify", write=True, sha=m.group(2))
+
+
+def server_name():
+    """The server's name for the laptop hint: profile network.server_name, lowercased (no personal value in code)."""
+    try:
+        p = subprocess.run([os.path.join(BIN, "profile-get"), "network.server_name"], capture_output=True, text=True,
+                           timeout=10, check=False)
+        name = p.stdout.strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        name = ""
+    return name.lower() or "<your server>"
+
+
+def summary(kind, write, sha=None):
+    bad = [r for r in results if not r[1]]
+    nf = sum(1 for r in results if r[0] == "fail")
+    nw = sum(1 for r in results if r[0] == "work")
+    lines = [f"# SSH lockdown {kind} {dt.datetime.now():%Y-%m-%d %H:%M}", ""]
+    if kind == "verify":
+        g = results[0][2]
+        lines += [f"- dispatcher sha256 {sha[:12]}… " + ("= reviewed copy" if "= the copy" in g else
+                                                        PENDING if PENDING in g else "NOT a release of mine"),
+                  f"- must FAIL: {sum(1 for r in results if r[0] == 'fail' and r[1])}/{nf} refused",
+                  f"- must WORK: {sum(1 for r in results if r[0] == 'work' and r[1])}/{nw} ok", ""]
+    lines += [("- ok   " if ok else "- FAIL ") + text for _, ok, text in results]
+    lines += [f"- NOTE {n}" for n in notes]
+    print("\n" + "\n".join(lines[2:6] if kind == "verify" else []) + "".join(f"\nNOTE {n}" for n in notes) +
+          (f"\n{len(bad)} problem(s)" if bad else "\nALL GOOD" + (f" ({PENDING})" if notes else "")))
+    if write:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        path = os.path.join(REPORT_DIR, f"lockdown-verify-{dt.date.today()}.md")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"report: {path}")
+    return 1 if bad else 0
+
+
+def main(argv):
+    cmd = argv[0] if argv else "status"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if cmd == "verify":
+        return cmd_verify(scripts="--no-scripts" not in argv)
+    return {"status": cmd_status, "preflight": cmd_preflight}.get(
+        cmd, lambda: print(f"unknown command {cmd} (status|preflight|verify)") or 2)()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

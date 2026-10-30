@@ -1,0 +1,978 @@
+#!/usr/bin/env python3
+"""skillforge: turn repeated asks and repeated tool sequences into draft skills / scripts (token-free; proposals only).
+
+  skillforge mine [--days 14] [--top 15] [--json]
+        Candidates from the session transcripts + the usage store: (a) recurring owner intents: his use-turns
+        (labels from usage.db `turns`; build/test/maint turns, taps, polls and reactions skipped) embedded with the
+        local EmbeddingGemma (recall's llama-server; hashed bag-of-words fallback) and clustered; (b) recurring tool
+        sequences: the same contiguous run of 2-5 steps (~/bin script + verb, skill, MCP tool) in >= min_turns turns on
+        >= min_days days (any trigger: owner, heartbeat, agent notes). Score = frequency x my cost per turn (tool calls,
+        seconds to first reply) x trouble (tool errors + his corrections/complaints right after) x gap (1 - coverage by
+        an existing skill, instant command or menu command). Writes ~/.local/state/skillforge/candidates.json:
+        counts, turn ids and keywords only, never message text.
+  skillforge draft [--top 3] [--id CAND]
+        Skeleton drafts for the top uncovered, undecided candidates -> ~/opt/skillforge/staging/<name>/: SKILL.md
+        (frontmatter + TODOs), meta.json, evidence.json, evals/evals.json + evals/trigger-evals.json in
+        anthropic-skills:skill-creator's schema; sequence drafts also get scripts/<name> + tests/run.sh stubs.
+        The main session fleshes a skeleton out (skill-creator conventions), then `propose`s it.
+  skillforge list [--json]                     staged drafts: status skeleton|proposed|accepted|rejected|installed
+  skillforge check NAME                        skill-creator quick_validate.py + the draft's tests/run.sh
+  skillforge propose NAME                      check, then status proposed (listed in the weekly note)
+  skillforge accept NAME | reject NAME [--why TEXT]   his decision; drop NAME --why TEXT = my triage (covered, noise)
+        Rejected/dropped candidates are never re-proposed (same id or steps, or an intent centroid >= 0.95 similar).
+  skillforge install NAME [--dry-run]          accepted (or auto-installable) draft -> ~/.claude/skills/NAME, its
+        scripts/ -> ~/bin via an atomic mv, its bindings.json (tg-bind import format: {"rows": [{kind, key, tool,
+        why, …}]}) -> `tg-bind import` once the files are in; refuses to overwrite anything (a file, or an active
+        tg-bind row with the same kind and key) and checks the rows first with `tg-bind import --dry-run` (every
+        tool must already be in the tools registry: a new script needs a registry tool in ~/opt/assistant first,
+        then a land). A draft that still has an instant.json is refused: convert it to bindings.json.
+        Then: TOOLS.md line, brain-commit.
+  skillforge stats [--json]                    proposed / accepted / rejected / installed, acceptance rate, uses of
+        installed drafts (usage.db) = the catalogue metric
+  skillforge weekly [--cron] [--dry-run]       mine + draft + ~/reports/product/skillforge-DATE.md; ONE
+        ~/inbox/skillforge-DATE.md only when there are new skeletons or proposals awaiting his decision.
+        auto_install_readonly (config, default false) installs proposed drafts with risk "readonly" only.
+Config ~/.config/skillforge/config.json: window_days, min_turns, min_days, top, cluster_sim, auto_install_readonly.
+Env (tests): SKILLFORGE_TRANSCRIPTS, SKILLFORGE_DB, SKILLFORGE_STAGING, SKILLFORGE_STATE, SKILLFORGE_CONFIG,
+SKILLFORGE_REPORTS, SKILLFORGE_INBOX, SKILLFORGE_SKILLS, SKILLFORGE_BIN_DIR, SKILLFORGE_TG_DIR (commands.json),
+SKILLFORGE_TG_BIND (the tg-bind command; default ~/bin/tg-bind: `menu --json`, `list --json`, `import`), SKILLFORGE_VALIDATOR, SKILLFORGE_EMBED=hash, SKILLFORGE_NOW (epoch); USAGE_* for the usage lib.
+Exit: 0 ok, 1 error, 2 usage / refused.
+"""
+import argparse
+import glob
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+
+sys.dont_write_bytecode = True
+BIN = os.path.dirname(os.path.realpath(__file__))
+LIB = os.environ.get("SKILLFORGE_LIB") or (os.path.join(BIN, "lib") if os.path.isdir(os.path.join(BIN, "lib"))
+                                          else os.path.expanduser("~/bin/lib"))
+sys.path.insert(0, LIB)
+import usage  # noqa: E402
+
+HOME = os.path.expanduser("~")
+
+
+def _p(env, rel):
+    return os.environ.get(env) or os.path.join(HOME, rel)
+
+
+TRANSCRIPTS = _p("SKILLFORGE_TRANSCRIPTS", ".claude/projects/-home-node-workspace")
+DB = os.environ.get("SKILLFORGE_DB") or usage.DB
+STAGING = _p("SKILLFORGE_STAGING", "opt/skillforge/staging")
+STATE = _p("SKILLFORGE_STATE", ".local/state/skillforge")
+CONFIG = _p("SKILLFORGE_CONFIG", ".config/skillforge/config.json")
+REPORTS = _p("SKILLFORGE_REPORTS", "reports/product")
+INBOX = _p("SKILLFORGE_INBOX", "inbox")
+SKILLS = _p("SKILLFORGE_SKILLS", ".claude/skills")
+BIN_DIR = _p("SKILLFORGE_BIN_DIR", "bin")
+TG_DIR = _p("SKILLFORGE_TG_DIR", ".claude/channels/telegram")
+TG_BIND = os.environ.get("SKILLFORGE_TG_BIND") or os.path.join(HOME, "bin", "tg-bind")
+VALIDATOR = os.environ.get("SKILLFORGE_VALIDATOR") or next(iter(sorted(glob.glob(os.path.join(
+    HOME, ".claude/skills/synced/*/skill-creator/scripts/quick_validate.py")))), "")
+DEFAULTS = {"window_days": 14, "min_turns": 3, "min_days": 2, "top": 3, "cluster_sim": 0.6,
+            "auto_install_readonly": False}
+STATUSES = ("skeleton", "proposed", "accepted", "rejected", "dropped", "installed")
+
+# shell words that say nothing about the workflow (reading, plumbing, editing)
+GENERIC = set("""grep egrep rg cat head tail sed awk ls echo cd find wc sort uniq cut tr xargs printf test true false
+sleep date stat mkdir cp mv rm chmod chown touch tee jq diff python3 python bash sh env export source set for while if
+do done then fi else timeout nl column file readlink basename dirname realpath du df ps pgrep pkill kill which type
+command git less more cmp ln install mktemp trap wait exit read local unset shift case esac sudo nohup time
+""".split())
+COMM = {"tg:reply", "tg:react", "tg:draft", "tg:edit_message", "tg:send_poll", "tg:chat_action", "tg:pin_message",
+        "tg:delete_message", "agent", "tg", "tg-buttons", "toolsearch"}
+STOP = set("""this that with what when where which have from your about just they them then there their will would
+could should also into than more some like only been were want need does done make made know think going yeah okay
+please thanks thank sure maybe still again much very really here other already right well good dass oder aber nicht
+noch auch eine einen einem einer schon kann soll will wird wäre bitte danke machen gibt habe hast haben sind ist mal
+jetzt heute morgen wieder alles etwas dann denn doch weil wenn wie was wer wo für über unter mit mein meine deine
+dein mir mich dir dich uns euch ihr sie er es ein der die das den dem des und zu im am vom zum zur nach vor bei aus
+""".split())
+OPS = {"brain-commit", "restart", "codebase-sync", "agent-watch", "board-lint", "secretscan", "brain", "test-all",
+       "waiting-nudge", "tg-status", "channel-check", "self-review", "plugin-drift", "risk-ok", "hb-gate"}
+PREFIX = re.compile(r"^\s*(?:🎙️|🗣️|📱)\s*\([^)]{0,40}\)\s*")
+URL = re.compile(r"https?://\S+")
+WORD = re.compile(r"[a-zäöüß][a-zäöüß-]{3,}")
+
+
+# ---------------------------------------------------------------- config / state
+def now():
+    return float(os.environ.get("SKILLFORGE_NOW") or time.time())
+
+
+def config():
+    c = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            c.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+    except (OSError, ValueError):
+        pass
+    return c
+
+
+def _load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _save(path, obj, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".sf-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+        f.write("\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def decisions():
+    return _load(os.path.join(STATE, "decisions.json"), {})
+
+
+def _log(verb, outcome="ok", ms=None, kind="run", **attrs):
+    usage.log("bin.skillforge", kind=kind, outcome=outcome, ms=ms, attrs=dict(attrs, verb=verb))
+
+
+# ---------------------------------------------------------------- transcripts -> turns
+def tool_tokens(b):
+    """Workflow steps of one tool_use block (no arguments, no text)."""
+    name, inp = b.get("name") or "", b.get("input") or {}
+    if name == "Bash":
+        cmd = inp.get("command") or ""
+        out = [f"{s} {v}" if v and re.fullmatch(r"[a-z][a-z0-9_-]{0,23}", v) else s for s, v in usage.scripts(cmd)]
+        if out:
+            return out
+        m = re.match(r"\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:cd\s+\S+\s*(?:&&|;)\s*)?([A-Za-z0-9_.-]+)", cmd)
+        w = m.group(1) if m else ""
+        return ["sh:" + w] if w and w not in GENERIC and not w.startswith(".") else []
+    if name == "Skill":
+        return ["skill:" + str(inp.get("skill") or "?")[:40]]
+    if name == "Agent":
+        return ["agent"]
+    if name.startswith("mcp__"):
+        verb = name.rsplit("__", 1)[-1]
+        if "_telegram__" in name:
+            return ["tg:" + verb]
+        if "Google_Calendar" in name:
+            return ["calendar:" + verb]
+        if name.startswith("mcp__browser__"):
+            return ["browser:" + verb.replace("browser_", "")]
+        return ["mcp:" + verb]
+    if name in ("Read", "Edit", "Write"):
+        p = str(inp.get("file_path") or "")
+        base = os.path.basename(p)
+        if base in usage.MEMFILES:
+            return [f"{name.lower()}:{base}"]
+        if "/.claude/skills/" in p:
+            return [f"{name.lower()}:skill/{p.split('/.claude/skills/')[1].split('/')[0]}"]
+        return []
+    if name in ("WebSearch", "WebFetch"):
+        return ["web:" + name[3:].lower()]
+    return []
+
+
+def scan(paths=None):
+    """{turn id: turn} over the main-session transcripts. Owner text is kept in memory only."""
+    turns, cur = {}, None
+    paths = paths or sorted(glob.glob(os.path.join(TRANSCRIPTS, "*.jsonl")))
+    for path in paths:
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            continue
+        with fh:
+            for raw in fh:
+                if not (b'"tool_use"' in raw or b'"tool_result"' in raw or b'"origin"' in raw or b"[heartbeat]" in raw
+                        or b"<channel" in raw or b"task-notification" in raw or b'"promptSource"' in raw):
+                    continue
+                try:
+                    e = json.loads(raw)
+                except ValueError:
+                    continue
+                if e.get("isSidechain") or e.get("type") not in ("user", "assistant", "attachment"):
+                    continue
+                ts = usage.iso(e.get("timestamp"))
+                if ts is None:
+                    continue
+                msg = e.get("message") or {}
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if e["type"] == "assistant":
+                    if cur is None:
+                        continue
+                    for b in content if isinstance(content, list) else []:
+                        if isinstance(b, dict) and b.get("type") == "tool_use":
+                            cur["calls"] += 1
+                            cur["end"] = ts
+                            for t in tool_tokens(b):
+                                if not cur["seq"] or cur["seq"][-1] != t:
+                                    cur["seq"].append(t)
+                            if (b.get("name") or "").endswith(("__reply", "__send_poll")) and cur["reply"] is None:
+                                cur["reply"] = ts
+                    continue
+                if isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                                     for b in content):
+                    if cur is not None:
+                        cur["errors"] += sum(1 for b in content if isinstance(b, dict) and b.get("is_error"))
+                    continue
+                et = usage._entry_text(e)
+                if et is None:
+                    continue
+                entry, text, _ = et
+                trig = usage._trigger(entry, text or "")
+                if not trig:
+                    continue
+                tid = usage._h(str(entry.get("uuid") or ts))
+                body = ""
+                if trig[0] == "owner":
+                    m = usage.TAG.search(text or "")
+                    body = html.unescape(m.group(2).strip()) if m else (text or "").strip()
+                    body = URL.sub(" ", PREFIX.sub("", body))[:600]
+                cur = turns[tid] = {"id": tid, "ts": ts, "end": ts, "trigger": trig[0], "ch": trig[1], "text": body,
+                                    "seq": [], "calls": 0, "errors": 0, "reply": None}
+    return turns
+
+
+def db_turns():
+    """turn id -> (label, primary feature, start), and turn id -> feedback ('correction'/'complaint')."""
+    lab, fb = {}, {}
+    if not os.path.exists(DB):
+        return lab, fb
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+        for t, label, pf, start in con.execute("SELECT turn, label, primary_f, start FROM turns"):
+            lab[t] = (label, pf, start)
+        for t, a in con.execute("SELECT turn, attrs FROM events WHERE kind='msg' AND turn IS NOT NULL "
+                                "AND (attrs LIKE '%correction%' OR attrs LIKE '%complaint%')"):
+            fb[t] = (json.loads(a or "{}").get("fb"))
+        con.close()
+    except sqlite3.Error:
+        pass
+    return lab, fb
+
+
+def _day(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------- embeddings + clustering
+class HashEmbed:
+    """Deterministic bag-of-words vectors: tests, and the fallback when EmbeddingGemma cannot start."""
+    name = "hash"
+
+    def embed(self, texts):
+        import numpy as np
+        m = np.zeros((len(texts), 512), dtype=np.float32)
+        for i, t in enumerate(texts):
+            for w in WORD.findall(t.lower()):
+                if w not in STOP:
+                    m[i, int(hashlib.md5(w.encode()).hexdigest(), 16) % 512] += 1
+        return m / np.maximum(np.linalg.norm(m, axis=1, keepdims=True), 1e-9)
+
+    def close(self):
+        pass
+
+
+class GemmaEmbed:
+    """recall's EmbeddingGemma (llama-server for this run; stopped on close)."""
+    name = "embeddinggemma"
+
+    def __init__(self):
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("recall_lib", os.environ.get("SKILLFORGE_RECALL") or os.path.join(os.path.dirname(LIB), "recall"))
+        spec = importlib.util.spec_from_loader("recall_lib", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        self.e = mod.Embedder(nice=True).start()
+
+    def embed(self, texts):
+        import numpy as np
+        out = [self.e.embed(["task: clustering | query: " + " ".join(t.split())[:500] for t in texts[i:i + 32]])
+               for i in range(0, len(texts), 32)]
+        return np.vstack(out)
+
+    def close(self):
+        self.e.close()
+
+
+def embedder():
+    if os.environ.get("SKILLFORGE_EMBED") == "hash":
+        return HashEmbed()
+    try:
+        g = GemmaEmbed()
+        g.embed(["probe"])
+        return g
+    except Exception as e:  # noqa: BLE001 - any failure: degrade to lexical
+        print(f"skillforge: EmbeddingGemma off ({type(e).__name__}); lexical vectors", file=sys.stderr)
+        return HashEmbed()
+
+
+def cluster(V, thr, min_size):
+    """Greedy density clustering: seed = point with most unassigned neighbours >= thr; members re-checked
+    against the centroid. Returns lists of row indices, biggest first."""
+    import numpy as np
+    n = len(V)
+    if n == 0:
+        return []
+    nb = (V @ V.T) >= thr
+    free = np.ones(n, bool)
+    out = []
+    while free.any():
+        counts = (nb & free[None, :]).sum(1) * free
+        i = int(counts.argmax())
+        if counts[i] < min_size:
+            break
+        mem = np.where(nb[i] & free)[0]
+        c = V[mem].mean(0)
+        c /= max(np.linalg.norm(c), 1e-9)
+        mem = mem[(V[mem] @ c) >= thr - 0.04]
+        if len(mem) < min_size:
+            free[i] = False
+            continue
+        out.append([int(x) for x in mem])
+        free[mem] = False
+    return out
+
+
+# ---------------------------------------------------------------- coverage sources
+def _frontmatter_desc(path):
+    try:
+        with open(path) as f:
+            txt = f.read(6000)
+    except OSError:
+        return "", ""
+    m = re.search(r"^description:\s*(.+?)(?=^\w[\w-]*:|^---)", txt, re.S | re.M)
+    return (m.group(1).strip() if m else ""), txt
+
+
+def tg_bind(*args, timeout=30):
+    """Run tg-bind; (exit code, stdout, stderr), (1, "", why) when it can't run."""
+    try:
+        r = subprocess.run([TG_BIND, *args], capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+
+
+def coverage_sources():
+    """[(kind, name, description, full text)] for skills, instant commands (the bound tg-bind command rows) and menu
+    commands (the brain's last set_commands list; commands.json only while that list is empty)."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(SKILLS, "*", "SKILL.md"))):
+        d, txt = _frontmatter_desc(p)
+        out.append(("skill", os.path.basename(os.path.dirname(p)), d, txt))
+    rc, so, _ = tg_bind("menu", "--json")
+    try:
+        menu = json.loads(so) if rc in (0, 1) and so.strip() else {}   # 1 = --diff only; menu itself never fails so
+    except ValueError:
+        menu = {}
+    menu = menu if isinstance(menu, dict) else {}
+    custom = [c for c in menu.get("custom") or [] if isinstance(c, dict)]
+    if not custom:
+        data = _load(os.path.join(TG_DIR, "commands.json"), [])
+        custom = data if isinstance(data, list) else data.get("commands", []) if isinstance(data, dict) else []
+    for kind, items in (("instant", menu.get("bound") or []), ("command", custom)):
+        for c in items:
+            if isinstance(c, dict) and c.get("command"):
+                out.append((kind, "/" + str(c["command"]), str(c.get("description") or ""), ""))
+    return out
+
+
+# ---------------------------------------------------------------- mining
+def _kw(texts, corpus_df, n_docs, k=5, min_c=2):
+    tf = {}
+    for t in texts:
+        for w in set(WORD.findall(t.lower())):
+            if w not in STOP:
+                tf[w] = tf.get(w, 0) + 1
+    import math
+    sc = {w: c * math.log((1 + n_docs) / (1 + corpus_df.get(w, 0))) for w, c in tf.items() if c >= min_c}
+    return [w for w, _ in sorted(sc.items(), key=lambda x: (-x[1], x[0]))[:k]]
+
+
+def _score(n, days, calls, lat, trouble, cov):
+    return round(n * min(1.0, days / 3) * (1 + min(calls, 20) / 10 + min(lat or 0, 180) / 180) * (1 + trouble)
+                 * (0.25 + 0.75 * (1 - cov)), 2)
+
+
+def mine(days=None, cfg=None, emb=None):
+    import numpy as np
+    cfg = cfg or config()
+    days = days or cfg["window_days"]
+    t0 = now() - days * 86400
+    turns = [t for t in scan().values() if t["ts"] >= t0]
+    lab, fb = db_turns()
+    owner = sorted((t for t in turns if t["trigger"] == "owner"), key=lambda t: t["ts"])
+    # his correction / complaint in the next owner turn within 15 min
+    corr = {}
+    for a, b in zip(owner, owner[1:]):
+        if b["ts"] - a["ts"] <= 900 and fb.get(b["id"]):
+            corr[a["id"]] = fb[b["id"]]
+    srcs = coverage_sources()
+    cands = []
+
+    # (a) recurring owner intents
+    use = []
+    for t in owner:
+        label, pf, start = lab.get(t["id"], (None, None, None))
+        if label not in (None, "use") or start in ("tap", "reaction", "poll", "command"):
+            continue
+        if label is None and usage.dev_flag(t["text"]):
+            continue
+        words = [w for w in WORD.findall(t["text"].lower()) if w not in STOP]
+        if len(words) < 2 or usage.ACK.match(t["text"]):     # acks and one-word replies are not asks
+            continue
+        t["pf"] = pf
+        use.append(t)
+    emb_close = emb is None
+    emb = emb or embedder()
+    try:
+        if use:
+            V = emb.embed([t["text"] for t in use])
+            S = emb.embed([f"{k} {n}: {d}"[:600] for k, n, d, _ in srcs]) if srcs else np.zeros((0, V.shape[1]))
+            raw = V
+            if emb.name != "hash":    # EmbeddingGemma is anisotropic (any two texts ~0.7): centre on his asks
+                mu = V.mean(0)
+                V = (V - mu) / np.maximum(np.linalg.norm(V - mu, axis=1, keepdims=True), 1e-9)
+                if len(S):
+                    S = (S - mu) / np.maximum(np.linalg.norm(S - mu, axis=1, keepdims=True), 1e-9)
+            df = {}
+            for t in use:
+                for w in set(WORD.findall(t["text"].lower())):
+                    df[w] = df.get(w, 0) + 1
+            for mem in cluster(V, cfg["cluster_sim"], cfg["min_turns"]):
+                ts = [use[i] for i in mem]
+                dset = sorted({_day(t["ts"]) for t in ts})
+                if len(dset) < cfg["min_days"]:
+                    continue
+                c = V[mem].mean(0)
+                c /= max(float(np.linalg.norm(c)), 1e-9)
+                rc = raw[mem].mean(0)
+                rc /= max(float(np.linalg.norm(rc)), 1e-9)
+                best, bsim = None, 0.0
+                if len(S):
+                    sims = S @ c
+                    j = int(sims.argmax())
+                    best, bsim = f"{srcs[j][0]}:{srcs[j][1]}", float(sims[j])
+                sk = {}
+                for t in ts:
+                    for s in {x[6:] for x in t["seq"] if x.startswith("skill:")} | (
+                            {t["pf"][6:]} if (t.get("pf") or "").startswith("skill.") else set()):
+                        sk[s] = sk.get(s, 0) + 1
+                top_skill, share = (max(sk.items(), key=lambda x: x[1]) if sk else (None, 0))
+                share = share / len(ts)
+                cov_emb = max(0.0, min(1.0, (bsim - 0.30) / 0.30)) if emb.name != "hash" else 0.0
+                cov = max(share, cov_emb)
+                calls = sum(t["calls"] for t in ts) / len(ts)
+                lats = [t["reply"] - t["ts"] for t in ts if t["reply"]]
+                lat = sorted(lats)[len(lats) // 2] if lats else None
+                errs = sum(1 for t in ts if t["errors"])
+                cors = sum(1 for t in ts if t["id"] in corr)
+                kw = _kw([t["text"] for t in ts], df, len(use)) or _kw([t["text"] for t in ts], df, len(use), 3, 1)
+                kind = ("improve" if cov >= 0.6 and (calls >= 8 or (lat or 0) >= 60) else
+                        "covered" if cov >= 0.6 else
+                        "instant-command" if calls <= 4 and not errs else "skill")
+                seqs = {}
+                for t in ts:
+                    k = " > ".join(x for x in t["seq"] if x not in COMM)[:200]
+                    if k:
+                        seqs[k] = seqs.get(k, 0) + 1
+                cands.append({
+                    "id": "i:" + hashlib.sha1((" ".join(sorted(kw)) or ts[0]["id"]).encode()).hexdigest()[:8], "type": "intent",
+                    "kind": kind, "keywords": kw, "turns": len(ts), "days": len(dset), "first": dset[0],
+                    "last": dset[-1], "channels": sorted({t["ch"] or "?" for t in ts}),
+                    "calls_avg": round(calls, 1), "reply_s_p50": round(lat) if lat is not None else None,
+                    "turns_with_errors": errs, "corrections": cors, "covered_by": top_skill, "covered_share":
+                    round(share, 2), "nearest": best, "nearest_sim": round(bsim, 3), "coverage": round(cov, 2),
+                    "top_sequences": sorted(seqs.items(), key=lambda x: -x[1])[:3],
+                    "turn_ids": [t["id"] for t in ts], "centroid": [round(float(x), 4) for x in rc],
+                    "score": _score(len(ts), len(dset), calls, lat, (errs + cors) / len(ts), cov)})
+    finally:
+        if emb_close:
+            emb.close()
+
+    # (b) recurring tool sequences (contiguous n-grams of steps, counted once per turn)
+    sup = {}
+    for t in turns:
+        seq = t["seq"]
+        seen = set()
+        for n in range(2, 6):
+            for i in range(len(seq) - n + 1):
+                g = tuple(seq[i:i + n])
+                if g in seen or g[0] in COMM or g[-1] in COMM or len({x for x in g if x not in COMM}) < 2 \
+                        or len(set(g)) < n:
+                    continue
+                seen.add(g)
+                sup.setdefault(g, []).append(t)
+    keep = {g: ts for g, ts in sup.items() if len(ts) >= cfg["min_turns"]
+            and len({_day(t["ts"]) for t in ts}) >= cfg["min_days"]}
+    closed = {}
+    for g in sorted(keep, key=len, reverse=True):
+        if any(len(h) > len(g) and len(keep[h]) >= 0.8 * len(keep[g]) and
+               any(h[i:i + len(g)] == g for i in range(len(h) - len(g) + 1)) for h in closed):
+            continue
+        closed[g] = keep[g]
+    fam = {}
+    for g, ts in closed.items():
+        key = frozenset(x.split()[0] for x in g if x not in COMM)
+        fam.setdefault(key, []).append((g, ts))
+    best_of = []
+    for key, items in fam.items():
+        items.sort(key=lambda x: (-len(x[1]), -len(x[0])))
+        best_of.append((items[0][0], items[0][1], len(items) - 1,
+                        len({t["id"] for _, ts in items for t in ts})))
+    for g, ts, variants, fam_turns in best_of:
+        dset = sorted({_day(t["ts"]) for t in ts})
+        scr = sorted({x.split()[0] for x in g if x not in COMM and ":" not in x})
+        docs = [n for _, n in sorted(((-sum(txt.count(s) for s in scr), n) for k, n, _, txt in srcs
+                                      if k == "skill" and scr and all(s in txt for s in scr)))[:3]]
+        single = len(scr) == 1 and all(":" not in x for x in g if x not in COMM)
+        ops = bool(scr) and all(s in OPS for s in scr) and all(":" not in x for x in g if x not in COMM)
+        cov = 0.5 if docs else 0.0
+        last = max(t["ts"] for t in ts)
+        changed = sorted(s for s in scr if os.path.getmtime(os.path.join(usage.BIN, s)) > last) if all(
+            os.path.exists(os.path.join(usage.BIN, s)) for s in scr) else []
+        if changed:                 # the script changed after the last time I did this by hand: maybe covered now
+            cov = min(1.0, cov + 0.25)
+        errs = sum(1 for t in ts if t["errors"])
+        trig = {}
+        for t in ts:
+            trig[t["trigger"]] = trig.get(t["trigger"], 0) + 1
+        cands.append({
+            "id": "s:" + hashlib.sha1(" > ".join(g).encode()).hexdigest()[:8], "type": "sequence",
+            "kind": "ops-script" if ops else "script-verb" if single else "script", "steps": list(g),
+            "variants": variants, "family_turns": fam_turns, "turns": len(ts), "days": len(dset),
+            "first": dset[0], "last": dset[-1], "triggers": trig, "calls_avg": round(sum(t["calls"] for t in ts)
+                                                                                       / len(ts), 1),
+            "turns_with_errors": errs, "documented_in": docs, "changed_after": changed, "coverage": cov, "turn_ids": [t["id"] for t in ts],
+            "score": round(_score(len(ts), len(dset), len(g) * 2, None, errs / len(ts), cov) * (0.5 if ops else 1), 2)})
+    cands.sort(key=lambda c: -c["score"])
+    out = {"generated": now(), "window_days": days, "turns": len(turns), "owner_turns": len(owner),
+           "use_turns": len(use), "embedder": emb.name, "candidates": cands}
+    _save(os.path.join(STATE, "candidates.json"), out)
+    return out
+
+
+# ---------------------------------------------------------------- drafts
+def _slug(words, n=3):
+    s = "-".join(re.sub(r"[^a-z0-9]+", "-", w.lower()).strip("-") for w in words if w)[:40].strip("-")
+    return s or "draft"
+
+
+def staged():
+    out = []
+    for p in sorted(glob.glob(os.path.join(STAGING, "*", "meta.json"))):
+        m = _load(p, {})
+        if m.get("name"):
+            out.append(m)
+    return out
+
+
+def _rejected(c, dec):
+    import numpy as np
+    for name, d in dec.items():
+        if d.get("status") not in ("rejected", "dropped", "installed", "accepted"):
+            continue
+        if d.get("cand") == c["id"]:
+            return True
+        if c["type"] == "intent" and d.get("centroid") and c.get("centroid"):
+            if float(np.dot(np.array(d["centroid"]), np.array(c["centroid"]))) >= 0.95:
+                return True
+        if c["type"] == "sequence" and d.get("steps") == c.get("steps"):
+            return True
+    return False
+
+
+def write_skeleton(c, name):
+    d = os.path.join(STAGING, name)
+    os.makedirs(os.path.join(d, "evals"), exist_ok=True)
+    ev = {k: v for k, v in c.items() if k != "centroid"}
+    if c["type"] == "intent":
+        what = f"the recurring ask about: {', '.join(c['keywords'])}"
+        how = "\n".join(f"- {n}x: {s}" for s, n in c["top_sequences"]) or "- (no tool steps)"
+    else:
+        what = "the recurring step sequence: " + " > ".join(c["steps"])
+        how = "\n".join(f"{i}. `{s}`" for i, s in enumerate(c["steps"], 1))
+    desc = (f"DRAFT skeleton ({c['kind']}) for {what}. TODO: rewrite as a trigger description (what it does + the "
+            f"phrases he uses), per anthropic-skills:skill-creator.")
+    with open(os.path.join(d, "SKILL.md"), "w") as f:
+        f.write(f"---\nname: {name}\ndescription: {json.dumps(desc, ensure_ascii=False)}\n---\n\n"
+                f"# {name} (skeleton)\n\nEvidence: {c['turns']} turns on {c['days']} days ({c['first']} to "
+                f"{c['last']}), my cost ~{c['calls_avg']} tool calls per turn, score {c['score']}. "
+                f"Details: evidence.json (counts and turn ids only).\n\n## What I did each time\n{how}\n\n"
+                "## TODO before `skillforge propose`\n- Read the turns (by id) and write the intent in his words, "
+                "paraphrased (no quotes, no vault output).\n- Fold the fixed steps into one script verb where possible"
+                " (scripts/ + tests/run.sh).\n- Fill evals/evals.json and evals/trigger-evals.json "
+                "(skill-creator schema).\n- Set meta.json risk: readonly or writes.\n")
+    _save(os.path.join(d, "evidence.json"), ev, 0o644)
+    _save(os.path.join(d, "evals", "evals.json"), {"skill_name": name, "evals": []}, 0o644)
+    _save(os.path.join(d, "evals", "trigger-evals.json"), [], 0o644)
+    if c["type"] == "sequence":
+        os.makedirs(os.path.join(d, "scripts"), exist_ok=True)
+        os.makedirs(os.path.join(d, "tests"), exist_ok=True)
+        sp = os.path.join(d, "scripts", name)
+        with open(sp, "w") as f:
+            f.write("#!/bin/sh\n# skeleton: the steps below ran in this order in "
+                    f"{c['turns']} turns; fold them into one command.\nset -eu\n"
+                    + "".join(f"# step {i}: {s}\n" for i, s in enumerate(c["steps"], 1))
+                    + 'echo "skeleton: not implemented" >&2\nexit 2\n')
+        os.chmod(sp, 0o755)
+        tp = os.path.join(d, "tests", "run.sh")
+        with open(tp, "w") as f:
+            f.write('#!/bin/sh\n# skeleton test: syntax only\nset -eu\nsh -n "$(dirname "$0")/../scripts/'
+                    f'{name}"\necho ok\n')
+        os.chmod(tp, 0o755)
+    meta = {"name": name, "type": c["type"], "kind": c["kind"], "status": "skeleton", "risk": "unknown",
+            "cand": c["id"], "score": c["score"], "turns": c["turns"], "days": c["days"],
+            "created": datetime.fromtimestamp(now()).strftime("%Y-%m-%d")}
+    _save(os.path.join(d, "meta.json"), meta, 0o644)
+    return meta
+
+
+def draft(top=None, cand_id=None, data=None):
+    cfg = config()
+    data = data or _load(os.path.join(STATE, "candidates.json"), {})
+    dec = decisions()
+    have = {m["cand"] for m in staged()}
+    names = {m["name"] for m in staged()} | set(dec)
+    made = []
+    for c in data.get("candidates", []):
+        if len(made) >= (top or cfg["top"]):
+            break
+        if cand_id and c["id"] != cand_id:
+            continue
+        if not cand_id and (c["kind"] in ("covered", "ops-script") or c["id"] in have or _rejected(c, dec)):
+            continue
+        words = c["keywords"][:3] if c["type"] == "intent" else [
+            w for s in c["steps"] if s not in COMM for w in s.split(":")[-1].split()]
+        base = _slug(list(dict.fromkeys(words))[:3])
+        name, i = base, 2
+        while name in names or os.path.exists(os.path.join(SKILLS, name)):
+            name, i = f"{base}-{i}", i + 1
+        names.add(name)
+        made.append(write_skeleton(c, name))
+    return made
+
+
+# ---------------------------------------------------------------- review / decisions / install
+def _meta(name):
+    p = os.path.join(STAGING, name, "meta.json")
+    m = _load(p, None)
+    if not m:
+        raise SystemExit(f"skillforge: no staged draft '{name}'")
+    return m, p
+
+
+def check(name):
+    d = os.path.join(STAGING, name)
+    _meta(name)
+    probs = []
+    if VALIDATOR and os.path.exists(VALIDATOR):
+        r = subprocess.run([sys.executable, VALIDATOR, d], capture_output=True, text=True, timeout=60)
+        if r.returncode:
+            probs.append("quick_validate: " + (r.stdout + r.stderr).strip()[-300:])
+    else:
+        probs.append("quick_validate.py not found (skill-creator)")
+    sk = open(os.path.join(d, "SKILL.md")).read()
+    if "DRAFT skeleton" in sk or "(skeleton)" in sk:
+        probs.append("still a skeleton (TODOs)")
+    t = os.path.join(d, "tests", "run.sh")
+    if os.path.exists(t):
+        r = subprocess.run(["sh", t], capture_output=True, text=True, timeout=600)
+        if r.returncode:
+            probs.append("tests/run.sh failed: " + (r.stdout + r.stderr).strip()[-300:])
+    return probs
+
+
+def set_status(name, status, why=None):
+    m, p = _meta(name)
+    m["status"] = status
+    m["decided"] = datetime.fromtimestamp(now()).strftime("%Y-%m-%d")
+    if why:
+        m["why"] = why[:200]
+    _save(p, m, 0o644)
+    dec = decisions()
+    ev = _load(os.path.join(STAGING, name, "evidence.json"), {})
+    dec[name] = {"status": status, "cand": m.get("cand"), "date": m["decided"], "why": (why or "")[:200],
+                 "steps": ev.get("steps")}
+    cands = _load(os.path.join(STATE, "candidates.json"), {}).get("candidates", [])
+    cen = next((c.get("centroid") for c in cands if c["id"] == m.get("cand")), None)
+    if cen:
+        dec[name]["centroid"] = cen
+    _save(os.path.join(STATE, "decisions.json"), dec)
+    return m
+
+
+def _row_key(r):
+    """(kind, key) of a tg-bind import row as tg-bind stores it (a command without "/", lower case)."""
+    k = str(r.get("key", ""))
+    return r.get("kind"), (k.lstrip("/").lower() if r.get("kind") == "command" else k)
+
+
+def install(name, dry=False, auto=False):
+    m, _ = _meta(name)
+    if m["status"] != "accepted" and not (auto and m["status"] == "proposed" and m.get("risk") == "readonly"):
+        raise SystemExit(f"skillforge: '{name}' is {m['status']}; install needs his accept (or auto + readonly)")
+    src = os.path.join(STAGING, name)
+    dst = os.path.join(SKILLS, name)
+    scripts = sorted(glob.glob(os.path.join(src, "scripts", "*")))
+    clash = [p for p in [dst] + [os.path.join(BIN_DIR, os.path.basename(s)) for s in scripts] if os.path.exists(p)]
+    if clash:
+        raise SystemExit("skillforge: refusing to overwrite " + ", ".join(clash))
+    probs = [p for p in check(name) if not p.startswith("quick_validate.py not found")]
+    if probs:
+        raise SystemExit("skillforge: check failed: " + "; ".join(probs))
+    if os.path.exists(os.path.join(src, "instant.json")):
+        raise SystemExit(f"skillforge: '{name}' still has an instant.json (0.1.22's table, gone): convert it to "
+                         "bindings.json in tg-bind import format {\"rows\": [{kind, key, tool, why, note?, forward?, "
+                         "args?, expires?}]}; a new script needs a registry tool first (packages/tools/domains/"
+                         "bindings.py in ~/opt/assistant, `tool gen`, then land it)")
+    bj = os.path.join(src, "bindings.json")
+    rows = []
+    if os.path.exists(bj):
+        doc = _load(bj, None)
+        rows = doc.get("rows") if isinstance(doc, dict) else None
+        if not isinstance(rows, list) or not rows or not all(isinstance(r, dict) for r in rows):
+            raise SystemExit(f"skillforge: {bj}: want {{\"rows\": [{{kind, key, tool, why, …}}]}}")
+        rc, so, se = tg_bind("list", "--json")
+        try:
+            live = json.loads(so) if rc == 0 else None
+        except ValueError:
+            live = None
+        if not isinstance(live, list):
+            raise SystemExit(f"skillforge: can't read the live tg-bind rows: {(se or so).strip()[:300]}")
+        have = {(r.get("kind"), r.get("key")) for r in live if r.get("active", 1)}
+        taken = [r for r in rows if _row_key(r) in have]
+        if taken:
+            raise SystemExit("skillforge: refusing to overwrite tg-bind row(s) " +
+                             ", ".join(f"{k} {v}" for k, v in map(_row_key, taken)))
+        rc, so, se = tg_bind("import", bj, "--dry-run")
+        if rc != 0:
+            raise SystemExit(f"skillforge: tg-bind import --dry-run refused {bj}: {(se or so).strip()[:500]}")
+    plan = [f"{dst}/SKILL.md"] + [f"{BIN_DIR}/{os.path.basename(s)}" for s in scripts] + [
+        f"tg-bind +{k} {v}" for k, v in map(_row_key, rows)]
+    if dry:
+        return plan
+    tmp = tempfile.mkdtemp(dir=SKILLS, prefix=".sf-")
+    for item in ("SKILL.md", "references", "assets"):
+        s = os.path.join(src, item)
+        if os.path.isdir(s):
+            shutil.copytree(s, os.path.join(tmp, item))
+        elif os.path.exists(s):
+            shutil.copy2(s, os.path.join(tmp, item))
+    os.rename(tmp, dst)
+    for s in scripts:
+        fd, t = tempfile.mkstemp(dir=BIN_DIR, prefix=".sf-")
+        os.close(fd)
+        shutil.copy2(s, t)
+        os.chmod(t, 0o755)
+        os.replace(t, os.path.join(BIN_DIR, os.path.basename(s)))
+    if rows:                      # tg-adapter reads the rows live; the "/" menu needs a session set_commands
+        rc, so, se = tg_bind("import", bj)
+        if rc != 0:
+            raise SystemExit(f"skillforge: files installed, but `tg-bind import {bj}` failed: "
+                             f"{(se or so).strip()[:500]}; run it again once fixed")
+    set_status(name, "installed")
+    return plan
+
+
+def stats():
+    dec = decisions()
+    st = {s: 0 for s in STATUSES}
+    for m in staged():
+        st[m["status"]] = st.get(m["status"], 0) + 1
+    decided = [d for d in dec.values() if d["status"] in ("accepted", "rejected", "installed")]
+    acc = sum(1 for d in decided if d["status"] in ("accepted", "installed"))
+    uses = {}
+    inst = [n for n, d in dec.items() if d["status"] == "installed"]
+    if inst and os.path.exists(DB):
+        try:
+            con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+            t0 = now() - 30 * 86400
+            for n in inst:
+                uses[n] = con.execute("SELECT COUNT(DISTINCT turn) FROM events WHERE feature=? AND ts>=?",
+                                      (f"skill.{n}", t0)).fetchone()[0]
+            con.close()
+        except sqlite3.Error:
+            pass
+    return {"staged": st, "decided": len(decided), "accepted": acc,
+            "acceptance_rate": round(acc / len(decided), 2) if decided else None, "uses_30d": uses}
+
+
+def _cand_line(c):
+    what = (", ".join(c["keywords"]) if c["type"] == "intent" else " > ".join(c["steps"]))
+    cov = c.get("covered_by") or ", ".join(c.get("documented_in") or []) or "-"
+    lat = c.get("reply_s_p50")
+    return (f"| {c['score']} | {c['type']} | {c['kind']} | {what} | {c['turns']} / {c['days']} d | "
+            f"{c['calls_avg']} | {lat if lat is not None else '-'} | "
+            f"{c['turns_with_errors']}{' + ' + str(c['corrections']) if c.get('corrections') else ''} | "
+            f"{cov} ({c['coverage']}) |")
+
+
+def report(data, made, auto_done=()):
+    day = datetime.fromtimestamp(now()).strftime("%Y-%m-%d")
+    st = stats()
+    lines = [f"# Skillforge ({day})", "",
+             f"Window {data.get('window_days')} days: {data.get('turns')} turns, {data.get('owner_turns')} from him, "
+             f"{data.get('use_turns')} of them use-turns with text; vectors: {data.get('embedder')}. "
+             "Counts and keywords only; no message text.", "",
+             "## Top candidates", "",
+             "| Score | Type | Suggests | Keywords / steps | Turns / days | Calls/turn | Reply s (p50) | "
+             "Error turns + corrections | Covered by (coverage) |", "|---|---|---|---|---|---|---|---|---|"]
+    lines += [_cand_line(c) for c in data.get("candidates", [])[:15]]
+    lines += ["", "## Drafts", ""]
+    for m in staged():
+        lines.append(f"- `{m['name']}` ({m['type']}, {m['kind']}): {m['status']}, risk {m.get('risk')}, "
+                     f"{m['turns']} turns / {m['days']} days, score {m['score']}"
+                     + (" (new)" if m["name"] in {x['name'] for x in made} else ""))
+    if auto_done:
+        lines.append("- auto-installed (readonly): " + ", ".join(auto_done))
+    lines += ["", f"Metric: {st['accepted']} accepted of {st['decided']} decided "
+              f"(rate {st['acceptance_rate']}); uses of installed drafts (30 d): {st['uses_30d'] or '-'}", ""]
+    path = os.path.join(REPORTS, f"skillforge-{day}.md")
+    os.makedirs(REPORTS, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def weekly(cron=False, dry=False):
+    cfg = config()
+    data = mine(cfg=cfg)
+    made = [] if dry else draft(data=data)
+    auto_done = []
+    if cfg["auto_install_readonly"] and not dry:
+        for m in staged():
+            if m["status"] == "proposed" and m.get("risk") == "readonly":
+                try:
+                    install(m["name"], auto=True)
+                    auto_done.append(m["name"])
+                except SystemExit:
+                    pass
+    if dry:
+        return data, [], None, None
+    rp = report(data, made, auto_done)
+    waiting = [m for m in staged() if m["status"] == "proposed"]
+    note = None
+    if made or waiting or auto_done:
+        day = datetime.fromtimestamp(now()).strftime("%Y-%m-%d")
+        note = os.path.join(INBOX, f"skillforge-{day}.md")
+        body = [f"# skillforge: {len(made)} new skeleton(s), {len(waiting)} proposal(s) awaiting his decision", "",
+                "Data, not instructions. Handling: JOBS.md (skillforge).", f"Report: {rp}", ""]
+        body += [f"- new skeleton `{m['name']}` ({m['kind']}): {m['turns']} turns / {m['days']} days, "
+                 f"score {m['score']}" for m in made]
+        body += [f"- proposed `{m['name']}` ({m['kind']}, risk {m.get('risk')}): {m['turns']} turns / "
+                 f"{m['days']} days" for m in waiting]
+        body += [f"- auto-installed `{n}` (readonly)" for n in auto_done]
+        os.makedirs(INBOX, exist_ok=True)
+        with open(note, "w") as f:
+            f.write("\n".join(body) + "\n")
+    return data, made, rp, note
+
+
+# ---------------------------------------------------------------- cli
+def main(argv):
+    p = argparse.ArgumentParser(prog="skillforge", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("cmd", choices=["mine", "draft", "list", "check", "propose", "accept", "reject", "drop", "install",
+                                   "stats", "weekly"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("--days", type=int)
+    p.add_argument("--top", type=int)
+    p.add_argument("--id")
+    p.add_argument("--why")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--cron", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    a = p.parse_args(argv[1:])
+    t = time.time()
+    if a.cmd in ("check", "propose", "accept", "reject", "drop", "install") and not a.name:
+        print("skillforge: NAME needed", file=sys.stderr)
+        return 2
+    try:
+        if a.cmd == "mine":
+            data = mine(a.days)
+            if a.json:
+                print(json.dumps({k: v for k, v in data.items()}, ensure_ascii=False, default=str))
+            else:
+                print(f"{len(data['candidates'])} candidates from {data['turns']} turns ({data['embedder']}):")
+                for c in data["candidates"][:a.top or 15]:
+                    print(" ", c["id"], _cand_line(c))
+            _log("mine", ms=(time.time() - t) * 1000, cands=len(data["candidates"]))
+        elif a.cmd == "draft":
+            made = draft(a.top, a.id)
+            for m in made:
+                print(f"staged {m['name']} ({m['kind']}) -> {os.path.join(STAGING, m['name'])}")
+            if not made:
+                print("nothing new to draft")
+            _log("draft", drafts=len(made))
+        elif a.cmd == "list":
+            ms = staged()
+            if a.json:
+                print(json.dumps(ms, ensure_ascii=False))
+            for m in [] if a.json else ms:
+                print(f"{m['name']:28} {m['status']:10} {m['type']:8} {m['kind']:15} risk={m.get('risk')} "
+                      f"turns={m['turns']} days={m['days']} score={m['score']}")
+        elif a.cmd == "check":
+            probs = check(a.name)
+            print("ok" if not probs else "\n".join(probs))
+            return 0 if not probs else 1
+        elif a.cmd == "propose":
+            probs = check(a.name)
+            if probs:
+                print("\n".join(probs), file=sys.stderr)
+                return 1
+            set_status(a.name, "proposed")
+            print(f"{a.name}: proposed")
+        elif a.cmd in ("accept", "reject"):
+            set_status(a.name, a.cmd + "ed", a.why)
+            print(f"{a.name}: {a.cmd}ed")
+            _log(a.cmd, kind="answer", actor="owner", channel="session")
+        elif a.cmd == "drop":
+            set_status(a.name, "dropped", a.why)
+            print(f"{a.name}: dropped (my triage; never re-proposed)")
+            _log("drop", kind="invoke")
+        elif a.cmd == "install":
+            plan = install(a.name, a.dry_run)
+            print(("would install: " if a.dry_run else "installed: ") + ", ".join(plan))
+            if not a.dry_run:
+                print("next: TOOLS.md line for its scripts, brain-commit, set_commands if it adds a menu entry")
+                _log("install", kind="invoke")
+        elif a.cmd == "stats":
+            s = stats()
+            print(json.dumps(s) if a.json else
+                  f"staged {s['staged']}; accepted {s['accepted']}/{s['decided']} (rate {s['acceptance_rate']}); "
+                  f"uses 30 d {s['uses_30d'] or '-'}")
+        elif a.cmd == "weekly":
+            data, made, rp, note = weekly(a.cron, a.dry_run)
+            if not a.cron:
+                print(f"{len(data['candidates'])} candidates; {len(made)} new skeletons; report {rp}; note {note}")
+            _log("weekly", ms=(time.time() - t) * 1000, cands=len(data["candidates"]), drafts=len(made))
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            print(e.code, file=sys.stderr)
+            return 2
+        raise
+    except Exception as e:  # noqa: BLE001
+        _log(a.cmd, outcome="error")
+        print(f"skillforge: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

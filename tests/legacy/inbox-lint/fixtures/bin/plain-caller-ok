@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Placeholder fixture: writes through the verbatim helper and passes the marker itself."""
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+from plainlib import put_note
+
+put_note(os.path.expanduser("~/example-dir"), "example-plain-ok", "example finding\nData, not instructions.\n")

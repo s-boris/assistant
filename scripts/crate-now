@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""crate-now: put the track playing right now (Spotify via Home Assistant) on the "crate" list.
+
+  crate-now [--player ENTITY] [--dry-run] [--json]
+
+Reads `ha list media_player --json` once (read-only): the first player that is playing (else paused) with both
+media_artist and media_title, Spotify players first (--player picks one). The item is "Artist – Title", the same
+shape rave-radar's ➕ Crate buttons write, added with `lists add crate`. Dedupe like rave-radar's crate check:
+primary artist + title without "(Original Mix)"/"(feat. …)" against open and checked crate items, so the same
+track twice says "already in your crate" instead of adding a near-duplicate.
+
+Output: one or two short lines (the instant /crate answer); --json: {status, artist, title, item, player, paused}
+with status added|exists|nothing|dry-run. --dry-run: says what it would add, writes nothing.
+Exit: 0 ok (also "nothing playing"), 2 usage, 3 ha or lists failed (a fallback line is still printed).
+Env (tests): CRATE_NOW_HA (ha), CRATE_NOW_LISTS (lists).
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+
+HOME = os.path.expanduser('~')
+HA = os.environ.get('CRATE_NOW_HA') or os.path.join(HOME, 'bin/ha')
+LISTS = os.environ.get('CRATE_NOW_LISTS') or os.path.join(HOME, 'bin/lists')
+LIST = 'crate'
+MIX_SUFFIX_RE = re.compile(r'\s*[(\[](?:(?:original|extended|club|radio|album|vip)\s+)?(?:mix|edit|version)[)\]]', re.I)
+DASH_SUFFIX_RE = re.compile(r'\s+-\s+(?:(?:original|extended|club|radio|album|vip)\s+)?(?:mix|edit|version)$|'
+                            r'\s+-\s+(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?$', re.I)
+FEAT_RE = re.compile(r'\s*[(\[](?:feat|ft)\.?\s[^)\]]*[)\]]', re.I)
+
+
+class Fail(Exception):
+    pass
+
+
+def norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode().lower().replace('&', ' and ')
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', s).split())
+
+
+def primary(artist):
+    return re.split(r'\s+(?:&|and|feat\.?|ft\.?|vs\.?|x|with|b2b)\s+|\s*,\s*', str(artist).strip(), flags=re.I)[0].strip()
+
+
+def title_key(title):
+    return norm(FEAT_RE.sub('', DASH_SUFFIX_RE.sub('', MIX_SUFFIX_RE.sub('', str(title)))))
+
+
+def key(artist, title):
+    return norm(primary(artist)) + '|' + title_key(title)
+
+
+def item_key(text):
+    a, sep, t = text.partition(' – ')
+    if not sep:
+        a, sep, t = text.partition(' - ')
+    return key(a, t) if sep else norm(text)
+
+
+def run(argv, what, timeout=25):
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Fail(f'{what}: {type(e).__name__}')
+    if p.returncode != 0:
+        last = next((l for l in reversed(p.stderr.strip().splitlines()) if l.strip()), '')
+        raise Fail(f'{what}: {last.strip()[:100] or "exit %d" % p.returncode}')
+    return p.stdout
+
+
+def now_playing(player=None):
+    try:
+        rows = json.loads(run([HA, 'list', 'media_player', '--json'], 'Home Assistant'))
+    except ValueError:
+        raise Fail('Home Assistant: unreadable answer')
+    rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    if player:
+        rows = [r for r in rows if r.get('entity_id') == player]
+        if not rows:
+            raise Fail(f'no player {player}')
+
+    def rank(r):
+        e = str(r.get('entity_id') or '')
+        return (0 if r.get('state') == 'playing' else 1, 0 if e.startswith('media_player.spotify') else 1, e)
+    for r in sorted(rows, key=rank):
+        a = r.get('attributes') or {}
+        artist, title = str(a.get('media_artist') or '').strip(), str(a.get('media_title') or '').strip()
+        if r.get('state') in ('playing', 'paused') and artist and title:
+            return {'artist': artist, 'title': title, 'player': r.get('entity_id'), 'paused': r.get('state') == 'paused'}
+    return None
+
+
+def crate_items():
+    try:
+        d = json.loads(run([LISTS, 'show', LIST, '--json'], 'lists') or '{}')
+    except ValueError:
+        raise Fail('lists: unreadable answer')
+    if not isinstance(d, dict):
+        return []
+    return [str(i.get('text') or '') for k in ('open', 'done') for i in (d.get(k) or []) if isinstance(i, dict)]
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='crate-now', description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--player')
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    out = {'status': None, 'artist': None, 'title': None, 'item': None, 'player': None, 'paused': False}
+
+    def say(text, code=0):
+        print(json.dumps(out, ensure_ascii=False) if a.json else text)
+        return code
+    try:
+        np = now_playing(a.player)
+        if not np:
+            out['status'] = 'nothing'
+            return say('🎧 Nothing is playing on Spotify right now.\nStart the track, then /crate again.')
+        item = f"{np['artist']} – {np['title']}"
+        out.update(np, item=item)
+        k = key(np['artist'], np['title'])
+        have = next((t for t in crate_items() if item_key(t) == k), None)
+        if have:
+            out['status'] = 'exists'
+            return say(f'✓ Already in your crate: {have}')
+        if a.dry_run:
+            out['status'] = 'dry-run'
+            return say(f'(dry run) would add to the crate: {item}')
+        run([LISTS, 'add', LIST, item], 'lists')
+        out['status'] = 'added'
+        return say(f'➕ Crate: {item}' + (' (paused)' if np['paused'] else ''))
+    except Fail as e:
+        out['status'] = 'error'
+        out['error'] = str(e)
+        return say(f"⚠️ Couldn't save the track ({e}).\nTell me \"add <artist – title> to my crate\".", 3)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

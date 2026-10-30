@@ -1,0 +1,91 @@
+#!/usr/local/bin/python3.13 -I
+"""profile-get: read one value from the owner's profile (~/.config/assistant/profile.json) for shell scripts.
+
+  profile-get KEY            print the value: strings as they are, numbers/lists/objects as compact JSON
+  profile-get KEY --hash     sha256 of exactly what KEY prints (no newline): compare a value without showing it
+  profile-get --keys         every key, one per line (names only, never values)
+  profile-get --source       the profile file in use, or "defaults" when there is none
+  profile-get --check        validate the file: types and unknown keys (names only); exit 1 on a problem
+  profile-get --feature NAME print "on" or "off" for the feature switch features.NAME; exit 3 when off
+  profile-get --features     the features that are on, one per line
+
+KEY is dotted: home.town, network.lan_prefix, network.hosts.web_vm. Missing file: the public placeholder
+defaults (bin/lib/assistant_profile.py). $ASSISTANT_PROFILE points to another file (tests use a fixture).
+locale.tz always prints a valid zone (assistant_profile.tz_name(): the profile's, else the helper's fallback), exit 0.
+Feature switches (features.*: core, telegram, hub, ...): every one is on unless the profile says false; core is
+always on. A shell tool gates itself with: [ "$(profile-get --feature media 2>/dev/null)" = off ] && exit 3
+Exit: 0 ok, 1 profile unreadable/invalid, 2 unknown key or bad usage, 3 the --feature is off.
+Example: town=$(profile-get home.town) || exit 1
+"""
+import hashlib
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib", "legacy"))  # repo checkout
+import assistant_profile as profile  # noqa: E402
+
+
+def main(argv):
+    flags = {a for a in argv if a.startswith("-")}
+    args = [a for a in argv if not a.startswith("-")]
+    if "-h" in flags or "--help" in flags or (not args and not flags & {"--keys", "--source", "--check", "--features"}):
+        print(__doc__.strip(), file=sys.stdout if flags & {"-h", "--help"} else sys.stderr)
+        return 0 if flags & {"-h", "--help"} else 2
+    bad = flags - {"--hash", "--keys", "--source", "--check", "--feature", "--features"}
+    if bad or len(args) > 1 or ("--feature" in flags and len(args) != 1):
+        print("profile-get: bad usage (see --help)", file=sys.stderr)
+        return 2
+    try:
+        if "--features" in flags:
+            print("\n".join(profile.features_on()))
+            return 0
+        if "--feature" in flags:
+            if args[0] not in profile.FEATURES:
+                print("profile-get: unknown feature %s (known: %s)" % (args[0], ", ".join(profile.FEATURES)),
+                      file=sys.stderr)
+                return 2
+            on = profile.feature_on(args[0])
+            print("on" if on else "off")
+            return 0 if on else profile.FEATURE_OFF_EXIT
+        if "--source" in flags:
+            print(profile.source() or "defaults")
+            return 0
+        if "--keys" in flags:
+            print("\n".join(profile.keys()))
+            return 0
+        if "--check" in flags:
+            src = profile.source()
+            unk = profile.unknown_keys()
+            for k in unk:
+                print("profile-get: unknown key %s (not in the defaults: typo?)" % k, file=sys.stderr)
+            if src:
+                mode = os.stat(src).st_mode & 0o777
+                if mode & 0o077:
+                    print("profile-get: %s is mode %o, want 600" % (src, mode), file=sys.stderr)
+                    return 1
+            print("profile-get: ok (%s, %d keys%s)" % (src or "defaults", len(profile.keys()),
+                                                      ", %d unknown" % len(unk) if unk else ""))
+            return 0
+        if args[0] == "locale.tz":   # never fails: tz_name() checks the zone and falls back (shell scripts need no literal)
+            v = profile.tz_name()
+        else:
+            try:
+                v = profile.get(args[0])
+            except KeyError:
+                print("profile-get: unknown key %s" % args[0], file=sys.stderr)
+                return 2
+    except profile.ProfileError as e:
+        print("profile-get: %s" % e, file=sys.stderr)
+        return 1
+    text = profile.as_text(v)
+    if "--hash" in flags:
+        print(hashlib.sha256(text.encode("utf-8")).hexdigest())
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

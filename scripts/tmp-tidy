@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""tmp-tidy: delete stale leftovers from /tmp in this container (old test dirs, temp files, caches, build dirs).
+
+  tmp-tidy [--days N] [--top N] [--json]      dry run (default): what would go, largest first
+  tmp-tidy --apply [--quiet] [--days N]       delete it; --quiet prints only when something was deleted or failed
+
+Only direct children of the root are considered. One is deleted only when ALL of these hold:
+  - owned by the current user;
+  - not protected: claude* / .claude* (live session task outputs and scratchpads), X11/ICE/font socket dirs,
+    tmux-*, ssh-*, systemd-private-*, hsperfdata_*, node-compile-cache;
+  - nothing in it changed for --days (default 3, minimum 2): the newest mtime or ctime anywhere in its tree
+    (ctime catches freshly extracted files that carry old mtimes);
+  - no socket or fifo inside (a daemon's runtime dir);
+  - no running process has anything under it open or mapped, or as its cwd or root (/proc/*/fd, maps, cwd, root).
+Symlinks are removed, never followed.
+
+Session scratchpads: inside the protected claude-<uid> dir, entries DIRECTLY inside
+<root>/claude-<uid>/<project>/<session>/scratchpad/ are tidied by the same rules (own, untouched for --days by
+the entry and everything in it by mtime only, since ctime there gets bumped in bulk; no socket, not held by a
+process). Never the scratchpad dir itself, the
+session's tasks/ dir or anything else outside a scratchpad, and never a name listed in the keep-file
+(~/.config/tmp-tidy/keep.txt: one entry name per line, # comments). Symlinked project/session/scratchpad dirs
+are skipped.
+Stale session dirs and pytest dirs (24 h, not --days): <root>/claude-<uid>/<project>/<session-uuid>/ as a whole, and
+<root>/pytest-of-<user>/pytest-N/, once nothing in them changed for 24 h (mtime; a pytest dir also by ctime), no process
+holds anything in them, they hold no socket and, for a session, it is not live: no running process of this user has
+it as CLAUDE_CODE_SESSION_ID (read from /proc/*/environ: only that variable) and it is not this process's own. Only
+real (non-symlink) dirs with a session-uuid / pytest-N name; nothing else under claude-<uid> or pytest-of-<user>.
+A session dir that goes takes its scratchpad entries with it (not listed twice).
+Exit 0; 1 = some deletions failed (listed on stderr); 2 = usage error.
+Env (tests): TMP_TIDY_ROOT (default /tmp), TMP_TIDY_NOW (epoch seconds, default now),
+TMP_TIDY_KEEP (keep-file path).
+Cron: daily 04:57, `--apply --quiet` (JOBS.md). Tests: ~/opt/assistant/tests/legacy/tmp-tidy/run.sh
+"""
+import argparse
+import fnmatch
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import sys
+import time
+
+ROOT = os.environ.get("TMP_TIDY_ROOT") or "/tmp"
+PROTECT = ("claude*", ".claude*", ".X*-unix", ".ICE-unix", ".font-unix", ".Test-unix", ".XIM-unix",
+           "tmux-*", "ssh-*", "systemd-private-*", "hsperfdata_*", "node-compile-cache")
+MIN_DAYS = 2
+SESSION_HOURS = 24        # stale session dirs and pytest-N dirs (dead sessions after the nightly rotation, test runs)
+UUID_RX = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+PYTEST_RX = re.compile(r"^pytest-\d+$")
+KEEP_FILE = os.environ.get("TMP_TIDY_KEEP") or os.path.expanduser("~/.config/tmp-tidy/keep.txt")
+
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000.0
+
+
+def held_paths(root):
+    """Paths under root that a running process holds (open fd, mapping, cwd, root), relative to root."""
+    pre = root.rstrip("/") + "/"
+    names = set()
+
+    def add(path):
+        if path.endswith(" (deleted)"):
+            path = path[:-10]
+        if path.startswith(pre):
+            names.add(path[len(pre):])
+
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        base = f"/proc/{pid}"
+        for link in ("cwd", "root"):
+            try:
+                add(os.readlink(f"{base}/{link}"))
+            except OSError:
+                pass
+        try:
+            for fd in os.listdir(f"{base}/fd"):
+                try:
+                    add(os.readlink(f"{base}/fd/{fd}"))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        try:
+            with open(f"{base}/maps") as f:
+                for line in f:
+                    i = line.find(" /")
+                    if i >= 0:
+                        add(line[i + 1:].rstrip("\n"))
+        except OSError:
+            pass
+    return names
+
+
+def read_keep(path=None):
+    """Names from the keep-file (one per line, blank lines and # comments ignored); missing file = none."""
+    try:
+        with open(path or KEEP_FILE) as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")}
+    except OSError:
+        return set()
+
+
+def is_real_dir(path):
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def scratchpads(root):
+    """Real (non-symlink) <root>/claude-<uid>/<project>/<session>/scratchpad dirs, as paths relative to root."""
+    base = f"claude-{os.getuid()}"
+    out = []
+    if not is_real_dir(os.path.join(root, base)):
+        return out
+    for proj in sorted(os.listdir(os.path.join(root, base))):
+        pdir = os.path.join(root, base, proj)
+        if not is_real_dir(pdir):
+            continue
+        try:
+            sessions = sorted(os.listdir(pdir))
+        except OSError:
+            continue
+        for sess in sessions:
+            rel = os.path.join(base, proj, sess, "scratchpad")
+            if is_real_dir(os.path.join(pdir, sess)) and is_real_dir(os.path.join(root, rel)):
+                out.append(rel)
+    return out
+
+
+def live_sessions():
+    """Session ids of running Claude Code processes of this user (CLAUDE_CODE_SESSION_ID in /proc/*/environ; nothing
+    else is read from there) plus this process's own."""
+    ids = {os.environ.get("CLAUDE_CODE_SESSION_ID", "")}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = f.read()
+        except OSError:
+            continue
+        for item in env.split(b"\0"):
+            if item.startswith(b"CLAUDE_CODE_SESSION_ID="):
+                ids.add(item.split(b"=", 1)[1].decode("utf-8", "replace"))
+                break
+    ids.discard("")
+    return ids
+
+
+def pytest_base():
+    return f"pytest-of-{pwd.getpwuid(os.getuid()).pw_name}"
+
+
+def stale_candidates(root):
+    """[(rel path, kind)]: real session-uuid dirs under <root>/claude-<uid>/<project>/ and pytest-N dirs under
+    <root>/pytest-of-<user>/."""
+    out = []
+    base = f"claude-{os.getuid()}"
+    if is_real_dir(os.path.join(root, base)):
+        for proj in sorted(os.listdir(os.path.join(root, base))):
+            pdir = os.path.join(root, base, proj)
+            if not is_real_dir(pdir):
+                continue
+            try:
+                out += [(os.path.join(base, proj, s), "session") for s in sorted(os.listdir(pdir))
+                        if UUID_RX.match(s) and is_real_dir(os.path.join(pdir, s))]
+            except OSError:
+                continue
+    pb = pytest_base()
+    if is_real_dir(os.path.join(root, pb)):
+        try:
+            out += [(os.path.join(pb, n), "pytest") for n in sorted(os.listdir(os.path.join(root, pb)))
+                    if PYTEST_RX.match(n) and is_real_dir(os.path.join(root, pb, n))]
+        except OSError:
+            pass
+    return out
+
+
+def scan_tree(path, use_ctime=True):
+    """-> (bytes, newest mtime (and ctime), has a socket or fifo) without following symlinks."""
+    st = os.lstat(path)
+    size, special = st.st_blocks * 512, False
+    newest = max(st.st_mtime, st.st_ctime) if use_ctime else st.st_mtime
+    if stat.S_ISSOCK(st.st_mode) or stat.S_ISFIFO(st.st_mode):
+        special = True
+    if not stat.S_ISDIR(st.st_mode):
+        return size, newest, special
+    for dirpath, dirs, files in os.walk(path, followlinks=False):
+        for n in dirs + files:
+            try:
+                s = os.lstat(os.path.join(dirpath, n))
+            except OSError:
+                continue
+            size += s.st_blocks * 512
+            newest = max(newest, s.st_mtime, s.st_ctime if use_ctime else 0)
+            if stat.S_ISSOCK(s.st_mode) or stat.S_ISFIFO(s.st_mode):
+                special = True
+    return size, newest, special
+
+
+def plan(root, days, now):
+    uid = os.getuid()
+    held = held_paths(root)
+    busy = {h.split("/", 1)[0] for h in held}
+    keep = read_keep()
+    out = {"root": root, "days": days, "delete": [], "kept": {"protected": 0, "not_mine": 0, "too_new": 0,
+                                                            "in_use": 0, "socket": 0, "error": 0, "keep_list": 0,
+                                                            "live_session": 0}}
+    live = live_sessions()
+    names = [(n, kind) for n, kind in stale_candidates(root)]
+    names += [(n, "top") for n in sorted(os.listdir(root))]
+    for sp in scratchpads(root):
+        try:
+            names += [(os.path.join(sp, n), "scratch") for n in sorted(os.listdir(os.path.join(root, sp)))]
+        except OSError:
+            out["kept"]["error"] += 1
+    gone = set()   # session dirs that go: their scratchpad entries are not listed again
+    for name, kind in names:
+        scratch = kind == "scratch"
+        if scratch and os.path.dirname(os.path.dirname(name)) in gone:
+            continue
+        path = os.path.join(root, name)
+        why = None
+        try:
+            st = os.lstat(path)
+            if kind == "top" and any(fnmatch.fnmatchcase(name, p) for p in PROTECT):
+                why = "protected"
+            elif scratch and os.path.basename(name) in keep:
+                why = "keep_list"
+            elif kind == "session" and os.path.basename(name) in live:
+                why = "live_session"
+            elif st.st_uid != uid:
+                why = "not_mine"
+            elif (name in busy) if kind == "top" else any(h == name or h.startswith(name + "/") for h in held):
+                why = "in_use"
+            else:
+                size, newest, special = scan_tree(path, use_ctime=kind in ("top", "pytest"))
+                limit = days * 86400 if kind in ("top", "scratch") else SESSION_HOURS * 3600
+                if special:
+                    why = "socket"
+                elif now - newest < limit:
+                    why = "too_new"
+        except OSError:
+            why = "error"
+        if why:
+            out["kept"][why] += 1
+        else:
+            if kind == "session":
+                gone.add(name)
+            out["delete"].append({"name": name, "bytes": size, "age_days": round((now - newest) / 86400, 1),
+                                  "dir": stat.S_ISDIR(st.st_mode), "scratch": scratch, "kind": kind})
+    if any(e["kind"] == "top" and e["name"] == pytest_base() for e in out["delete"]):   # the whole dir goes anyway
+        out["delete"] = [e for e in out["delete"] if e["kind"] != "pytest"]
+    out["delete"].sort(key=lambda e: -e["bytes"])
+    out["bytes"] = sum(e["bytes"] for e in out["delete"])
+    return out
+
+
+def remove(root, name, kind="top"):
+    path = os.path.join(root, name)
+    parts = name.split("/")
+    parent = os.path.dirname(path)
+    inside = (all(p not in ("", ".", "..") for p in parts) and os.path.realpath(parent) == parent
+              and parent.startswith(root.rstrip("/") + "/"))
+    if kind == "scratch":
+        ok = inside and len(parts) == 5 and parts[0] == f"claude-{os.getuid()}" and parts[3] == "scratchpad"
+    elif kind == "session":
+        ok = (inside and len(parts) == 3 and parts[0] == f"claude-{os.getuid()}" and bool(UUID_RX.match(parts[2]))
+              and parts[2] not in live_sessions() and is_real_dir(path))
+    elif kind == "pytest":
+        ok = inside and len(parts) == 2 and parts[0] == pytest_base() and bool(PYTEST_RX.match(parts[1])) \
+            and is_real_dir(path)
+    else:
+        ok = len(parts) == 1 and name not in ("", ".", "..") and os.path.dirname(path) == root
+    if not ok:
+        raise OSError(f"refusing {path!r}")
+    st = os.lstat(path)
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="tmp-tidy", description="delete stale leftovers from /tmp (dry run by default)")
+    ap.add_argument("--apply", action="store_true", help="delete (default: dry run)")
+    ap.add_argument("--days", type=float, default=3, help=f"untouched for this many days (default 3, min {MIN_DAYS})")
+    ap.add_argument("--top", type=int, default=15, help="dry run: list this many of the largest (default 15)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true", help="print only when something was deleted or failed")
+    a = ap.parse_args()
+    if a.days < MIN_DAYS:
+        ap.error(f"--days must be at least {MIN_DAYS}")
+    root = os.path.realpath(ROOT)
+    if not os.path.isabs(ROOT) or root in ("/", os.path.realpath(os.path.expanduser("~"))) or not os.path.isdir(root):
+        ap.error(f"bad root {ROOT!r}")
+    now = float(os.environ.get("TMP_TIDY_NOW") or time.time())
+    p = plan(root, a.days, now)
+    errors = []
+    if a.apply:
+        done = []
+        for e in p["delete"]:
+            try:
+                remove(root, e["name"], e["kind"])
+                done.append(e)
+            except OSError as ex:
+                errors.append(f"{e['name']}: {ex.strerror or ex}")
+        p["deleted"], p["freed"] = len(done), sum(e["bytes"] for e in done)
+        p["errors"] = errors
+    if a.json:
+        print(json.dumps(p, indent=1))
+    else:
+        k = p["kept"]
+        kept = (f"kept {sum(k.values())} ({k['too_new']} too new, {k['in_use']} in use, {k['protected']} protected, "
+                f"{k['socket']} with sockets, {k['not_mine']} not mine" + (f", {k['error']} unreadable" if k["error"] else "")
+                + (f", {k['keep_list']} on the keep list" if k["keep_list"] else "")
+                + (f", {k['live_session']} live session(s)" if k["live_session"] else "") + ")")
+        nk = {kd: sum(1 for e in p["delete"] if e["kind"] == kd) for kd in ("scratch", "session", "pytest")}
+        sc = ", ".join(x for x in (f"{nk['scratch']} in session scratchpads" if nk["scratch"] else "",
+                                   f"{nk['session']} stale session dirs" if nk["session"] else "",
+                                   f"{nk['pytest']} pytest dirs" if nk["pytest"] else "") if x)
+        sc = f" ({sc})" if sc else ""
+        if a.apply:
+            if p["deleted"] or errors or not a.quiet:
+                print(time.strftime("%Y-%m-%d %H:%M ") + f"tmp-tidy: deleted {p['deleted']} entries older than "
+                      f"{a.days:g} d{sc}, {fmt_bytes(p['freed'])} freed; {kept}")
+        else:
+            print(f"tmp-tidy dry run: would delete {len(p['delete'])} entries older than {a.days:g} d, "
+                  f"{fmt_bytes(p['bytes'])}{sc}; {kept}")
+            for e in p["delete"][:max(0, a.top)]:
+                print(f"  {fmt_bytes(e['bytes']):>9}  {e['age_days']:5.1f} d  {e['name']}{'/' if e['dir'] else ''}")
+            if len(p["delete"]) > a.top:
+                print(f"  … and {len(p['delete']) - a.top} more")
+    for line in errors[:20]:
+        print(f"tmp-tidy: could not delete {line}", file=sys.stderr)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

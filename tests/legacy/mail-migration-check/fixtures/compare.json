@@ -1,0 +1,29 @@
+{
+ "old": "main", "new": "personal", "matched_by": "message-id; without one: day + sender domain",
+ "accounts": {
+  "main": {"domain": "gmail.com", "source": "all_mail", "labels_from": "gmail", "mails": 1200, "no_message_id": 12,
+           "sent": 150, "by_year": {"2018": 400, "2019": 500, "2020": 300},
+           "labels": [{"label": "Inbox", "mails": 900}, {"label": "Sent", "mails": 150},
+                      {"label": "Kunden x.y@leak.example", "mails": 3}], "labels_more": 0},
+  "personal": {"domain": "gmail.com", "source": "all_mail", "labels_from": "gmail", "mails": 1000,
+               "no_message_id": 10, "sent": 100, "by_year": {"2018": 390, "2019": 300, "2020": 290, "2026": 20},
+               "labels": [{"label": "…@old-firma.example", "mails": 980}, {"label": "Inbox", "mails": 20}],
+               "labels_more": 0}
+ },
+ "compare": {
+  "old_mails": 1200, "new_mails": 1000, "moved": 980, "moved_by_bucket": 8, "missing": 220, "new_only": 20,
+  "by_year": {"2018": {"old": 400, "new": 390, "moved": 390, "missing": 10},
+              "2019": {"old": 500, "new": 300, "moved": 300, "missing": 200},
+              "2020": {"old": 300, "new": 290, "moved": 290, "missing": 10},
+              "2026": {"old": 0, "new": 20, "moved": 0, "missing": 0}},
+  "missing_by_month": {"2018-05": 10, "2019-02": 120, "2019-03": 80, "2020-01": 10},
+  "by_label": [{"label": "Inbox", "old": 900, "missing": 170}, {"label": "Sent", "old": 150, "missing": 50}],
+  "top_domains": [{"domain": "shop.example", "missing": 130}, {"domain": "(sent)", "missing": 50},
+                  {"domain": "amt.example.ch", "missing": 40}],
+  "gaps": [{"domain": "shop.example", "month": "2019-02", "missing": 90},
+           {"domain": "(sent)", "month": "2019-03", "missing": 50},
+           {"domain": "amt.example.ch", "month": "2019-02", "missing": 30}],
+  "gap_rows": 9, "gap_domains": 5
+ },
+ "scanned_at": "2026-10-16T18:00:00+02:00", "seconds": 141.2
+}

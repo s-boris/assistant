@@ -1,0 +1,200 @@
+#!/usr/bin/env -S python3 -I
+"""vidmontage: build a simple video montage (clips + photos + optional music) with ffmpeg, locally.
+
+Usage:
+  vidmontage -o out.mp4 [--music song.mp3] [--music-only] [--fade 0.8] [--photo-secs 4]
+             [--title "Text"] [--size 1920x1080] [--underwater [--uw-strength 0.8]] FILE... | --dir DIR
+Inputs are used in the given order (--dir: its photos and videos, sorted by name). Photos
+(jpg/png/heic/webp) become stills of --photo-secs; videos keep their length and sound. Every part
+is scaled and padded to --size at 30 fps, then joined with crossfades (--fade 0: hard cuts). --music mixes a track under the clip audio
+(--music-only replaces it); music fades out at the end. --title puts a text on the first 4 s.
+--underwater runs every clip and photo through uwfix first (per-scene underwater colour correction;
+--uw-strength 0–1, default 0.8; HEIC photos are left as they are).
+Nothing leaves the machine.
+"""
+import argparse, json, os, shutil, subprocess, sys, tempfile
+
+PHOTO = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp"}
+VIDEO = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm", ".3gp", ".mts", ".m2ts", ".mpg", ".mpeg", ".wmv"}
+UW_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"} | VIDEO  # what uwfix (ffmpeg) can correct
+FONT = os.environ.get("VIDMONTAGE_FONT") or "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"  # seam for tests
+
+
+def size(s):
+    try:
+        w, h = (int(x) for x in s.lower().split("x"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"bad size {s!r}: want WxH, e.g. 1920x1080")
+    if w < 2 or h < 2 or w % 2 or h % 2:
+        raise argparse.ArgumentTypeError(f"bad size {s!r}: width and height must be even (libx264 yuv420p)")
+    return w, h
+
+
+def positive(s):
+    v = float(s)
+    if not v > 0:
+        raise argparse.ArgumentTypeError(f"must be > 0: {s}")
+    return v
+
+
+def non_negative(s):
+    v = float(s)
+    if not v >= 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0: {s}")
+    return v
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"ffmpeg failed: {' '.join(cmd[:6])}...\n{r.stderr[-1500:]}")
+    return r
+
+
+def duration(path):
+    r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path])
+    return float(json.loads(r.stdout)["format"]["duration"])
+
+
+def has_audio(path):
+    r = run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path])
+    return bool(r.stdout.strip())
+
+
+def normalize(src, dst, w, h, photo_secs):
+    """-> True when the part carries the source's own audio (a silent track is made for photos and mute videos)."""
+    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+          "setsar=1,fps=30,format=yuv420p")
+    ext = os.path.splitext(src)[1].lower()
+    audio = False
+    if ext in PHOTO:
+        cmd = ["ffmpeg", "-y", "-loop", "1", "-t", str(photo_secs), "-i", src,
+               "-f", "lavfi", "-t", str(photo_secs), "-i", "anullsrc=r=48000:cl=stereo",
+               "-vf", vf, "-map", "0:v", "-map", "1:a"]
+    elif audio := has_audio(src):
+        cmd = ["ffmpeg", "-y", "-i", src, "-vf", vf, "-map", "0:v:0", "-map", "0:a:0"]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", src, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+               "-vf", vf, "-map", "0:v:0", "-map", "1:a", "-shortest"]
+    run(cmd + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-ar", "48000",
+               "-ac", "2", dst])
+    return audio
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("files", nargs="*")
+    ap.add_argument("--dir")
+    ap.add_argument("-o", "--out", required=True)
+    ap.add_argument("--music")
+    ap.add_argument("--music-only", action="store_true")
+    ap.add_argument("--fade", type=non_negative, default=0.8)
+    ap.add_argument("--photo-secs", type=positive, default=4.0)
+    ap.add_argument("--title")
+    ap.add_argument("--size", type=size, default="1920x1080")
+    ap.add_argument("--underwater", action="store_true")
+    ap.add_argument("--uw-strength", type=non_negative, default=0.8)
+    a = ap.parse_args()
+    if a.uw_strength > 1:
+        sys.exit(f"--uw-strength must be 0–1: {a.uw_strength}")
+    files = list(a.files)
+    if a.dir:
+        # only photos and videos: a stray .txt/.json or a subfolder would fail ffmpeg after minutes of work
+        for f in sorted(os.listdir(a.dir)):
+            path = os.path.join(a.dir, f)
+            if f.startswith("."):
+                continue
+            if os.path.isfile(path) and os.path.splitext(f)[1].lower() in PHOTO | VIDEO:
+                files.append(path)
+            else:
+                print(f"skipped (not a photo/video): {path}", file=sys.stderr)
+    if not files:
+        sys.exit("no input files")
+    # fail before any work, not after the first parts were rendered
+    for f in files + ([a.music] if a.music else []):
+        if not os.path.isfile(f):
+            sys.exit(f"no such file: {f}")
+    if not os.path.isdir(os.path.dirname(os.path.abspath(a.out))):
+        sys.exit(f"output folder does not exist: {os.path.dirname(os.path.abspath(a.out))}")
+    uwfix = None
+    if a.underwater:
+        uwfix = os.environ.get("VIDMONTAGE_UWFIX") or shutil.which("uwfix") or os.path.expanduser("~/bin/uwfix")
+        if not os.access(uwfix, os.X_OK):
+            sys.exit(f"--underwater needs uwfix: {uwfix} not found")
+    if a.title and not os.path.exists(FONT):
+        print(f"warning: font {FONT} missing, --title skipped", file=sys.stderr)
+    music_only = bool(a.music and a.music_only)
+    w, h = a.size
+    tmp = tempfile.mkdtemp(prefix="vidmontage-")
+    try:
+        parts, durs, heard = [], [], False
+        for i, f in enumerate(files):
+            p = os.path.join(tmp, f"p{i:03d}.mp4")
+            src = f
+            ext = os.path.splitext(f)[1].lower()
+            if uwfix and ext in UW_EXT:
+                src = os.path.join(tmp, f"uw{i:03d}" + (".jpg" if ext in PHOTO else ".mp4"))
+                r = subprocess.run([uwfix, f, "-o", src, "--quiet", "--strength", str(a.uw_strength)],
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    sys.exit(f"uwfix failed on {f}:\n{r.stderr[-1500:]}")
+            elif uwfix:
+                print(f"underwater fix skipped (unsupported format): {f}", file=sys.stderr)
+            heard = normalize(src, p, w, h, a.photo_secs) or heard
+            parts.append(p)
+            durs.append(duration(p))
+            print(f"[{i + 1}/{len(files)}] {os.path.basename(f)} {durs[-1]:.1f}s", file=sys.stderr)
+        fade = min(a.fade, min(durs) / 2) if len(parts) > 1 else 0
+        cmd = ["ffmpeg", "-y"]
+        for p in parts:
+            cmd += ["-i", p]
+        fc, v, au, off = [], "[0:v]", "[0:a]", 0.0
+        if len(parts) > 1 and fade == 0:  # xfade with duration 0 drops everything after the first part: plain concat
+            n = len(parts)
+            if music_only:
+                fc.append("".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vc]")
+                v = "[vc]"
+            else:
+                fc.append("".join(f"[{i}:v][{i}:a]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
+                v, au = "[vc]", "[ac]"
+        for i in range(1, len(parts) if fade else 1):
+            off += durs[i - 1] - fade
+            fc.append(f"{v}[{i}:v]xfade=transition=fade:duration={fade}:offset={off:.3f}[v{i}]")
+            v = f"[v{i}]"
+            if not music_only:  # an unused acrossfade output makes ffmpeg fail ("unconnected output")
+                fc.append(f"{au}[{i}:a]acrossfade=d={fade}[a{i}]")
+                au = f"[a{i}]"
+        total = sum(durs) - fade * (len(parts) - 1)
+        if a.title and os.path.exists(FONT):
+            t = a.title.replace("\\", "\\\\").replace("'", "’").replace(":", "\\:")
+            fc.append(f"{v}drawtext=fontfile={FONT}:text='{t}':fontcolor=white:fontsize=h/14:"
+                      f"box=1:boxcolor=black@0.4:boxborderw=20:x=(w-tw)/2:y=h*0.8:enable='lt(t,4)'[vt]")
+            v = "[vt]"
+        if a.music:
+            n = len(parts)
+            cmd += ["-stream_loop", "-1", "-i", a.music]
+            fo = max(total - 3, 0)
+            fc.append(f"[{n}:a]atrim=0:{total:.3f},afade=t=out:st={fo:.3f}:d=3,volume={1.0 if music_only else 0.35}[m]")
+            if music_only:
+                au = "[m]"
+            else:
+                fc.append(f"{au}[m]amix=inputs=2:duration=first:normalize=0[am]")
+                au = "[am]"
+        # loudnorm over pure digital silence (photos and mute clips, no music) yields NaN, which ffmpeg 7's AAC
+        # encoder refuses ("Input contains (near) NaN/+-Inf"): nothing audible goes in, so nothing to level
+        fc.append(f"{au}loudnorm=I=-16:TP=-1.5[aout]" if heard or a.music else f"{au}anull[aout]")
+        if v == "[0:v]":
+            fc.append("[0:v]null[vout]")
+        else:
+            fc.append(f"{v}null[vout]")
+        cmd += ["-filter_complex", ";".join(fc), "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-t", f"{total:.3f}", a.out]
+        run(cmd)
+        print(f"{a.out}: {len(parts)} parts, {total:.1f}s", file=sys.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

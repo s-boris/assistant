@@ -1,0 +1,11 @@
+#!/bin/sh
+# fake pack TYPE: a card like tg-cmd's
+[ -n "$FAKE_PACK_LOG" ] && echo "pack $*" >> "$FAKE_PACK_LOG"
+echo "🎒 $1 · Packing"
+case "$1" in
+  rave) printf '🎟 Ticket on phone\n👂 Earplugs\n🔋 Powerbank + cable\n💳 Card + some cash\n' ;;
+  dive) printf '🛂 Passport\n🤿 Mask + computer\n🧴 Reef-safe sunscreen\n🔌 Plug adapter\n' ;;
+  business) printf '👔 Shirt\n🪪 ID card\n🔌 Charger\n' ;;
+  *) exit 3 ;;
+esac
+echo "/pack TYPE shows one"

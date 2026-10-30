@@ -1,0 +1,10 @@
+[project]
+name = "assistant-hub"
+version = "0.1.0"
+description = "Hub-side runtime packages beyond the gateway's (DBOS Transact for durable workflows and schedules); shipped in hub releases' vendor/, never in ~/bin."
+requires-python = ">=3.11,<3.14"
+# Exact pins under the repo's two-week rule. psycopg stays at the release's hand-pinned 3.3.6 (ops/hub/vendor.toml).
+dependencies = ["dbos==3.3.0", "psycopg[binary]==3.3.6"]
+
+[tool.uv]
+package = false

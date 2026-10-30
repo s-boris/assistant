@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.reminders.op.response.json",
+  "title": "POST /v1/reminders answer: status ok (done; list = the fresh GET body), preview (at or where + message, nothing stored), duplicate (id seen before), invalid (the phrase or rid was not usable: message says why, show it), failed (remind failed; try again later).",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "preview",
+        "duplicate",
+        "invalid",
+        "failed"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "at": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4102444800
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "where": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 80
+    },
+    "list": {
+      "$ref": "http.reminders.response.json"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "id",
+    "status"
+  ]
+}

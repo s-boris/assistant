@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""tripclock: the time zone the owner is in (home, or a trip's zone while he is away). One source for his local
+time: quiet hours (push, channel-check, vault-events, remind's location holds), the sleep-in guard (sleepin, so
+`tg --soft`) and my morning report follow it. Server and log timestamps stay on the home zone.
+
+  tripclock tz [--at T]                 the IANA zone he is in (home outside trips)
+  tripclock now [--at T] [--json]       his wall clock: "Sat 21.11 12:00 Area/Zone (UTC+04:00) · home 09:00"
+  tripclock status [--at T] [--json]    zone + why, trip, every switch moment (past and ahead), quiet hours now
+  tripclock quiet [--at T] [--hours A-B]   exit 0 inside his quiet hours (default 0-8), 1 outside (shell gates)
+  tripclock sync [--quiet]              snapshot flight-watch's legs (and live landing times) into the config, so
+                                        the switch moments survive after flight-watch drops past flights
+T: ISO with offset, "@EPOCH", or "YYYY-MM-DD HH:MM" (home wall time). Default: now ($TRIPCLOCK_NOW, same forms).
+
+Config: ~/.config/tripclock/trips.json (private, 0600; $TRIPCLOCK_CONFIG):
+  {"trips": [{"name", "tz", "from": "YYYY-MM-DD", "to": "YYYY-MM-DD", "start"?, "end"?, "legs"?: [...]}]}
+Switching rule (lib/tripclock.py): inside a trip's dates he is in the zone of the airport where he last landed
+(flight legs from flight-watch, its estimated/actual landing time when known), before the first landing the
+zone he left from; explicit "start"/"end" instants override the legs; no legs: the trip zone for the whole dates.
+Reminder rule (remind): an owner reminder keeps the zone it was set in. One set at home rings at its home wall
+time during a trip too (`trip-shift` proposes moves for night ones); a one-off or daily owner reminder added while
+he is away is read as HIS local time (stored as the same instant in home wall time, with "tz" and "local").
+Exit: 0 ok, 1 `quiet` outside quiet hours, 2 usage or a broken config (status / sync).
+Env (tests): TRIPCLOCK_CONFIG, TRIPCLOCK_FLIGHTS, TRIPCLOCK_NOW, TRIPCLOCK_HOME_TZ (home zone), TRIPCLOCK_OFF=1.
+"""
+import datetime as dt
+import json
+import os
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+import tripclock as tc  # noqa: E402
+
+FMT = '%Y-%m-%d %H:%M'
+
+
+def home():
+    name = os.environ.get('TRIPCLOCK_HOME_TZ')
+    if name:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return tc.home_zone(None)
+
+
+def parse_t(s, hz):
+    s = (s or '').strip()
+    if not s:
+        return tc.instant(None)
+    if s.startswith('@'):
+        return tc.instant(float(s[1:]))
+    try:
+        return dt.datetime.strptime(s, FMT).replace(tzinfo=hz).astimezone(tc.UTC)
+    except ValueError:
+        pass
+    d = dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=hz)
+    return d.astimezone(tc.UTC)
+
+
+def take(args, opt):
+    if opt in args:
+        i = args.index(opt)
+        if i + 1 >= len(args):
+            raise ValueError(f'{opt} needs a value')
+        v = args[i + 1]
+        del args[i:i + 2]
+        return v
+    return None
+
+
+def off(t):
+    o = t.utcoffset()
+    s = int(o.total_seconds())
+    return 'UTC%s%02d:%02d' % ('+' if s >= 0 else '-', abs(s) // 3600, abs(s) % 3600 // 60)
+
+
+def now_line(t, hz):
+    lt, ht = tc.local(t, hz), t.astimezone(hz)
+    s = f"{lt:%a %d.%m %H:%M} {lt.tzinfo.key} ({off(lt)})"
+    return s if lt.tzinfo.key == hz.key else s + f" · home {ht:%H:%M}" + ('' if ht.date() == lt.date() else f" {ht:%a}")
+
+
+def status(t, hz):
+    z, why, trip = tc.zone_why(t, hz)
+    err = None
+    try:
+        tc.load_config()
+    except ValueError as e:
+        err = str(e)
+    sw = tc.switches(hz)
+    nxt = next((s for s in sw if s[0] > t), None)
+    return {'now': tc.local(t, hz).isoformat(), 'zone': z.key, 'why': why, 'trip': trip, 'away': z.key != hz.key,
+            'home_zone': hz.key, 'quiet_now': tc.in_quiet(t, 0, 8, hz), 'config_error': err,
+            'switches': [{'at': p.isoformat(), 'his_time': p.astimezone(ZoneInfo(k)).strftime('%a %d.%m %H:%M'),
+                          'home_time': p.astimezone(hz).strftime('%a %d.%m %H:%M'), 'zone': k, 'why': w,
+                          'past': p <= t} for p, k, w in sw],
+            'next_switch': nxt[0].isoformat() if nxt else None}
+
+
+def write_private(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.trips.')
+    with os.fdopen(fd, 'w') as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def sync(hz, quiet):
+    cfg = tc.load_config()
+    if not cfg.get('trips'):
+        if not quiet:
+            print('no trips configured')
+        return 0
+    live = tc.live_legs()
+    n_new = n_upd = 0
+    for tr in cfg['trips']:
+        t2 = dict(tr, _home=hz)
+        old = {(g.get('no'), g.get('dep')): g for g in tr.get('legs') or []}
+        legs = tc.legs_of(t2, live)
+        for g in legs:
+            k = (g.get('no'), g.get('dep'))
+            if k not in old:
+                n_new += 1
+            elif old[k] != g:
+                n_upd += 1
+        tr['legs'] = legs
+    if n_new or n_upd:
+        write_private(tc.config_path(), cfg)
+    if not quiet:
+        print(f"synced {len(cfg['trips'])} trip(s): {n_new} new leg(s), {n_upd} updated")
+    return 0
+
+
+def main(argv):
+    args = list(argv)
+    if not args or args[0] in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+        return 0 if args else 2
+    cmd, args = args[0], args[1:]
+    hz = home()
+    try:
+        at = take(args, '--at')
+        t = parse_t(at if at is not None else os.environ.get('TRIPCLOCK_NOW'), hz)
+    except ValueError as e:
+        print(f'tripclock: bad time: {e}', file=sys.stderr)
+        return 2
+    js = '--json' in args
+    args = [a for a in args if a != '--json']
+    if cmd == 'tz' and not args:
+        print(tc.zone_name(t, hz))
+        return 0
+    if cmd == 'now' and not args:
+        if js:
+            lt = tc.local(t, hz)
+            print(json.dumps({'local': lt.strftime(FMT), 'zone': lt.tzinfo.key, 'offset': off(lt),
+                              'home': t.astimezone(hz).strftime(FMT), 'home_zone': hz.key, 'away': tc.away(t, hz)}))
+        else:
+            print(now_line(t, hz))
+        return 0
+    if cmd == 'quiet':
+        hours = take(args, '--hours') or '0-8'
+        try:
+            a, b = (int(x) for x in hours.split('-'))
+        except ValueError:
+            print('tripclock: --hours takes A-B (whole hours)', file=sys.stderr)
+            return 2
+        return 0 if tc.in_quiet(t, a, b, hz) else 1
+    if cmd == 'status' and not args:
+        st = status(t, hz)
+        if js:
+            print(json.dumps(st, indent=1))
+        else:
+            print(f"his time: {now_line(t, hz)}")
+            print(f"zone: {st['zone']} ({st['why']}{', trip ' + st['trip'] if st['trip'] else ''})"
+                  + (' · quiet hours now' if st['quiet_now'] else ''))
+            if st['config_error']:
+                print(f"config error (home zone used): {st['config_error']}")
+            for s in st['switches']:
+                print(f"  {'done' if s['past'] else 'next' if s['at'] == st['next_switch'] else 'ahead'}: "
+                      f"{s['home_time']} home = {s['his_time']} → {s['zone']} ({s['why']})")
+            if not st['switches']:
+                print('no trips ahead (home zone all the time)')
+        return 2 if st['config_error'] else 0
+    if cmd == 'sync':
+        try:
+            return sync(hz, '--quiet' in args)
+        except ValueError as e:
+            print(f'tripclock: {e}', file=sys.stderr)
+            return 2
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

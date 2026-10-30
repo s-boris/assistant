@@ -1,0 +1,2687 @@
+# Managed files: written only by `assistant deploy` (via `assistant land`). dest is relative to $HOME.
+# Per [[file]]: src (repo path), dest, mode (default 0755 under bin/, else 0644), header (default true: the managed
+# header line goes after the shebang), smoke (sh command after install; {dest} {home} {lib} are shell-quoted),
+# suite (legacy suite ~/opt/<suite>-tests run by `assistant ci` against a staged bin overlay), seam (env var that
+# suite reads for the binary under test; default NAME_BIN).
+# [core]: the stdlib library tree, installed as dest -> dest.releases/<release>/core (atomic symlink, last 3 kept).
+
+[core]
+src = "core"
+dest = "bin/lib/core"
+smoke = "/usr/bin/python3 -I -c \"import sys; sys.path.insert(0, sys.argv[1]); import core.paths, core.clock, core.jsonstate, core.locks, core.http, core.notes, core.tg; core.clock.now()\" {lib}"
+
+[[file]]
+src = "ops/assistant.py"
+dest = "bin/assistant"
+mode = "0755"
+smoke = "{dest} --version"
+suite = "assistant"
+seam = "ASSISTANT_BIN"
+
+# Memory records: `memory` = FACTS.md facts and ledger lines as rows in mem.db (schema 2, additive
+# next to memory2's tables), rendered back byte for byte.
+# The gate on the live file runs from a private suite outside the repo.
+[[file]]
+src = "scripts/memory"
+dest = "bin/memory"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null"
+
+[[file]]
+src = "packages/memrows/__init__.py"
+dest = "bin/lib/memrows/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/memrows/store.py"
+dest = "bin/lib/memrows/store.py"
+mode = "0644"
+
+# The facts core (FACTS-core.md, `memory render --core`, `memory core`), re-rendered by the memory-import cron.
+[[file]]
+src = "packages/memrows/corepack.py"
+dest = "bin/lib/memrows/corepack.py"
+mode = "0644"
+
+[[file]]
+src = "packages/memrows/cli.py"
+dest = "bin/lib/memrows/cli.py"
+mode = "0644"
+
+# Event ledger + agenda: the events CLI, its inbox package next to core in ~/bin/lib, the kind registry, and the
+# agenda hook (registered in settings.json).
+[[file]]
+src = "scripts/events"
+dest = "bin/events"
+mode = "0755"
+smoke = "{dest} kinds --json >/dev/null && /usr/bin/python3 -I -S {dest} kinds >/dev/null"
+
+# Loop: `loop` (daily change proposals, metric first, as PR-draft branches; owner corrections ->
+# fact-row + eval-case drafts) and `reflex` (the brain's reflex registry v0) over packages/loop next to core in
+# ~/bin/lib; the self-review runs the loop as its step (g). Nothing merges by itself.
+[[file]]
+src = "scripts/loop"
+dest = "bin/loop"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} ls >/dev/null"
+
+[[file]]
+src = "scripts/reflex"
+dest = "bin/reflex"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} ls >/dev/null"
+
+[[file]]
+src = "scripts/self-review"
+dest = "bin/self-review"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} open >/dev/null"
+suite = "self-review"
+seam = "SR"
+
+[[file]]
+src = "packages/loop/__init__.py"
+dest = "bin/lib/loop/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/common.py"
+dest = "bin/lib/loop/common.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/signals.py"
+dest = "bin/lib/loop/signals.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/propose.py"
+dest = "bin/lib/loop/propose.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/targets.json"
+dest = "bin/lib/loop/targets.json"
+mode = "0644"
+header = false
+
+# The loop coverage map (`loop coverage`, the self-review collector `coverage`): which loop step reads which part.
+[[file]]
+src = "packages/loop/coverage.py"
+dest = "bin/lib/loop/coverage.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/coverage.toml"
+dest = "bin/lib/loop/coverage.toml"
+mode = "0644"
+header = false
+
+[[file]]
+src = "packages/loop/review.py"
+dest = "bin/lib/loop/review.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/corrections.py"
+dest = "bin/lib/loop/corrections.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/reflex.py"
+dest = "bin/lib/loop/reflex.py"
+mode = "0644"
+
+# self-review step (h): the whole-setup health pass (collectors per log/trace source) and the Phoenix client
+# (span stats, annotations, datasets, before/after experiments of loop proposals).
+[[file]]
+src = "packages/loop/health.py"
+dest = "bin/lib/loop/health.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/phoenix.py"
+dest = "bin/lib/loop/phoenix.py"
+mode = "0644"
+
+[[file]]
+src = "packages/loop/cli.py"
+dest = "bin/lib/loop/cli.py"
+mode = "0644"
+
+# Stamps mcp__hub__* calls with the caller (main session or subagent) for the hub gateway's policy. Registered
+# in settings.json together with the HTTP MCP entry.
+[[file]]
+src = "hooks/hub-stamp.py"
+dest = ".claude/hooks/hub-stamp.py"
+mode = "0755"
+smoke = "{dest} </dev/null"
+
+[[file]]
+src = "hooks/agenda.sh"
+dest = ".claude/hooks/agenda.sh"
+mode = "0755"
+smoke = "sh -n {dest} && {dest} </dev/null"
+
+# Rules audit 29.10 (C2-C5, C1 later): conduct checks at the moment of the act, deny-once (a held call's identical
+# retry goes through). conduct.py: PreToolUse (Bash, hub waits, sends), UserPromptSubmit (the turn) and Stop (idle
+# beats) in settings.json; pitch-check.sh runs its send lint before board-lint pitch on every reply.
+[[file]]
+src = "hooks/conduct.py"
+dest = ".claude/hooks/conduct.py"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "hooks/pitch-check.sh"
+dest = ".claude/hooks/pitch-check.sh"
+mode = "0755"
+smoke = "sh -n {dest}"
+
+[[file]]
+src = "schemas/kinds.toml"
+dest = "bin/lib/inbox/kinds.toml"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/__init__.py"
+dest = "bin/lib/inbox/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/agenda.py"
+dest = "bin/lib/inbox/agenda.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/cli.py"
+dest = "bin/lib/inbox/cli.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/hook.py"
+dest = "bin/lib/inbox/hook.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/ingest.py"
+dest = "bin/lib/inbox/ingest.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/kinds.py"
+dest = "bin/lib/inbox/kinds.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/metrics.py"
+dest = "bin/lib/inbox/metrics.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/notes.py"
+dest = "bin/lib/inbox/notes.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/sources.py"
+dest = "bin/lib/inbox/sources.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/writer.py"
+dest = "bin/lib/inbox/writer.py"
+mode = "0644"
+
+# Delivery receipts (agenda hook), `events metrics --tg`, brain-watch.
+[[file]]
+src = "packages/inbox/receipts.py"
+dest = "bin/lib/inbox/receipts.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/tgmetrics.py"
+dest = "bin/lib/inbox/tgmetrics.py"
+mode = "0644"
+
+[[file]]
+src = "packages/inbox/reflexrun.py"
+dest = "bin/lib/inbox/reflexrun.py"
+mode = "0644"
+
+# The loop SLO tiles (`slo`, read-only; the hub feed sends the cached tiles).
+[[file]]
+src = "packages/inbox/slo.py"
+dest = "bin/lib/inbox/slo.py"
+mode = "0644"
+
+# The exit-review window counts (`slo window`, read-only).
+[[file]]
+src = "packages/inbox/exitwindow.py"
+dest = "bin/lib/inbox/exitwindow.py"
+mode = "0644"
+
+[[file]]
+src = "scripts/slo"
+dest = "bin/slo"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+# The continuous scorecard (`scorecard`): hourly metrics vs a 7-day baseline, one inbox note per regression a day.
+[[file]]
+src = "packages/loop/scorecard.py"
+dest = "bin/lib/loop/scorecard.py"
+mode = "0644"
+
+[[file]]
+src = "scripts/scorecard"
+dest = "bin/scorecard"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "packages/inbox/brainwatch.py"
+dest = "bin/lib/inbox/brainwatch.py"
+mode = "0644"
+
+[[file]]
+src = "scripts/brain-watch"
+dest = "bin/brain-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} --status >/dev/null"
+
+# Skill and tail CLIs (trips, tracks, research, cards); suites in tests/legacy/<suite>/.
+# night-log, pack and waiting-card have no suite (smoke only); night-log and waiting-card have no --help, so their smoke
+# is a run on empty inputs. trackid and vision reach outside services only on a real run, never on --help.
+[[file]]
+src = "scripts/mail-migration-check"
+dest = "bin/mail-migration-check"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "mail-migration-check"
+seam = "MMC_SCRIPT"
+
+[[file]]
+src = "scripts/night-log"
+dest = "bin/night-log"
+mode = "0755"
+smoke = "NIGHTLOG_TRANSCRIPTS=/nonexistent NIGHTLOG_BRAIN_GIT=/nonexistent {dest} >/dev/null"
+
+[[file]]
+src = "scripts/pack"
+dest = "bin/pack"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/pretrip-check"
+dest = "bin/pretrip-check"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "pretrip-check"
+seam = "PRETRIP_UNDER_TEST"
+
+[[file]]
+src = "scripts/research"
+dest = "bin/research"
+mode = "0755"
+smoke = "[ ! -d {home}/opt/research-venv ] || ( {dest} --help >/dev/null )"
+suite = "research"
+seam = "RESEARCH_BIN"
+
+[[file]]
+src = "scripts/route"
+dest = "bin/route"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "route"
+seam = "ROUTE_BIN"
+
+[[file]]
+src = "scripts/stay-compare"
+dest = "bin/stay-compare"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "stay-compare"
+seam = "SC"
+
+[[file]]
+src = "scripts/trackid"
+dest = "bin/trackid"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "trackid"
+seam = "TRACKID_BIN"
+
+[[file]]
+src = "scripts/trackinfo"
+dest = "bin/trackinfo"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "trackinfo"
+seam = "TRACKINFO_BIN"
+
+[[file]]
+src = "scripts/trip-admin"
+dest = "bin/trip-admin"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "trip-admin"
+seam = "TRIP_ADMIN_SCRIPT"
+
+[[file]]
+src = "scripts/trip-conditions"
+dest = "bin/trip-conditions"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "trip-conditions"
+seam = "TRIP_CONDITIONS_BIN"
+
+[[file]]
+src = "scripts/trip-pack"
+dest = "bin/trip-pack"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "trip-pack"
+seam = "TRIP_PACK"
+
+[[file]]
+src = "scripts/trip-recap"
+dest = "bin/trip-recap"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "trip-recap"
+seam = "TRIP_RECAP_BIN"
+
+[[file]]
+src = "scripts/trip-shift"
+dest = "bin/trip-shift"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "trip-shift"
+seam = "TRIP_SHIFT_BIN"
+
+[[file]]
+src = "scripts/vision"
+dest = "bin/vision"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "vision"
+seam = "VISION_BIN"
+
+[[file]]
+src = "scripts/waiting-card"
+dest = "bin/waiting-card"
+mode = "0755"
+smoke = "WAITING_TODO=/dev/null {dest} >/dev/null"
+
+# Small tail CLIs (each gets the managed header line but the two node
+# fetchers carry no header: a "#" line is no JavaScript). Suites in tests/legacy/<suite>/. transcribe's ~/opt suite
+# is a whisper benchmark (test-all entry), so the land only smokes it. gohome and tripclock import ~/bin/lib modules that are
+# not in the repo; their suites default to ~/bin and the land CI runs them on the overlay copy.
+[[file]]
+src = "scripts/whisper-server-ctl"
+dest = "bin/whisper-server-ctl"
+mode = "0755"
+smoke = "bash -n {dest}"
+suite = "whisper-server-ctl"
+seam = "WHISPER_SERVER_CTL_BIN"
+
+[[file]]
+src = "scripts/llm-server-ctl"
+dest = "bin/llm-server-ctl"
+mode = "0755"
+smoke = "bash -n {dest}"
+suite = "llm-server-ctl"
+seam = "LLM_SERVER_CTL_BIN"
+
+[[file]]
+src = "scripts/transcribe"
+dest = "bin/transcribe"
+mode = "0755"
+smoke = "bash -n {dest}"
+
+[[file]]
+src = "scripts/lights-preset"
+dest = "bin/lights-preset"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "lights-preset"
+seam = "LIGHTS_PRESET_BIN"
+
+[[file]]
+src = "scripts/gohome"
+dest = "bin/gohome"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "gohome"
+seam = "GOHOME_BIN"
+
+[[file]]
+src = "scripts/tripclock"
+dest = "bin/tripclock"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "tripclock"
+seam = "TRIPCLOCK_BIN"
+
+[[file]]
+src = "scripts/tutti-fetch"
+dest = "bin/tutti-fetch"
+mode = "0755"
+header = false
+smoke = "node --check {dest}"
+
+[[file]]
+src = "scripts/shop-orders-fetch"
+dest = "bin/shop-orders-fetch"
+mode = "0755"
+header = false
+smoke = "node --check {dest}"
+
+# Skill and HA tail CLIs. Suites in
+# tests/legacy/<suite>/. kk-compare and lists import ~/bin/lib/assistant_profile (not in the repo): their suites default
+# to ~/bin and the land CI runs them on the overlay copy. kb's tests are memory2's (KB_BIN): smoke only. ha-audit's
+# fake HA (tests/legacy/ha-audit/fake_ha.py) also serves ha-avail's suite.
+[[file]]
+src = "scripts/divelog"
+dest = "bin/divelog"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "divelog"
+seam = "DIVELOG_BIN"
+
+[[file]]
+src = "scripts/ha-audit"
+dest = "bin/ha-audit"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ha-audit"
+seam = "HA_AUDIT_BIN"
+
+[[file]]
+src = "scripts/ha-apply"
+dest = "bin/ha-apply"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ha-apply"
+seam = "HA_APPLY_BIN"
+
+[[file]]
+src = "scripts/ha-dashboard-gen"
+dest = "bin/ha-dashboard-gen"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ha-dashboard-gen"
+seam = "GEN_BIN"
+
+[[file]]
+src = "scripts/kb"
+dest = "bin/kb"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/kk-compare"
+dest = "bin/kk-compare"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "kk"
+seam = "KK_BIN"
+
+[[file]]
+src = "scripts/lists"
+dest = "bin/lists"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "lists"
+seam = "LISTS_BIN"
+
+# The guarded tail (paperless, Telegram senders, phonegw, unraid-ssh callers).
+# Suites in tests/legacy/<suite>/; their fakes stand in for paperless,
+# remind, tg, phone and unraid-ssh. _admindesk.py is letter's and pdfform's shared module (0644, imported from their
+# own dir; no smoke of its own: theirs import it); its src has no .py so ruff leaves it alone, like
+# the other extension-less scripts. The letter suite covers pdfform too and, under CI, runs the staged letter beside
+# the tree's _admindesk.py and pdfform. decision-deck has no suite: smoke only.
+[[file]]
+src = "scripts/_admindesk"
+dest = "bin/_admindesk.py"
+mode = "0644"
+suite = "_admindesk"
+seam = "ADMINDESK_SRC"
+
+[[file]]
+src = "scripts/letter"
+dest = "bin/letter"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "letter"
+seam = "LETTER_BIN"
+
+[[file]]
+src = "scripts/pdfform"
+dest = "bin/pdfform"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/deadlines"
+dest = "bin/deadlines"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "deadlines"
+seam = "DEADLINES_BIN"
+
+[[file]]
+src = "scripts/deals"
+dest = "bin/deals"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "deals"
+seam = "DEALS_BIN"
+
+[[file]]
+src = "scripts/health"
+dest = "bin/health"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "health"
+seam = "HEALTH_CLI"
+
+[[file]]
+src = "scripts/decision-deck"
+dest = "bin/decision-deck"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/disk-day-check"
+dest = "bin/disk-day-check"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "disk-day-check"
+seam = "DDC_SCRIPT"
+
+# Skill, dashboard and watcher CLIs. Suites in tests/legacy/<suite>/ (run.sh where the test files run directly;
+# arr-mismatch and missing-docs read their *_BIN seam). Smoke: --help (each returns
+# before any work); ha-autopilot-watch (prints usage, exit 2) parses only, dash-publish bash -n. No suite here yet:
+# product (none), calcache, context, usage (theirs stay in ~/opt, red under CI's temp HOME + netguard: real
+# crontab, 2 blocked connections, agent rows, owner-channel env; fold them once fixed). arr-mismatch and cat-autopilot
+# run their copy beside a link to the live sibling they call (arr-unblock, cat-supplies).
+
+[[file]]
+src = "scripts/arr-mismatch"
+dest = "bin/arr-mismatch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "arr-mismatch"
+seam = "ARR_MISMATCH_BIN"
+
+[[file]]
+src = "scripts/arr-unblock"
+dest = "bin/arr-unblock"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "arr-unblock"
+seam = "ARR_UNBLOCK_BIN"
+
+[[file]]
+src = "scripts/board-lint"
+dest = "bin/board-lint"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "board-lint"
+seam = "BOARD_LINT_BIN"
+
+[[file]]
+src = "scripts/calcache"
+dest = "bin/calcache"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "calcache"
+seam = "CALCACHE_BIN"
+
+[[file]]
+src = "scripts/cat-autopilot"
+dest = "bin/cat-autopilot"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "cat-autopilot"
+seam = "CAT_AUTOPILOT_BIN"
+
+[[file]]
+src = "scripts/cat-corner"
+dest = "bin/cat-corner"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "cat-corner"
+seam = "CAT_CORNER_BIN"
+
+[[file]]
+src = "scripts/cat-supplies"
+dest = "bin/cat-supplies"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "cat-supplies"
+seam = "CAT_SUPPLIES_BIN"
+
+[[file]]
+src = "scripts/context"
+dest = "bin/context"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "context"
+seam = "CONTEXT_BIN"
+
+[[file]]
+src = "scripts/dash-data"
+dest = "bin/dash-data"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "dash-data"
+seam = "DASH_BIN"
+
+[[file]]
+src = "scripts/dash-growth"
+dest = "bin/dash-growth"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "dash-growth"
+seam = "GROWTH_BIN"
+
+[[file]]
+src = "scripts/dash-publish"
+dest = "bin/dash-publish"
+mode = "0755"
+smoke = "bash -n {dest}"
+suite = "dash-publish"
+seam = "DASH_PUBLISH_BIN"
+
+[[file]]
+src = "scripts/drive-brief"
+dest = "bin/drive-brief"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "drive-brief"
+seam = "DRIVE_BRIEF_BIN"
+
+[[file]]
+src = "scripts/emby"
+dest = "bin/emby"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "emby"
+seam = "EMBY_BIN"
+
+[[file]]
+src = "scripts/gift-radar"
+dest = "bin/gift-radar"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "gift-radar"
+seam = "GIFT_RADAR_BIN"
+
+[[file]]
+src = "scripts/gym"
+dest = "bin/gym"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "gym"
+seam = "GYM_BIN"
+
+[[file]]
+src = "scripts/ha-autopilot-watch"
+dest = "bin/ha-autopilot-watch"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+suite = "ha-autopilot-watch"
+seam = "AUTOPILOT_BIN"
+
+[[file]]
+src = "scripts/home-ctx"
+dest = "bin/home-ctx"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "home-ctx"
+seam = "HOME_CTX_BIN"
+
+[[file]]
+src = "scripts/media"
+dest = "bin/media"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "media"
+seam = "MEDIA_BIN"
+
+[[file]]
+src = "scripts/menu-usage"
+dest = "bin/menu-usage"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "menu-usage"
+seam = "MENU_USAGE_BIN"
+
+[[file]]
+src = "scripts/missing-docs"
+dest = "bin/missing-docs"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "missing-docs"
+seam = "MISSING_DOCS_BIN"
+
+[[file]]
+src = "scripts/night-plan"
+dest = "bin/night-plan"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "night-plan"
+seam = "NIGHT_PLAN_BIN"
+
+[[file]]
+src = "scripts/parcels"
+dest = "bin/parcels"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "parcels"
+seam = "PARCELS_BIN"
+
+[[file]]
+src = "scripts/product"
+dest = "bin/product"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/security-watch"
+dest = "bin/security-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "security-watch"
+seam = "SW_BIN"
+
+[[file]]
+src = "scripts/ticket-check"
+dest = "bin/ticket-check"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ticket-check"
+seam = "TICKET_CHECK"
+
+[[file]]
+src = "scripts/unifi-health"
+dest = "bin/unifi-health"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "unifi-health"
+seam = "UNIFI_HEALTH_BIN"
+
+[[file]]
+src = "scripts/unraid-capacity"
+dest = "bin/unraid-capacity"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "unraid-capacity"
+seam = "UNRAID_CAPACITY_BIN"
+
+[[file]]
+src = "scripts/usage"
+dest = "bin/usage"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "usage"
+seam = "USAGE_CLI"
+
+[[file]]
+src = "scripts/voice-plan"
+dest = "bin/voice-plan"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "voice-plan"
+seam = "VOICE_PLAN_BIN"
+# Guarded-tail, voice, browser and server CLIs; scripts/secretscan_py lands as bin/secretscan.py (no .py in the src,
+# so ruff leaves it alone, like _admindesk; the secretscan symlink stays unmanaged). Suites in tests/legacy/<suite>/; tts, tg-senders and brain test a bin dir, so their run.sh builds a temp bin of links to the
+# live ~/bin with the staged copies in place and runs the original as suite.sh. One entry per suite (CI runs a suite
+# once): driving (tts suite) and tg-voice (tg-senders suite) carry none, like pdfform. Suites CI runs from ~/opt:
+# bills (binary photo samples), secretscan (synthetic tokens), webagent (holds the secure-fill suite). Smoke only, red
+# under CI's temp HOME, test-all runs them: codebase-sync, unraid-do. Smoke: --help (each returns before any work);
+# driving, paperless, talk-button, secretscan.py parse only; risk-ok and the senders tg-buttons, tg-voice (never run)
+# sh -n. usage has its suite here too (real home via pwd, the staged copy's lib, USAGE_TEST unset for the
+# actor cases); calcache and context (2 blocked) stay red under CI and stay in ~/opt. dash-data's suite (30.10)
+# renders the gym card in Chrome, host only; Chrome's IPv6 probe goes to the suite's own guard log.
+
+[[file]]
+src = "scripts/bills"
+dest = "bin/bills"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "bills"
+seam = "BILLS_BIN"
+
+[[file]]
+src = "scripts/contracts"
+dest = "bin/contracts"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "contracts"
+seam = "CONTRACTS_BIN"
+
+[[file]]
+src = "scripts/ha"
+dest = "bin/ha"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ha"
+seam = "HA_BIN"
+
+[[file]]
+src = "scripts/traces"
+dest = "bin/traces"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "traces"
+seam = "TRACES_BIN"
+
+[[file]]
+src = "scripts/tts"
+dest = "bin/tts"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "tts"
+seam = "TTS_BIN"
+
+[[file]]
+src = "scripts/webagent"
+dest = "bin/webagent"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "webagent"
+seam = "WEBAGENT_CLI"
+
+[[file]]
+src = "scripts/paperless-inbox-review"
+dest = "bin/paperless-inbox-review"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "paperless-inbox"
+seam = "PINB_BIN"
+
+[[file]]
+src = "scripts/drive-update"
+dest = "bin/drive-update"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/voice-say"
+dest = "bin/voice-say"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/abx"
+dest = "bin/abx"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/brain"
+dest = "bin/brain"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "brain"
+seam = "BRAIN_BIN"
+
+[[file]]
+src = "scripts/browser"
+dest = "bin/browser"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "browser"
+seam = "BROWSER_BIN"
+
+# codebase-sync: its precheck gates every land (ops/assistant.py _precheck_only: a change to it or to this manifest = the whole would-be home)
+[[file]]
+src = "scripts/codebase-sync"
+dest = "bin/codebase-sync"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "codebase-sync"
+
+[[file]]
+src = "scripts/flowd"
+dest = "bin/flowd"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "flowd"
+seam = "FLOWD_BIN"
+
+[[file]]
+src = "scripts/push"
+dest = "bin/push"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "push"
+seam = "PUSH_BIN"
+
+[[file]]
+src = "scripts/unraid-do"
+dest = "bin/unraid-do"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "unraid-do"
+
+[[file]]
+src = "scripts/unraid-ssh"
+dest = "bin/unraid-ssh"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/whereabouts"
+dest = "bin/whereabouts"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/phone-routine"
+dest = "bin/phone-routine"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/driving"
+dest = "bin/driving"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+
+[[file]]
+src = "scripts/paperless"
+dest = "bin/paperless"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+suite = "paperless"
+seam = "PAPERLESS_BIN"
+
+[[file]]
+src = "scripts/risk-ok"
+dest = "bin/risk-ok"
+mode = "0755"
+smoke = "sh -n {dest}"
+suite = "risk-ok"
+seam = "RISK_OK_BIN"
+
+[[file]]
+src = "scripts/talk-button"
+dest = "bin/talk-button"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+suite = "talk-button"
+seam = "TALK_BUTTON_BIN"
+
+[[file]]
+src = "scripts/tg-buttons"
+dest = "bin/tg-buttons"
+mode = "0755"
+smoke = "sh -n {dest}"
+suite = "tg-senders"
+seam = "TG_BUTTONS_BIN"
+
+[[file]]
+src = "scripts/tg-voice"
+dest = "bin/tg-voice"
+mode = "0755"
+smoke = "sh -n {dest}"
+
+[[file]]
+src = "scripts/secretscan_py"
+dest = "bin/secretscan.py"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+suite = "secretscan"
+seam = "SECRETSCAN_UNDER_TEST"
+
+# unraid-lockdown: its laptop hint reads profile network.server_name (lowercased). Smoke --help only; its suite
+# stays in ~/opt/unraid-lockdown-tests (real home, throwaway sshd), test-all runs it.
+[[file]]
+src = "scripts/unraid-lockdown"
+dest = "bin/unraid-lockdown"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+# Agent titles: tg-status (the pinned board) and agent-watch
+# (the subagent watchdog), plus their shared agent_titles module (one file maps agent id -> a short title;
+# both show it over the spawn description; `tg-status title ID|PREFIX ["Short title"]` sets or clears one). Suites in
+# tests/legacy/<suite>/; tg-status's runs the copy with the live hb-gate when the overlay holds tg-status alone.
+[[file]]
+src = "scripts/lib/agent_titles.py"
+dest = "bin/lib/agent_titles.py"
+mode = "0644"
+smoke = "/usr/bin/python3 -I -c \"import sys; sys.path.insert(0, sys.argv[1]); import agent_titles; assert agent_titles.MAX\" {lib}"
+
+[[file]]
+src = "scripts/tg-status"
+dest = "bin/tg-status"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "tg-status"
+seam = "TG_STATUS_BIN"
+
+[[file]]
+src = "scripts/agent-watch"
+dest = "bin/agent-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "agent-watch"
+seam = "AGENT_WATCH_BIN"
+
+# agentfeed: the dashboard Agents tab's rows and its ONE privacy filter clean() (dash-data embeds
+# it, flowd streams it); a renamed agent's card shows its title (agent-watch --json "title"), through clean(). Ruff
+# fixed + formatted, otherwise as live (the _mods import order kept). Suite tests/legacy/agentfeed/ (AGENTFEED_PATH:
+# the staged copy; it tests the identical copy in the overlay's lib/, beside ownermask, securefill, assistant_profile).
+[[file]]
+src = "scripts/lib/agentfeed.py"
+dest = "bin/lib/agentfeed.py"
+mode = "0644"
+smoke = "/usr/bin/python3 -I -c \"import sys; sys.path.insert(0, sys.argv[1]); import agentfeed; assert agentfeed.clean and agentfeed.snapshot\" {lib}"
+suite = "agentfeed"
+seam = "AGENTFEED_PATH"
+
+# Wake rules: the brain's holds, delivery rules and timers; `wake check` is what ~/bin/hb-gate reads.
+[[file]]
+src = "scripts/wake"
+dest = "bin/wake"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} check --json >/dev/null && /usr/bin/python3 -I -S {dest} check >/dev/null"
+
+[[file]]
+src = "packages/inbox/wake.py"
+dest = "bin/lib/inbox/wake.py"
+
+# tg-adapter + the outbox shadow in ~/bin/tg (adopted from the live wrapper).
+[[file]]
+src = "scripts/tg"
+dest = "bin/tg"
+mode = "0755"
+smoke = "sh -n {dest}"
+
+[[file]]
+src = "scripts/tg-adapter"
+dest = "bin/tg-adapter"
+mode = "0755"
+smoke = "{dest} --version >/dev/null && /usr/bin/python3 -I -S {dest} --version >/dev/null"
+
+[[file]]
+src = "packages/tgadapter/__init__.py"
+dest = "bin/lib/tgadapter/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tgadapter/cli.py"
+dest = "bin/lib/tgadapter/cli.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tgadapter/ctl.py"
+dest = "bin/lib/tgadapter/ctl.py"
+mode = "0644"
+
+# One sender. tg (texts, --buttons, --voice), event-card and tg-status's board enqueue into the hub outbox (core/tg.py)
+# while the hub's tg-adapter drains it; tg-outbox is the shell senders' way in (gate | send | status).
+[[file]]
+src = "scripts/tg-outbox"
+dest = "bin/tg-outbox"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null"
+
+# The brain's Telegram bindings (rows in the events store; tg-adapter runs them, schemas/tools.toml = the registry)
+[[file]]
+src = "scripts/tg-bind"
+dest = "bin/tg-bind"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null"
+
+[[file]]
+src = "packages/tgadapter/bind.py"
+dest = "bin/lib/tgadapter/bind.py"
+mode = "0644"
+
+# botlib (delegates to core; its legacy suite reads BOTLIB_PATH) and four watchers on core
+# helpers (legacy suites via their *_BIN seams). Smokes only import + print help.
+[[file]]
+src = "scripts/lib/botlib.py"
+dest = "bin/lib/botlib.py"
+mode = "0644"
+smoke = "/usr/bin/python3 -I -c \"import sys; sys.path.insert(0, sys.argv[1]); import botlib; assert botlib.CORE\" {lib}"
+suite = "botlib"
+seam = "BOTLIB_PATH"
+
+[[file]]
+src = "scripts/train-watch"
+dest = "bin/train-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "train-watch"
+seam = "TRAIN_WATCH_BIN"
+
+[[file]]
+src = "scripts/flight-watch"
+dest = "bin/flight-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "flight-watch"
+seam = "FLIGHT_WATCH_BIN"
+
+[[file]]
+src = "scripts/strike-watch"
+dest = "bin/strike-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "strike-watch"
+seam = "STRIKE_WATCH_BIN"
+
+[[file]]
+src = "scripts/ai-releases"
+dest = "bin/ai-releases"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ai-releases"
+seam = "AI_RELEASES_BIN"
+
+# Writers on the emit contract (typed row + the identical md note; DB failure = note only + emit-errors.log):
+# cron-fail (Recovered -> events update), remind (the note-for-me path only), plans-watch (vault-plans notes).
+[[file]]
+src = "scripts/cron-runs"
+dest = "bin/cron-runs"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/cron-back"
+dest = "bin/cron-back"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/cron-fail"
+dest = "bin/cron-fail"
+mode = "0755"
+smoke = "bash -n {dest} && {dest} --help >/dev/null"
+suite = "cron-fail"
+seam = "CRON_FAIL_BIN"
+
+[[file]]
+src = "scripts/remind"
+dest = "bin/remind"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "remind"
+seam = "REMIND_BIN"
+
+[[file]]
+src = "scripts/plans-watch"
+dest = "bin/plans-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "plans-watch"
+seam = "PLANS_WATCH_BIN"
+# Five scripts on core helpers (legacy suites via their *_BIN seams;
+# watch and sleepin suites gained theirs). Smokes only print help.
+[[file]]
+src = "scripts/damp-watch"
+dest = "bin/damp-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "damp-watch"
+seam = "DAMP_WATCH_BIN"
+
+[[file]]
+src = "scripts/ha-health-watch"
+dest = "bin/ha-health-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ha-health-watch"
+seam = "HA_HEALTH_WATCH_BIN"
+
+[[file]]
+src = "scripts/watch"
+dest = "bin/watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "watch"
+seam = "WATCH_BIN"
+
+[[file]]
+src = "scripts/eventwf"
+dest = "bin/eventwf"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/sleepin"
+dest = "bin/sleepin"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "sleepin"
+seam = "SLEEPIN_BIN"
+
+[[file]]
+src = "scripts/event-card"
+dest = "bin/event-card"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "event-card"
+seam = "EVENT_CARD_BIN"
+
+# Writers on the emit contract (typed row + the identical md note; DB failure = note only + emit-errors.log):
+# vault-events (its note writers only: message, HA and failing notes; Recovered -> events update), rave-radar
+# (radar, releases and preshow notes), unraid-health (unreachable, issues, reachable again, crashed notes).
+[[file]]
+src = "scripts/vault-events"
+dest = "bin/vault-events"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "vault-events"
+seam = "VE_BIN"
+
+[[file]]
+src = "scripts/rave-radar"
+dest = "bin/rave-radar"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "rave-radar"
+seam = "RAVE_RADAR_BIN"
+
+[[file]]
+src = "scripts/unraid-health"
+dest = "bin/unraid-health"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "unraid-health"
+seam = "UH_BIN"
+
+# party, lastcall, battery-guard, hddheat, shop on core helpers (legacy suites
+# via their *_BIN seams; battery-guard loads lastcall as a module from ~/bin). Smokes only print help.
+[[file]]
+src = "scripts/party"
+dest = "bin/party"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "party"
+seam = "PARTY_BIN"
+
+[[file]]
+src = "scripts/lastcall"
+dest = "bin/lastcall"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "lastcall"
+seam = "LASTCALL_BIN"
+
+[[file]]
+src = "scripts/battery-guard"
+dest = "bin/battery-guard"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "battery-guard"
+seam = "BATTERY_GUARD_BIN"
+
+[[file]]
+src = "scripts/hddheat"
+dest = "bin/hddheat"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "hddheat"
+seam = "HDDHEAT_BIN"
+
+[[file]]
+src = "scripts/shop"
+dest = "bin/shop"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "shop"
+seam = "SHOP_BIN"
+
+[[file]]
+src = "scripts/tg-cmd"
+dest = "bin/tg-cmd"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} --list >/dev/null"
+suite = "tg-cmd"
+seam = "TGCMD_BIN"
+
+# Approvals: the CLI and its package next to core in ~/bin/lib (tg-adapter keeps the same DDL: schemas/approvals.sql
+# = adapters/tg/src/approvals.sql). Store: ~/.local/state/assistant/approvals.db (vault-guard rule approvals-state).
+[[file]]
+src = "scripts/approvals"
+dest = "bin/approvals"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null"
+
+[[file]]
+src = "packages/approvals/__init__.py"
+dest = "bin/lib/approvals/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/approvals/cli.py"
+dest = "bin/lib/approvals/cli.py"
+mode = "0644"
+
+# The typed tool registry. ~/bin/tool runs packages/tools in its own venv (built from the deployed
+# requirements.lock by the smoke on first use: ~/.local/share/assistant/venvs/tools-<hash>); `tool serve` is the
+# MCP server `hub`. The registry also generates schemas/tools.toml (bindings) and docs/tools/*.md (`tool gen`).
+[[file]]
+src = "scripts/tool"
+dest = "bin/tool"
+mode = "0755"
+smoke = "{dest} ls >/dev/null && {dest} serve --check >/dev/null && {dest} docs reminders >/dev/null && {dest} docs ha >/dev/null && {dest} docs media >/dev/null && {dest} docs phone >/dev/null && {dest} direct >/dev/null && {dest} policy validate >/dev/null"
+
+[[file]]
+src = "packages/tools/requirements.lock"
+dest = "bin/lib/tools/requirements.lock"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/__init__.py"
+dest = "bin/lib/tools/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/core.py"
+dest = "bin/lib/tools/core.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/gateway.py"
+dest = "bin/lib/tools/gateway.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/mcp_server.py"
+dest = "bin/lib/tools/mcp_server.py"
+mode = "0644"
+
+# The hub gateway's Cedar policy and the brain-side executor (`tool worker`, cron-ensured); tools.hubgw itself
+# runs in the hub (hub releases carry packages/tools), the brain keeps a copy for `tool policy check|validate`.
+[[file]]
+src = "scripts/hub-mcp-headers"
+dest = "bin/hub-mcp-headers"
+mode = "0755"
+smoke = "[ ! -f {home}/.secrets/hub-token ] || ( {dest} | python3 -I -c 'import json, sys; assert list(json.load(sys.stdin)) == [\"Authorization\"]' )"
+
+[[file]]
+src = "packages/tools/policy.py"
+dest = "bin/lib/tools/policy.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/policy.cedar"
+dest = "bin/lib/tools/policy.cedar"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/hubgw.py"
+dest = "bin/lib/tools/hubgw.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/worker.py"
+dest = "bin/lib/tools/worker.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/cli.py"
+dest = "bin/lib/tools/cli.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/gen.py"
+dest = "bin/lib/tools/gen.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/__init__.py"
+dest = "bin/lib/tools/domains/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/bindings.py"
+dest = "bin/lib/tools/domains/bindings.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/reminders.py"
+dest = "bin/lib/tools/domains/reminders.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/clirun.py"
+dest = "bin/lib/tools/clirun.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/vault.py"
+dest = "bin/lib/tools/domains/vault.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/paperless.py"
+dest = "bin/lib/tools/domains/paperless.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/ha.py"
+dest = "bin/lib/tools/domains/ha.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/calendar.py"
+dest = "bin/lib/tools/domains/calendar.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/media.py"
+dest = "bin/lib/tools/domains/media.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/web.py"
+dest = "bin/lib/tools/domains/web.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/cat.py"
+dest = "bin/lib/tools/domains/cat.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/server.py"
+dest = "bin/lib/tools/domains/server.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/phone.py"
+dest = "bin/lib/tools/domains/phone.py"
+mode = "0644"
+
+# traces.* (traces.db report + gateway stats, Phoenix status / trace / slow through the `traces` CLI).
+[[file]]
+src = "packages/tools/domains/traces.py"
+dest = "bin/lib/tools/domains/traces.py"
+mode = "0644"
+
+# deploy.* (what is deployed, the land gate; deploy main to ~/bin or the hub).
+[[file]]
+src = "packages/tools/domains/deploy.py"
+dest = "bin/lib/tools/domains/deploy.py"
+mode = "0644"
+
+# H15: workflow.* (start/status/send/cancel workflows on the hub, the watch schedules, workflow.job for a schedule).
+[[file]]
+src = "packages/tools/domains/workflow.py"
+dest = "bin/lib/tools/domains/workflow.py"
+mode = "0644"
+
+# Evals on Inspect AI: `evals` (adopted from the live script) runs the private corpus (~/opt/evals-private,
+# never in this repo) on Inspect by default (switch: ~/.config/evals/runner = legacy), keeping the evalbot sandbox as
+# the solver; the lib files are copied into each sandbox. The Inspect venv is built by `evals setup` from
+# inspect-requirements.txt (pinned, two-week rule). The legacy suite runs the tree's script + lib (ASSISTANT_CI_TREE).
+[[file]]
+src = "scripts/evals"
+dest = "bin/evals"
+mode = "0755"
+smoke = "[ ! -d {home}/opt/evals-private ] || ( {dest} --help >/dev/null && {dest} list >/dev/null )"
+suite = "evals"
+seam = "EVALS_BIN"
+
+[[file]]
+src = "scripts/lib/evals/inspect_task.py"
+dest = "bin/lib/evals/inspect_task.py"
+mode = "0644"
+smoke = "py={home}/.local/share/evals/inspect-venv/bin/python; test ! -x \"$py\" || \"$py\" -I -c \"import sys; sys.path.insert(0, sys.argv[1]); import inspect_task\" {lib}/evals"
+suite = "evals-inspect"  # one suite per entry (CI makes one dir per suite): runs test_evals_inspect.py
+seam = "EVALS_INSPECT_TASK"
+
+[[file]]
+src = "scripts/lib/evals/inspect-requirements.txt"
+dest = "bin/lib/evals/inspect-requirements.txt"
+mode = "0644"
+
+[[file]]
+src = "scripts/lib/evals/evalstub.py"
+dest = "bin/lib/evals/evalstub.py"
+mode = "0755"
+
+[[file]]
+src = "scripts/lib/evals/fake_mcp.py"
+dest = "bin/lib/evals/fake_mcp.py"
+mode = "0644"
+
+[[file]]
+src = "scripts/lib/evals/guard_hook.py"
+dest = "bin/lib/evals/guard_hook.py"
+mode = "0644"
+
+[[file]]
+src = "scripts/lib/evals/launch.sh"
+dest = "bin/lib/evals/launch.sh"
+mode = "0755"
+smoke = "bash -n {dest}"
+
+[[file]]
+src = "scripts/lib/evals/netguard_eval.c"
+dest = "bin/lib/evals/netguard_eval.c"
+mode = "0644"
+header = false
+
+# claude-hub stack kit: the `hub` CLI and its hubkit package next to core in ~/bin/lib (releases, kit
+# render, /health client). The hub-side code (packages/hub) and the compose kit (ops/hub) are not installed here:
+# `assistant deploy --target hub` builds them into ~/.local/share/claude-hub from a git archive.
+[[file]]
+src = "scripts/hub"
+dest = "bin/hub"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null"
+
+[[file]]
+src = "packages/hubkit/__init__.py"
+dest = "bin/lib/hubkit/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/cli.py"
+dest = "bin/lib/hubkit/cli.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/kitapply.py"
+dest = "bin/lib/hubkit/kitapply.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/client.py"
+dest = "bin/lib/hubkit/client.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/ci.py"
+dest = "bin/lib/hubkit/ci.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/citool.py"
+dest = "bin/lib/hubkit/citool.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/kit.py"
+dest = "bin/lib/hubkit/kit.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/release.py"
+dest = "bin/lib/hubkit/release.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/store.py"
+dest = "bin/lib/hubkit/store.py"
+mode = "0644"
+
+# H17: the brain side of the hub's status feed (`hub feed`: the tunnel to the web VM, the brain's report, watch parts).
+[[file]]
+src = "packages/hubkit/feed.py"
+dest = "bin/lib/hubkit/feed.py"
+mode = "0644"
+
+# H6: `hub tg stop|start|status`, the brain's emergency stop for the hub's Telegram adapter (a hold tgloader honours).
+[[file]]
+src = "packages/hubkit/tg.py"
+dest = "bin/lib/hubkit/tg.py"
+mode = "0644"
+
+# `hub secrets status|pull|paste` (the fingerprint export for secretscan, the owner's copy-by-path paste).
+[[file]]
+src = "packages/hubkit/secrets.py"
+dest = "bin/lib/hubkit/secrets.py"
+mode = "0644"
+
+# `hub egress status|check|use|endpoints` (the egress injector's brain side; core.egress is in [core]).
+[[file]]
+src = "packages/hubkit/egress.py"
+dest = "bin/lib/hubkit/egress.py"
+mode = "0644"
+
+# H15: `hub wf …`, the hub's workflow engine (DBOS) and the watch schedules (Pilot 2).
+[[file]]
+src = "packages/hubkit/wf.py"
+dest = "bin/lib/hubkit/wf.py"
+mode = "0644"
+
+[[file]]
+src = "packages/hubkit/vendor.py"
+dest = "bin/lib/hubkit/vendor.py"
+mode = "0644"
+
+# assistant-publish: neutral snapshots of main -> its GitHub repo (profile repos.assistant): one root commit, then
+# one commit per publish (never main's own history), each after a privacy scan of what it adds. Started after every land.
+[[file]]
+src = "scripts/assistant-publish"
+dest = "bin/assistant-publish"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+# Schedules as data: the registry is core/schedules.toml (+ core.schedules, core.jobfail, in [core]).
+# `keepers ensure` (one cron line for the daemons that must run while the hub is down) and `hub-sentinel check`
+# (hub /health down >= 3 min -> one app push + one note) ship dark: no cron line runs them until the switch-over.
+[[file]]
+src = "scripts/keepers"
+dest = "bin/keepers"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} status >/dev/null"
+
+[[file]]
+src = "scripts/hub-sentinel"
+dest = "bin/hub-sentinel"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} status >/dev/null"
+
+[[file]]
+src = "packages/hubkit/voice.py"
+dest = "bin/lib/hubkit/voice.py"
+mode = "0644"
+
+# `hub voice inbox` / `hub phone inbox`: hand-offs to the live session as the bridge's own hub row (bridge.handoff)
+# while the bridge reads the hub; no local token (~/.secrets/voice-local-token only for a bridge on its own store).
+[[file]]
+src = "packages/hubkit/handoff.py"
+dest = "bin/lib/hubkit/handoff.py"
+mode = "0644"
+
+[[file]]
+src = "packages/tools/domains/voice.py"
+dest = "bin/lib/tools/domains/voice.py"
+mode = "0644"
+
+# The brain's callers reach the relay in claude-hub-voice. ~/bin/voice-relay (adapters/voice/bin/voice-relay)
+# hands call | reply | status to voice-hub; the local rest (fastlane for voicecheck, calls, stats, files, greet,
+# canary, health) runs the hub's current release copy (voice/run.py). voice-reply = voice-relay reply. Tests:
+# tests/hub/test_voice_hub.py (the wrapper), adapters/voice/run-tests.sh (the relay, ~/opt/voice-venv).
+[[file]]
+src = "adapters/voice/bin/voice-relay"
+dest = "bin/voice-relay"
+mode = "0755"
+smoke = "[ ! -s {home}/.local/share/claude-hub/releases/CURRENT ] || ( {dest} --help >/dev/null )"
+
+[[file]]
+src = "adapters/voice/bin/voice-reply"
+dest = "bin/voice-reply"
+mode = "0755"
+smoke = "test -x {dest}"
+
+[[file]]
+src = "scripts/voice-hub"
+dest = "bin/voice-hub"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null"
+
+[[file]]
+src = "packages/hubkit/phone.py"
+dest = "bin/lib/hubkit/phone.py"
+mode = "0644"
+
+# The brain's mirror of the gateway's allow-listed DB slice (GET /internal/export), refreshed by `hub phone inbox`;
+# usage.py, board and dash-data read it.
+[[file]]
+src = "packages/hubkit/phonemirror.py"
+dest = "bin/lib/hubkit/phonemirror.py"
+mode = "0644"
+
+# The phone CLI (the phone gateway's internal API: it reaches claude-hub-phone with its own token,
+# ~/.secrets/phone-cli-token) and the gateway's widget producers run here for claude-hub-phone
+# (phone.lookup `phone-produce KIND`). Tests: adapters/phone/run-tests.sh (PHONE_BIN).
+[[file]]
+src = "adapters/phone/bin/phone"
+dest = "bin/phone"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "adapters/phone/bin/phone-produce"
+dest = "bin/phone-produce"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+# Job bodies; their suites live in tests/legacy/<suite>/ (CI runs them on change).
+[[file]]
+src = "scripts/log-rotate"
+dest = "bin/log-rotate"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "log-rotate"
+seam = "LOG_ROTATE_BIN"
+
+[[file]]
+src = "scripts/tmp-tidy"
+dest = "bin/tmp-tidy"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "tmp-tidy"
+seam = "TMP_TIDY_BIN"
+
+# The browser service CLI (the CDP gate in claude-hub-browser: route, audit, log).
+[[file]]
+src = "scripts/browsersvc"
+dest = "bin/browsersvc"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && {dest} route --json >/dev/null"
+
+# The brain's side of claude-hub-browser (~/bin/browser hands every command to it).
+[[file]]
+src = "scripts/browser-hub"
+dest = "bin/browser-hub"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "packages/browsersvc/__init__.py"
+dest = "bin/lib/browsersvc/__init__.py"
+mode = "0644"
+
+# Job bodies, session plumbing and skill CLIs; suites in tests/legacy/<suite>/.
+# A script whose bare run or --help would act (send, restart, commit, write state) gets a syntax-only smoke.
+
+[[file]]
+src = "scripts/model-drift"
+dest = "bin/model-drift"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "model-drift"
+seam = "MODEL_DRIFT_BIN"
+
+[[file]]
+src = "scripts/transcript-compact"
+dest = "bin/transcript-compact"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "transcript-compact"
+seam = "TRANSCRIPT_COMPACT_BIN"
+
+[[file]]
+src = "scripts/unraid-update-check"
+dest = "bin/unraid-update-check"
+mode = "0755"
+smoke = "sh -n {dest}"
+suite = "unraid-update-check"
+seam = "UNRAID_UPDATE_CHECK_BIN"
+
+[[file]]
+src = "scripts/waiting-nudge"
+dest = "bin/waiting-nudge"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+suite = "waiting-nudge"
+seam = "WAITING_NUDGE_BIN"
+
+# The brain's scheduled cues as typed cue.* events (hub schedules cue-*; tests tests/inbox/test_writers_b4.py).
+[[file]]
+src = "scripts/cue"
+dest = "bin/cue"
+mode = "0755"
+smoke = "{dest} list >/dev/null && {dest} weekly-digest --dry-run >/dev/null"
+
+[[file]]
+src = "scripts/self-report"
+dest = "bin/self-report"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "self-report"
+seam = "SELF_REPORT_BIN"
+
+[[file]]
+src = "scripts/ha-backup-pull"
+dest = "bin/ha-backup-pull"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ha-backup-pull"
+seam = "HA_BACKUP_PULL_BIN"
+
+[[file]]
+src = "scripts/brain-commit"
+dest = "bin/brain-commit"
+mode = "0755"
+smoke = "sh -n {dest}"
+suite = "brain-commit"
+seam = "BRAIN_COMMIT_BIN"
+
+[[file]]
+src = "scripts/plugin-drift"
+dest = "bin/plugin-drift"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "plugin-drift"
+seam = "PLUGIN_DRIFT_BIN"
+
+[[file]]
+src = "scripts/restart"
+dest = "bin/restart"
+mode = "0755"
+smoke = "sh -n {dest}"
+suite = "restart"
+seam = "RESTART_BIN"
+
+[[file]]
+src = "scripts/proxy"
+dest = "bin/proxy"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "proxy"
+seam = "PROXY_BIN"
+
+[[file]]
+src = "scripts/uwfix"
+dest = "bin/uwfix"
+mode = "0755"
+smoke = "[ ! -d {home}/opt/dive-venv ] || ( {dest} --help >/dev/null )"
+suite = "uwfix"
+seam = "UWFIX_BIN"
+
+[[file]]
+src = "scripts/vidmontage"
+dest = "bin/vidmontage"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "vidmontage"
+seam = "VIDMONTAGE_BIN"
+
+[[file]]
+src = "scripts/taxdesk"
+dest = "bin/taxdesk"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "taxdesk"
+seam = "TAXDESK_BIN"
+
+[[file]]
+src = "scripts/ha-avail"
+dest = "bin/ha-avail"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "ha-avail"
+seam = "HA_AVAIL_BIN"
+
+[[file]]
+src = "scripts/crate-now"
+dest = "bin/crate-now"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "crate-now"
+seam = "CRATE_NOW"
+
+[[file]]
+src = "scripts/preclear-watch"
+dest = "bin/preclear-watch"
+mode = "0755"
+smoke = "bash -n {dest}"
+suite = "preclear-watch"
+seam = "PW_SCRIPT"
+
+# `context-size` measures the main session's always-on context in tokens (candidates, sections, a `claude -p`
+# calibration on request) and `rotate` is the nightly session rotation: quiet-slot checks, the hand-off from durable
+# state, the promise ledger. rotate does nothing without ~/.config/assistant/rotate-on and start-claude's fresh-start
+# block.
+[[file]]
+src = "scripts/context-size"
+dest = "bin/context-size"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null"
+
+[[file]]
+src = "packages/ctxsize/__init__.py"
+dest = "bin/lib/ctxsize/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/ctxsize/cli.py"
+dest = "bin/lib/ctxsize/cli.py"
+mode = "0644"
+
+[[file]]
+src = "scripts/rotate"
+dest = "bin/rotate"
+mode = "0755"
+smoke = "{dest} --help >/dev/null && /usr/bin/python3 -I -S {dest} --help >/dev/null && {dest} status >/dev/null"
+
+[[file]]
+src = "packages/rotation/__init__.py"
+dest = "bin/lib/rotation/__init__.py"
+mode = "0644"
+
+[[file]]
+src = "packages/rotation/session.py"
+dest = "bin/lib/rotation/session.py"
+mode = "0644"
+
+[[file]]
+src = "packages/rotation/checks.py"
+dest = "bin/lib/rotation/checks.py"
+mode = "0644"
+
+[[file]]
+src = "packages/rotation/handoff.py"
+dest = "bin/lib/rotation/handoff.py"
+mode = "0644"
+
+[[file]]
+src = "packages/rotation/cli.py"
+dest = "bin/lib/rotation/cli.py"
+mode = "0644"
+
+# container-watch (weekly container + UniFi OS VM update / advisory check, skill container-watch);
+# suite tests/legacy/container-watch (CW_BIN). --help only prints (no collection, no state).
+
+[[file]]
+src = "scripts/container-watch"
+dest = "bin/container-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "container-watch"
+seam = "CW_BIN"
+
+# drive-watch (Waze traffic before his 🚗 legs and rule trips, JOBS.md cron); suite
+# tests/legacy/drive-watch (DRIVE_WATCH_BIN). --help only prints (no calendar, no state, no Waze).
+
+[[file]]
+src = "scripts/drive-watch"
+dest = "bin/drive-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "drive-watch"
+seam = "DRIVE_WATCH_BIN"
+
+# Job bodies and session plumbing; suites in tests/legacy/<suite>/ (profile-get:
+# tests/legacy/profile; brain-backup-verify: its wrapper runs the brain-backup suite). brain-backup, cputemp-log and
+# restart-cause run from cron, keepers or boot, so their smoke is syntax-only.
+
+[[file]]
+src = "scripts/brain-backup"
+dest = "bin/brain-backup"
+mode = "0755"
+smoke = "sh -n {dest}"
+suite = "brain-backup"
+seam = "BRAIN_BACKUP_BIN"
+
+[[file]]
+src = "scripts/brain-backup-verify"
+dest = "bin/brain-backup-verify"
+mode = "0755"
+smoke = "bash -n {dest} && {dest} --help >/dev/null"
+suite = "brain-backup-verify"
+seam = "BRAIN_BACKUP_VERIFY_BIN"
+
+[[file]]
+src = "scripts/cache-ttl-watch"
+dest = "bin/cache-ttl-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "cache-ttl-watch"
+seam = "CTW"
+
+[[file]]
+src = "scripts/cputemp-log"
+dest = "bin/cputemp-log"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+suite = "cputemp-log"
+seam = "CPUTEMP_LOG_BIN"
+
+[[file]]
+src = "scripts/dayline"
+dest = "bin/dayline"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "dayline"
+seam = "DAYLINE_BIN"
+
+[[file]]
+src = "scripts/media-remux"
+dest = "bin/media-remux"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "media-remux"
+seam = "MEDIA_REMUX_BIN"
+
+[[file]]
+src = "scripts/usage-watch"
+dest = "bin/usage-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "usage-watch"
+seam = "USAGE_WATCH_BIN"
+
+[[file]]
+src = "scripts/fx-watch"
+dest = "bin/fx-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "fx-watch"
+seam = "FX_WATCH_BIN"
+
+[[file]]
+src = "scripts/hwtrend"
+dest = "bin/hwtrend"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "hwtrend"
+seam = "HWTREND_BIN"
+
+[[file]]
+src = "scripts/memory2"
+dest = "bin/memory2"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "memory2"
+seam = "MEMORY2_BIN"
+
+[[file]]
+src = "scripts/scraper-canary"
+dest = "bin/scraper-canary"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "scraper-canary"
+seam = "SCRAPER_CANARY_UNDER_TEST"
+
+[[file]]
+src = "scripts/skillforge"
+dest = "bin/skillforge"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "skillforge"
+seam = "SKILLFORGE_BIN"
+
+[[file]]
+src = "scripts/window-watch"
+dest = "bin/window-watch"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "window-watch"
+seam = "WINDOW_WATCH_BIN"
+
+[[file]]
+src = "scripts/wled-sync"
+dest = "bin/wled-sync"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "wled-sync"
+seam = "WLED_SYNC_BIN"
+
+[[file]]
+src = "scripts/profile-get"
+dest = "bin/profile-get"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "profile"
+seam = "PROFILE_GET"
+
+[[file]]
+src = "scripts/recall"
+dest = "bin/recall"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "recall"
+seam = "RECALL_BIN"
+
+[[file]]
+src = "scripts/restart-cause"
+dest = "bin/restart-cause"
+mode = "0755"
+smoke = "/usr/bin/python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1], \"rb\").read())' {dest}"
+suite = "restart-cause"
+seam = "RESTART_CAUSE_BIN"
+
+[[file]]
+# The board as records in the hub store; TODO.md and the dashboard render them (hub job board-eval).
+src = "scripts/board"
+dest = "bin/board"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
+src = "scripts/test-all"
+dest = "bin/test-all"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "test-all"
+seam = "TEST_ALL_BIN"
+
+# voicecheck (adopted, class A, 29.10): the daily voice/phone canary (cron voicecheck + voicecheck-pending, the only
+# hub voice/phone check until a hub schedule exists) moved in with its hub-mode Gemini verdict (voice.status: the hub
+# relay's call digest; no local key). Suite in tests/legacy/voicecheck/ (fakes + fixtures, no call).
+[[file]]
+src = "scripts/voicecheck"
+dest = "bin/voicecheck"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+suite = "voicecheck"
+seam = "VOICECHECK_BIN"
+
+# ~/bin/lib helpers (29.10, CI runner move): the 28 unmanaged ~/bin/lib helpers move into the repo, byte-identical
+# to live (copied 29.10, hashes in the land script's base file; the deploy adds only the managed header line, not to
+# the .mjs). scripts/lib/legacy/ is outside ruff (extend-exclude): as is, not ruff-gated. With them in the tree the
+# legacy step's overlay lib holds no live link, so the hub runner (no brain home) sees the same lib as this host.
+# Smoke: parse only (importing runs module code).
+[[file]]
+src = "scripts/lib/legacy/assistant_profile.py"
+dest = "bin/lib/assistant_profile.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/cardimg.py"
+dest = "bin/lib/cardimg.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/catstock.py"
+dest = "bin/lib/catstock.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/cifeed.py"
+dest = "bin/lib/cifeed.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+suite = "cifeed"
+seam = "CIFEED_SRC"
+
+[[file]]
+src = "scripts/lib/legacy/flights.py"
+dest = "bin/lib/flights.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/gymcoach.py"
+dest = "bin/lib/gymcoach.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/ha_privacy.py"
+dest = "bin/lib/ha_privacy.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/healthlib.py"
+dest = "bin/lib/healthlib.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/home_place.py"
+dest = "bin/lib/home_place.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+suite = "home-place"
+
+[[file]]
+src = "scripts/lib/legacy/homectx.py"
+dest = "bin/lib/homectx.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/homectx_sim.py"
+dest = "bin/lib/homectx_sim.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/livecount.py"
+dest = "bin/lib/livecount.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+suite = "livecount"
+seam = "LIVECOUNT_LIB"
+
+[[file]]
+src = "scripts/lib/legacy/llm_prices.py"
+dest = "bin/lib/llm_prices.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/memory2.py"
+dest = "bin/lib/memory2.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/memory2_core.py"
+dest = "bin/lib/memory2_core.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/night_settime.py"
+dest = "bin/lib/night_settime.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/ownermask.py"
+dest = "bin/lib/ownermask.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/product.py"
+dest = "bin/lib/product.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/remindwhen.py"
+dest = "bin/lib/remindwhen.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/sbb.py"
+dest = "bin/lib/sbb.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/securefill-cdp.mjs"
+dest = "bin/lib/securefill-cdp.mjs"
+mode = "0644"
+header = false
+
+[[file]]
+src = "scripts/lib/legacy/securefill.py"
+dest = "bin/lib/securefill.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/trackid_shazam.py"
+dest = "bin/lib/trackid_shazam.py"
+mode = "0755"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/tripclock.py"
+dest = "bin/lib/tripclock.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/usage.py"
+dest = "bin/lib/usage.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/webagent.py"
+dest = "bin/lib/webagent.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+[[file]]
+src = "scripts/lib/legacy/whereabouts.py"
+dest = "bin/lib/whereabouts.py"
+mode = "0644"
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"
+
+# The Claude Code plugins in ~/plugins (marketplace home-plugins, a directory source): the telegram-plus channel
+# bridge (bun; its node_modules come from `bun install` at server start, never from here) and the heartbeat mod
+# with hb-gate (~/bin/hb-gate links to it). Byte for byte (header = false): a deploy leaves the running plugin's
+# files as they are; a change here reaches the session only at its next restart. Suites test the live ~/plugins.
+# Moved from the ~/plugins git repo 30.10 (its history: ~/backups/plugins-git-30-10.tar.gz). plugin-drift and
+# codebase-sync read plugins/ here as the source of the plugin files.
+
+[[file]]
+src = "plugins/.claude-plugin/marketplace.json"
+dest = "plugins/.claude-plugin/marketplace.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/.gitignore"
+dest = "plugins/.gitignore"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/.claude-plugin/plugin.json"
+dest = "plugins/heartbeat/.claude-plugin/plugin.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/.gitignore"
+dest = "plugins/heartbeat/.gitignore"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/hooks/hooks.json"
+dest = "plugins/heartbeat/hooks/hooks.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/hooks/register.js"
+dest = "plugins/heartbeat/hooks/register.js"
+mode = "0644"
+header = false
+suite = "heartbeat"
+
+[[file]]
+src = "plugins/heartbeat/ops/hb-gate"
+dest = "plugins/heartbeat/ops/hb-gate"
+mode = "0755"
+header = false
+suite = "hb-gate"
+
+[[file]]
+src = "plugins/heartbeat/ops/heartbeat-cron"
+dest = "plugins/heartbeat/ops/heartbeat-cron"
+mode = "0755"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/test/hb-gate.test.mjs"
+dest = "plugins/heartbeat/test/hb-gate.test.mjs"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/test/heartbeat-cron.test.mjs"
+dest = "plugins/heartbeat/test/heartbeat-cron.test.mjs"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/test/live-session.sh"
+dest = "plugins/heartbeat/test/live-session.sh"
+mode = "0755"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/test/logic.test.mjs"
+dest = "plugins/heartbeat/test/logic.test.mjs"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/heartbeat/test/register.test.mjs"
+dest = "plugins/heartbeat/test/register.test.mjs"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/.claude-plugin/plugin.json"
+dest = "plugins/telegram-plus/.claude-plugin/plugin.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/.mcp.json"
+dest = "plugins/telegram-plus/.mcp.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/.npmrc"
+dest = "plugins/telegram-plus/.npmrc"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/ACCESS.md"
+dest = "plugins/telegram-plus/ACCESS.md"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/LICENSE"
+dest = "plugins/telegram-plus/LICENSE"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/README.md"
+dest = "plugins/telegram-plus/README.md"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/bridge.ts"
+dest = "plugins/telegram-plus/bridge.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/bridgedb.ts"
+dest = "plugins/telegram-plus/bridgedb.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/bridgehub.ts"
+dest = "plugins/telegram-plus/bridgehub.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/bridgelease.ts"
+dest = "plugins/telegram-plus/bridgelease.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/bun.lock"
+dest = "plugins/telegram-plus/bun.lock"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/ops/SWITCHOVER.md"
+dest = "plugins/telegram-plus/ops/SWITCHOVER.md"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/ops/managed-settings.json"
+dest = "plugins/telegram-plus/ops/managed-settings.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/ops/start-claude"
+dest = "plugins/telegram-plus/ops/start-claude"
+mode = "0755"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/ops/start-claude.official"
+dest = "plugins/telegram-plus/ops/start-claude.official"
+mode = "0755"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/package.json"
+dest = "plugins/telegram-plus/package.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/scan.ts"
+dest = "plugins/telegram-plus/scan.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/server.ts"
+dest = "plugins/telegram-plus/server.ts"
+mode = "0644"
+header = false
+suite = "telegram-plus"
+
+[[file]]
+src = "plugins/telegram-plus/skills/access/SKILL.md"
+dest = "plugins/telegram-plus/skills/access/SKILL.md"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/skills/configure/SKILL.md"
+dest = "plugins/telegram-plus/skills/configure/SKILL.md"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/bridge-only.test.ts"
+dest = "plugins/telegram-plus/test/bridge-only.test.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/bridge.test.ts"
+dest = "plugins/telegram-plus/test/bridge.test.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/fakehub.ts"
+dest = "plugins/telegram-plus/test/fakehub.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/fixtures/events-v1.sql"
+dest = "plugins/telegram-plus/test/fixtures/events-v1.sql"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/fixtures/mcp-surface-0.2.0.json"
+dest = "plugins/telegram-plus/test/fixtures/mcp-surface-0.2.0.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/fixtures/tools-0.1.22.json"
+dest = "plugins/telegram-plus/test/fixtures/tools-0.1.22.json"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/hub.test.ts"
+dest = "plugins/telegram-plus/test/hub.test.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/offline.ts"
+dest = "plugins/telegram-plus/test/offline.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/scan.test.ts"
+dest = "plugins/telegram-plus/test/scan.test.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/sdk-guard.test.ts"
+dest = "plugins/telegram-plus/test/sdk-guard.test.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/start-claude.sh"
+dest = "plugins/telegram-plus/test/start-claude.sh"
+mode = "0755"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/test/voiceinbox.test.ts"
+dest = "plugins/telegram-plus/test/voiceinbox.test.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/tools.ts"
+dest = "plugins/telegram-plus/tools.ts"
+mode = "0644"
+header = false
+
+[[file]]
+src = "plugins/telegram-plus/voiceinbox.ts"
+dest = "plugins/telegram-plus/voiceinbox.ts"
+mode = "0644"
+header = false
+
+# ~/boot.sh: the boot-time setup (run by the image's entrypoint as the bot user, before the main session; only $HOME
+# survives a rebuild). Edit it here, never live: a live edit is drift and stops the next deploy. Moved 30.10.
+[[file]]
+src = "ops/boot.sh"
+dest = "boot.sh"
+mode = "0755"
+smoke = "sh -n {dest}"
+suite = "boot"
+seam = "BOOT_SCRIPT"
+
+# The dashboard page (dash-data turns it into the published site; dash-publish copies that to the web VM): the
+# data-free template, its self-hosted Geist fonts and the architecture-map generator. Byte for byte (header =
+# false). Edit them here, never live in ~/opt/dash (a live edit is drift and stops the next deploy). Suite:
+# tests/legacy/dash (test-all, against the deployed ~/opt/dash). Moved 30.10.
+[[file]]
+src = "web/dash/index.html"
+dest = "opt/dash/index.html"
+mode = "0644"
+header = false
+
+[[file]]
+src = "web/dash/fonts/OFL.txt"
+dest = "opt/dash/fonts/OFL.txt"
+mode = "0644"
+header = false
+
+[[file]]
+src = "web/dash/fonts/geist_400.woff2"
+dest = "opt/dash/fonts/geist_400.woff2"
+mode = "0644"
+header = false
+
+[[file]]
+src = "web/dash/fonts/geist_500.woff2"
+dest = "opt/dash/fonts/geist_500.woff2"
+mode = "0644"
+header = false
+
+[[file]]
+src = "web/dash/fonts/geist_600.woff2"
+dest = "opt/dash/fonts/geist_600.woff2"
+mode = "0644"
+header = false
+
+[[file]]
+src = "web/dash/fonts/geist_mono_500.woff2"
+dest = "opt/dash/fonts/geist_mono_500.woff2"
+mode = "0644"
+header = false
+
+[[file]]
+src = "web/dash/tools/arch-gen.py"
+dest = "opt/dash/tools/arch-gen.py"
+mode = "0755"
+header = false
+smoke = "/usr/local/bin/python3.13 -I -c \"import ast, sys; ast.parse(open(sys.argv[1], 'rb').read())\" {dest}"

@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.reminders.response.json",
+  "title": "GET /v1/reminders (mTLS): his pending reminders (timed, series, place; next first, place ones last) and the ones fired in the last 36 h (newest first), from `remind list --json --mine`. ETag/If-None-Match -> 304. Text = his own reminder text.",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "now": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "items": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}$"
+          },
+          "kind": {
+            "enum": [
+              "timed",
+              "series",
+              "place"
+            ]
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4102444800
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "every": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 80
+          },
+          "where": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 80
+          },
+          "every_time": {
+            "type": "boolean"
+          },
+          "held_until": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4102444800
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "call": {
+            "type": "boolean"
+          },
+          "local": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 40
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "at",
+          "title"
+        ]
+      }
+    },
+    "recent": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}$"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "state": {
+            "enum": [
+              "fired",
+              "snoozed",
+              "done"
+            ]
+          },
+          "fired": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4102444800
+          },
+          "to": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4102444800
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "where": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 80
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "state",
+          "fired"
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "ok",
+    "now",
+    "items",
+    "recent"
+  ]
+}

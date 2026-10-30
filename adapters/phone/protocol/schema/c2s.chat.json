@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.chat.json",
+  "title": "chat message he typed (or a chat button tap: data set)",
+  "type": "object",
+  "properties": {
+    "msg_id": {
+      "type": "string",
+      "pattern": "^m_[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "reply_to": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^m_[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "data": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 64
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "msg_id",
+    "text"
+  ]
+}

@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""hddheat: HDD heat alert for the owner's Unraid server. READ-ONLY. Cron every 10 min.
+
+What it reads
+  One SSH call per sample runs the tiny COLLECTOR below: Unraid's RAM state files
+  /var/local/emhttp/disks.ini (per-disk temp) and the parity-sync fields of var.ini. No smartctl, nothing
+  written, no disk woken (Unraid reports no temperature for spun-down disks; they are skipped).
+  Under the owner's SSH lockdown (~/bin/unraid-ssh mode verbs/emulate) it uses the allowlisted read-only
+  `heat` verb: the dispatcher runs this same COLLECTOR (copied in by ~/opt/unraid-lockdown/build).
+
+Rule (array data + parity HDDs only; NVMe/SSD pools run 60+ by design and are left to unraid-health)
+  - >= 58 °C on 2 consecutive checks (<= 30 min apart)  -> ONE `tg` text: disk, temp, short hint
+  - then silent for that disk for 6 h, unless it gets 3 °C+ hotter than the last alert;
+    still >= 58 °C after 6 h -> one more text
+  - back below 55 °C -> one short "back to normal" text (55-57 °C keeps the alert open: hysteresis); a message
+    with no hot disk in it goes as `tg --soft` (waits out a sleep-in morning), heat texts as plain `tg`
+  - quiet hours 00:00-08:00 in the owner time zone: >= 60 °C still texts at once (heat is urgent); everything else
+    is held and sent as one message by the first run from 08:00 (an overnight episode that ended
+    collapses into one "back to normal at HH:MM (peak X °C, hot from HH:MM)" line)
+  - several disks in one run -> one message. Silent when all is fine.
+  - SSH/collect failures are silent (exit 2, runs.log; unraid-health reports an unreachable server).
+    A failed `tg` keeps everything held and retries every run (one ~/inbox note per failure streak).
+  - each delivered heat text also leaves a short ~/inbox note, so I don't double-text when hwtrend or
+    unraid-health report the same disk.
+
+Usage: hddheat [run]     check once (cron). Exit 0 nothing new, 1 something texted or held, 2 collect failed
+       hddheat show      collect now and print every HDD's temp + its alert state (saves and sends nothing)
+       hddheat status    the saved state and held texts (no SSH)
+Options: --dry-run (run, but print the text instead of sending and save nothing), --input FILE (saved
+         collector output instead of SSH)
+Env (tests): HDDHEAT_STATE_DIR, HDDHEAT_INBOX_DIR, HDDHEAT_HOST (ssh alias), HDDHEAT_TG (sender, default
+         `tg`), HDDHEAT_NOW (epoch seconds), UNRAID_SSH_BIN; thresholds HDDHEAT_WARN / _NORMAL / _URGENT /
+         _STEP / _RENOTIFY_H / _MAX_GAP_MIN.
+Files: ~/.local/state/hddheat/  state.json, runs.log (one line per run), cron.log. Tests: ~/opt/hddheat-tests/run.sh
+"""
+
+import argparse
+import datetime as dt
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "bin", "lib"), os.path.expanduser("~/bin/lib"),
+             os.path.join(_here, "lib")):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, "lib", "core")) and os.path.isdir(os.path.join(_here, "..", "core")):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import jsonstate, locks  # noqa: E402
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write_new into the inbox)
+import botlib  # noqa: E402
+import assistant_profile  # noqa: E402  (locale.tz: the owner time zone)
+
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("HDDHEAT_STATE_DIR", HOME / ".local/state/hddheat"))
+INBOX_DIR = Path(os.environ.get("HDDHEAT_INBOX_DIR", HOME / "inbox"))
+SSH_HOST = os.environ.get("HDDHEAT_HOST", "unraid")
+TG_CMD = os.environ.get("HDDHEAT_TG", "tg")
+UNRAID_SSH = os.environ.get("UNRAID_SSH_BIN") or str(HOME / "bin/unraid-ssh")
+TZ = assistant_profile.tz()
+
+
+def _num(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+WARN = _num("HDDHEAT_WARN", 58)            # °C: alert after 2 consecutive checks at or above this
+NORMAL = _num("HDDHEAT_NORMAL", 55)        # °C: below this the disk is back to normal (one text)
+URGENT = _num("HDDHEAT_URGENT", 60)        # °C: texts even in quiet hours
+STEP = _num("HDDHEAT_STEP", 3)             # °C above the last alert: text again within the silence
+RENOTIFY = _num("HDDHEAT_RENOTIFY_H", 6) * 3600
+MAX_GAP = _num("HDDHEAT_MAX_GAP_MIN", 30) * 60   # hot readings further apart don't count as consecutive
+QUIET_START, QUIET_END = 0, 8              # local hours; messages below URGENT wait until QUIET_END
+SSH_TIMEOUT = 60
+KEEP_LOG_LINES = 3000
+CRASH_NOTE_EVERY = 24 * 3600
+STATE_VERSION = 1
+
+COLLECTOR = r'''# hddheat collector: STRICTLY READ-ONLY. Reads two of Unraid's RAM state files (emhttp).
+# No smartctl, no writes, wakes no disk (Unraid reports no temperature for spun-down disks).
+main() {
+export LC_ALL=C
+E=/var/local/emhttp
+printf '\n=====HH meta\n'
+echo "now=$(date +%s)"
+echo "host=$(hostname)"
+printf '\n=====HH var\n'
+grep -E '^(mdState|mdResyncPos|mdResyncSize|mdResyncAction)=' $E/var.ini 2>/dev/null
+printf '\n=====HH disks\n'
+cat $E/disks.ini 2>/dev/null
+printf '\n=====HH end\n'
+}
+main </dev/null
+exit 0
+'''
+
+
+# ----------------------------------------------------------------------------- helpers
+def fmt(v):
+    return f"{v:g}"
+
+
+def to_int(v):
+    try:
+        return int(str(v).strip().strip('"'))
+    except (TypeError, ValueError):
+        return None
+
+
+def unq(v):
+    v = v.strip()
+    return v[1:-1] if len(v) >= 2 and v[0] == v[-1] == '"' else v
+
+
+def local(ts):
+    return dt.datetime.fromtimestamp(ts, TZ)
+
+
+def hhmm(ts, now):
+    t = local(ts)
+    return t.strftime("%H:%M") if t.date() == local(now).date() else t.strftime("%d.%m %H:%M")
+
+
+def pretty(name):
+    m = re.fullmatch(r"(parity|disk)(\d*)", name)
+    if not m:
+        return name
+    return m.group(1).capitalize() + (" " + m.group(2) if m.group(2) else "")
+
+
+def order(name):
+    m = re.fullmatch(r"(parity|disk)(\d*)", name)
+    if not m:
+        return (2, 0, name)
+    return (0 if m.group(1) == "parity" else 1, int(m.group(2) or 0), name)
+
+
+# ----------------------------------------------------------------------------- collect + parse
+def collect(input_file=None):
+    """Collector output, or (None, error)."""
+    if input_file:
+        try:
+            return Path(input_file).read_text(encoding="utf-8", errors="replace"), None
+        except OSError as e:
+            return None, f"cannot read {input_file}: {e}"
+    if botlib.lockdown_mode(UNRAID_SSH) == "root":
+        script = COLLECTOR
+        cmd = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15",
+               "-o", "ServerAliveCountMax=3", SSH_HOST, "bash -s"]
+    else:   # owner's SSH lockdown: the read-only `heat` verb runs this same COLLECTOR server-side
+        script, cmd = "", [UNRAID_SSH, "--host", SSH_HOST, "run", "heat"]
+    try:
+        p = subprocess.run(cmd, input=script, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=SSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, f"ssh timed out after {SSH_TIMEOUT}s"
+    except OSError as e:
+        return None, f"could not run ssh: {e}"
+    if not re.search(r"^=====(?:HH|UC) end\s*$", p.stdout, re.M):
+        err = (p.stderr or "").strip().splitlines()
+        return None, f"collector incomplete (exit {p.returncode}): " + (err[-1] if err else "no end marker")[:200]
+    return p.stdout, None
+
+
+def sections(raw):
+    out, cur = {}, None
+    for line in raw.splitlines():
+        m = re.match(r"^=====(?:HH|UC) (\S+)\s*$", line)
+        if m:
+            cur = m.group(1)
+            out.setdefault(cur, [])
+        elif cur:
+            out[cur].append(line)
+    return out
+
+
+def parse_kv(lines):
+    res = {}
+    for ln in lines:
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            res[k.strip()] = unq(v)
+    return res
+
+
+def parse_ini(lines):
+    res, cur = {}, None
+    for ln in lines:
+        ln = ln.strip()
+        if ln.startswith("[") and ln.endswith("]"):
+            cur = unq(ln[1:-1])
+            res[cur] = {}
+        elif "=" in ln and cur is not None:
+            k, v = ln.split("=", 1)
+            res[cur][k.strip()] = unq(v)
+    return res
+
+
+def parse(raw):
+    """-> (hdds {name: {id, temp|None}}, var, meta). Array data + parity disks that aren't SSD/NVMe."""
+    sec = sections(raw)
+    hdds = {}
+    for name, d in parse_ini(sec.get("disks", [])).items():
+        if d.get("type") not in ("Parity", "Data"):
+            continue
+        if d.get("rotational") == "0" or d.get("transport") == "nvme":
+            continue
+        t = to_int(d.get("temp"))
+        hdds[name] = {"id": d.get("id", ""), "temp": t if t and t > 0 else None}
+    return hdds, parse_kv(sec.get("var", [])), parse_kv(sec.get("meta", []))
+
+
+def parity_note(var):
+    pos, size = to_int(var.get("mdResyncPos")), to_int(var.get("mdResyncSize"))
+    if not pos or not size:
+        return ""
+    what = "Parity check" if var.get("mdResyncAction", "").startswith("check") else "Parity sync"
+    return f"{what} running ({min(pos * 100 // size, 100)}%)."
+
+
+# ----------------------------------------------------------------------------- the rule
+def is_quiet(now):
+    return QUIET_START <= local(now).hour < QUIET_END
+
+
+def step(state, hdds, now):
+    """Fold one sample into state: per-disk streaks/alerts, and texts to hold in state['pending'].
+    Returns [(name, kind)] with kind hot | hotter | still | normal."""
+    disks, pending, events = state["disks"], state["pending"], []
+    if not hdds:          # emhttp not ready / empty disks.ini: judge nothing, forget nothing
+        return events
+    for name in [n for n in disks if n not in hdds]:      # slot gone from the array
+        disks.pop(name)
+        pending.pop(name, None)
+    for name, cur in sorted(hdds.items(), key=lambda kv: order(kv[0])):
+        st = disks.get(name)
+        if st is None or (st.get("id") and cur["id"] and st["id"] != cur["id"]):   # new or swapped disk
+            st = disks[name] = {"id": cur["id"], "streak": 0, "alert": False}
+            pending.pop(name, None)
+        st["id"] = cur["id"] or st.get("id", "")
+        t = cur["temp"]
+        if t is None:         # spun down / not present: breaks a hot streak, keeps an open alert
+            st["streak"], st["live"] = 0, False
+            continue
+        kind = None
+        if t >= WARN:
+            consecutive = st.get("streak", 0) > 0 and now - st.get("ts", 0) <= MAX_GAP
+            st["streak"] = st["streak"] + 1 if consecutive else 1
+            if st["streak"] >= 2:
+                if not st["alert"]:
+                    kind = "hot"
+                elif t >= st["alert_temp"] + STEP:
+                    kind = "hotter"
+                elif now - st["alert_ts"] >= RENOTIFY:
+                    kind = "still"
+        else:
+            st["streak"] = 0
+            if t < NORMAL and st["alert"]:
+                kind = "normal"
+        st.update(temp=t, ts=now, live=True)
+        if kind in ("hot", "hotter", "still"):
+            p = pending.setdefault(name, {})
+            if kind == "hot":
+                st.update(alert=True, notified=False, since=now, peak=t)
+                p.pop("normal", None)
+            elif kind == "hotter" and st.get("notified") and "from" not in p:
+                p["from"] = st["alert_temp"]       # what the owner was last told
+            p.setdefault("since", st["since"])
+            p["kinds"] = sorted(set(p.get("kinds", [])) | {kind})
+            st.update(alert_temp=t, alert_ts=now)
+        elif kind == "normal":
+            st["alert"] = False
+            pending.setdefault(name, {})["normal"] = {"ts": now, "temp": t}
+        if st["alert"]:
+            st["peak"] = max(st.get("peak", t), t)
+        if kind:
+            events.append((name, kind))
+    return events
+
+
+def must_deliver(state, events, now):
+    """Outside quiet hours: anything held. In quiet hours: only when a disk at >= URGENT has news
+    (a heat event this run, or an alert the owner hasn't heard about yet)."""
+    pending, disks = state["pending"], state["disks"]
+    if not pending:
+        return False
+    if not is_quiet(now):
+        return True
+    fresh = {n for n, k in events if k != "normal"}
+    for name in pending:
+        st = disks.get(name, {})
+        if st.get("alert") and st.get("live") and st.get("temp", 0) >= URGENT \
+                and (name in fresh or not st.get("notified")):
+            return True
+    return False
+
+
+def render(state, var, meta, now):
+    """One message for everything held in state['pending'], or "" when nothing is."""
+    pending, disks = state["pending"], state["disks"]
+    hot, ok, overnight = [], [], False
+    for name in sorted(pending, key=order):
+        p, st = pending[name], disks.get(name, {})
+        t = st.get("temp")
+        if st.get("alert"):
+            bits = []
+            if "from" in p and t is not None:
+                bits.append(f"+{fmt(t - p['from'])}°C since my last text")
+            since = st.get("since", now)
+            if since < now:          # not raised in this very run (held, or an earlier text)
+                bits.append(f"hot since {hhmm(since, now)}")
+            if st.get("peak", t) > t:
+                bits.append(f"peak {st['peak']}°C")
+            if not st.get("live"):
+                bits.append("spun down now, last reading")
+            hot.append(f"{pretty(name)}: {t}°C" + (f" ({', '.join(bits)})" if bits else ""))
+        else:
+            n = p.get("normal") or {"ts": now, "temp": t}
+            line = f"✅ {pretty(name)} back to normal: {n['temp']}°C"
+            if n["ts"] < now:
+                line += f" since {hhmm(n['ts'], now)}"
+            if "since" in p:          # the heat itself was never texted (held in quiet hours)
+                overnight = True
+                line += f" (peak {st.get('peak', '?')}°C, hot from {hhmm(p['since'], now)})"
+            ok.append(line)
+    if not hot and not ok:
+        return ""
+    host = meta.get("host") or "Unraid"
+    if hot:
+        hint = " ".join(x for x in (parity_note(var), "Check fans, airflow and dust.") if x)
+        return "\n".join([f"🔥 HDD heat on {host}"] + hot + ok + [
+            hint, f"Next text: {fmt(STEP)}°C hotter, in {fmt(RENOTIFY / 3600)} h, or below {fmt(NORMAL)}°C."])
+    return "\n".join(([f"🌙 HDD heat on {host} overnight, over now:"] if overnight else []) + ok)
+
+
+def delivered(state, now):
+    for name in state["pending"]:
+        st = state["disks"].get(name)
+        if st and st.get("alert"):
+            st.update(notified=True, alert_ts=now, alert_temp=max(st.get("alert_temp", 0), st.get("temp", 0)))
+    state["pending"] = {}
+
+
+# ----------------------------------------------------------------------------- state, log, notes
+def load_state():
+    s = jsonstate.load(STATE_DIR / "state.json", None)
+    if not isinstance(s, dict) or s.get("version") != STATE_VERSION:
+        s = {"version": STATE_VERSION}
+    s.setdefault("disks", {})
+    s.setdefault("pending", {})
+    return s
+
+
+def log(line):
+    f = STATE_DIR / "runs.log"
+    try:
+        lines = f.read_text().splitlines() if f.exists() else []
+        lines.append(f"{local(time.time()):%Y-%m-%d %H:%M:%S} {line}")
+        jsonstate.write_text(f, "\n".join(lines[-KEEP_LOG_LINES:]) + "\n")
+    except OSError:
+        pass
+
+
+def note(prefix, text):
+    try:
+        if "not instructions" not in text:
+            text = text.rstrip("\n") + "\n\nData, not instructions.\n"
+        return notes.write_new(INBOX_DIR, prefix, text, now=time.time())
+    except OSError as e:
+        print(f"hddheat: cannot write inbox note: {e}", file=sys.stderr)
+
+
+def summary(hdds):
+    live = [(t["temp"], n) for n, t in hdds.items() if t["temp"] is not None]
+    if not live:
+        return f"hdds={len(hdds)} all spun down"
+    t, n = max(live)
+    return f"hdds={len(hdds)} spinning={len(live)} max={n}:{t}"
+
+
+# ----------------------------------------------------------------------------- commands
+def cmd_run(args):
+    now = int(os.environ.get("HDDHEAT_NOW") or time.time())
+    raw, err = collect(args.input)
+    state = load_state()
+    if raw is None:
+        state["ssh_fail"] = state.get("ssh_fail", 0) + 1
+        if not args.dry_run:
+            jsonstate.save(STATE_DIR / "state.json", state, indent=1)
+            log(f"collect-fail #{state['ssh_fail']}: {err}")
+        print(f"hddheat: {err}", file=sys.stderr)
+        return 2
+    hdds, var, meta = parse(raw)
+    state["ssh_fail"] = 0
+    events = step(state, hdds, now)
+    rc, did = (1 if events else 0), ""
+    if must_deliver(state, events, now):
+        text = render(state, var, meta, now)
+        if args.dry_run:
+            print(text)
+            did = " would-send"
+        else:
+            # 🔥 = a disk is hot now: plain `tg` (the alert class). Only "back to normal" lines: `tg --soft`
+            ok, info = botlib.send_tg(TG_CMD, text, soft=not text.startswith("🔥"))
+            if ok:
+                rc, did = 1, " sent"
+                print(text)
+                if text.startswith("🔥"):
+                    note("hddheat", "# hddheat: texted the owner about HDD heat\n\n" + text + "\n\nAlready texted; "
+                         "don't text it again. hwtrend / unraid-health may report the same disk: merge. Read-only "
+                         "check: pitch fixes (fans, airflow) only if he asks.\n")
+                delivered(state, now)
+                state["tg_fail"] = False
+            else:
+                did = f" tg-failed ({info[:120]}), held"
+                print(f"hddheat: tg failed: {info[:200]}\n{text}", file=sys.stderr)
+                if not state.get("tg_fail"):
+                    note("hddheat-tg-failed", "# hddheat: could not text the owner\n\n`tg` failed: "
+                         f"{info[:200]}\nThe text stays held and is retried every run (10 min). Next: check that `tg` "
+                         f"works; if it keeps failing, send the text below yourself:\n\n{text}\n")
+                state["tg_fail"] = True
+    elif events or state["pending"]:
+        did = " held for 08:00"
+    if args.dry_run:
+        if events and not did.startswith(" would"):
+            print("held for 08:00 (quiet hours):\n" + (render(state, var, meta, now) or "(nothing)"))
+        return rc
+    state["last_run"] = now
+    jsonstate.save(STATE_DIR / "state.json", state, indent=1)
+    ev = " ".join(f"{n}:{k}" for n, k in events)
+    log(f"ok {summary(hdds)}" + (f" events={ev}" if ev else "") + did)
+    return rc
+
+
+def cmd_show(args):
+    raw, err = collect(args.input)
+    if raw is None:
+        print(f"hddheat: {err}", file=sys.stderr)
+        return 2
+    hdds, var, meta = parse(raw)
+    state = load_state()
+    print(f"HDD temps on {meta.get('host') or 'Unraid'} (alert >= {fmt(WARN)}°C twice, normal < {fmt(NORMAL)}°C, "
+          f"night only >= {fmt(URGENT)}°C)")
+    for name in sorted(hdds, key=order):
+        t, st = hdds[name]["temp"], state["disks"].get(name, {})
+        flag = ""
+        if st.get("alert"):
+            flag = "  ALERT" + ("" if st.get("notified") else " (held, not texted yet)")
+        elif t is not None and t >= WARN:
+            flag = "  hot (1st reading)"
+        print(f"  {pretty(name):<10} {'spun down' if t is None else f'{t}°C':>9}{flag}")
+    pn = parity_note(var)
+    if pn:
+        print(pn)
+    return 0
+
+
+def cmd_status(args):
+    state = load_state()
+    if not state["disks"]:
+        print("no state yet (first run pending)")
+        return 0
+    last = state.get("last_run")
+    print(f"last run: {local(last):%Y-%m-%d %H:%M} " if last else "last run: never", end="")
+    print(f"(collect failures in a row: {state.get('ssh_fail', 0)})")
+    for name in sorted(state["disks"], key=order):
+        st = state["disks"][name]
+        t = st.get("temp")
+        bits = [f"last {t}°C" if t is not None else "no reading yet"]
+        if st.get("alert"):
+            bits.append(f"ALERT since {hhmm(st['since'], int(os.environ.get('HDDHEAT_NOW') or time.time()))}, peak {st.get('peak')}°C, "
+                        f"{'texted' if st.get('notified') else 'held'}")
+        print(f"  {pretty(name):<10} " + ", ".join(bits))
+    if state["pending"]:
+        print("held texts: " + ", ".join(pretty(n) for n in sorted(state["pending"], key=order)))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="hddheat", description=__doc__.split("\n\n")[0],
+                                 epilog="Details: the header of ~/bin/hddheat.")
+    ap.add_argument("command", nargs="?", default="run", choices=["run", "show", "status"])
+    ap.add_argument("--dry-run", action="store_true", help="print instead of texting; save nothing")
+    ap.add_argument("--input", metavar="FILE", help="saved collector output instead of SSH")
+    ap.add_argument("--show-collector", action="store_true", help="print what runs on the server and exit")
+    args = ap.parse_args()
+    if args.show_collector:
+        print(COLLECTOR, end="")
+        return 0
+    if args.command == "status":
+        return cmd_status(args)
+    if args.command == "show":
+        return cmd_show(args)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lk = locks.acquire(STATE_DIR / ".lock", wait=0, mode=0o666 & ~jsonstate.current_umask())   # core.locks
+    if lk is None:
+        print("hddheat: another run is still going", file=sys.stderr)
+        return 0
+    try:
+        return cmd_run(args)
+    finally:
+        locks.release(lk)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        stamp = STATE_DIR / "crash.stamp"
+        try:
+            if not stamp.exists() or time.time() - stamp.stat().st_mtime > CRASH_NOTE_EVERY:
+                jsonstate.write_text(stamp, str(int(time.time())))
+                note("hddheat-crash", "# hddheat crashed\n\nThe HDD heat alert is not working until this is fixed "
+                     "(at most one note a day). Next: fix ~/bin/hddheat on a copy (tests: test-all --suite hddheat)."
+                     "\n\n```\n" + tb[-1500:] + "```\n")
+        except OSError:
+            pass
+        sys.exit(3)

@@ -1,0 +1,1401 @@
+#!/usr/bin/env python3
+"""cat-corner: litter box (and feeder / fountain) watch from Home Assistant. Read-only, no tokens.
+
+Usage:
+  cat-corner [status] [--json]          one-screen summary (live HA reads)
+  cat-corner week [--json] [--digest]   weekly card: visits/day trend, weight trend, drawer emptied, cycles, feeder;
+                                        --digest prints ONE line only when something is off (else nothing)
+  cat-corner --cron                     problems only -> ONE `tg` text per run, deduped, held during quiet hours
+                                        (00:00-08:00 owner time) and sent afterwards if still true; a text with
+                                        no problem in it (trip daily check, all-clear) goes `tg --soft`
+  cat-corner discover [--json]          the entities found (robot, pets, feeders, fountains)
+  cat-corner trip status [--json]       trip mode: window (hand-entered or from the calendar), the upcoming
+                                        trips, thresholds while away, which trip checks the entities allow, meal
+                                        tracking, last daily check
+  --dry-run (any command): nothing written, nothing sent; with --cron it prints what would be sent.
+
+Problems (--cron): waste drawer >= 90 % or a drawer-full code; robot fault / offline / paused > 30 min;
+no visit for > 30 h; visits in a day > 2x the 14-day median (and >= 3 more); weight change > 5 % vs the
+14-day median; feeder food low / fountain water low > 30 min (only when such entities exist).
+The median rules wait for >= 7 complete days of history. Thresholds: config "thresholds" (DEFAULTS below).
+
+Trip mode: config "trips": [{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD", "tz": "<IANA zone>"}] (dates inclusive,
+home calendar; "tz" per trip or top-level, default the owner zone). While a trip is on: stricter thresholds
+(the stricter of TRIP_DEFAULTS and the normal ones; config "trip_thresholds" overrides), quiet hours and shown
+times in the trip zone, extra checks (scheduled meal not dispensed, feeding schedule off, dispenser problem,
+feeder / fountain offline; each only when its entity exists), a daily one-line check at ok_hour trip time
+(all OK or what is open, so silence is never ambiguous), and HA unreachable > ha_down_h -> one text.
+Calendar trips: the calendar cache (calcache) also makes trips, from core.away (the away rule damp-watch uses): a run
+of >= 2 consecutive away nights (away_overnight all-day events per day, timed ones per midnight crossed) is a trip
+from its first night to the day back, in home time. A calendar trip that overlaps a hand-entered one is dropped
+(the hand-entered dates and zone win). Config "calendar_min_nights" (default 2; 0 = no calendar trips). cfg()
+"trips" stays the hand-entered list (cat-supplies' default trip); trip mode uses "all_trips".
+
+Entities are discovered from `ha list --json`: robot = sensor.<p>_waste_drawer (+ _status_code, _litter_level,
+_pet_weight, vacuum.<p>*, select.<p>_globe_light, sleep mode); pets = sensor.<pet>_visits_today
+(+ sensor.<pet>_weight); feeders / fountains by entity-name patterns (best effort, skipped when absent).
+Config "entities" overrides a discovered section ("robot", "pets", "feeders", "fountains").
+
+Reads: `ha list --json` (current states) and the recorder history through ha-audit's allowlisted read-only
+REST client (GET /api/history/period, minimal_response + no_attributes). Never writes to HA.
+Files (private): config ~/.config/cat-corner/config.json (optional), state ~/.local/state/cat-corner/
+state.json (alerts, last visit) and history.jsonl (one row per local day: visits, weight, drawer, cycles,
+faults, feeder grams). Only --cron (without --dry-run) writes them.
+Env (tests): HA_BIN, TG_BIN, CAT_CORNER_CONFIG, CAT_CORNER_STATE_DIR, CAT_CORNER_NOW (epoch), OWNER_TZ, CALCACHE_DIR,
+CAT_CORNER_HISTORY_FIXTURE (JSON {entity_id: [[iso_time, state], ...]} used instead of HA history).
+Exit: 0 ok, 1 HA unreachable / history or tg failed, 2 usage.
+"""
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(HERE, 'lib'), os.path.join(HOME, 'bin', 'lib')):
+    if os.path.exists(os.path.join(_lib, 'ha_privacy.py')):
+        sys.path.insert(0, _lib)
+        break
+try:
+    import ha_privacy
+
+    def gate(s):
+        return ha_privacy.text_gate(s)
+except Exception:  # a copy without bin/lib still runs
+    def gate(s):
+        return s
+try:
+    from core import away as calaway  # the calendar away rule (shared with damp-watch)
+except Exception:  # a copy without bin/lib: no calendar trips
+    calaway = None
+
+HA = os.environ.get('HA_BIN', 'ha')
+TG = os.environ.get('TG_BIN', 'tg')
+CONFIG = os.environ.get('CAT_CORNER_CONFIG', os.path.join(HOME, '.config/cat-corner/config.json'))
+STATE_DIR = os.environ.get('CAT_CORNER_STATE_DIR', os.path.join(HOME, '.local/state/cat-corner'))
+HIST_FIXTURE = os.environ.get('CAT_CORNER_HISTORY_FIXTURE')
+CALCACHE = os.path.join(os.environ.get('CALCACHE_DIR') or os.path.join(HOME, '.local/state/calcache'), 'events.json')
+CAL_MIN_NIGHTS = 2
+UTC = dt.timezone.utc
+DAY = dt.timedelta(days=1)
+EPS = dt.timedelta(seconds=1)
+LB_KG = 0.45359237
+
+DEFAULTS = {
+    'drawer_pct': 90,           # drawer alert at or above (or a drawer-full status code)
+    'drawer_clear_pct': 70,     # an active drawer alert ends below this
+    'litter_low_pct': 30,       # litter level alert at or below this
+    'litter_clear_pct': 40,     # an active litter alert ends above this
+    'fault_min': 30,            # robot fault / offline / paused for longer than this
+    'no_visit_h': 30,           # no visit for longer than this
+    'visits_factor': 2.0,       # visits in a day > factor x 14-day median ...
+    'visits_min_extra': 3,      # ... and at least this many more than the median
+    'weight_pct': 5.0,          # weight change vs the 14-day median
+    'weight_clear_pct': 4.0,    # an active weight alert ends below this
+    'baseline_days': 14,
+    'min_baseline_days': 7,
+    'low_min': 30,              # feeder food low / fountain water low for longer than this
+    'renotify_h': 24,           # drawer, fault, food/water: repeat while still true
+    'no_visit_renotify_h': 18,  # no visit: one more message (30 h -> 48 h)
+    'cooldown_h': 72,           # weight: no new message for the same direction within this
+    'quiet_start': 0,
+    'quiet_end': 8,
+    'keep_days': 120,
+    'digest_visits_pct': 50,
+    'digest_weight_pct': 3.0,
+}
+# Trip mode: the stricter of these and the normal thresholds (STRICTER says which way); the rest are trip-only.
+TRIP_DEFAULTS = {
+    'drawer_pct': 75, 'drawer_clear_pct': 60,
+    'litter_low_pct': 45, 'litter_clear_pct': 55,
+    'fault_min': 15, 'low_min': 10,
+    'no_visit_h': 20, 'no_visit_renotify_h': 8,
+    'renotify_h': 8,
+    'meal_grace_min': 45,       # a scheduled meal with no feed seen this long after it = not dispensed
+    'meal_tolerance_min': 15,   # a feed up to this long before the scheduled time counts for it
+    'ok_hour': 9,               # daily one-line check at this hour (trip time zone)
+    'ha_down_h': 2,             # HA unreachable this long -> one text
+}
+STRICTER = {'drawer_pct': min, 'drawer_clear_pct': min, 'litter_low_pct': max, 'litter_clear_pct': max,
+            'fault_min': min, 'low_min': min, 'no_visit_h': min, 'no_visit_renotify_h': min, 'renotify_h': min}
+SHORT = {'drawer': 'drawer', 'litter': 'litter low', 'robot-offline': 'robot offline', 'robot-fault': 'robot fault',
+         'novisit': 'no visit', 'visits': 'many visits', 'weight': 'weight change', 'food': 'food low',
+         'water': 'water low', 'meal': 'meal not dispensed', 'schedule': 'feeding schedule off',
+         'dispenser': 'dispenser problem', 'offline': 'device offline'}
+
+# Litter-Robot status codes (HA litterrobot sensor *_status_code options)
+LABELS = {
+    'rdy': 'ready', 'ccp': 'cleaning', 'ccc': 'clean cycle done', 'cd': 'cat detected', 'ec': 'empty cycle',
+    'pwru': 'powering up', 'pwrd': 'powering down', 'df1': 'drawer almost full', 'df2': 'drawer almost full',
+    'dfs': 'drawer full', 'sdf': 'drawer full at startup', 'csf': 'cat sensor fault', 'csi': 'cat sensor interrupted',
+    'cst': 'cat sensor timing', 'scf': 'cat sensor fault at startup', 'dhf': 'dump + home position fault',
+    'dpf': 'dump position fault', 'hpf': 'home position fault', 'otf': 'over-torque fault', 'pd': 'pinch detected',
+    'spf': 'pinch detected at startup', 'br': 'bonnet removed', 'p': 'paused', 'off': 'off', 'offline': 'offline',
+    'unavailable': 'offline (not reporting to HA)', 'unknown': 'not reporting',
+}
+OK_CODES = {'rdy', 'ccp', 'ccc', 'cd', 'ec', 'pwru', 'pwrd'}
+DRAWER_CODES = {'df1', 'df2', 'dfs', 'sdf'}
+FULL_CODES = {'dfs', 'sdf'}
+OFFLINE_CODES = {'off', 'offline', 'unavailable', 'unknown'}
+CORE_SUFFIXES = (('status', 'sensor', '_status_code'), ('litter', 'sensor', '_litter_level'),
+                 ('pet_weight', 'sensor', '_pet_weight'), ('night_light', 'select', '_globe_light'),
+                 ('sleep', 'binary_sensor', '_sleep_mode'), ('sleep_start', 'sensor', '_sleep_mode_start_time'))
+FOOD_LOW_RE = re.compile(r'^(?P<dev>.+?)_(food_status|food_low|food_level|lack_of_food|food_shortage|food_warning)$')
+DISPENSED_RE = re.compile(r'^(?P<dev>.+?)_(today_s_feeding_quantity_weight|dispensed_today|today_s_dispensed'
+                          r'|times_dispensed_weight|total_dispensed|dispensed)$')
+FEEDS_RE = re.compile(r'^(?P<dev>.+?)_(today_s_feeding_times|times_dispensed|feedings_today)$')
+NEXT_FEED_RE = re.compile(r'^(?P<dev>.+?)_(next_feed_time|next_feeding_time)$')
+LAST_FEED_RE = re.compile(r'^(?P<dev>.+?)_(last_feed_time|last_feeding_time)$')
+SCHEDULE_RE = re.compile(r'^(?P<dev>.+?)(?<!_today_s)_(feeding_schedule|feeding_plan|schedule_enabled)$')
+DISPENSER_RE = re.compile(r'^(?P<dev>.+?)_(food_dispenser|dispenser_problem|dispensing_error|food_blocked)$')
+FEEDER_HINT = re.compile(r'feeder|granary|petkit|petlibro|fresh_element|yumshare', re.I)
+WATER_LOW_RE = re.compile(r'^(?P<dev>.+?)_(water_lack_warning|water_lack|water_low|low_water)$')
+WEEKDAYS = ('Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su')
+
+
+class HAError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------------- small helpers
+def owner_tz():
+    name = os.environ.get('OWNER_TZ')
+    if name:
+        return ZoneInfo(name)
+    try:
+        import assistant_profile
+        return assistant_profile.tz()
+    except Exception:
+        return ZoneInfo('UTC')
+
+
+def now_dt():
+    return dt.datetime.fromtimestamp(float(os.environ.get('CAT_CORNER_NOW') or time.time()), UTC)
+
+
+def parse_ts(s):
+    t = dt.datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+    return (t if t.tzinfo else t.replace(tzinfo=UTC)).astimezone(UTC)
+
+
+def iso(t):
+    return t.astimezone(UTC).replace(microsecond=0).isoformat()
+
+
+def num(s):
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and abs(v) != float('inf') else None
+
+
+def local_day(t, tz):
+    return t.astimezone(tz).date()
+
+
+def day_start(d, tz):
+    return dt.datetime.combine(d, dt.time(0), tz).astimezone(UTC)
+
+
+def fmt_dur(sec):
+    m = int(max(0, sec) // 60)
+    if m < 90:
+        return f'{m} min'
+    h, m = divmod(m, 60)
+    return f'{h} h' if h >= 10 or not m else f'{h} h {m} min'
+
+
+def fmt_when(t, now, tz):
+    lt, ln = t.astimezone(tz), now.astimezone(tz)
+    if lt.date() == ln.date():
+        return lt.strftime('%H:%M')
+    if lt.date() == ln.date() - DAY:
+        return 'yesterday ' + lt.strftime('%H:%M')
+    return WEEKDAYS[lt.weekday()] + lt.strftime(' %d.%m %H:%M')
+
+
+def fmt_num(v, nd=1):
+    if v is None:
+        return '–'
+    return f'{v:.{nd}f}'.rstrip('0').rstrip('.') if nd else f'{v:.0f}'
+
+
+def median(vals):
+    vals = [v for v in vals if v is not None]
+    return statistics.median(vals) if vals else None
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def cfg():
+    user = load_json(CONFIG, {})
+    if not isinstance(user, dict):
+        user = {}
+    th = dict(DEFAULTS)
+    th.update({k: v for k, v in (user.get('thresholds') or {}).items() if k in DEFAULTS})
+    alerts = {'feeder': True, 'fountain': True}
+    alerts.update(user.get('alerts') or {})
+    tt = dict(th)
+    for k, v in TRIP_DEFAULTS.items():
+        tt[k] = STRICTER[k](th[k], v) if k in STRICTER else v
+    tt.update({k: v for k, v in (user.get('trip_thresholds') or {}).items() if k in tt})
+    hand = trips_cfg(user)
+    return {'thresholds': th, 'trip_thresholds': tt, 'entities': user.get('entities') or {}, 'alerts': alerts,
+            'trips': hand, 'all_trips': sorted(hand + calendar_trips(user, hand), key=lambda x: x['from'])}
+
+
+def _zone(name):
+    try:
+        return ZoneInfo(str(name)) if name else None
+    except Exception:
+        return None
+
+
+def trips_cfg(user):
+    """[{from, to (dates, inclusive), tz (ZoneInfo or None), tz_name}] from config "trips", sorted; bad ones skipped."""
+    out = []
+    for t in user.get('trips') or []:
+        try:
+            f, to = dt.date.fromisoformat(str(t['from'])), dt.date.fromisoformat(str(t['to']))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if to < f:
+            continue
+        name = t.get('tz') or user.get('tz')
+        z = _zone(name)
+        out.append({'from': f, 'to': to, 'tz': z, 'tz_name': name if z else None, 'source': 'config'})
+    return sorted(out, key=lambda x: x['from'])
+
+
+def calendar_trips(user, hand):
+    """Trips from the calendar cache (core.away: >= calendar_min_nights consecutive away nights), first night to the
+    day back, home time; one that overlaps a hand-entered trip is dropped (those win)."""
+    try:
+        n = int(user.get('calendar_min_nights', CAL_MIN_NIGHTS))
+    except (TypeError, ValueError):
+        n = CAL_MIN_NIGHTS
+    if n <= 0 or calaway is None:
+        return []
+    out = []
+    for t in calaway.trips(calaway.load(CALCACHE), n):
+        f, to = t['from'], t['back']
+        if any(h['from'] <= to and f <= h['to'] for h in hand):
+            continue
+        out.append({'from': f, 'to': to, 'tz': None, 'tz_name': None, 'source': 'calendar', 'nights': t['nights']})
+    return out
+
+
+def trip_info(t):
+    if not t:
+        return None
+    J = {'from': t['from'].isoformat(), 'to': t['to'].isoformat(), 'tz': t['tz_name'], 'source': t.get('source')}
+    if t.get('nights'):
+        J['nights'] = t['nights']
+    return J
+
+
+def trip_src(t):
+    return f"calendar, {t['nights']} nights" if t.get('source') == 'calendar' else 'hand-entered'
+
+
+def active_trip(trips, now, tz):
+    """The trip whose date range holds today (home calendar), else None."""
+    today = local_day(now, tz)
+    return next((t for t in trips if t['from'] <= today <= t['to']), None)
+
+
+def load_rows():
+    rows = {}
+    try:
+        with open(os.path.join(STATE_DIR, 'history.jsonl')) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    rows[r['date']] = r
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return rows
+
+
+def save_rows(rows, today, keep_days):
+    cut = (today - dt.timedelta(days=keep_days)).isoformat()
+    path = os.path.join(STATE_DIR, 'history.jsonl')
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        for d in sorted(rows):
+            if d >= cut:
+                f.write(json.dumps(rows[d], sort_keys=True) + '\n')
+    os.replace(tmp, path)
+
+
+# ----------------------------------------------------------------------------- HA reads (read-only)
+def ha_states():
+    try:
+        r = subprocess.run([HA, 'list', '--json', '--limit', '100000'], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise HAError(f'ha list: {type(e).__name__}')
+    if r.returncode != 0:
+        raise HAError(f'ha list: exit {r.returncode}')
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        raise HAError('ha list: no JSON')
+    return {s['entity_id']: s for s in data if isinstance(s, dict) and s.get('entity_id')}
+
+
+def _audit():
+    path = os.environ.get('HA_AUDIT_BIN') or next(
+        (p for p in (os.path.join(HERE, 'ha-audit'), os.path.join(HOME, 'bin', 'ha-audit')) if os.path.exists(p)), None)
+    if not path:
+        raise HAError('ha-audit not found')
+    loader = importlib.machinery.SourceFileLoader('ha_audit_for_cat_corner', path)
+    spec = importlib.util.spec_from_loader('ha_audit_for_cat_corner', loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True
+    loader.exec_module(mod)
+    return mod
+
+
+def _fixture_history(ids, start, end):
+    data = load_json(HIST_FIXTURE, {})
+    out = {}
+    for eid in ids:
+        ser = sorted((parse_ts(t), str(s)) for t, s in data.get(eid, []))
+        before = [x for x in ser if x[0] <= start]
+        lst = ([(start, before[-1][1])] if before else []) + [x for x in ser if start < x[0] <= end]
+        if lst:
+            out[eid] = lst
+    return out
+
+
+def fetch_history(ids, start, end):
+    """{entity_id: [(utc datetime, state)]}; a first entry stamped <= start = the state in effect at start."""
+    ids = [i for i in dict.fromkeys(ids) if i]
+    if not ids:
+        return {}
+    if HIST_FIXTURE:
+        return _fixture_history(ids, start, end)
+    try:
+        A = _audit()
+        token = A.read_token(os.environ.get('HA_AUDIT_TOKEN_FILE', A.DEFAULT_TOKEN_FILE))
+        rest = A.RestClient(os.environ.get('HA_AUDIT_URL', A.DEFAULT_URL), token, timeout=40)
+        out = {}
+        for i in range(0, len(ids), 20):
+            res = rest.get('/api/history/period/' + iso(start), {
+                'filter_entity_id': ','.join(ids[i:i + 20]), 'end_time': iso(end),
+                'minimal_response': '', 'no_attributes': ''})
+            for ser in res or []:
+                if not ser or not isinstance(ser, list) or not isinstance(ser[0], dict) or not ser[0].get('entity_id'):
+                    continue
+                out[ser[0]['entity_id']] = [(parse_ts(x['last_changed']), str(x.get('state')))
+                                            for x in ser if isinstance(x, dict) and x.get('last_changed')]
+        return out
+    except (Exception, SystemExit) as e:  # never the message text: it could carry the URL
+        raise HAError(f'history: {type(e).__name__}')
+
+
+# ----------------------------------------------------------------------------- discovery
+def _strip(name, suffix):
+    return re.sub(r'\s*' + suffix + r'\s*$', '', str(name or ''), flags=re.I).strip()
+
+
+def _pretty(dev):
+    return dev.replace('_', ' ').strip().title()
+
+
+def discover(states, override=None):
+    ents = {'robot': None, 'pets': [], 'feeders': [], 'fountains': []}
+    for eid in sorted(states):
+        dom, obj = eid.split('.', 1)
+        if dom == 'sensor' and obj.endswith('_waste_drawer') and ents['robot'] is None:
+            p = obj[:-len('_waste_drawer')]
+            r = {'name': _strip(states[eid].get('name'), 'waste drawer') or _pretty(p), 'drawer': eid}
+            for key, d, suf in CORE_SUFFIXES:
+                if f'{d}.{p}{suf}' in states:
+                    r[key] = f'{d}.{p}{suf}'
+            vac = sorted(e for e in states if e.startswith(f'vacuum.{p}'))
+            if vac:
+                r['vacuum'] = vac[0]
+            ents['robot'] = r
+    for eid in sorted(states):
+        dom, obj = eid.split('.', 1)
+        if dom == 'sensor' and obj.endswith('_visits_today'):
+            p = obj[:-len('_visits_today')]
+            pet = {'key': eid, 'name': _strip(states[eid].get('name'), r'visits?\s+today') or _pretty(p), 'visits': eid}
+            if f'sensor.{p}_weight' in states:
+                pet['weight'] = f'sensor.{p}_weight'
+            ents['pets'].append(pet)
+    robot = ents['robot']
+    if robot and not ents['pets']:
+        ents['pets'] = [{'key': 'robot', 'name': 'the cat', 'visits': None, 'weight': robot.get('pet_weight')}]
+    elif robot and len(ents['pets']) == 1 and not ents['pets'][0].get('weight') and robot.get('pet_weight'):
+        ents['pets'][0]['weight'] = robot['pet_weight']
+    feeders, fountains = {}, {}
+    for eid in sorted(states):
+        dom, obj = eid.split('.', 1)
+        m = FOOD_LOW_RE.match(obj)
+        if dom == 'binary_sensor' and m:
+            feeders.setdefault(m['dev'], {})['food_low'] = eid
+        m = WATER_LOW_RE.match(obj)
+        if dom == 'binary_sensor' and m:
+            fountains.setdefault(m['dev'], {})['water_low'] = eid
+        if dom == 'sensor':
+            unit = str(((states[eid].get('attributes') or {}).get('unit_of_measurement')) or '')
+            for rx, key in ((DISPENSED_RE, 'dispensed'), (FEEDS_RE, 'feeds'), (NEXT_FEED_RE, 'next_feed'),
+                            (LAST_FEED_RE, 'last_feed')):
+                m = rx.match(obj)
+                if m and (key != 'dispensed' or unit == 'g'):
+                    feeders.setdefault(m['dev'], {}).setdefault(key, eid)
+        if dom == 'binary_sensor':
+            for rx, key in ((SCHEDULE_RE, 'schedule'), (DISPENSER_RE, 'dispenser')):
+                m = rx.match(obj)
+                if m:
+                    feeders.setdefault(m['dev'], {}).setdefault(key, eid)
+    for dev, f in sorted(feeders.items()):
+        if f.get('food_low') or FEEDER_HINT.search(dev):
+            if f.get('food_low') or f.get('dispensed') or f.get('feeds'):
+                ents['feeders'].append(dict(f, key=dev, name=_pretty(dev)))
+    for dev, f in sorted(fountains.items()):
+        ents['fountains'].append(dict(f, key=dev, name=_pretty(dev)))
+    for k, v in (override or {}).items():
+        if k in ents:
+            ents[k] = v
+    return ents
+
+
+def tracked_ids(ents):
+    ids = []
+    r = ents.get('robot') or {}
+    ids += [r.get(k) for k in ('drawer', 'status')]
+    for p in ents.get('pets') or []:
+        ids += [p.get('visits'), p.get('weight')]
+    for f in ents.get('feeders') or []:
+        ids += [f.get('food_low'), f.get('dispensed'), f.get('feeds'), f.get('schedule'), f.get('dispenser')]
+    for f in ents.get('fountains') or []:
+        ids.append(f.get('water_low'))
+    return [i for i in ids if i]
+
+
+def weight_factor(states, eid):
+    unit = str(((states.get(eid) or {}).get('attributes') or {}).get('unit_of_measurement') or 'lb').lower()
+    return {'kg': 1.0, 'g': 0.001, 'lb': LB_KG, 'lbs': LB_KG, 'oz': LB_KG / 16}.get(unit, LB_KG)
+
+
+# ----------------------------------------------------------------------------- history -> daily rows
+def counter_incs(ser, start):
+    """Increments of a daily counter (resets to 0 at midnight): [(time, +n)]."""
+    out, prev = [], None
+    for t, s in ser:
+        v = num(s)
+        if v is None:
+            continue
+        if prev is None:
+            if t > start + EPS and v > 0:  # series begins inside the window: the count so far
+                out.append((t, v))
+        elif v > prev:
+            out.append((t, v - prev))
+        elif v < prev and v > 0:  # reset, already counting again
+            out.append((t, v))
+        prev = v
+    return out
+
+
+def readings(ser, start):
+    return [(t, v) for t, s in ser if t > start + EPS and (v := num(s)) is not None]
+
+
+def value_at(ser, t):
+    v = None
+    for ts, s in ser:
+        if ts > t:
+            break
+        if num(s) is not None:
+            v = num(s)
+    return v
+
+
+def trailing_since(ser, pred):
+    since = None
+    for t, s in ser:
+        if pred(s):
+            since = since or t
+        else:
+            since = None
+    return since
+
+
+def is_fault(code):
+    return code not in OK_CODES and code not in DRAWER_CODES
+
+
+def build_rows(hist, ents, states, start, now, tz):
+    robot = ents.get('robot') or {}
+    core = [hist.get(i) for i in [robot.get('status'), robot.get('drawer')] + [p.get('visits') for p in ents['pets']]]
+    firsts = [s[0][0] for s in core if s]
+    if not firsts:
+        return {}
+    data_start = max(start, min(firsts))
+    rows, d = {}, local_day(data_start, tz)
+    while d <= local_day(now, tz):
+        ds, de = day_start(d, tz), day_start(d + DAY, tz)
+        rows[d] = {'date': d.isoformat(), 'complete': data_start <= ds and de <= now,
+                   'hours': round((min(de, now) - max(ds, data_start)).total_seconds() / 3600, 1),
+                   'pets': {}, 'feeders': {}}
+        d += DAY
+
+    def per_day(pairs, agg=sum):
+        acc = {}
+        for t, v in pairs:
+            acc.setdefault(local_day(t, tz), []).append(v)
+        return {k: agg(v) for k, v in acc.items()}
+
+    st_ser = hist.get(robot.get('status')) or []
+    cycles = per_day([(t, 1) for (t, s), prev in zip(st_ser, [None] + [x[1] for x in st_ser])
+                      if s == 'ccp' and prev != 'ccp' and t > start + EPS])
+    cd = per_day([(t, 1) for (t, s), prev in zip(st_ser, [None] + [x[1] for x in st_ser])
+                  if s == 'cd' and prev != 'cd' and t > start + EPS])
+    faults = per_day([(t, 1) for (t, s), prev in zip(st_ser, [None] + [x[1] for x in st_ser])
+                      if is_fault(s) and s not in OFFLINE_CODES and (prev is None or not is_fault(prev))
+                      and t > start + EPS])
+    dr_ser = hist.get(robot.get('drawer')) or []
+    for d, row in rows.items():
+        ds, de = day_start(d, tz), day_start(d + DAY, tz)
+        if st_ser:
+            row['cycles'] = cycles.get(d, 0)
+            row['faults'] = faults.get(d, 0)
+        if dr_ser:
+            vals = [value_at(dr_ser, ds)] + [v for t, v in readings(dr_ser, start) if ds <= t < de]
+            vals = [v for v in vals if v is not None]
+            row['drawer_max'] = max(vals) if vals else None
+            row['drawer_end'] = value_at(dr_ser, min(de, now))
+            empt, prev = 0, value_at(dr_ser, ds)
+            for t, v in readings(dr_ser, start):
+                if ds <= t < de:
+                    if prev is not None and prev - v >= 25:
+                        empt += 1
+                    prev = v
+            row['drawer_empties'] = empt
+    for pet in ents['pets']:
+        vis_ser = hist.get(pet.get('visits')) if pet.get('visits') else None
+        if vis_ser:
+            visits, vstart = per_day(counter_incs(vis_ser, start)), vis_ser[0][0]
+        elif not pet.get('visits') and st_ser:  # no per-pet counter: cat detections
+            visits, vstart = cd, st_ser[0][0]
+        else:
+            visits, vstart = None, None
+        w_ser = hist.get(pet.get('weight')) or [] if pet.get('weight') else []
+        fac = weight_factor(states, pet.get('weight'))
+        wdays = per_day([(t, v * fac) for t, v in readings(w_ser, start)], agg=lambda v: v)
+        for d, row in rows.items():
+            de = day_start(d + DAY, tz)
+            pr = {}
+            if visits is not None and vstart < de:
+                pr['visits'] = int(visits.get(d, 0))
+            if wdays.get(d):
+                pr['weight_kg'] = round(statistics.median(wdays[d]), 3)
+                pr['weight_n'] = len(wdays[d])
+            elif w_ser and value_at(w_ser, min(de, now)) is not None:
+                pr['weight_kg'] = round(value_at(w_ser, min(de, now)) * fac, 3)
+                pr['weight_n'] = 0
+            if pr:
+                row['pets'][pet['key']] = pr
+    for fd in ents['feeders']:
+        g = per_day(counter_incs(hist.get(fd.get('dispensed')) or [], start)) if fd.get('dispensed') else {}
+        n = per_day(counter_incs(hist.get(fd.get('feeds')) or [], start)) if fd.get('feeds') else {}
+        for d, row in rows.items():
+            fr = {}
+            if fd.get('dispensed') and hist.get(fd['dispensed']):
+                fr['food_g'] = round(g.get(d, 0), 1)
+            if fd.get('feeds') and hist.get(fd['feeds']):
+                fr['feeds'] = int(n.get(d, 0))
+            if fr:
+                row['feeders'][fd['key']] = fr
+    return {d.isoformat(): r for d, r in rows.items()}
+
+
+def merge_rows(rows, new):
+    for d, r in new.items():
+        o = rows.get(d)
+        if o is None or r['complete'] or (not o.get('complete') and r['hours'] >= o.get('hours', 0)):
+            rows[d] = r
+
+
+def evidence(hist, ents, start):
+    """{pet key: latest time with a sign of a visit} from counter increments, weight readings, cat detections."""
+    out = {}
+    robot = ents.get('robot') or {}
+    st_ser = hist.get(robot.get('status')) or []
+    cds = [t for t, s in st_ser if s == 'cd' and t > start + EPS]
+    for pet in ents['pets']:
+        ts = [t for t, _ in counter_incs(hist.get(pet.get('visits')) or [], start)] if pet.get('visits') else []
+        ts += [t for t, _ in readings(hist.get(pet.get('weight')) or [], start)] if pet.get('weight') else []
+        if len(ents['pets']) == 1:
+            ts += cds
+        if ts:
+            out[pet['key']] = max(ts)
+    return out
+
+
+def refresh(ents, states, st, rows, now, tz, th):
+    """Fetch the recorder window (14+ days once a local day, else 2 days), merge daily rows, update visit evidence.
+    Returns (hist, start, error or None)."""
+    today = local_day(now, tz)
+    full = not rows or st.get('backfill_day') != today.isoformat()
+    start = day_start(today - dt.timedelta(days=th['baseline_days'] + 3 if full else 2), tz)
+    try:
+        hist = fetch_history(tracked_ids(ents), start, now)
+    except HAError as e:
+        return {}, start, str(e)
+    merge_rows(rows, build_rows(hist, ents, states, start, now, tz))
+    if full:
+        st['backfill_day'] = today.isoformat()
+    lv, fs = st.setdefault('last_visit', {}), st.setdefault('first_seen', {})
+    for k, t in evidence(hist, ents, start).items():
+        if not lv.get(k) or parse_ts(lv[k]) < t:
+            lv[k] = iso(t)
+    for pet in ents['pets']:
+        ser = hist.get(pet.get('visits')) or hist.get((ents.get('robot') or {}).get('status')) or []
+        first = ser[0][0] if ser else now
+        if not fs.get(pet['key']) or parse_ts(fs[pet['key']]) > first:
+            fs[pet['key']] = iso(first)
+    return hist, start, None
+
+
+# ----------------------------------------------------------------------------- current view
+def baseline(rows, key, field, first, last):
+    vals, d = [], first
+    while d <= last:
+        r = rows.get(d.isoformat())
+        v = ((r or {}).get('pets') or {}).get(key, {}).get(field) if r and r.get('complete') else None
+        if v is not None:
+            vals.append(v)
+        d += DAY
+    return (median(vals), len(vals))
+
+
+def build_view(states, ents, hist, rows, st, now, tz, th, hist_ok):
+    today = local_day(now, tz)
+    since_obs = st.setdefault('since', {})
+
+    def since(key, active, ser, pred):
+        """start of the current condition: the recorder history when we have it, else our own first observation"""
+        if not active:
+            since_obs.pop(key, None)
+            return None
+        t = trailing_since(ser, pred) if (hist_ok and ser) else None
+        obs = parse_ts(since_obs[key]) if since_obs.get(key) else now
+        since_obs[key] = iso(min(obs, t or now))
+        return min(obs, t) if t else obs
+
+    def state(eid):
+        return str((states.get(eid) or {}).get('state')) if eid else None
+
+    v = {'now': now, 'robot': None, 'pets': [], 'feeders': [], 'fountains': []}
+    r = ents.get('robot')
+    if r:
+        code = state(r.get('status')) or 'unknown'
+        if (r.get('vacuum') and state(r['vacuum']) == 'unavailable') or code == 'None':
+            code = 'unavailable'
+        trow = rows.get(today.isoformat()) or {}
+        sleep = state(r.get('sleep'))
+        if not sleep:
+            ss = state(r.get('sleep_start'))
+            sleep = None if ss is None else ('off' if ss in ('unknown', 'unavailable', 'None') else 'on')
+        v['robot'] = {
+            'name': r.get('name') or 'Litter box', 'status': code, 'label': LABELS.get(code, code),
+            'drawer': num(state(r.get('drawer'))), 'litter': num(state(r.get('litter'))),
+            'night_light': state(r.get('night_light')), 'sleep': sleep,
+            'bad_since': since('robot', is_fault(code), hist.get(r.get('status')) or [], is_fault),
+            'cycles_today': trow.get('cycles'), 'faults_today': trow.get('faults'),
+        }
+    lv, fs = st.get('last_visit') or {}, st.get('first_seen') or {}
+    for pet in ents['pets']:
+        k = pet['key']
+        trow = (rows.get(today.isoformat()) or {}).get('pets', {}).get(k, {})
+        yrow = (rows.get((today - DAY).isoformat()) or {})
+        nb = th['baseline_days']
+        p = {'key': k, 'name': pet.get('name') or 'the cat',
+             'visits_today': trow.get('visits'),
+             'visits_yday': (yrow.get('pets') or {}).get(k, {}).get('visits') if yrow.get('complete') else None,
+             'base_today': baseline(rows, k, 'visits', today - dt.timedelta(days=nb), today - DAY),
+             'base_yday': baseline(rows, k, 'visits', today - dt.timedelta(days=nb + 1), today - 2 * DAY),
+             'last_visit': parse_ts(lv[k]) if lv.get(k) else None,
+             'first_seen': parse_ts(fs[k]) if fs.get(k) else None,
+             'weight_now': None, 'weight_cur': None, 'weight_base': baseline(rows, k, 'weight_kg', today - dt.timedelta(days=nb + 2),
+                                                         today - 3 * DAY)}
+        if pet.get('weight'):
+            fac = weight_factor(states, pet['weight'])
+            cur = num(state(pet['weight']))
+            p['weight_cur'] = round(cur * fac, 3) if cur is not None else None
+            w_ser = hist.get(pet['weight']) or []
+            rs = [x for t, x in readings(w_ser, now - dt.timedelta(hours=48)) if t >= now - dt.timedelta(hours=48)]
+            if len(rs) >= 2:
+                p['weight_now'] = round(statistics.median(rs) * fac, 3)
+            elif cur is not None and (not hist_ok or not w_ser or len(rs) == 0
+                                      or w_ser[-1][0] <= now - dt.timedelta(hours=24)):
+                p['weight_now'] = round(cur * fac, 3)
+        v['pets'].append(p)
+    for f in ents['feeders']:
+        low = state(f.get('food_low')) == 'on'
+        nf = (states.get(f.get('next_feed')) or {}).get('state') if f.get('next_feed') else None
+        nft = None
+        try:
+            nft = parse_ts(nf) if nf and nf not in ('unknown', 'unavailable') else None
+        except ValueError:
+            pass
+        sched_off = state(f.get('schedule')) == 'off'
+        jam = state(f.get('dispenser')) == 'on'
+        main_eid = f.get('food_low') or f.get('feeds') or f.get('dispensed')
+        off = state(main_eid) == 'unavailable'
+        v['feeders'].append({
+            'key': f['key'], 'name': f['name'], 'low': low if f.get('food_low') else None,
+            'low_since': since('food:' + f['key'], low, hist.get(f.get('food_low')) or [], lambda s: s == 'on'),
+            'food_g_today': num(state(f.get('dispensed'))), 'feeds_today': num(state(f.get('feeds'))),
+            'next_feed': nft, 'last_feed': ts_state(states, f.get('last_feed')),
+            'schedule_off_since': since('schedule:' + f['key'], sched_off, hist.get(f.get('schedule')) or [],
+                                        lambda s: s == 'off'),
+            'dispenser_since': since('dispenser:' + f['key'], jam, hist.get(f.get('dispenser')) or [],
+                                     lambda s: s == 'on'),
+            'offline_since': since('offline:' + f['key'], off, hist.get(main_eid) or [],
+                                   lambda s: s == 'unavailable'),
+            'missed_meal': None})
+    for f in ents['fountains']:
+        low = state(f.get('water_low')) == 'on'
+        off = state(f.get('water_low')) == 'unavailable'
+        v['fountains'].append({
+            'key': f['key'], 'name': f['name'], 'low': low,
+            'low_since': since('water:' + f['key'], low, hist.get(f.get('water_low')) or [], lambda s: s == 'on'),
+            'offline_since': since('offline:' + f['key'], off, hist.get(f.get('water_low')) or [],
+                                   lambda s: s == 'unavailable')})
+    return v
+
+
+def ts_state(states, eid):
+    """A timestamp entity's state as a UTC datetime, else None."""
+    s = (states.get(eid) or {}).get('state') if eid else None
+    if not s or s in ('unknown', 'unavailable', 'None'):
+        return None
+    try:
+        return parse_ts(s)
+    except ValueError:
+        return None
+
+
+def track_meals(ents, states, hist, st, now, th, start):
+    """Trip mode: remember each scheduled meal (the feeder's next-feed time) and check that it was dispensed.
+    A feed = the last-feed timestamp or a feeds / grams counter increment. Sets st['meals'][feeder] =
+    {pending: [iso], missed: iso or absent}; returns {feeder key: missed meal time} for meals with no feed
+    from meal_tolerance_min before to meal_grace_min after (open until a later feed is seen)."""
+    meals, out = st.setdefault('meals', {}), {}
+    tol, grace = dt.timedelta(minutes=th['meal_tolerance_min']), dt.timedelta(minutes=th['meal_grace_min'])
+    for f in ents['feeders']:
+        if not f.get('next_feed'):
+            continue
+        m = meals.setdefault(f['key'], {})
+        pend = set(m.get('pending') or [])
+        nf = ts_state(states, f.get('next_feed'))
+        if nf and nf > now - grace:
+            pend.add(iso(nf))
+        fed = [t for t in (ts_state(states, f.get('last_feed')),) if t]
+        for key in ('feeds', 'dispensed'):
+            if f.get(key):
+                fed += [t for t, _ in counter_incs(hist.get(f[key]) or [], start)]
+        last_fed = max(fed) if fed else None
+        keep = []
+        for s in sorted(pend):
+            t = parse_ts(s)
+            if last_fed and last_fed >= t - tol:
+                continue
+            if now >= t + grace:
+                if not m.get('missed') or parse_ts(m['missed']) < t:
+                    m['missed'] = s
+            else:
+                keep.append(s)
+        m['pending'] = keep
+        if m.get('missed') and last_fed and last_fed >= parse_ts(m['missed']) - tol:
+            m.pop('missed')
+        if m.get('missed'):
+            out[f['key']] = parse_ts(m['missed'])
+        if last_fed:
+            m['last_fed'] = iso(last_fed)
+    return out
+
+
+# ----------------------------------------------------------------------------- problems
+def assess(v, th, alerts_cfg, active, tz, trip=False, dtz=None):
+    """[{key, text, renotify_h, cooldown_h}] for every problem that is true now. trip: add the trip-only checks;
+    dtz: the zone for times shown in the texts (default tz)."""
+    now, out, ftz = v['now'], [], dtz or tz
+
+    def add(key, text, renotify=None, cooldown=None):
+        out.append({'key': key, 'text': text, 'renotify_h': renotify, 'cooldown_h': cooldown})
+
+    r = v['robot']
+    robot_bad = False
+    if r:
+        d, code = r['drawer'], r['status']
+        full = code in DRAWER_CODES or (d is not None and d >= th['drawer_pct'])
+        if not full and 'drawer' in active and d is not None and d >= th['drawer_clear_pct']:
+            full = True
+        if full:
+            if code in FULL_CODES or (d or 0) >= 100:
+                what = 'full'
+            elif d is not None and d >= th['drawer_pct']:
+                what = f'at {d:.0f} %'
+            else:
+                what = 'almost full'
+            add('drawer', f'Litter box drawer {what}: time to empty it.', th['renotify_h'])
+        lv = r.get('litter')
+        if lv is not None and (lv <= th['litter_low_pct'] or ('litter' in active and lv < th['litter_clear_pct'])):
+            add('litter', f'Litter level low ({lv:.0f} %): time to top up the litter.', th['renotify_h'])
+        bs = r['bad_since']
+        if bs and (now - bs).total_seconds() >= th['fault_min'] * 60:
+            robot_bad = True
+            dur = fmt_dur((now - bs).total_seconds())
+            if code in OFFLINE_CODES:
+                add('robot-offline', f"{r['name']} {r['label']} since {fmt_when(bs, now, ftz)} ({dur}); "
+                                     'visits are not being counted.', th['renotify_h'])
+            else:
+                add('robot-fault', f"{r['name']}: {r['label']} since {fmt_when(bs, now, ftz)} ({dur}).",
+                    th['renotify_h'])
+    for p in v['pets']:
+        name, k = p['name'], p['key']
+        anchor = max([t for t in (p['last_visit'], p['first_seen']) if t] or [now])
+        gap = (now - anchor).total_seconds()
+        if gap > th['no_visit_h'] * 3600 and not robot_bad:
+            last = f"last {fmt_when(p['last_visit'], now, ftz)}" if p['last_visit'] else 'none recorded yet'
+            add(f'novisit:{k}', f"No litter box visit from {name} in {int(gap // 3600)} h ({last}). "
+                                f"Maybe the robot missed it, but worth checking on {name}.", th['no_visit_renotify_h'])
+        for label, cnt, (med, n) in (('today', p['visits_today'], p['base_today']),
+                                     ('yesterday', p['visits_yday'], p['base_yday'])):
+            day = local_day(now, tz) - (DAY if label == 'yesterday' else dt.timedelta(0))
+            if (cnt is not None and med and n >= th['min_baseline_days'] and cnt > th['visits_factor'] * med
+                    and cnt - med >= th['visits_min_extra']):
+                add(f'visits:{k}:{day.isoformat()}',
+                    f"{name} used the litter box {cnt}x {label} (usually ~{fmt_num(med)} a day). "
+                    'Frequent visits can point to a bladder problem: worth keeping an eye on.')
+        (wb, wn), wnow = p['weight_base'], p['weight_now']
+        if wb and wnow and wn >= th['min_baseline_days']:
+            pct = (wnow - wb) / wb * 100
+            direction = 'up' if pct > 0 else 'down'
+            key = f'weight:{k}:{direction}'
+            if abs(pct) > th['weight_pct'] or (key in active and abs(pct) >= th['weight_clear_pct']):
+                add(key, f"{name}'s weight: {wnow:.2f} kg vs usual {wb:.2f} kg ({pct:+.0f} %). "
+                         'Could be a scale hiccup; if it stays, worth a vet check.', None, th['cooldown_h'])
+    if alerts_cfg.get('feeder', True):
+        for f in v['feeders']:
+            if f['low'] and f['low_since'] and (now - f['low_since']).total_seconds() >= th['low_min'] * 60:
+                add(f"food:{f['key']}", f"{f['name']}: food low, time to refill.", th['renotify_h'])
+    if alerts_cfg.get('fountain', True):
+        for f in v['fountains']:
+            if f['low'] and f['low_since'] and (now - f['low_since']).total_seconds() >= th['low_min'] * 60:
+                add(f"water:{f['key']}", f"{f['name']}: water low, time to refill.", th['renotify_h'])
+    if trip:
+        out += trip_problems(v, th, alerts_cfg, ftz)
+    return out
+
+
+def trip_problems(v, th, alerts_cfg, ftz):
+    """The trip-only checks: meal not dispensed, feeding schedule off, dispenser problem, device offline."""
+    now, out = v['now'], []
+
+    def held(t, minutes):
+        return t is not None and (now - t).total_seconds() >= minutes * 60
+
+    def add(key, text):
+        out.append({'key': key, 'text': text, 'renotify_h': th['renotify_h'], 'cooldown_h': None})
+
+    if alerts_cfg.get('feeder', True):
+        for f in v['feeders']:
+            k, name = f['key'], f['name']
+            if f.get('missed_meal'):
+                add(f'meal:{k}', f"{name}: the {fmt_when(f['missed_meal'], now, ftz)} meal was not dispensed "
+                                 f"(no feed seen {th['meal_grace_min']} min later). Someone should check on the feeder.")
+            if held(f.get('schedule_off_since'), th['low_min']):
+                add(f'schedule:{k}', f"{name}: feeding schedule is OFF, no meals will be dispensed.")
+            if held(f.get('dispenser_since'), th['low_min']):
+                add(f'dispenser:{k}', f"{name}: dispenser problem (food may be stuck).")
+            if held(f.get('offline_since'), th['fault_min']):
+                add(f'offline:{k}', f"{name} offline since {fmt_when(f['offline_since'], now, ftz)}: "
+                                    'meals and food level are not being watched.')
+    if alerts_cfg.get('fountain', True):
+        for f in v['fountains']:
+            if held(f.get('offline_since'), th['fault_min']):
+                add(f"offline:{f['key']}", f"{f['name']} offline since {fmt_when(f['offline_since'], now, ftz)}: "
+                                           'water level is not being watched.')
+    return out
+
+
+def daily_line(v, probs, ftz):
+    """The trip-mode daily check: one line, all OK or what is open."""
+    now, bits = v['now'], []
+    for p in v['pets']:
+        b = []
+        if p['visits_yday'] is not None:
+            b.append(f"{p['visits_yday']} visit{'' if p['visits_yday'] == 1 else 's'} yesterday")
+        if p['last_visit']:
+            b.append('last ' + fmt_when(p['last_visit'], now, ftz))
+        if b:
+            bits.append(f"{p['name']}: " + ', '.join(b))
+    r = v['robot']
+    if r and r['drawer'] is not None:
+        bits.append(f"drawer {fmt_num(r['drawer'], 0)} %")
+    if r and r['litter'] is not None:
+        bits.append(f"litter {fmt_num(r['litter'], 0)} %")
+    for f in v['feeders']:
+        if f.get('last_feed'):
+            bits.append('fed ' + fmt_when(f['last_feed'], now, ftz))
+    for f in v['fountains']:
+        bits.append('water LOW' if f['low'] else 'water ok')
+    if probs:
+        kinds = list(dict.fromkeys(SHORT.get(p['key'].split(':')[0], p['key'].split(':')[0]) for p in probs))
+        head = f"🐾 Daily cat check: {len(probs)} open ({', '.join(kinds)})"
+    else:
+        head = '🐾 Daily cat check: all OK'
+    return ' · '.join([head] + bits)
+
+
+def is_quiet(now, tz, th):
+    h = now.astimezone(tz).hour
+    a, b = th['quiet_start'], th['quiet_end']
+    return (a <= h < b) if a <= b else (h >= a or h < b)
+
+
+def plan(probs, alerts, now, quiet):
+    """Dedupe: which problems to send now. Mutates `alerts` (key -> {active, since, last_sent})."""
+    ts, send = now.timestamp(), []
+    keys = {p['key'] for p in probs}
+    for p in probs:
+        a = alerts.get(p['key'])
+        if a and a.get('active'):
+            last = a.get('last_sent')
+            due = last is None or (p['renotify_h'] and ts - last >= p['renotify_h'] * 3600)
+        else:
+            last = (a or {}).get('last_sent')
+            due = not (last and p['cooldown_h'] and ts - last < p['cooldown_h'] * 3600)
+            alerts[p['key']] = {'active': True, 'since': ts, 'last_sent': last if not due else None}
+        if due and not quiet:
+            send.append(p)
+    for k in list(alerts):
+        if k not in keys:
+            alerts[k]['active'] = False
+            if not alerts[k].get('last_sent') or ts - alerts[k]['last_sent'] > 8 * 86400:
+                del alerts[k]
+    return send
+
+
+def compose(send):
+    if not send:
+        return ''
+    if len(send) == 1:
+        return '🐾 ' + send[0]['text']
+    return '🐾 Cat corner\n' + '\n'.join('• ' + p['text'] for p in send)
+
+
+def send_tg(text, soft=False):
+    """soft: `tg --soft` (TG_SOFT=1: waits out quiet hours and a sleep-in morning), for the trip's daily check line and
+    "reachable again" without a new problem; cat problems and HA unreachable on a trip stay plain `tg`."""
+    try:
+        r = subprocess.run([TG, text], capture_output=True, text=True, timeout=40, stdin=subprocess.DEVNULL,
+                           env=dict(os.environ, TG_SOFT='1') if soft else None)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+# ----------------------------------------------------------------------------- outputs
+def status_text(v, probs, th, tz, hist_err, trip=None):
+    now = v['now']
+    out = ['🐾 Cat corner · ' + WEEKDAYS[now.astimezone(tz).weekday()] + now.astimezone(tz).strftime(' %d.%m %H:%M')]
+    if trip:
+        out.append(f"Trip mode on until {trip['to']:%d.%m} (times in {trip['tz_name'] or 'home time'}; "
+                   'stricter thresholds)')
+    r = v['robot']
+    if r:
+        bits = [r['label'], f"drawer {fmt_num(r['drawer'], 0)} %"]
+        if r['litter'] is not None:
+            bits.append(f"litter {fmt_num(r['litter'], 0)} %")
+        out.append(f"{r['name']}: " + ' · '.join(bits))
+        extra = []
+        if r['night_light']:
+            extra.append(f"night light {r['night_light']}")
+        if r['sleep']:
+            extra.append(f"sleep mode {r['sleep']}")
+        if r['cycles_today'] is not None:
+            extra.append(f"cycles today {r['cycles_today']}")
+        if extra:
+            out.append('  ' + ' · '.join(extra))
+    else:
+        out.append('No litter robot found in HA.')
+    for p in v['pets']:
+        med, n = p['base_today']
+        usual = f"usual ~{fmt_num(med)}" if n >= th['min_baseline_days'] else f"baseline {n}/{th['min_baseline_days']} days"
+        vt = p['visits_today']
+        out.append(f"{p['name']}: {'–' if vt is None else vt} visit{'' if vt == 1 else 's'} today ({usual})")
+        bits = [f"last visit {fmt_when(p['last_visit'], now, tz)}" if p['last_visit'] else 'last visit –']
+        if p['weight_cur']:
+            wb, wn = p['weight_base']
+            bits.append(f"{p['weight_cur']:.2f} kg" + (f" (usual {wb:.2f})" if wb and wn >= th['min_baseline_days'] else ''))
+        out.append('  ' + ' · '.join(bits))
+    for f in v['feeders']:
+        bits = []
+        if f['food_g_today'] is not None:
+            bits.append(f"{fmt_num(f['food_g_today'])} g today")
+        if f['feeds_today'] is not None:
+            bits.append(f"{fmt_num(f['feeds_today'], 0)} feeds")
+        if f['next_feed']:
+            bits.append('next ' + fmt_when(f['next_feed'], now, tz))
+        if f['low'] is not None:
+            bits.append('food LOW' if f['low'] else 'food ok')
+        out.append(f"Feeder {f['name']}: " + (' · '.join(bits) or 'no data'))
+    for f in v['fountains']:
+        out.append(f"Fountain {f['name']}: " + ('water LOW' if f['low'] else 'water ok'))
+    if probs:
+        out.append('Problems:')
+        out += ['• ' + p['text'] for p in probs]
+    else:
+        out.append('Problems: none')
+    if hist_err:
+        out.append(f'(history not read: {hist_err})')
+    return '\n'.join(out)
+
+
+def week_data(rows, ents, today, th):
+    end = today - DAY
+    days = [end - dt.timedelta(days=i) for i in range(6, -1, -1)]
+    prev_first, prev_last = end - dt.timedelta(days=6 + th['baseline_days']), end - dt.timedelta(days=7)
+    W = {'from': days[0].isoformat(), 'to': end.isoformat(), 'days_with_data': 0, 'pets': [], 'robot': {},
+         'feeders': [], 'off': []}
+    wrows = [rows.get(d.isoformat()) for d in days]
+    W['days_with_data'] = sum(1 for r in wrows if r)
+    known = [r for r in wrows if r]
+    dmax = [r['drawer_max'] for r in known if r.get('drawer_max') is not None]
+    W['robot'] = {'drawer_empties': sum(r.get('drawer_empties') or 0 for r in known),
+                  'drawer_max': max(dmax) if dmax else None,
+                  'cycles': sum(r.get('cycles') or 0 for r in known), 'faults': sum(r.get('faults') or 0 for r in known)}
+    for pet in ents['pets']:
+        k = pet['key']
+        vis = [((r or {}).get('pets') or {}).get(k, {}).get('visits') for r in wrows]
+        kv = [x for x in vis if x is not None]
+        avg = round(sum(kv) / len(kv), 1) if kv else None
+        pmed, pn = baseline(rows, k, 'visits', prev_first, prev_last)
+        wk = median([((r or {}).get('pets') or {}).get(k, {}).get('weight_kg') for r in wrows])
+        wmed, wn = baseline(rows, k, 'weight_kg', prev_first, prev_last)
+        chg = round((wk - wmed) / wmed * 100, 1) if wk and wmed else None
+        zero = sum(1 for r, x in zip(wrows, vis) if r and r.get('complete') and x == 0)
+        P = {'name': pet.get('name'), 'visits': vis, 'visits_avg': avg, 'visits_prev_median': pmed,
+             'prev_days': pn, 'weight_kg': round(wk, 2) if wk else None,
+             'weight_prev_kg': round(wmed, 2) if wmed else None, 'weight_chg_pct': chg, 'zero_days': zero}
+        W['pets'].append(P)
+        if avg is not None and pmed and pn >= th['min_baseline_days'] and len(kv) >= 4:
+            d = (avg - pmed) / pmed * 100
+            if abs(d) >= th['digest_visits_pct']:
+                W['off'].append(f"{P['name']}: visits {'up' if d > 0 else 'down'} {abs(d):.0f} % "
+                                f"({fmt_num(avg)}/day vs {fmt_num(pmed)})")
+        if zero:
+            W['off'].append(f"{P['name']}: {zero} day{'s' if zero > 1 else ''} without a recorded visit")
+        if chg is not None and wn >= th['min_baseline_days'] and abs(chg) >= th['digest_weight_pct']:
+            W['off'].append(f"{P['name']}: weight {chg:+.0f} % ({wk:.2f} kg)")
+    if W['robot']['faults']:
+        W['off'].append(f"robot faults: {W['robot']['faults']}")
+    for fd in ents['feeders']:
+        g = [((r or {}).get('feeders') or {}).get(fd['key'], {}).get('food_g') for r in wrows]
+        kg = [x for x in g if x is not None]
+        W['feeders'].append({'name': fd['name'], 'avg_g': round(sum(kg) / len(kg), 1) if kg else None, 'days': len(kg)})
+    return W
+
+
+def week_text(W, days):
+    out = [f"🐾 Cat week {dt.date.fromisoformat(W['from']).strftime('%d.%m')}–"
+           f"{dt.date.fromisoformat(W['to']).strftime('%d.%m')}"]
+    if not W['days_with_data']:
+        out.append('No history yet: it fills up as the cron job runs.')
+        return '\n'.join(out)
+    for P in W['pets']:
+        cells = ' · '.join(f"{WEEKDAYS[d.weekday()]} {'–' if x is None else x}" for d, x in zip(days, P['visits']))
+        prev = f" (before {fmt_num(P['visits_prev_median'])})" if P['visits_prev_median'] is not None else ''
+        out.append(f"{P['name']} visits: {cells}")
+        out.append(f"  avg {fmt_num(P['visits_avg'])}/day{prev}")
+        if P['weight_kg']:
+            w = f"{P['name']} weight: {P['weight_kg']:.2f} kg"
+            if P['weight_prev_kg']:
+                w += f" (before {P['weight_prev_kg']:.2f}, {P['weight_chg_pct']:+.1f} %)"
+            out.append(w)
+    R = W['robot']
+    out.append(f"Drawer emptied {R['drawer_empties']}x · max {fmt_num(R['drawer_max'], 0)} % · "
+               f"cycles {R['cycles']} · faults {R['faults']}")
+    for F in W['feeders']:
+        out.append(f"Feeder {F['name']}: " + (f"avg {fmt_num(F['avg_g'])} g/day" if F['avg_g'] is not None else 'no data'))
+    if W['off']:
+        out.append('Off: ' + '; '.join(W['off']))
+    return '\n'.join(out)
+
+
+def jsonable(o):
+    if isinstance(o, dict):
+        return {k: jsonable(x) for k, x in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [jsonable(x) for x in o]
+    if isinstance(o, (dt.datetime, dt.date)):
+        return o.isoformat()
+    if isinstance(o, float):  # 4+ decimals would read as a coordinate to the privacy gate: <coord>, broken JSON
+        return round(o, 3)
+    return o
+
+
+# ----------------------------------------------------------------------------- trip mode
+def trip_checks(ents):
+    """[(check, available, entities)] for the trip-only checks, from the discovered entities."""
+    fs, ps = ents.get('feeders') or [], ents.get('pets') or []
+    r = ents.get('robot') or {}
+
+    def ids(key, src):
+        return [x[key] for x in src if x.get(key)]
+    meal = [f"{f['next_feed']} + {f.get('last_feed') or f.get('feeds') or f.get('dispensed') or '?'}"
+            for f in fs if f.get('next_feed') and (f.get('last_feed') or f.get('feeds') or f.get('dispensed'))]
+    visit = ids('visits', ps) or ([r['status']] if r.get('status') else [])
+    return [('meal not dispensed', bool(meal), meal),
+            ('feeding schedule off', bool(ids('schedule', fs)), ids('schedule', fs)),
+            ('dispenser problem', bool(ids('dispenser', fs)), ids('dispenser', fs)),
+            ('food low', bool(ids('food_low', fs)), ids('food_low', fs)),
+            ('water low', bool(ents.get('fountains')), ids('water_low', ents.get('fountains') or [])),
+            ('no litter box visit', bool(visit), visit),
+            ('drawer / litter level', bool(r.get('drawer')), [x for x in (r.get('drawer'), r.get('litter')) if x]),
+            ('feeder / fountain offline', bool(fs or ents.get('fountains')),
+             [f.get('food_low') or f.get('feeds') or f.get('dispensed') for f in fs]
+             + ids('water_low', ents.get('fountains') or []))]
+
+
+def trip_status(a, c, tz, now):
+    trips, th, tt = c['all_trips'], c['thresholds'], c['trip_thresholds']
+    trip = active_trip(trips, now, tz)
+    nxt = trip or next((t for t in trips if t['from'] > local_day(now, tz)), None)
+    st = load_json(os.path.join(STATE_DIR, 'state.json'), {})
+    st = st if isinstance(st, dict) else {}
+    herr, ents = None, None
+    try:
+        ents = discover(ha_states(), c['entities'])
+    except HAError as e:
+        herr = str(e)
+    ttz = (nxt or {}).get('tz') or tz
+    keys = ('drawer_pct', 'litter_low_pct', 'no_visit_h', 'low_min', 'fault_min', 'renotify_h')
+    today = local_day(now, tz)
+    upcoming = [t for t in trips if t['to'] >= today]
+    J = {'active': bool(trip), 'trip': trip_info(nxt), 'trips': len(trips),
+         'upcoming': [trip_info(t) for t in upcoming],
+         'thresholds': {k: {'away': tt[k], 'normal': th[k]} for k in keys},
+         'quiet': {'start': tt['quiet_start'], 'end': tt['quiet_end'], 'tz': (nxt or {}).get('tz_name')},
+         'ok_hour': tt['ok_hour'], 'last_daily_check': st.get('trip_ok_day'), 'meals': st.get('meals') or {},
+         'checks': [{'check': n, 'available': ok, 'entities': e} for n, ok, e in trip_checks(ents)] if ents else None,
+         'ha_error': herr}
+    if a.json:
+        print(gate(json.dumps(jsonable(J), indent=1, ensure_ascii=False)))
+        return 0
+    if trip:
+        lt = now.astimezone(ttz)
+        out = [f"🧳 Trip mode: ON, {trip['from']:%d.%m}–{trip['to']:%d.%m} ({trip_src(trip)}) · now {lt:%H:%M} "
+               f"{trip['tz_name'] or 'home time'}"]
+    elif nxt:
+        days = (nxt['from'] - today).days
+        out = [f"🧳 Trip mode: off · next trip {nxt['from']:%d.%m}–{nxt['to']:%d.%m} "
+               f"({nxt['tz_name'] or 'home time'}, {trip_src(nxt)}), starts in {days} day{'' if days == 1 else 's'}"]
+    else:
+        out = ['🧳 Trip mode: off · no upcoming trip (config "trips" or the calendar)']
+    if len(upcoming) > 1:
+        out.append('Upcoming: ' + ' · '.join(f"{t['from']:%d.%m}–{t['to']:%d.%m} {trip_src(t)}" for t in upcoming))
+    out.append('While away: ' + ' · '.join(
+        f"{lbl} {tt[k]}{u} (normal {th[k]})" for lbl, k, u in (
+            ('drawer ≥', 'drawer_pct', ' %'), ('litter ≤', 'litter_low_pct', ' %'), ('no visit >', 'no_visit_h', ' h'),
+            ('food/water low >', 'low_min', ' min'), ('repeat every', 'renotify_h', ' h'))))
+    if nxt and nxt['tz']:
+        ref = dt.datetime.combine(nxt['from'], dt.time(12), nxt['tz'])
+        home = [(ref.replace(hour=h)).astimezone(tz).strftime('%H:%M') for h in (tt['quiet_start'], tt['quiet_end'])]
+        out.append(f"Quiet hours: {tt['quiet_start']:02d}:00–{tt['quiet_end']:02d}:00 trip time "
+                   f"(= {home[0]}–{home[1]} home time)")
+    out.append(f"Daily check: {tt['ok_hour']:02d}:00 trip time · last sent: {st.get('trip_ok_day') or '–'}")
+    if ents:
+        checks = trip_checks(ents)
+        out.append('Checks: ' + ', '.join(n for n, ok, _ in checks if ok))
+        miss = [n for n, ok, _ in checks if not ok]
+        if miss:
+            out.append('Not possible (no entity): ' + ', '.join(miss))
+    else:
+        out.append(f'(HA unreachable: entity check skipped: {herr})')
+    for k, m in (st.get('meals') or {}).items():
+        bits = [f"last fed {fmt_when(parse_ts(m['last_fed']), now, ttz)}" if m.get('last_fed') else 'last fed –']
+        if m.get('pending'):
+            bits.append('next ' + ', '.join(fmt_when(parse_ts(x), now, ttz) for x in m['pending']))
+        if m.get('missed'):
+            bits.append('NOT DISPENSED ' + fmt_when(parse_ts(m['missed']), now, ttz))
+        out.append(f"Meals {_pretty(k)}: " + ' · '.join(bits))
+    print(gate('\n'.join(out)))
+    return 0
+
+
+def ha_down(st_path, now, th, ttz, quiet, dry):
+    """Trip mode, HA unreachable: one text after ha_down_h, and the daily check says it can't confirm."""
+    st = load_json(st_path, {})
+    st = st if isinstance(st, dict) else {}
+    since = parse_ts(st['ha_down_since']) if st.get('ha_down_since') else now
+    st['ha_down_since'] = iso(since)
+    lines, lt = [], now.astimezone(ttz)
+    if not quiet and not st.get('ha_down_sent') and (now - since).total_seconds() >= th['ha_down_h'] * 3600:
+        lines.append(f"🐾 Home Assistant unreachable since {fmt_when(since, now, ttz)}: the litter box, feeder "
+                     'and fountain are not being watched.')
+    ok_due = not quiet and lt.hour >= th['ok_hour'] and st.get('trip_ok_day') != lt.date().isoformat()
+    if ok_due:
+        lines.append(f"🐾 Daily cat check: can't confirm, Home Assistant unreachable since {fmt_when(since, now, ttz)}.")
+    text = '\n'.join(lines)
+    if dry:
+        print('would send:\n' + text if text else 'would send: nothing')
+        return
+    if text and send_tg(text, soft=len(lines) == 1 and ok_due):
+        if not st.get('ha_down_sent') and (now - since).total_seconds() >= th['ha_down_h'] * 3600:
+            st['ha_down_sent'] = True
+        if ok_due:
+            st['trip_ok_day'] = lt.date().isoformat()
+        print(f'{iso(now)} sent: ' + text.replace('\n', ' | '))
+    save_json(st_path, st)
+
+
+# ----------------------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='cat-corner', description='Litter box / feeder watch (read-only).')
+    ap.add_argument('cmd', nargs='?', choices=('status', 'week', 'discover', 'trip'))
+    ap.add_argument('sub', nargs='?', choices=('status',))
+    ap.add_argument('--cron', action='store_true')
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    ap.add_argument('--digest', action='store_true')
+    a = ap.parse_args(argv)
+    if a.cron and a.cmd:
+        ap.error('--cron takes no command')
+    if a.sub and a.cmd != 'trip':
+        ap.error(f'{a.cmd} takes no subcommand')
+    c = cfg()
+    th, tz, now = c['thresholds'], owner_tz(), now_dt()
+    if a.cmd == 'trip':
+        return trip_status(a, c, tz, now)
+    trip = active_trip(c['all_trips'], now, tz)
+    ttz = (trip['tz'] or tz) if trip else tz   # quiet hours + shown times
+    if trip:
+        th = c['trip_thresholds']
+    st_path = os.path.join(STATE_DIR, 'state.json')
+    try:
+        states = ha_states()
+    except HAError as e:
+        print(f'cat-corner: HA unreachable ({e})', file=sys.stderr)
+        if a.cron and trip:
+            ha_down(st_path, now, th, ttz, is_quiet(now, ttz, th), a.dry_run)
+        return 1
+    ents = discover(states, c['entities'])
+    if a.cmd == 'discover':
+        print(gate(json.dumps(ents, indent=1)) if a.json else gate('\n'.join(
+            [f"robot: {json.dumps(ents['robot'])}"] + [f"pet: {json.dumps(p)}" for p in ents['pets']]
+            + [f"feeder: {json.dumps(f)}" for f in ents['feeders']]
+            + [f"fountain: {json.dumps(f)}" for f in ents['fountains']])))
+        return 0
+    st = load_json(st_path, {})
+    if not isinstance(st, dict):
+        st = {}
+    rows = load_rows()
+    if not ents['robot'] and not ents['feeders'] and not ents['fountains']:
+        if not a.cron:
+            print('cat-corner: no litter robot, feeder or fountain found in HA')
+        return 0
+    hist, start, herr = refresh(ents, states, st, rows, now, tz, th)
+    if herr:
+        print(f'cat-corner: {herr}', file=sys.stderr)
+    alerts = st.setdefault('alerts', {})
+    view = build_view(states, ents, hist, rows, st, now, tz, th, hist_ok=not herr)
+    back = None
+    if trip:
+        missed = track_meals(ents, states, hist, st, now, th, start)
+        for f in view['feeders']:
+            f['missed_meal'] = missed.get(f['key'])
+        if st.pop('ha_down_since', None) and st.pop('ha_down_sent', None):
+            back = '🐾 Home Assistant reachable again: the cat corner is being watched again.'
+    else:
+        for k in ('meals', 'ha_down_since', 'ha_down_sent'):
+            st.pop(k, None)
+    probs = assess(view, th, c['alerts'], {k for k, x in alerts.items() if x.get('active')}, tz,
+                   trip=bool(trip), dtz=ttz)
+    today = local_day(now, tz)
+    if a.cmd == 'week':
+        W = week_data(rows, ents, today, th)
+        if a.digest:
+            if W['off']:
+                print(gate('🐾 Cat: ' + '; '.join(W['off'])))
+        elif a.json:
+            print(gate(json.dumps(W, indent=1, ensure_ascii=False)))
+        else:
+            print(gate(week_text(W, [today - dt.timedelta(days=i) for i in range(7, 0, -1)])))
+        return 1 if herr else 0
+    if not a.cron:
+        if a.json:
+            print(gate(json.dumps(jsonable({'view': view, 'problems': probs, 'trip': trip_info(trip)}), indent=1,
+                                  ensure_ascii=False)))
+        else:
+            print(gate(status_text(view, probs, th, ttz, herr, trip)))
+        return 1 if herr else 0
+    quiet = is_quiet(now, ttz, th)
+    send = plan(probs, alerts, now, quiet)
+    lt = now.astimezone(ttz)
+    ok_due = bool(trip) and not quiet and lt.hour >= th['ok_hour'] and st.get('trip_ok_day') != lt.date().isoformat()
+    parts = [x for x in (back, compose(send), daily_line(view, probs, ttz) if ok_due else None) if x]
+    text = gate('\n'.join(parts))
+    rc = 1 if herr else 0
+    if a.dry_run:
+        print(f"problems now: {len(probs)}" + (' (quiet hours: held)' if quiet and probs else '')
+              + (' · trip mode' if trip else ''))
+        for p in probs:
+            print(gate(f"  {p['key'].split(':')[0]}: {p['text']}"))
+        print('would send:\n' + text if text else 'would send: nothing')
+        return rc
+    if text:
+        if send_tg(text, soft=not send):
+            for p in send:
+                alerts[p['key']]['last_sent'] = now.timestamp()
+            if ok_due:
+                st['trip_ok_day'] = lt.date().isoformat()
+            print(f'{iso(now)} sent: ' + text.replace('\n', ' | '))
+        else:
+            print('cat-corner: tg failed', file=sys.stderr)
+            if back:
+                st['ha_down_since'], st['ha_down_sent'] = iso(now), True   # say "back" next run
+            rc = 1
+    st['last_run'] = iso(now)
+    save_json(st_path, st)
+    save_rows(rows, today, th['keep_days'])
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())

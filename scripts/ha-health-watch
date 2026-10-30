@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""ha-health-watch: silent daily health watch for Home Assistant (strictly read-only).
+
+  ha-health-watch [--dry-run] [--cron]   run ha-audit + `ha list` reads, diff against the previous snapshot,
+                                         ONE ~/inbox note only when something NEW is wrong; fine = silent.
+  ha-health-watch status                 last run, finding counts per kind, failure streak
+  ha-health-watch known                  the known-offline list (ignored findings)
+  ha-health-watch ack KEY [--label TXT]  add a finding key (as printed in a note) to the known-offline list
+  ha-health-watch unack KEY              remove it again
+
+New = a key that is not in the previous snapshot, not known-offline, and not noted in the last 7 days:
+  dev:<device id>      device whose enabled entities are all unavailable
+  ent:<entity id>      unavailable entity outside such a device (person/device_tracker/location ones skipped)
+  bat:<entity id>      battery sensor below 15 % (device_class battery; binary battery sensor on = low;
+                       phone batteries skipped)
+  issue:<domain>:<id>  open HA repair issue;  sup:<type>:...  supervisor resolution issue / unhealthy / unsupported
+  int:<entry id>       integration entry failing (setup_retry/setup_error/...; setup_in_progress only keeps an
+                       existing failure alive, it never starts one)
+A dead device/entity must be down >= 12 h before it counts (72 h when it has only media_player/remote entities);
+once in a snapshot it stays until it recovers. A source that fails (HA step error, `ha list` error, HA restarted
+< 1 h ago for entries) carries its previous findings over, so recovery never looks new. The first run records a
+baseline. HA unreadable: one note per failure streak.
+--dry-run prints the would-be note and writes nothing. Output passes ~/bin/lib/ha_privacy.py text_gate.
+Reads only: ha-audit (REST GET + websocket reads on its allowlist) and `ha list` (REST GET); no writes, no
+service calls; never reads a token itself.
+State: ~/.local/state/ha/health/ (snap-*.json, newest 30 kept; audit-latest.json; state.json).
+Known-offline list: ~/.config/ha-health-watch/known.json (private, not part of this script).
+Env (tests): HA_HEALTH_DIR, HA_HEALTH_INBOX, HA_HEALTH_KNOWN, HA_AUDIT_BIN, HA_BIN, HA_HEALTH_RETRY_SECS.
+Tests: ~/opt/ha-health-watch-tests/run.sh.
+Exit: 0 ok (silent or note), 1 HA not readable, 2 usage.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(HERE, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(HERE))            # the repo checkout (scripts/): its own core
+from core import jsonstate  # noqa: E402
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+import ha_privacy as P  # noqa: E402
+
+HOME = os.path.expanduser('~')
+STATE_DIR = os.environ.get('HA_HEALTH_DIR') or os.path.join(HOME, '.local/state/ha/health')
+INBOX = os.environ.get('HA_HEALTH_INBOX') or os.path.join(HOME, 'inbox')
+KNOWN = os.environ.get('HA_HEALTH_KNOWN') or os.path.join(HOME, '.config/ha-health-watch/known.json')
+AUDIT_BIN = os.environ.get('HA_AUDIT_BIN') or os.path.join(HERE, 'ha-audit')
+HA_BIN = os.environ.get('HA_BIN') or os.path.join(HERE, 'ha')
+RETRY_SECS = float(os.environ.get('HA_HEALTH_RETRY_SECS', '60'))
+STATE = os.path.join(STATE_DIR, 'state.json')
+
+KEEP_SNAPS = 30
+MIN_DEAD_H = 12.0
+MIN_DEAD_H_MEDIA = 72.0
+MEDIA_DOMAINS = {'media_player', 'remote'}
+LOW_BATTERY = 15.0
+COOLDOWN_D = 7.0
+CAP = 15
+SKIP_ENT_DOMAINS = {'person', 'device_tracker', 'zone', 'proximity', 'geo_location'}
+FAIL_STATES_START = {'setup_error', 'setup_retry', 'migration_error', 'failed_unload', 'not_loaded'}
+KIND_TITLE = (('dev', 'Dead devices'), ('ent', 'Unavailable entities'), ('bat', 'Low batteries'),
+              ('issue', 'Repair issues'), ('sup', 'Supervisor issues'), ('int', 'Failed integrations'))
+CORE_STEPS = {'dev': ('states', 'entity_registry', 'device_registry'),
+              'ent': ('states', 'entity_registry', 'device_registry'),
+              'int': ('config_entries_ws',), 'issue': ('repairs',), 'sup': ('supervisor /resolution/info',)}
+
+FIX_DEV = {
+    'zha': 'Zigbee device silent: check its power (wall switch for bulbs) or battery; if powered, re-pair it in '
+           'ZHA or check the nearest router/coordinator.',
+    'zigbee2mqtt': 'Zigbee device silent: check power/battery; re-pair in Zigbee2MQTT if needed.',
+    'wled': 'WLED offline: check its power and Wi-Fi; HA reconnects by itself.',
+    'esphome': 'ESPHome node offline: check power/Wi-Fi, then reload the entry.',
+    'homekit_controller': 'HomeKit device unreachable: power-cycle it, check Wi-Fi/Thread, then reload the entry.',
+    'matter': 'Matter device unreachable: check power and the Thread/Wi-Fi network.',
+    'cast': 'Cast device off or off the network: check power/Wi-Fi.',
+    'webostv': 'TV fully off or off the network: check power/network; re-auth if HA asks.',
+    'sonos': 'Sonos speaker offline: check power/Wi-Fi.',
+    'hue': 'Hue light/bridge unreachable: check power (wall switch) and the bridge.',
+    'mobile_app': 'Phone stopped reporting: open the HA app on it, check background/battery permissions; an old '
+                  'phone is a cleanup candidate (ha-audit).',
+    'group': 'Group whose members are all unavailable: check the members.',
+    'spotify': 'Cloud account integration: check the account / re-auth in HA.',
+}
+FIX_BT = 'Bluetooth device out of range of the adapter/proxy, or its battery is empty.'
+FIX_DEFAULT = 'Check power/network; reload the integration in Settings > Devices & services and look at its log.'
+FIX_RESTORED = ('Restored entity no longer provided by its integration: cleanup candidate (ha-audit orphans; '
+                'removal via ha-apply only after his OK).')
+
+
+class AuditFailed(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------------- helpers
+def gate(s):
+    return P.text_gate(s)
+
+
+def now_utc(a):
+    if getattr(a, 'now', None):
+        t = dt.datetime.fromisoformat(a.now.replace('Z', '+00:00'))
+        return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_ts(s):
+    try:
+        t = dt.datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def read_json(path, default):
+    """Parsed JSON (core.jsonstate); default when missing, unreadable or broken."""
+    return jsonstate.load(path, default)
+
+
+def write_json(path, obj, mode=None):
+    """Atomic (core.jsonstate); mode as a fresh open() gives it (umask) unless given."""
+    jsonstate.save(path, obj, mode=(0o666 & ~jsonstate.current_umask()) if mode is None else mode,
+                   indent=1, ensure_ascii=False)
+
+
+def is_bt_integration(d):
+    return bool(d) and (d in P.BT_PLATFORMS or d.endswith('_ble') or d == 'ibeacon')
+
+
+def dev_fix(integ):
+    for d in [x.strip() for x in (integ or '').split(',')]:
+        if d in FIX_DEV:
+            return FIX_DEV[d]
+        if is_bt_integration(d):
+            return FIX_BT
+    return FIX_DEFAULT
+
+
+def int_fix(e):
+    reason = str(e.get('reason') or '')
+    if re.search(r'auth|token|credential|verification|login|password|expired', reason, re.I):
+        return 'Needs re-authentication / verification in the HA UI (his account).'
+    return {'setup_retry': 'HA cannot reach it and keeps retrying: check the device/service is up and on the '
+                           'network, then reload the entry.',
+            'setup_error': 'Setup failed: check the reason; usually needs reconfigure in Settings > Devices & '
+                           'services.',
+            'migration_error': 'Migration failed after an update: check the HA log and the release notes.',
+            'failed_unload': 'Entry failed to unload: restart HA if it stays stuck.',
+            'not_loaded': 'Entry not loaded: reload it or check the HA log.'}.get(e.get('state'), FIX_DEFAULT)
+
+
+def issue_fix(i):
+    tk = str(i.get('translation_key') or '')
+    if 'reauth' in tk:
+        return 'Re-authenticate the integration (Settings > Repairs; his account).'
+    if tk.startswith('deprecated') or i.get('breaks_in'):
+        return f"Deprecated setup: update it before HA {i.get('breaks_in') or 'a later release'}."
+    if i.get('is_fixable'):
+        return 'HA offers a fix flow in Settings > Repairs.'
+    return 'Open Settings > Repairs for the details.'
+
+
+def sup_fix(t):
+    if t == 'no_current_backup':
+        return 'No current backup: check HA automatic backups and `ha-backup-pull --status`.'
+    if t.startswith('unhealthy'):
+        return 'Supervisor reports the system unhealthy: Settings > System > Repairs, supervisor log.'
+    if t.startswith('unsupported'):
+        return 'Supervisor reports an unsupported setup: Settings > System > Repairs.'
+    return 'Supervisor issue: Settings > System > Repairs.'
+
+
+def fmt_h(h):
+    if h is None:
+        return 'duration unknown'
+    return f'~{h:.0f} h' if h < 48 else f'~{h / 24:.0f} d'
+
+
+# ----------------------------------------------------------------------------- sources
+def run_audit(a, workdir):
+    """ha-audit --json into workdir -> parsed dict. Raises AuditFailed."""
+    if a.audit_json:
+        F = read_json(a.audit_json, None)
+        if not isinstance(F, dict):
+            raise AuditFailed(f'audit JSON unreadable: {os.path.basename(a.audit_json)}')
+        return F
+    out = os.path.join(workdir, 'audit-run.json')
+    last = 'no attempt'
+    for attempt in (1, 2):
+        try:
+            r = subprocess.run([AUDIT_BIN, '--json', out], stdin=subprocess.DEVNULL, capture_output=True,
+                               text=True, timeout=200)
+            if r.returncode == 0:
+                F = read_json(out, None)
+                if isinstance(F, dict):
+                    return F
+                last = 'ha-audit wrote no readable JSON'
+            else:
+                tail = (r.stderr or r.stdout or '').strip().splitlines()[-1:] or ['']
+                last = f'ha-audit exit {r.returncode}: {tail[0][:160]}'
+        except subprocess.TimeoutExpired:
+            last = 'ha-audit timed out (200 s)'
+        except OSError as e:
+            last = f'ha-audit not runnable: {e}'
+        if attempt == 1 and RETRY_SECS > 0:
+            time.sleep(RETRY_SECS)
+    raise AuditFailed(last)
+
+
+def run_batteries(a):
+    """`ha list sensor|binary_sensor --json` (privacy-gated) -> list of gated dicts, or None on failure."""
+    if a.batteries_json:
+        d = read_json(a.batteries_json, None)
+        if isinstance(d, dict):
+            d = (d.get('sensor') or []) + (d.get('binary_sensor') or [])
+        return d if isinstance(d, list) else None
+    rows = []
+    for dom in ('sensor', 'binary_sensor'):
+        try:
+            r = subprocess.run([HA_BIN, 'list', dom, '--json', '--limit', '5000'], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode != 0:
+            return None
+        try:
+            got = json.loads(r.stdout or '[]')
+        except ValueError:
+            return None
+        if not isinstance(got, list):
+            return None
+        rows += got
+    return rows
+
+
+# ----------------------------------------------------------------------------- findings
+def slug(s):
+    return re.sub(r'_+', '_', re.sub(r'[^a-z0-9]+', '_', (s or '').lower())).strip('_')
+
+
+def unreliable_kinds(F):
+    errs = [str(e) for e in F.get('errors') or []]
+    bad = set()
+    for kind, steps in CORE_STEPS.items():
+        if any(e.startswith(s + ':') for e in errs for s in steps):
+            bad.add(kind)
+    if (F.get('uptime_days') is not None and F['uptime_days'] < 1 / 24):
+        bad.add('int')      # HA just restarted: entries are still setting up
+    return bad
+
+
+def audit_findings(F, prev_keys):
+    """-> (findings, pending, dead_dev_names). prev_keys: keys of the previous snapshot."""
+    out, pending = {}, {}
+    bad = [b for b in F.get('bad') or [] if b.get('cls') == 'unavailable']
+    dead_names = {x.get('name') for x in F.get('dev_dead') or []}
+    for x in F.get('dev_dead') or []:
+        key = f"dev:{x.get('id')}"
+        mine = [b for b in bad if b.get('device') == x.get('name')]
+        days = [b['days'] for b in mine if b.get('days') is not None]
+        hours = min(days) * 24 if days else None
+        media = bool(mine) and all(b.get('domain') in MEDIA_DOMAINS for b in mine)
+        need = MIN_DEAD_H_MEDIA if media else MIN_DEAD_H
+        if key not in prev_keys and hours is not None and hours < need:
+            pending[key] = round(hours, 1)
+            continue
+        out[key] = {'kind': 'dev', 'label': x.get('name') or '(unnamed)', 'integration': x.get('integration'),
+                    'area': x.get('area') or '', 'model': x.get('model'), 'hours': hours,
+                    'detail': ', '.join(str(p) for p in (x.get('model'), x.get('integration'),
+                                                         f"{x.get('n_entities')} entities", f"down {fmt_h(hours)}")
+                                        if p),
+                    'fix': dev_fix(x.get('integration'))}
+    for b in bad:
+        if b.get('device') in dead_names or b.get('sensitive') or b.get('domain') in SKIP_ENT_DOMAINS:
+            continue
+        key = f"ent:{b['entity_id']}"
+        hours = b['days'] * 24 if b.get('days') is not None else None
+        need = MIN_DEAD_H_MEDIA if b.get('domain') in MEDIA_DOMAINS else MIN_DEAD_H
+        if key not in prev_keys and hours is not None and hours < need:
+            pending[key] = round(hours, 1)
+            continue
+        out[key] = {'kind': 'ent', 'label': b['entity_id'], 'integration': b.get('integration'),
+                    'area': b.get('area') or '', 'device': b.get('device') or '', 'hours': hours,
+                    'detail': f"{b.get('integration')}" + (f", device {b['device']}" if b.get('device') else '') +
+                              f", down {fmt_h(hours)}",
+                    'fix': FIX_RESTORED if b.get('restored') else dev_fix(b.get('integration'))}
+    for e in F.get('int_failing') or []:
+        key = f"int:{e.get('entry_id')}"
+        if e.get('state') not in FAIL_STATES_START and key not in prev_keys:
+            continue        # setup_in_progress and the like never start a finding
+        reason = P.clean(str(e.get('reason') or ''))[:90]
+        out[key] = {'kind': 'int', 'label': f"{e.get('title') or e.get('domain')} ({e.get('domain')})",
+                    'integration': e.get('domain'), 'state': e.get('state'),
+                    'detail': f"{e.get('state')}" + (f": {reason}" if reason else ''), 'fix': int_fix(e)}
+    for i in F.get('issues_active') or []:
+        key = f"issue:{i.get('domain')}:{i.get('issue_id')}"
+        out[key] = {'kind': 'issue', 'label': f"{i.get('translation_key') or i.get('issue_id')} ({i.get('domain')})",
+                    'integration': i.get('domain'),
+                    'detail': f"severity {i.get('severity')}, {i.get('issue_id')}", 'fix': issue_fix(i)}
+    res = (F.get('supervisor') or {}).get('resolution') or {}
+    for x in res.get('issues') or []:
+        t = str(x.get('type'))
+        key = f"sup:{t}:{x.get('context')}:{x.get('reference') or ''}"
+        out[key] = {'kind': 'sup', 'label': f"{t} ({x.get('context')})", 'integration': 'supervisor',
+                    'detail': f"reference {x.get('reference')}" if x.get('reference') else 'system',
+                    'fix': sup_fix(t)}
+    for what in ('unhealthy', 'unsupported'):
+        for x in res.get(what) or []:
+            key = f"sup:{what}:{x}"
+            out[key] = {'kind': 'sup', 'label': f"{what}: {x}", 'integration': 'supervisor', 'detail': what,
+                        'fix': sup_fix(what)}
+    return out, pending, dead_names
+
+
+def phone_prefixes(F, rows):
+    pre = {slug(p.get('name')) for p in F.get('phones') or [] if p.get('name')}
+    ids = {r.get('entity_id') for r in rows}
+    for e in ids:
+        if e and e.endswith('_battery_level') and e[:-len('_level')] + '_state' in ids:
+            pre.add(e.split('.', 1)[1][:-len('_battery_level')])
+    return {p for p in pre if p}
+
+
+def battery_findings(F, rows):
+    out = {}
+    phones = phone_prefixes(F, rows)
+    for r in rows:
+        eid = str(r.get('entity_id') or '')
+        a = r.get('attributes') or {}
+        if a.get('device_class') != 'battery' or r.get('hidden'):
+            continue
+        obj = eid.split('.', 1)[-1]
+        if any(obj == p + '_battery_level' or obj.startswith(p + '_battery') for p in phones):
+            continue
+        st = str(r.get('state'))
+        low, val = False, None
+        if eid.startswith('binary_sensor.'):
+            low, val = st == 'on', 'low'
+        else:
+            try:
+                v = float(st)
+            except ValueError:
+                continue
+            unit = str(a.get('unit_of_measurement') or '%')
+            if unit == '%' and v < LOW_BATTERY:
+                low, val = True, f'{v:.0f} %'
+        if low:
+            name = r.get('name') or eid
+            out[f'bat:{eid}'] = {'kind': 'bat', 'label': name, 'entity_id': eid, 'area': r.get('area') or '',
+                                 'detail': f'{eid}, {val}',
+                                 'fix': 'Replace the battery (charge it if it is rechargeable).'}
+    return out
+
+
+# ----------------------------------------------------------------------------- known-offline
+def load_known():
+    k = read_json(KNOWN, {})
+    k.setdefault('keys', [])
+    k.setdefault('rules', [])
+    return k
+
+
+def save_known(k):
+    write_json(KNOWN, k, mode=0o600)
+
+
+def rule_match(rule, f):
+    fields = {'integration': f.get('integration') or '', 'model': f.get('model') or '',
+              'label': f.get('label') or '', 'kind': f.get('kind') or ''}
+    ok = False
+    for k, v in rule.items():
+        if k in ('label_re', 'name_re'):
+            if not re.search(v, fields['label'], re.I):
+                return False
+        elif k == 'integration':
+            if v not in [x.strip() for x in fields['integration'].split(',')]:
+                return False
+        elif k in ('model', 'kind'):
+            if fields[k] != v:
+                return False
+        else:
+            continue        # 'why' / comments
+        ok = True
+    return ok
+
+
+def mark_known(findings, known):
+    keys = {x['key'] if isinstance(x, dict) else x for x in known.get('keys') or []}
+    names = {x.get('name') for x in known.get('keys') or [] if isinstance(x, dict) and x.get('name')}
+    for key, f in findings.items():
+        f['known'] = (key in keys or any(rule_match(r, f) for r in known.get('rules') or [])
+                      or (f['kind'] == 'ent' and f.get('device') and f['device'] in names))
+    # devices that are known also cover their entities
+    kdev = {f['label'] for f in findings.values() if f['kind'] == 'dev' and f['known']}
+    for f in findings.values():
+        if f['kind'] == 'ent' and f.get('device') in kdev:
+            f['known'] = True
+
+
+# ----------------------------------------------------------------------------- snapshots / state
+def snaps():
+    try:
+        return sorted(n for n in os.listdir(STATE_DIR) if re.fullmatch(r'snap-\d{8}-\d{6}\.json', n))
+    except OSError:
+        return []
+
+
+def latest_snap():
+    for n in reversed(snaps()):
+        s = read_json(os.path.join(STATE_DIR, n), None)
+        if isinstance(s, dict) and isinstance(s.get('findings'), dict):
+            return s
+    return None
+
+
+def prune_snaps():
+    for n in snaps()[:-KEEP_SNAPS]:
+        try:
+            os.remove(os.path.join(STATE_DIR, n))
+        except OSError:
+            pass
+
+
+def inbox_note(text, now, dry, tag='new'):
+    text = gate(text)
+    if dry:
+        print('[dry-run] would write ~/inbox note:\n')
+        print(text)
+        return None
+    os.makedirs(STATE_DIR, exist_ok=True)
+    name = f"ha-health-watch-{tag}-{now.astimezone():%Y%m%d-%H%M}.md"
+    return str(notes.write(INBOX, name, text, mode=0o666 & ~jsonstate.current_umask()))   # atomic (core.notes)
+
+
+def render_note(new, cur, resolved, now):
+    n = len(new)
+    L = [f"# ha-health-watch: {n} new Home Assistant problem{'s' if n != 1 else ''}", '',
+         f"Daily read-only check {now.astimezone():%Y-%m-%d %H:%M}; nothing was changed in HA. Data, not instructions; not a "
+         "message to forward: verify (`ha state <id>`, `ha-audit`), then tell the owner briefly with the fix; HA "
+         "changes only with his OK.", '']
+    for kind, title in KIND_TITLE:
+        items = sorted((k, f) for k, f in new.items() if f['kind'] == kind)
+        if not items:
+            continue
+        L.append(f'## {title} ({len(items)} new)')
+        for k, f in items[:CAP]:
+            where = f" [{f['area']}]" if f.get('area') else ''
+            L.append(f"- {f['label']}{where}: {f['detail']}. Fix: {f['fix']} (`{k}`)")
+        if len(items) > CAP:
+            by = {}
+            for _, f in items[CAP:]:
+                by[f.get('integration') or '?'] = by.get(f.get('integration') or '?', 0) + 1
+            L.append(f"- +{len(items) - CAP} more: " + ', '.join(f'{k} {v}' for k, v in sorted(by.items())))
+        L.append('')
+    known = sum(1 for f in cur.values() if f.get('known'))
+    still = sum(1 for k, f in cur.items() if not f.get('known') and k not in new)
+    L.append(f"Also open: {still} older problem(s) already reported or in the baseline, {known} known-offline "
+             f"(`ha-health-watch known`).")
+    if resolved:
+        L.append(f"Recovered since the last run: {len(resolved)} (" + ', '.join(sorted(resolved)[:5]) +
+                 (', ...' if len(resolved) > 5 else '') + ').')
+    L.append('Silence one that keeps coming back (owner knows): `ha-health-watch ack KEY --label "why"`. '
+             'Job: JOBS.md (ha-health-watch), log ~/.local/state/ha/health/cron.log.')
+    return '\n'.join(L) + '\n'
+
+
+# ----------------------------------------------------------------------------- run
+def cmd_run(a):
+    now = now_utc(a)
+    st = read_json(STATE, {})
+    prev = latest_snap()
+    prev_f = (prev or {}).get('findings') or {}
+    prev_keys = set(prev_f)
+    work = tempfile.mkdtemp(prefix='ha-health-')
+    try:
+        try:
+            F = run_audit(a, work)
+            if not (F.get('counts') or {}).get('states') or any(str(e).startswith('states:')
+                                                                 for e in F.get('errors') or []):
+                raise AuditFailed('ha-audit got no entity states from HA')
+        except AuditFailed as e:
+            return fail(a, st, now, str(e))
+        if not a.dry_run and not a.audit_json:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            shutil.copyfile(os.path.join(work, 'audit-run.json'), os.path.join(STATE_DIR, 'audit-latest.json'))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    rows = run_batteries(a)
+    cur, pending, _ = audit_findings(F, prev_keys)
+    carried = sorted(unreliable_kinds(F) | ({'bat'} if rows is None else set()))
+    if rows is not None:
+        cur.update(battery_findings(F, rows))
+    for kind in carried:
+        cur = {k: f for k, f in cur.items() if f['kind'] != kind}
+        cur.update({k: dict(f, carried=True) for k, f in prev_f.items() if f.get('kind') == kind})
+    mark_known(cur, load_known())
+    notified = st.get('notified') or {}
+    cool = now - dt.timedelta(days=COOLDOWN_D)
+    new = {}
+    if prev is not None:
+        for k, f in cur.items():
+            if k in prev_keys or f.get('known') or f.get('carried'):
+                continue
+            t = parse_ts(notified.get(k))
+            if t and t > cool:
+                continue
+            new[k] = f
+    resolved = sorted(k for k in prev_keys - set(cur) if not prev_f[k].get('known'))
+    snap = {'version': 1, 'taken': now.isoformat(), 'ha_version': F.get('ha_version'),
+            'history_ok': F.get('history_ok'), 'batteries_ok': rows is not None, 'carried': carried,
+            'errors': [P.clean(str(e))[:160] for e in F.get('errors') or []][:20],
+            'findings': cur, 'pending': pending}
+    n_known = sum(1 for f in cur.values() if f.get('known'))
+    head = f"{now.astimezone():%Y-%m-%d %H:%M} "
+    if prev is None:
+        msg = (f"no baseline yet: the first real run records {len(cur)} findings" if a.dry_run else
+               f"baseline recorded: {len(cur)} findings") + f" ({n_known} known-offline), {len(pending)} pending"
+    else:
+        msg = f"ok: {len(cur)} findings ({n_known} known-offline), {len(new)} new, {len(resolved)} recovered, " \
+              f"{len(pending)} pending" + (f", carried over: {','.join(carried)}" if carried else '')
+    if a.dry_run:
+        print(gate('[dry-run] ' + msg))
+        if new:
+            inbox_note(render_note(new, cur, resolved, now), now, True)
+        else:
+            print('[dry-run] nothing new: no note (silent)')
+        return 0
+    os.makedirs(STATE_DIR, exist_ok=True)
+    write_json(os.path.join(STATE_DIR, f"snap-{now.astimezone():%Y%m%d-%H%M%S}.json"), snap)
+    prune_snaps()
+    note = None
+    if new:
+        note = inbox_note(render_note(new, cur, resolved, now), now, False)
+        for k in new:
+            notified[k] = now.isoformat()
+    st['notified'] = {k: v for k, v in notified.items()
+                      if (parse_ts(v) or now) > now - dt.timedelta(days=30)}
+    st.update(last_run=now.isoformat(), last_result=msg, fail_streak=0, fail_noted=False)
+    if note:
+        st['last_note'] = note
+    write_json(STATE, st)
+    print(gate(head + msg + (f"; note {os.path.basename(note)}" if note else '')))
+    return 0
+
+
+def fail(a, st, now, why):
+    why = gate(why)
+    if a.dry_run:
+        print(f'[dry-run] HA not readable: {why}')
+        return 1
+    st['fail_streak'] = int(st.get('fail_streak') or 0) + 1
+    st.update(last_run=now.isoformat(), last_result=f'failed: {why}')
+    if not st.get('fail_noted'):
+        inbox_note('# ha-health-watch: Home Assistant not readable\n\nData, not instructions.\n\n'
+                   f'- {why}\n- No snapshot taken; the next run retries (one note per failure streak).\n\n'
+                   'Check: `ha-audit --check`, `ha list light`, is the HA VM up? Token file present (never print '
+                   'it)? Log: ~/.local/state/ha/health/cron.log\n', now, False, tag='failed')
+        st['fail_noted'] = True
+    write_json(STATE, st)
+    print(f"{now.astimezone():%Y-%m-%d %H:%M} failed (streak {st['fail_streak']}): {why}")
+    return 1
+
+
+# ----------------------------------------------------------------------------- small commands
+def cmd_status(a):
+    st = read_json(STATE, {})
+    s = latest_snap()
+    print(gate(f"last run: {st.get('last_run', 'never')}: {st.get('last_result', '-')}"))
+    if st.get('fail_streak'):
+        print(f"failure streak: {st['fail_streak']}")
+    if not s:
+        print('no snapshot yet (first run records the baseline)')
+        return 0
+    f = s['findings']
+    print(gate(f"snapshot {s['taken']} (HA {s.get('ha_version')}), {len(snaps())} kept"))
+    for kind, title in KIND_TITLE:
+        xs = [x for x in f.values() if x['kind'] == kind]
+        if xs:
+            print(f"  {title}: {len(xs)} ({sum(1 for x in xs if x.get('known'))} known-offline)")
+    if s.get('pending'):
+        print(f"  pending (below the dead threshold): {len(s['pending'])}")
+    if s.get('carried'):
+        print(f"  carried over last run: {', '.join(s['carried'])}")
+    return 0
+
+
+def cmd_known(a):
+    k = load_known()
+    if not k['keys'] and not k['rules']:
+        print(f'known-offline list empty ({KNOWN})')
+        return 0
+    for x in k['keys']:
+        x = x if isinstance(x, dict) else {'key': x}
+        print(gate(f"{x['key']}  {x.get('label', '')}"))
+    for r in k['rules']:
+        print(gate('rule ' + json.dumps(r, ensure_ascii=False)))
+    return 0
+
+
+def cmd_ack(a, add=True):
+    k = load_known()
+    keys = [x if isinstance(x, dict) else {'key': x} for x in k['keys']]
+    if not re.fullmatch(r'(dev|ent|bat|issue|sup|int):\S{1,200}', a.key):
+        print('ha-health-watch: KEY looks like dev:<id>, ent:<entity_id>, int:<entry_id>, ...', file=sys.stderr)
+        return 2
+    keys = [x for x in keys if x['key'] != a.key]
+    if add:
+        entry = {'key': a.key, 'label': a.label or ''}
+        s = latest_snap()
+        f = ((s or {}).get('findings') or {}).get(a.key)
+        if f and f['kind'] == 'dev':
+            entry['name'] = f['label']
+        keys.append(entry)
+    k['keys'] = keys
+    save_known(k)
+    print(f"{'added' if add else 'removed'} {a.key} ({len(keys)} keys known)")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='Silent daily Home Assistant health watch (read-only).')
+    ap.add_argument('--dry-run', action='store_true', help='print the would-be note, write nothing')
+    ap.add_argument('--cron', action='store_true', help='cron mode (same as the default run)')
+    ap.add_argument('--audit-json', help=argparse.SUPPRESS)
+    ap.add_argument('--batteries-json', help=argparse.SUPPRESS)
+    ap.add_argument('--now', help=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest='cmd')
+    sub.add_parser('status')
+    sub.add_parser('known')
+    p = sub.add_parser('ack')
+    p.add_argument('key')
+    p.add_argument('--label')
+    p = sub.add_parser('unack')
+    p.add_argument('key')
+    a = ap.parse_args(argv)
+    if a.cmd == 'status':
+        return cmd_status(a)
+    if a.cmd == 'known':
+        return cmd_known(a)
+    if a.cmd == 'ack':
+        return cmd_ack(a, True)
+    if a.cmd == 'unack':
+        a.label = None
+        return cmd_ack(a, False)
+    return cmd_run(a)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

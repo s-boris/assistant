@@ -1,0 +1,926 @@
+#!/usr/local/bin/python3.13 -I
+"""kk-compare: Swiss basic health insurance (OKP/KVG) premium comparison from the official BAG data.
+
+Ranks every insurer's tariff for one canton/region/age group, works out yearly costs including the
+deductible (franchise) and the 10% co-pay, and drafts a cancellation letter. Read-only: it never
+contacts an insurer and never sends anything.
+
+  kk-compare [filters] [--franchise 2500] [--model all] [-n 15]     ranked offers
+             [--current-insurer X] [--current-premium 512.40] [--current-franchise 2500]
+  kk-compare --franchise-matrix [filters] [--model ...]              cheapest offer per franchise and
+                                                                     model + break-even vs. CHF 2500
+  kk-compare --costs [filters] [--medical 0,500,1000,...]            yearly totals for medical-cost scenarios
+  kk-compare --letter [--insurer X] [--policy N] [--out FILE]        cancellation letter draft (prints only)
+  kk-compare --region-of PLZ                                         premium region(s) of a postcode
+  kk-compare --insurers                                              BAG number -> insurer table
+  kk-compare --info | --refresh                                      data provenance / re-download
+
+Filters (defaults: canton, BFS number and place from the assistant profile, region, age and accident from
+~/.config/kk/profile.json, which wins): --canton XX --region 1 | --plz 1234 | --bfs 9001, --age adult|young|child,
+--accident no|yes. --json prints machine-readable output for the ranking, matrix and costs.
+
+Models: standard (BAG BASE), hmo / hausarzt (BAG PRAXIS, split by tariff name: HMO, "Health
+Maintenance", Gesundheitspraxis -> hmo, the rest -> hausarzt), praxis (both), telmed (TEL_DIG),
+flex (FLEX: choose between doctor / telmed / pharmacy), pharm (PHARM), managed (all but standard).
+
+Cost model (KVG): yearly total = 12 x premium + min(costs, franchise) + 10% of the rest, co-pay
+capped at CHF 700 (children 350). Not included: CHF 15/day hospital contribution, 40% co-pay on
+drugs with cheaper generics.
+
+Data (cached in ~/.cache/kk, refreshed after 30 days, --refresh forces it): BAG "Prämien CH" CSV,
+"Einzugsgebiete" CSV, "Tarife" CSV (opendata.bagnet.ch, dataset health-insurance-premiums on
+opendata.swiss), priminfo praemienregionen-<year>.xlsx. Insurer names and addresses: BAG register
+of approved health insurers, October 2026.
+
+Tests: KK_DATA_DIR=<dir> uses fixture files there, KK_OFFLINE=1 never downloads, KK_PROFILE=<file>
+another kk profile, ASSISTANT_PROFILE=<file> another owner profile, KK_NOW=<ISO 8601 date or time> pins today
+(the letter's default year: this year up to its arrival deadline, then next year; a time without an offset is in
+the owner time zone). Tests live in ~/opt/assistant/tests/legacy/kk/run.sh.
+"""
+import argparse, csv, datetime as dt, hashlib, json, os, re, sys, tempfile, unicodedata
+import urllib.request, zipfile
+import xml.etree.ElementTree as ET
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import assistant_profile  # noqa: E402  (owner name, home address, canton, BFS)
+
+HOME = os.path.expanduser("~")
+DATA = os.environ.get("KK_DATA_DIR") or os.path.join(HOME, ".cache", "kk")
+OFFLINE = os.environ.get("KK_OFFLINE") == "1"
+PROFILE = os.environ.get("KK_PROFILE") or os.path.join(HOME, ".config", "kk", "profile.json")
+MAX_AGE_DAYS = 30
+UA = "Mozilla/5.0 (X11; Linux x86_64) kk-compare/1.0"
+BAG = "https://opendata.bagnet.ch/?r=/download&path="
+FILES = {
+    # local name: (url, sanity check on the first bytes)
+    "praemien_ch.csv": (BAG + "L1ByYWVtaWVuL1Byw6RtaWVuX0NILmNzdg%3D%3D", "Versicherer,Kanton"),
+    "einzugsgebiete.csv": (BAG + "L1ByYWVtaWVuL0Vpbnp1Z3NnZWJpZXRlLmNzdg%3D%3D", "Versicherer,Kanton"),
+    "tarife.csv": (BAG + "L1ByYWVtaWVuL1RhcmlmZS5jc3Y%3D", "Versicherer,Gesch"),
+}
+REGIONS_URL = "https://www.priminfo.admin.ch/downloads/praemienregionen-{year}.xlsx"
+
+# BAG register of approved health insurers (October 2026): number -> (short name as in the BAG
+# premium guide, legal name, address lines). Use the address on the policy if it differs.
+INSURERS = {
+    8: ("CSS", "CSS Kranken-Versicherung AG", ["Tribschenstrasse 21", "Postfach 2568", "6002 Luzern"]),
+    32: ("Aquilana", "Aquilana Versicherungen", ["Bruggerstrasse 46", "5401 Baden"]),
+    134: ("Einsiedler", "Einsiedler Krankenkasse", ["Kronenstrasse 19", "Postfach 57", "8840 Einsiedeln"]),
+    194: ("Sumiswalder", "Sumiswalder Krankenkasse", ["Spitalstrasse 47", "3454 Sumiswald"]),
+    246: ("Steffisburg", "Genossenschaft Krankenkasse Steffisburg", ["Unterdorfstrasse 37", "Postfach", "3612 Steffisburg"]),
+    290: ("Concordia", "CONCORDIA Schweiz. Kranken- und Unfallversicherung AG", ["Bundesplatz 15", "6002 Luzern"]),
+    312: ("Atupri", "Atupri Gesundheitsversicherung AG", ["Laupenstrasse 18", "3008 Bern"]),
+    343: ("Avenir", "Avenir Krankenversicherung AG (Groupe Mutuel)", ["Rue des Cèdres 5", "1919 Martigny"]),
+    360: ("Luzerner Hinterland", "Krankenkasse Luzerner Hinterland", ["Luzernstrasse 19", "6144 Zell LU"]),
+    376: ("KPT", "KPT Krankenkasse AG", ["Wankdorfallee 3", "Postfach", "3001 Bern"]),
+    455: ("ÖKK", "ÖKK Kranken- und Unfallversicherungen AG", ["Bahnhofstrasse 13", "7302 Landquart"]),
+    509: ("Vivao Sympany", "Vivao Sympany AG", ["Peter Merian-Weg 4", "4002 Basel"]),
+    780: ("Glarner", "Genossenschaft Glarner Krankenversicherung", ["Abläsch 8", "Postfach", "8762 Schwanden"]),
+    820: ("curaulta", "curaulta", ["Postfach 22", "7144 Vella"]),
+    881: ("EGK", "EGK Grundversicherungen AG", ["Birspark 1", "4242 Laufen"]),
+    923: ("SLKK", "Genossenschaft Krankenkasse SLKK", ["Hofwiesenstrasse 370", "Postfach 5652", "8050 Zürich"]),
+    941: ("sodalis", "sodalis gesundheitsgruppe", ["Balfrinstrasse 15", "3930 Visp"]),
+    966: ("Vita Surselva", "vita surselva", ["Bahnhofstrasse 33", "Postfach 217", "7130 Ilanz"]),
+    1040: ("Visperterminen", "Verein Krankenkasse Visperterminen", ["Dorfstrasse 66", "3932 Visperterminen"]),
+    1113: ("Vallée d'Entremont", "Caisse-maladie de la vallée d'Entremont", ["Place centrale 5", "1937 Orsières"]),
+    1318: ("Wädenswil", "Stiftung Krankenkasse Wädenswil", ["Industriestrasse 15", "8820 Wädenswil"]),
+    1322: ("Birchmeier", "Krankenkasse Birchmeier", ["Hauptstrasse 22", "5444 Künten"]),
+    1384: ("Swica", "SWICA Krankenversicherung AG", ["Römerstrasse 37", "8401 Winterthur"]),
+    1386: ("Galenos", "Galenos AG", ["Binzmühlestrasse 95", "8050 Zürich"]),
+    1401: ("Rhenusana", "rhenusana", ["Widnauerstrasse 6", "9435 Heerbrugg"]),
+    1479: ("Mutuel", "Mutuel Krankenversicherung AG (Groupe Mutuel)", ["Rue des Cèdres 5", "1919 Martigny"]),
+    1507: ("AMB", "AMB Versicherungen AG", ["Route de Verbier 13", "1934 Le Châble"]),
+    1509: ("Sanitas", "Sanitas Grundversicherungen AG", ["Jägergasse 3", "Postfach 2010", "8021 Zürich"]),
+    1535: ("Philos", "Philos Krankenversicherung AG (Groupe Mutuel)", ["Rue des Cèdres 5", "1919 Martigny"]),
+    1542: ("Assura", "Assura-Basis AG", ["Avenue C.-F. Ramuz 70", "1009 Pully"]),
+    1555: ("Visana", "Visana AG", ["Weltpoststrasse 19", "Postfach", "3000 Bern 16"]),
+    1560: ("Agrisano", "Agrisano Krankenkasse AG", ["Laurstrasse 10", "5201 Brugg AG"]),
+    1562: ("Helsana", "Helsana Versicherungen AG", ["Postfach", "8081 Zürich"]),
+    1568: ("Sana24", "sana24 AG", ["Weltpoststrasse 19", "Postfach", "3000 Bern 16"]),
+}
+
+AGE = {"adult": ("AKA_03_ERW", "E1"), "young": ("AKA_02_JUG", "J1"), "child": ("AKA_01_KIN", "K1")}
+AGE_LABEL = {"adult": "adult (26+)", "young": "young adult (19-25)", "child": "child (0-18)"}
+COPAY_CAP = {"adult": 700, "young": 700, "child": 350}
+FRANCHISES = {"adult": [300, 500, 1000, 1500, 2000, 2500], "young": [300, 500, 1000, 1500, 2000, 2500],
+              "child": [0, 100, 200, 300, 400, 500, 600]}
+MODELS = ["standard", "hmo", "hausarzt", "telmed", "flex", "pharm"]
+MODEL_SETS = {"all": set(MODELS), "praxis": {"hmo", "hausarzt"}, "managed": set(MODELS) - {"standard"}}
+HMO_RE = re.compile(r"\bHMO\b|Health Maintenance|Gesundheitspraxis|Gesundheitszentrum", re.I)
+DEFAULT_MEDICAL = [0, 500, 1000, 2000, 3000, 5000, 10000]
+
+
+def die(msg, code=1):
+    print(f"kk-compare: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(f"kk-compare: {msg}", file=sys.stderr)
+
+
+def chf(x, dec=2):
+    """Swiss formatting: 4'242.00"""
+    s = f"{x:,.{dec}f}".replace(",", "'")
+    return s
+
+
+def fold(s):
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+# ---------------------------------------------------------------- data files
+
+def meta_path():
+    return os.path.join(DATA, "meta.json")
+
+
+def load_meta():
+    try:
+        with open(meta_path()) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_meta(m):
+    os.makedirs(DATA, exist_ok=True)
+    tmp = meta_path() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(m, f, indent=1, sort_keys=True)
+    os.replace(tmp, meta_path())
+
+
+def download(name, url, magic=None):
+    os.makedirs(DATA, exist_ok=True)
+    dest = os.path.join(DATA, name)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    fd, tmp = tempfile.mkstemp(dir=DATA, prefix="." + name + ".")
+    h = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, os.fdopen(fd, "wb") as out:
+            while True:
+                b = r.read(1 << 16)
+                if not b:
+                    break
+                h.update(b)
+                out.write(b)
+        with open(tmp, "rb") as f:
+            head = f.read(64)
+        if magic and magic.encode() not in head:
+            raise ValueError(f"unexpected content (starts {head[:24]!r})")
+        if name.endswith(".xlsx") and not head.startswith(b"PK"):
+            raise ValueError("not an xlsx file")
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    m = load_meta()
+    m[name] = {"url": url, "downloaded": dt.datetime.now().isoformat(timespec="seconds"),
+               "sha256": h.hexdigest(), "bytes": os.path.getsize(dest)}
+    save_meta(m)
+    return dest
+
+
+def ensure(name, force=False):
+    """Path of a cached data file, downloading it when missing, stale (30 d) or forced."""
+    path = os.path.join(DATA, name)
+    if name in FILES:
+        url, magic = FILES[name]
+    else:
+        url, magic = None, None
+    fresh = os.path.exists(path) and (dt.datetime.now().timestamp() - os.path.getmtime(path)) < MAX_AGE_DAYS * 86400
+    if (fresh and not force) or OFFLINE or url is None:
+        if not os.path.exists(path):
+            die(f"missing data file {path}" + (" (offline)" if OFFLINE else ""))
+        return path
+    try:
+        return download(name, url, magic)
+    except Exception as e:
+        if os.path.exists(path):
+            warn(f"refresh of {name} failed ({type(e).__name__}: {e}); using the cached copy")
+            return path
+        die(f"cannot download {name}: {type(e).__name__}: {e}")
+
+
+def regions_file(year, force=False):
+    name = f"praemienregionen-{year}.xlsx"
+    path = os.path.join(DATA, name)
+    if os.path.exists(path) and not force:
+        return path
+    if OFFLINE:
+        return path if os.path.exists(path) else None
+    try:
+        return download(name, REGIONS_URL.format(year=year))
+    except Exception as e:
+        warn(f"cannot download {name}: {type(e).__name__}: {e}")
+        return path if os.path.exists(path) else None
+
+
+# ---------------------------------------------------------------- parsing
+
+class Offer:
+    __slots__ = ("ins", "canton", "region", "age", "acc", "tarif", "ttype", "sub", "fr", "prem", "base",
+                 "name", "model")
+
+    def insurer(self):
+        return INSURERS.get(self.ins, (f"BAG #{self.ins}",))[0]
+
+    def as_dict(self):
+        return {"insurer": self.insurer(), "bag_no": self.ins, "model": self.model, "bag_type": self.ttype,
+                "tariff": self.name, "tariff_id": self.tarif, "franchise": self.fr, "premium": self.prem,
+                "canton": self.canton, "region": self.region, "accident": self.acc == "MIT_UNF"}
+
+
+def classify(ttype, tarif, name, name_en=""):
+    if ttype == "BASE":
+        return "standard"
+    if ttype == "TEL_DIG":
+        return "telmed"
+    if ttype == "FLEX":
+        return "flex"
+    if ttype == "PHARM":
+        return "pharm"
+    if ttype == "PRAXIS":
+        return "hmo" if HMO_RE.search(" ".join((tarif, name, name_en))) else "hausarzt"
+    return ttype.lower()
+
+
+def tariff_names():
+    """(insurer, tarif) -> English name, for the HMO/Hausarzt split; optional."""
+    out = {}
+    try:
+        path = ensure("tarife.csv")
+    except SystemExit:
+        return out
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if r.get("Kategorie") == "MOD":
+                out[(r["Versicherer"], r["Tarif"])] = r.get("Name_EN") or ""
+    return out
+
+
+def load_offers(canton, path=None):
+    path = path or ensure("praemien_ch.csv")
+    en = tariff_names()
+    out, years = [], set()
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rd = csv.reader(f)
+        hdr = next(rd)
+        ix = {k: i for i, k in enumerate(hdr)}
+        need = ["Versicherer", "Kanton", "Geschäftsjahr", "Region", "Altersklasse", "Unfalleinschluss", "Tarif",
+                "Tariftyp", "Altersuntergruppe", "Franchise", "Prämie", "isBaseP", "Tarifbezeichnung"]
+        miss = [k for k in need if k not in ix]
+        if miss:
+            die(f"premium CSV lacks columns {miss}; the BAG format changed")
+        k_can = ix["Kanton"]
+        for row in rd:
+            if row[k_can] != canton:
+                continue
+            o = Offer()
+            o.ins = int(row[ix["Versicherer"]])
+            o.canton = canton
+            o.region = int(row[ix["Region"]].rsplit("_", 1)[-1])
+            o.age = row[ix["Altersklasse"]]
+            o.acc = row[ix["Unfalleinschluss"]]
+            o.tarif = row[ix["Tarif"]]
+            o.ttype = row[ix["Tariftyp"]]
+            o.sub = row[ix["Altersuntergruppe"]]
+            o.fr = int(row[ix["Franchise"]].rsplit("_", 1)[-1])
+            o.prem = float(row[ix["Prämie"]])
+            o.base = row[ix["isBaseP"]] == "1"
+            o.name = row[ix["Tarifbezeichnung"]].strip()
+            o.model = classify(o.ttype, o.tarif, o.name, en.get((str(o.ins), o.tarif), ""))
+            years.add(row[ix["Geschäftsjahr"]])
+            out.append(o)
+    return out, sorted(years)
+
+
+def data_year(path=None):
+    path = path or ensure("praemien_ch.csv")
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rd = csv.reader(f)
+        hdr = next(rd)
+        row = next(rd)
+    return int(row[hdr.index("Geschäftsjahr")])
+
+
+def catchment():
+    """(insurer, canton, region, tarif) -> set of BFS numbers, only for restricted tariffs."""
+    out = {}
+    try:
+        path = ensure("einzugsgebiete.csv")
+    except SystemExit:
+        warn("no catchment-area file; restricted HMO/Hausarzt areas are not checked")
+        return out
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if r.get("Eingeschränkt") == "Y":
+                key = (int(r["Versicherer"]), r["Kanton"], int(r["Region"].rsplit("_", 1)[-1]), r["Tarif"])
+                out[key] = {int(x) for x in re.findall(r"\d+", r.get("Gemeinden-BFS") or "")}
+    return out
+
+
+def xlsx_rows(path, sheet):
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+          "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+          "p": "http://schemas.openxmlformats.org/package/2006/relationships"}
+    z = zipfile.ZipFile(path)
+    ss = []
+    if "xl/sharedStrings.xml" in z.namelist():
+        for si in ET.fromstring(z.read("xl/sharedStrings.xml")).findall("m:si", ns):
+            ss.append("".join(t.text or "" for t in si.iter("{%s}t" % ns["m"])))
+    rels = {r.get("Id"): r.get("Target") for r in ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))}
+    target = None
+    for s in ET.fromstring(z.read("xl/workbook.xml")).find("m:sheets", ns):
+        if s.get("name") == sheet:
+            target = rels[s.get("{%s}id" % ns["r"])]
+    if not target:
+        return
+    target = target.lstrip("/")
+    if not target.startswith("xl/"):
+        target = "xl/" + target
+    for row in ET.fromstring(z.read(target)).iter("{%s}row" % ns["m"]):
+        vals = []
+        for c in row.findall("m:c", ns):
+            v = c.find("m:v", ns)
+            if v is None:
+                vals.append("".join(x.text or "" for x in c.iter("{%s}t" % ns["m"])))
+            else:
+                vals.append(ss[int(v.text)] if c.get("t") == "s" else v.text)
+        yield vals
+
+
+def region_lookup(plz=None, bfs=None, year=None):
+    """Rows (bfs, canton, municipality, region, plz, place) from the priminfo regions file."""
+    year = year or data_year()
+    path = regions_file(year)
+    if not path:
+        die("premium-region file unavailable")
+    out = []
+    for v in xlsx_rows(path, "A_COM"):
+        if len(v) < 7 or not re.fullmatch(r"\d+(\.0)?", v[0] or ""):
+            continue
+        rec = (int(float(v[0])), v[1], v[2], int(float(v[3])), str(v[5]).split(".")[0], v[6])
+        if (plz and rec[4] == str(plz)) or (bfs and rec[0] == int(bfs)):
+            out.append(rec)
+    return out
+
+
+# ---------------------------------------------------------------- profile + filters
+
+def load_profile():
+    """kk settings: the owner's name, home address, canton and BFS number from the assistant profile (only when
+    a profile file exists: its public placeholders would put a made-up sender into a letter), then
+    ~/.config/kk/profile.json on top (region, age, accident, birthdate, current insurer; its keys win)."""
+    out = {}
+    if assistant_profile.source():
+        first, last = assistant_profile.get("owner.first_name"), assistant_profile.get("owner.last_name")
+        postcode, town = str(assistant_profile.get("home.postcode") or ""), assistant_profile.get("home.town")
+        out = {"name": " ".join(x for x in (first, last) if x), "street": assistant_profile.get("home.street"),
+               "plz_city": " ".join(x for x in (postcode, town) if x), "city": town,
+               "canton": assistant_profile.get("home.canton"), "bfs": assistant_profile.get("home.municipality_bfs")}
+    try:
+        with open(PROFILE) as f:
+            kk = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        kk = {}
+    out.update(kk if isinstance(kk, dict) else {})
+    return out
+
+
+def resolve_area(a, prof):
+    canton = (a.canton or prof.get("canton") or "").upper() or None
+    region, bfs, place = a.region, a.bfs, None
+    if a.plz:
+        rows = region_lookup(plz=a.plz)
+        if canton:
+            rows = [r for r in rows if r[1] == canton]
+        if not rows:
+            die(f"postcode {a.plz} not found in the premium-region file")
+        combos = sorted({(r[1], r[3]) for r in rows})
+        if len(combos) > 1:
+            die(f"postcode {a.plz} spans several premium regions {combos}; add --canton or --bfs")
+        canton, region = combos[0]
+        same = [r for r in rows if fold(r[2]) == fold(r[5])] or rows
+        bfs, place = same[0][0], same[0][2]
+    elif a.bfs:
+        rows = region_lookup(bfs=a.bfs)
+        if not rows:
+            die(f"BFS number {a.bfs} not found")
+        canton, region, place = rows[0][1], rows[0][3], rows[0][2]
+    elif canton == prof.get("canton") and region in (None, prof.get("region")):
+        region, bfs, place = prof.get("region"), prof.get("bfs"), prof.get("city")
+    if not canton:
+        die("no canton: pass --canton/--plz/--bfs or set it in the profile")
+    return canton, region, bfs, place
+
+
+def select(offers, canton, region, age, accident, models, franchise=None, bfs=None, restricted=None):
+    aka, sub = AGE[age]
+    acc = "MIT_UNF" if accident == "yes" else "OHN_UNF"
+    out = []
+    for o in offers:
+        if o.canton != canton or o.age != aka or o.sub != sub or o.acc != acc or o.model not in models:
+            continue
+        if region is not None and o.region != region:
+            continue
+        if franchise is not None and o.fr != franchise:
+            continue
+        if restricted:
+            area = restricted.get((o.ins, o.canton, o.region, o.tarif))
+            if area is not None and bfs is not None and int(bfs) not in area:
+                continue
+        out.append(o)
+    return out
+
+
+def regions_present(offers, canton):
+    return sorted({o.region for o in offers if o.canton == canton})
+
+
+def find_insurer(q):
+    if q is None:
+        return None
+    q = str(q).strip()
+    if q.isdigit() and int(q) in INSURERS:
+        return int(q)
+    fq = fold(q)
+    hits = [n for n, (short, legal, _) in INSURERS.items() if fq == fold(short)]
+    hits = hits or [n for n, (short, legal, _) in INSURERS.items() if fq in fold(short) or fq in fold(legal)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die(f"unknown insurer {q!r}; see kk-compare --insurers")
+    die(f"insurer {q!r} is ambiguous: " + ", ".join(INSURERS[h][0] for h in hits))
+
+
+# ---------------------------------------------------------------- cost maths
+
+def out_of_pocket(fr, costs, cap):
+    """Franchise + 10% co-pay (capped) for given yearly medical costs."""
+    return min(costs, fr) + min(0.10 * max(costs - fr, 0.0), cap)
+
+
+def yearly_total(prem, fr, costs, cap):
+    return 12 * prem + out_of_pocket(fr, costs, cap)
+
+
+def worst_case(prem, fr, cap):
+    return 12 * prem + fr + cap
+
+
+def break_even(low, high, cap):
+    """Smallest yearly medical cost from which offer `low` (lower franchise) costs no more than `high`.
+    None when the high franchise is never worse."""
+    pl, fl = low
+    ph, fh = high
+    s = 12 * (pl - ph)
+    if s <= 0:
+        return 0.0
+    d = lambda c: out_of_pocket(fh, c, cap) - out_of_pocket(fl, c, cap)
+    hi = fh + 10 * cap + 1000
+    if d(hi) < s - 1e-9:
+        return None
+    lo = 0.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if d(mid) >= s - 1e-9:
+            hi = mid
+        else:
+            lo = mid
+    return round(hi, 0)
+
+
+# ---------------------------------------------------------------- output helpers
+
+def header(canton, region, place, age, accident, extra=""):
+    reg = f"region {region}" if region is not None else "all regions"
+    pl = f" ({place})" if place else ""
+    acc = "with accident cover" if accident == "yes" else "without accident cover"
+    return f"{canton} {reg}{pl} · {AGE_LABEL[age]} · {acc}{extra}"
+
+
+def provenance(year):
+    m = load_meta().get("praemien_ch.csv", {})
+    when = m.get("downloaded", "?")[:10]
+    return f"Source: BAG premium data {year} (opendata.bagnet.ch), downloaded {when}."
+
+
+def collapse(offers):
+    """Merge tariffs of one insurer and model with the same premium (e.g. regional doctor networks)."""
+    groups = {}
+    order = []
+    for o in offers:
+        k = (o.ins, o.model, o.prem, o.fr)
+        if k not in groups:
+            groups[k] = []
+            order.append(k)
+        groups[k].append(o)
+    out = []
+    for k in order:
+        g = groups[k]
+        names = []
+        for o in g:
+            if o.name not in names:
+                names.append(o.name)
+        out.append((g[0], " / ".join(names)))
+    return out
+
+
+def table(rows, aligns):
+    widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
+    lines = []
+    for j, r in enumerate(rows):
+        cells = []
+        for i, c in enumerate(r):
+            c = str(c)
+            cells.append(c.rjust(widths[i]) if aligns[i] == "r" else c.ljust(widths[i]))
+        lines.append("  ".join(cells).rstrip())
+        if j == 0:
+            lines.append("  ".join("-" * w for w in widths))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_rank(a, prof):
+    canton, region, bfs, place = resolve_area(a, prof)
+    offers, years = load_offers(canton)
+    if not offers:
+        die(f"no premium rows for canton {canton}")
+    if region is not None and region not in regions_present(offers, canton):
+        die(f"{canton} has regions {regions_present(offers, canton)}, not {region}")
+    models = model_set(a.model)
+    sel = select(offers, canton, region, a.age, a.accident, models, a.franchise, bfs, catchment())
+    if not sel:
+        die(f"no offers for franchise {a.franchise} (valid: {FRANCHISES[a.age]})")
+    sel.sort(key=lambda o: (o.prem, o.insurer(), o.name))
+    cur_ins = find_insurer(a.current_insurer)
+    cap = COPAY_CAP[a.age]
+    items = collapse(sel)
+    if a.json:
+        out = {"area": {"canton": canton, "region": region, "bfs": bfs, "place": place}, "age": a.age,
+               "accident": a.accident, "franchise": a.franchise, "year": years,
+               "offers": []}
+        for o, nm in items[: a.n]:
+            d = o.as_dict()
+            d["tariff"] = nm
+            d["year_premium"] = round(12 * o.prem, 2)
+            d["worst_case_year"] = round(worst_case(o.prem, o.fr, cap), 2)
+            if a.current_premium:
+                d["delta_year_vs_current"] = round(12 * (o.prem - a.current_premium), 2)
+            out["offers"].append(d)
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return
+    print(f"{'/'.join(years)} basic insurance (KVG) premiums · "
+          + header(canton, region, place, a.age, a.accident, f" · franchise CHF {a.franchise}"))
+    hdr = ["#", "Insurer", "Model", "Tariff", "CHF/month", "CHF/year", f"max/yr*"]
+    if a.current_premium:
+        hdr.append("vs current/yr")
+    rows = [hdr]
+    for i, (o, nm) in enumerate(items[: a.n], 1):
+        mark = " ←" if cur_ins and o.ins == cur_ins else ""
+        nm = nm if len(nm) <= 46 else nm[:45] + "…"
+        r = [i, o.insurer() + mark, o.model, nm, chf(o.prem), chf(12 * o.prem, 0), chf(worst_case(o.prem, o.fr, cap), 0)]
+        if a.current_premium:
+            r.append(("+" if o.prem >= a.current_premium else "-") + chf(abs(12 * (o.prem - a.current_premium)), 0))
+        rows.append(r)
+    print(table(rows, ["r", "l", "l", "l", "r", "r", "r", "r"]))
+    print(f"* max/yr = 12 × premium + franchise {a.franchise} + co-pay cap {cap} (worst case).")
+    by_model = {}
+    for o in sel:
+        by_model.setdefault(o.model, []).append(o)
+    spans = []
+    for m in MODELS:
+        if m in by_model:
+            lo = min(by_model[m], key=lambda o: o.prem)
+            hi = max(by_model[m], key=lambda o: o.prem)
+            spans.append(f"{m} {chf(lo.prem)} ({lo.insurer()}) – {chf(hi.prem)} ({hi.insurer()}), {len(by_model[m])} tariffs")
+    print("Range per model: " + "; ".join(spans) + ".")
+    if cur_ins:
+        mine = [o for o in sel if o.ins == cur_ins]
+        if mine:
+            print(f"{INSURERS[cur_ins][0]} 2027 at this franchise: " + "; ".join(
+                f"{o.name} ({o.model}) {chf(o.prem)}" for o in sorted(mine, key=lambda o: o.prem)))
+    if a.current_premium:
+        best = sel[0]
+        print(f"Cheapest vs your current CHF {chf(a.current_premium)}/month: "
+              f"{chf(12 * (a.current_premium - best.prem), 0)} CHF/year less with {best.insurer()} {best.name}.")
+    print(provenance(years[0] if years else "?"))
+
+
+def model_set(m):
+    m = (m or "all").lower()
+    if m in MODEL_SETS:
+        return MODEL_SETS[m]
+    parts = {x.strip() for x in m.split(",")}
+    bad = parts - set(MODELS)
+    if bad:
+        die(f"unknown model {sorted(bad)}; use all, standard, hmo, hausarzt, praxis, telmed, flex, pharm, managed")
+    return parts
+
+
+def matrix_data(a, prof):
+    canton, region, bfs, place = resolve_area(a, prof)
+    offers, years = load_offers(canton)
+    models = [m for m in MODELS if m in model_set(a.model)]
+    sel = select(offers, canton, region, a.age, a.accident, set(models), None, bfs, catchment())
+    best = {}
+    for o in sel:
+        k = (o.model, o.fr)
+        if k not in best or o.prem < best[k].prem or (o.prem == best[k].prem and o.insurer() < best[k].insurer()):
+            best[k] = o
+    models = [m for m in models if any(k[0] == m for k in best)]
+    return canton, region, bfs, place, years, models, best
+
+
+def cmd_matrix(a, prof):
+    canton, region, bfs, place, years, models, best = matrix_data(a, prof)
+    cap = COPAY_CAP[a.age]
+    frs = FRANCHISES[a.age]
+    top = frs[-1]
+    if a.json:
+        out = {"area": {"canton": canton, "region": region, "bfs": bfs}, "age": a.age, "accident": a.accident,
+               "cells": []}
+        for m in models:
+            for f in frs:
+                o = best.get((m, f))
+                if not o:
+                    continue
+                d = o.as_dict()
+                d["worst_case_year"] = round(worst_case(o.prem, f, cap), 2)
+                hi = best.get((m, top))
+                d["break_even_vs_top"] = break_even((o.prem, f), (hi.prem, top), cap) if hi and f != top else None
+                out["cells"].append(d)
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return
+    print(f"Cheapest offer per franchise and model (CHF/month) · " + header(canton, region, place, a.age, a.accident))
+    rows = [["Franchise"] + models]
+    for f in frs:
+        r = [chf(f, 0)]
+        for m in models:
+            o = best.get((m, f))
+            r.append(f"{chf(o.prem)} {o.insurer()}" if o else "–")
+        rows.append(r)
+    print(table(rows, ["r"] + ["l"] * len(models)))
+    print()
+    print(f"Break-even vs franchise {top}: the lower franchise only pays off once your yearly medical costs exceed")
+    print(f"this amount (cheapest offer of the same model at each level; co-pay 10%, cap {cap}).")
+    rows = [["Franchise"] + models]
+    for f in frs[:-1]:
+        r = [chf(f, 0)]
+        for m in models:
+            o, hi = best.get((m, f)), best.get((m, top))
+            if not o or not hi:
+                r.append("–")
+                continue
+            be = break_even((o.prem, f), (hi.prem, top), cap)
+            extra = 12 * (o.prem - hi.prem)
+            r.append("never" if be is None else f"{chf(be, 0)} (+{chf(extra, 0)}/yr)")
+        rows.append(r)
+    print(table(rows, ["r"] + ["l"] * len(models)))
+    print(f"(+X/yr = extra premium per year vs. the cheapest {top} offer; the extra deductible is at most "
+          f"CHF {chf(top - frs[0], 0)}.)")
+    print(provenance(years[0] if years else "?"))
+
+
+def cmd_costs(a, prof):
+    canton, region, bfs, place, years, models, best = matrix_data(a, prof)
+    cap = COPAY_CAP[a.age]
+    try:
+        levels = [float(x) for x in a.medical.split(",")] if a.medical else DEFAULT_MEDICAL
+    except ValueError:
+        die("--medical takes comma-separated amounts, e.g. 0,1000,5000")
+    canton_offers = None
+    if a.current_premium and a.current_franchise is None:
+        die("--costs with --current-premium also needs --current-franchise")
+    res = []
+    for c in levels:
+        row = {"medical": c, "best": {}}
+        for m in models:
+            cands = [(yearly_total(o.prem, f, c, cap), f, o) for (mm, f), o in best.items() if mm == m]
+            if cands:
+                t, f, o = min(cands, key=lambda x: (x[0], -x[1]))
+                row["best"][m] = (t, f, o)
+        if a.current_premium:
+            row["current"] = yearly_total(a.current_premium, a.current_franchise, c, cap)
+        res.append(row)
+    if a.json:
+        out = {"area": {"canton": canton, "region": region}, "age": a.age, "accident": a.accident, "rows": []}
+        for r in res:
+            out["rows"].append({"medical": r["medical"], "current": r.get("current"),
+                                "best": {m: {"total": round(t, 2), "franchise": f, "insurer": o.insurer(),
+                                             "tariff": o.name, "premium": o.prem}
+                                         for m, (t, f, o) in r["best"].items()}})
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return
+    print("Yearly total cost = 12 × premium + franchise + 10% co-pay (cap " + str(cap) + "), best franchise per model")
+    print(header(canton, region, place, a.age, a.accident))
+    hdr = ["Medical costs/yr"] + models + (["current"] if a.current_premium else [])
+    rows = [hdr]
+    for r in res:
+        line = [chf(r["medical"], 0)]
+        for m in models:
+            if m in r["best"]:
+                t, f, o = r["best"][m]
+                line.append(f"{chf(t, 0)} ({f}, {o.insurer()})")
+            else:
+                line.append("–")
+        if a.current_premium:
+            line.append(chf(r["current"], 0))
+        rows.append(line)
+    print(table(rows, ["r"] + ["l"] * (len(hdr) - 1)))
+    print("Cell = total CHF/year (franchise, insurer of the cheapest tariff). Hospital CHF 15/day not included.")
+    print(provenance(years[0] if years else "?"))
+
+
+LETTER = """{name}
+{street}
+{plz_city}
+Versicherten-Nr.: {policy}
+Geburtsdatum: {birthdate}
+
+
+EINSCHREIBEN
+{ins_block}
+
+
+{city}, {date}
+
+
+Kündigung der obligatorischen Krankenpflegeversicherung (Grundversicherung)
+
+Sehr geehrte Damen und Herren
+
+Hiermit kündige ich meine Grundversicherung per 31. Dezember {year}. Ich werde ab 1. Januar {next_year} bei einem anderen Krankenversicherer nach KVG versichert sein.
+{vvg}
+Besten Dank für die Ausführung des Auftrages. Bitte stellen Sie mir eine entsprechende schriftliche Bestätigung zu.
+
+Freundliche Grüsse
+
+
+
+{name}
+"""
+
+VVG_LINE = "\nMeine Zusatzversicherungen (VVG) sind von dieser Kündigung nicht betroffen und laufen unverändert weiter.\n"
+
+
+def deadline(year):
+    """Cancellation must arrive by 30 Nov, or the last working day before it (weekends; holidays ignored)."""
+    d = dt.date(year, 11, 30)
+    while d.weekday() >= 5:
+        d -= dt.timedelta(days=1)
+    return d
+
+
+def today():
+    """The owner's date today; KK_NOW (ISO 8601 date or time, no offset = owner time zone) pins it for tests."""
+    pin = os.environ.get("KK_NOW")
+    if not pin:
+        return dt.date.today()
+    try:
+        t = dt.datetime.fromisoformat(pin)
+    except ValueError:
+        die(f"KK_NOW is not ISO 8601: {pin!r}", 2)
+    return (t.astimezone(assistant_profile.tz()) if t.tzinfo else t).date()
+
+
+def default_year(day):
+    """The letter's year when --year is absent: this year until its deadline, next year once that has passed."""
+    return day.year if day <= deadline(day.year) else day.year + 1
+
+
+def cmd_letter(a, prof):
+    year = a.year or default_year(today())
+    ins = find_insurer(a.insurer or (prof.get("current") or {}).get("insurer"))
+    if ins:
+        short, legal, addr = INSURERS[ins]
+        ins_block = "\n".join([legal] + addr)
+    else:
+        ins_block = "[Name der Krankenkasse]\n[Adresse – wie auf Ihrer Police / Prämienrechnung]"
+    policy = a.policy or (prof.get("current") or {}).get("policy_no") or "[Versichertennummer – siehe Police oder Versicherungskarte]"
+    date = a.date or "[Datum]"
+    text = LETTER.format(
+        name=a.name or prof.get("name") or "[Vorname Name]",
+        street=a.street or prof.get("street") or "[Strasse Nr.]",
+        plz_city=a.plz_city or prof.get("plz_city") or "[PLZ Ort]",
+        city=a.city or prof.get("city") or "[Ort]",
+        birthdate=prof.get("birthdate") or "[TT.MM.JJJJ]",
+        policy=policy, ins_block=ins_block, date=date, year=year, next_year=year + 1,
+        vvg=VVG_LINE if a.keep_vvg else "")
+    dl = deadline(year)
+    wd = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"][dl.weekday()]
+    notes = (f"\n---\nHinweise (nicht Teil des Briefs):\n"
+             f"- Muss bis {wd}, {dl.day}. November {year} bei der Kasse EINTREFFEN (Poststempel zählt nicht).\n"
+             f"  Das BAG empfiehlt: eingeschrieben bis Mitte November senden.\n"
+             f"- Gleichzeitig bei der neuen Kasse beitreten (Beitrittsformular, keine Gesundheitsfragen in der\n"
+             f"  Grundversicherung). Die alte Versicherung endet erst, wenn die neue Kasse dies bestätigt hat.\n"
+             f"- Unbezahlte, bis 30.11. gemahnte Prämien/Kostenbeteiligungen blockieren den Wechsel.\n"
+             f"- Zusatzversicherungen (VVG) sind separat und haben eigene Kündigungsfristen.\n"
+             f"- Vorlage: BAG-Musterbrief 08 \"Kündigung (Grundversicherung)\", priminfo.admin.ch.\n")
+    if a.out:
+        with open(a.out, "w") as f:
+            f.write(text + notes)
+        print(f"written {a.out}")
+    else:
+        print(text + notes)
+
+
+def cmd_info(a):
+    m = load_meta()
+    for name in list(FILES) + sorted(k for k in m if k.startswith("praemienregionen")):
+        d = m.get(name)
+        p = os.path.join(DATA, name)
+        print(f"{name}: " + (f"{d['bytes']} bytes, downloaded {d['downloaded']}, sha256 {d['sha256'][:12]}…, {d['url']}"
+                             if d else ("present (no meta)" if os.path.exists(p) else "missing")))
+    try:
+        print(f"premium year: {data_year()}")
+    except SystemExit:
+        pass
+
+
+def cmd_region_of(a):
+    rows = region_lookup(plz=a.region_of)
+    if not rows:
+        die(f"postcode {a.region_of} not found")
+    for r in rows:
+        print(f"PLZ {r[4]} {r[5]}: {r[2]} (BFS {r[0]}), canton {r[1]}, premium region {r[3]}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="kk-compare", description=__doc__.split("\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="\n".join(__doc__.split("\n")[2:]))
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--franchise-matrix", action="store_true")
+    mode.add_argument("--costs", action="store_true")
+    mode.add_argument("--letter", action="store_true")
+    mode.add_argument("--region-of", metavar="PLZ")
+    mode.add_argument("--insurers", action="store_true")
+    mode.add_argument("--info", action="store_true")
+    mode.add_argument("--refresh", action="store_true")
+    p.add_argument("--canton")
+    p.add_argument("--region", type=int)
+    p.add_argument("--plz")
+    p.add_argument("--bfs", type=int)
+    p.add_argument("--age", choices=list(AGE))
+    p.add_argument("--accident", choices=["no", "yes"])
+    p.add_argument("--franchise", type=int)
+    p.add_argument("--model", default="all")
+    p.add_argument("-n", type=int, default=15)
+    p.add_argument("--current-insurer")
+    p.add_argument("--current-premium", type=float)
+    p.add_argument("--current-franchise", type=int)
+    p.add_argument("--medical", help="comma-separated yearly medical costs for --costs")
+    p.add_argument("--json", action="store_true")
+    # letter
+    p.add_argument("--insurer")
+    p.add_argument("--policy")
+    p.add_argument("--name")
+    p.add_argument("--street")
+    p.add_argument("--plz-city")
+    p.add_argument("--city")
+    p.add_argument("--date")
+    p.add_argument("--year", type=int, help="letter: cancel as of 31 Dec of this year (default: this year, "
+                   "next year once this year's arrival deadline has passed)")
+    p.add_argument("--keep-vvg", action="store_true", help="letter: add a line that supplementary insurance stays")
+    p.add_argument("--out")
+    a = p.parse_args()
+    prof = load_profile()
+    a.age = a.age or prof.get("age") or "adult"
+    a.accident = a.accident or prof.get("accident") or "no"
+    if a.franchise is None:
+        a.franchise = FRANCHISES[a.age][-1]
+    if a.refresh:
+        for name in FILES:
+            print(f"{name}: {ensure(name, force=True)}")
+        print(f"regions: {regions_file(data_year(), force=True)}")
+        return
+    if a.info:
+        return cmd_info(a)
+    if a.insurers:
+        for n in sorted(INSURERS, key=lambda n: INSURERS[n][0].lower()):
+            s, legal, addr = INSURERS[n]
+            print(f"{n:>5}  {s:<20} {legal}, {', '.join(addr)}")
+        return
+    if a.region_of:
+        return cmd_region_of(a)
+    if a.letter:
+        return cmd_letter(a, prof)
+    if a.franchise_matrix:
+        return cmd_matrix(a, prof)
+    if a.costs:
+        return cmd_costs(a, prof)
+    return cmd_rank(a, prof)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass

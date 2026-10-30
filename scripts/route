@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Swiss public transport connections (transport.opendata.ch; addresses via swisstopo).
+
+  route "Exampletown, Examplestrasse" "Otherstrasse 2, Wallisellen" [--arrive 17:00] [--at 15:50] [--date 2026-10-09] [-n 4]
+
+Home is door to door: "home", the home town (or an alias, its station name) or the town's stop on the home street
+means the profile's home address (lib/home_place: geocoded to coordinates, since the API snaps some free addresses
+to another street); the walk there or back shows as "home". --literal takes FROM/TO exactly as typed.
+Other addresses work directly ("Street N, Town").
+"""
+import argparse, json, os, sys, urllib.error, urllib.parse
+from datetime import date
+
+_here = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(_here, 'lib'))
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))   # the repo checkout (scripts/): its own core
+import home_place  # noqa: E402
+from core import http as web  # noqa: E402
+
+API = os.environ.get('ROUTE_API', 'https://transport.opendata.ch/v1')   # test seam (~/opt/route-tests)
+URLLIB_UA = 'Python-urllib/%d.%d' % sys.version_info[:2]   # the UA these calls always sent
+
+def get(url, params):
+    """JSON from the API; a network/HTTP/JSON failure is a one-line error (exit 1), not a traceback."""
+    try:
+        with web.open(url + '?' + urllib.parse.urlencode(params), timeout=20, ua=URLLIB_UA) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            why = json.load(e)['errors'][0]['message']
+        except Exception:
+            why = f'HTTP {e.code}'
+        sys.exit(f'route: transport API error: {why}')
+    except (OSError, ValueError) as e:      # URLError, timeout, junk instead of JSON
+        sys.exit(f'route: transport API unreachable or broken: {getattr(e, "reason", e)}')
+
+ap = argparse.ArgumentParser()
+ap.add_argument('src'); ap.add_argument('dst')
+ap.add_argument('--arrive'); ap.add_argument('--at'); ap.add_argument('--date', default=str(date.today()))
+ap.add_argument('-n', type=int, default=4)
+ap.add_argument('--literal', action='store_true', help='FROM/TO as typed (no home address)')
+a = ap.parse_args()
+q = (lambda x: x) if a.literal else home_place.query
+params = {'from': q(a.src), 'to': q(a.dst), 'date': a.date, 'limit': a.n}
+if a.arrive:
+    params.update(time=a.arrive, isArrivalTime=1)
+elif a.at:
+    params.update(time=a.at)
+data = get(API + '/connections', params)
+if not data.get('connections'):
+    sys.exit('no connections found (check spelling; try a nearby stop name)')
+for c in data['connections']:
+    print(f"{c['from']['departure'][11:16]} → {c['to']['arrival'][11:16]}  ({c['duration'][3:8]}, {c['transfers']} transfers)")
+    for s in c['sections']:
+        if s.get('journey'):
+            j = s['journey']
+            print(f"   {s['departure']['departure'][11:16]} {s['departure']['station']['name']} [pl {s['departure'].get('platform') or '-'}] → "
+                  f"{s['arrival']['arrival'][11:16]} {s['arrival']['station']['name']}  {j.get('category') or ''}{j.get('number') or ''} → {j.get('to') or '?'}")
+        elif s.get('walk'):
+            dest = (s['arrival'].get('station') or {}).get('name') or (s['arrival'].get('location') or {}).get('name') or ''   # null-safe
+            if s is c['sections'][-1] and not a.literal and home_place.is_home(a.dst):
+                dest = 'home'
+            print(f"   walk {round((s['walk'].get('duration') or 0) / 60)} min → {dest}")
+    print()

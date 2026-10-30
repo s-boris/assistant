@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""window-watch: window-left-open detector from the room temperature + humidity sensors (no window contacts).
+Read-only, no tokens. It polls nothing itself: it reads damp-watch's samples (same cron line, every 10 min).
+
+Usage:
+  window-watch [status] [--json]       per room from damp-watch's newest sample: temperature, the 3 h normal, drops over
+                                       30/90 min, absolute humidity vs outdoor, open episode; tuning or live
+  window-watch run [--dry-run]         cron, right after `damp-watch run`: new samples -> open/closed episodes; during the
+                                       tuning period only the candidate log; then ONE ~/inbox note per episode (below)
+  window-watch candidates [--days N] [--json]   the candidate log: episodes, how they ended, what would have alerted
+  window-watch replay FILE [--json]    the detector over a JSON list of damp-watch samples (tests, backtests)
+  window-watch backtest [--days N] [--step MIN] [--json]   HA recorder history of the configured sensors (read-only
+                                       REST history through ha-audit's client) -> step samples -> replay + near misses
+
+Detection per room (rooms + outdoor reference = damp-watch's config; outdoor = the balcony sensor, open-meteo at home
+  when it is missing in `run`). An opening needs ALL of:
+  - fast rule: >= fast_drop_c (1.5 °C) under the warmest value of the last fast_min (30 min); slow rule (tilted
+    window): >= slow_drop_c (2.0 °C) within slow_min (90 min);
+  - >= base_drop_c (1.0 °C) under the room's normal: the lower median of the base_h (3 h) before the drop began and
+    the 3 h before that, so a room cooling back from cooking, a shower or afternoon sun is no opening;
+  - outdoor >= out_delta_c (4 °C) colder than the room was, and the drop no bigger than that gap;
+  - absolute humidity (g/m³) moving toward the outdoor value: when they differ by >= ah_gap_min (1.0), moved >=
+    ah_min (0.3) and >= ah_ratio (0.5) x the share of the temperature gap that closed, and not above its own 3 h
+    median; else (no humidity contrast) it must not rise by > ah_rise_max (0.5): moisture = cooking/shower, and the
+    drop must be no_ah_extra_c (0.5 °C) bigger.
+  An open episode starts at the warmest point before the drop and ends when the room warms ≥ recover_c (0.5 °C)
+  over its low (window shut), gets back within normal_c (0.4 °C) of the normal, has no data for stale_min, or
+  after max_open_h (24 h). Alerts need it still >= base_drop_c under the normal.
+  "Left open" = still open open_min (30 min) after it began; shorter = aired (never alerted).
+Alerts (only after the tuning period: tuning_days (7) from the first run, at 09:00; or config live_from):
+  - away (remind's place-state.json zone, `vault ha now` when stale) and outdoor <= away_max_out_c (10 °C), or
+    <= trip_max_out_c (15 °C) in trip mode -> ONE ~/inbox/window-watch-away-*.md per episode;
+  - trip mode = HA input_boolean.away_mode on, or damp-watch's trip (trips.json / calendar): + a cat-sitter line;
+  - home, outdoor <= home_max_out_c (8 °C), outside hint_quiet (22-08) -> ONE window-watch-hint-*.md per episode,
+    at most one a day.
+  During tuning the same decisions go to the candidate log as "would" lines.
+
+Config (optional; thresholds only) ~/.config/window-watch/config.json: any DEFAULTS key, e.g. {"live_from":
+  "YYYY-MM-DD", "fast_drop_c": 1.5}. State ~/.local/state/window-watch/ (0600): state.json (episodes, last sample,
+  tuning end, weather cache), candidates.jsonl (log_days).
+Exit: 0 ok, 1 no data (damp-watch state missing; HA history unreadable), 2 usage or config error.
+Env (tests): DAMP_WATCH_BIN, DAMP_WATCH_CONFIG, DAMP_WATCH_STATE_DIR, DAMP_WATCH_TRIPS, CALCACHE_DIR, HA_BIN,
+  WINDOW_WATCH_CONFIG, WINDOW_WATCH_STATE_DIR, WINDOW_WATCH_INBOX, WINDOW_WATCH_NOW (epoch), WINDOW_WATCH_PLACE
+  (place-state.json), WINDOW_WATCH_VAULT (command or "off"), WINDOW_WATCH_WEATHER (open-meteo JSON file or "off"),
+  OWNER_TZ.
+Tests: ~/opt/assistant/tests/legacy/window-watch/run.sh
+"""
+import argparse
+import bisect
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.dont_write_bytecode = True
+
+
+def _load(name, env, fname):
+    path = os.environ.get(env) or next(
+        (p for p in (os.path.join(HERE, fname), os.path.join(HOME, 'bin', fname)) if os.path.exists(p)), None)
+    if not path:
+        raise SystemExit(f'window-watch: {fname} not found')
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+D = _load('damp_watch_for_window', 'DAMP_WATCH_BIN', 'damp-watch')  # config, samples, Magnus, trip mode, helpers
+Fail = D.Fail
+
+STATE_DIR = os.environ.get('WINDOW_WATCH_STATE_DIR') or os.path.join(HOME, '.local/state/window-watch')
+STATE = os.path.join(STATE_DIR, 'state.json')
+CANDS = os.path.join(STATE_DIR, 'candidates.jsonl')
+CONFIG = os.environ.get('WINDOW_WATCH_CONFIG') or os.path.join(HOME, '.config/window-watch/config.json')
+INBOX = os.environ.get('WINDOW_WATCH_INBOX') or os.path.join(HOME, 'inbox')
+PLACE = os.environ.get('WINDOW_WATCH_PLACE') or os.path.join(HOME, '.local/state/remind/place-state.json')
+VAULT = os.environ.get('WINDOW_WATCH_VAULT', 'vault')
+WEATHER = os.environ.get('WINDOW_WATCH_WEATHER', '')
+
+DEFAULTS = {'fast_min': 30, 'fast_drop_c': 1.5, 'slow_min': 90, 'slow_drop_c': 2.0, 'base_h': 3, 'base_drop_c': 1.0,
+            'out_delta_c': 4.0, 'ah_gap_min': 1.0, 'ah_min': 0.3, 'ah_ratio': 0.5, 'ah_rise_max': 0.5,
+            'no_ah_extra_c': 0.5, 'recover_c': 0.5, 'normal_c': 0.4, 'stale_min': 70, 'max_open_h': 24,
+            'open_min': 30, 'away_max_out_c': 10.0,
+            'trip_max_out_c': 15.0, 'home_max_out_c': 8.0, 'hint_quiet': [22, 8], 'place_stale_min': 30,
+            'tuning_days': 7, 'live_from': None, 'log_days': 60}
+RULES = ('fast', 'slow')
+
+
+# ----------------------------------------------------------------------------- config + math
+def load_cfg():
+    cfg = dict(DEFAULTS)
+    raw = D.load_json(CONFIG, {}) or {}
+    if not isinstance(raw, dict):
+        raise Fail(f'{CONFIG}: not a JSON object')
+    unknown = sorted(set(raw) - set(DEFAULTS))
+    if unknown:
+        raise Fail(f'{os.path.basename(CONFIG)}: unknown keys {", ".join(unknown)}')
+    cfg.update({k: v for k, v in raw.items() if v is not None})
+    return cfg
+
+
+def ah(t, rh):
+    """Absolute humidity, g/m³ (Magnus saturation pressure, as damp-watch)."""
+    if t is None or rh is None:
+        return None
+    return 216.7 * (rh / 100.0) * D.es(t) / (273.15 + t)
+
+
+def now_ts():
+    return int(float(os.environ.get('WINDOW_WATCH_NOW') or os.environ.get('DAMP_WATCH_NOW') or time.time()))
+
+
+def hm(ts):
+    return D.local(ts).strftime('%H:%M')
+
+
+def dm(ts):
+    return D.local(ts).strftime('%d.%m %H:%M')
+
+
+# ----------------------------------------------------------------------------- detector
+class Series:
+    """One room's samples: (ts, t, rh, out_t, out_rh) in time order."""
+
+    def __init__(self, samples, room):
+        self.p = []
+        for s in samples:
+            r = (s.get('rooms') or {}).get(room) or {}
+            o = s.get('out') or {}
+            self.p.append((s['ts'], r.get('t'), r.get('rh'), o.get('t'), o.get('rh')))
+        self.ts = [x[0] for x in self.p]
+
+    def between(self, a, b):
+        """Points with a <= ts < b."""
+        return self.p[bisect.bisect_left(self.ts, a):bisect.bisect_left(self.ts, b)]
+
+
+def normal(S, ref, cfg):
+    """(normal temperature, points) before the drop: the lower median of the base_h before it and the base_h before
+    that, so a warm spell of a few hours (afternoon sun, cooking) is not the normal it falls back from."""
+    h = cfg['base_h'] * 3600
+    near = [p for p in S.between(ref[0] - h, ref[0]) if p[1] is not None]
+    early = [p for p in S.between(ref[0] - 2 * h, ref[0] - h) if p[1] is not None]
+    meds = [statistics.median(p[1] for p in x) for x in (near, early) if len(x) >= 3]
+    return (min(meds) if meds else ref[1]), near
+
+
+def check(S, i, cfg):
+    """(hit, near): hit = the opening signature at point i, else None; near = (drop, rule, reason) of the biggest
+    rejected drop >= half its threshold (backtest near misses), else None."""
+    ts, t, rh, ot, orh = S.p[i]
+    near = None
+    if t is None or rh is None:
+        return None, None
+    for rule in RULES:
+        thr = float(cfg[rule + '_drop_c'])
+        pts = [p for p in S.between(ts - cfg[rule + '_min'] * 60, ts) if p[1] is not None]
+        if not pts:
+            continue
+        ref = max(pts, key=lambda p: (p[1], p[0]))  # warmest, the latest among ties (just before the drop)
+        drop = ref[1] - t
+
+        def miss(reason):
+            return (drop, rule, reason) if drop >= thr / 2 and (near is None or drop > near[0]) else near
+
+        if drop < thr:
+            near = miss('drop')
+            continue
+        if ot is None:
+            near = miss('no outdoor value')
+            continue
+        gap_t = ref[1] - ot
+        if gap_t < cfg['out_delta_c'] or drop > gap_t:
+            near = miss('outdoor not colder')
+            continue
+        base, base_pts = normal(S, ref, cfg)
+        below = base - t
+        if below < cfg['base_drop_c']:
+            near = miss('cooling back to normal (peak)')
+            continue
+        a_ref = ah(ref[1], ref[2]) if ref[2] is not None else ah(ref[1], rh)
+        a_now, a_out = ah(t, rh), ah(ot, orh)
+        frac_t, frac_a = drop / gap_t, None
+        if a_out is not None and abs(a_ref - a_out) >= cfg['ah_gap_min']:
+            sgn = 1 if a_ref > a_out else -1
+            moved = (a_ref - a_now) * sgn
+            frac_a = moved / abs(a_ref - a_out)
+            base_a = [ah(p[1], p[2]) for p in base_pts if p[2] is not None]
+            a_base = statistics.median(base_a) if len(base_a) >= 3 else a_ref
+            if moved < cfg['ah_min'] or frac_a < cfg['ah_ratio'] * frac_t:
+                near = miss('humidity not toward outdoor')
+                continue
+            if (a_base - a_now) * sgn < 0:
+                near = miss('humidity above its normal')
+                continue
+        elif a_now - a_ref > cfg['ah_rise_max']:
+            near = miss('humidity rising (moisture source)')
+            continue
+        elif drop < thr + cfg['no_ah_extra_c']:
+            near = miss('no humidity contrast: needs a bigger drop')
+            continue
+        return ({'rule': rule, 'start': ref[0], 'detected': ts, 't_ref': ref[1], 't': t, 'drop': round(drop, 2),
+                 'base': round(base, 2), 'below': round(below, 2), 'out_t': ot, 'frac_t': round(frac_t, 3),
+                 'frac_ah': None if frac_a is None else round(frac_a, 3), 'ah_ref': round(a_ref, 2),
+                 'ah_now': round(a_now, 2), 'ah_out': None if a_out is None else round(a_out, 2)}, None)
+    return None, near
+
+
+def advance(S, i, ep, cfg, room):
+    """Move one room's episode to point i. Returns (episode or None, events, near)."""
+    ts, t = S.p[i][0], S.p[i][1]
+    if ep:
+        if t is None:
+            if ts - ep['last_ts'] > cfg['stale_min'] * 60:
+                return None, [close_ev(ep, ep['last_ts'], 'no data')], None
+            return ep, [], None
+        ep['last_ts'], ep['t_now'] = ts, t
+        ep['t_min'] = min(ep['t_min'], t)
+        if S.p[i][2] is not None:
+            ep['ah_now'] = round(ah(t, S.p[i][2]), 2)
+        if t >= ep['t_min'] + cfg['recover_c']:
+            return None, [close_ev(ep, ts, 'warming (shut)')], None
+        if t >= ep['base'] - cfg['normal_c']:
+            return None, [close_ev(ep, ts, 'back to normal')], None
+        if ts - ep['start'] > cfg['max_open_h'] * 3600:
+            return None, [close_ev(ep, ts, 'expired')], None
+        return ep, [], None
+    hit, near = check(S, i, cfg)
+    if not hit:
+        return None, [], near
+    ep = dict(hit, id=f'{D.slug(room)}-{hit["start"]}', room=room, t_min=hit['t'], t_now=hit['t'], last_ts=ts)
+    return ep, [dict({'ev': 'open', 'ts': ts}, **{k: ep[k] for k in (
+        'id', 'room', 'start', 'rule', 'drop', 'below', 't_ref', 't', 'base', 'out_t', 'frac_t', 'frac_ah', 'ah_ref',
+        'ah_now', 'ah_out')})], None
+
+
+def close_ev(ep, ts, how):
+    mins = round((ts - ep['start']) / 60)
+    return {'ev': 'close', 'ts': ts, 'id': ep['id'], 'room': ep['room'], 'minutes': mins, 'how': how,
+            't_min': ep['t_min']}
+
+
+def replay(samples, rooms, cfg):
+    """Detector over a whole sample list: {'events': [...], 'open': {room: ep}, 'near': [...]}."""
+    samples = sorted((s for s in samples if isinstance(s, dict) and isinstance(s.get('ts'), (int, float))),
+                     key=lambda s: s['ts'])
+    events, opened, near = [], {}, []
+    for room in rooms:
+        S, ep = Series(samples, room), None
+        for i in range(len(S.p)):
+            ep, ev, nm = advance(S, i, ep, cfg, room)
+            events += ev
+            if nm:
+                near.append({'room': room, 'ts': S.p[i][0], 'drop': round(nm[0], 2), 'rule': nm[1], 'reason': nm[2]})
+        if ep:
+            opened[room] = ep
+    events.sort(key=lambda e: e['ts'])
+    return {'events': events, 'open': opened, 'near': near}
+
+
+def episodes(events, still_open=None, cfg=None):
+    """Join open/close events into episode rows."""
+    rows = {}
+    for e in events:
+        r = rows.setdefault(e['id'], {'id': e['id'], 'room': e['room']})
+        if e['ev'] == 'open':
+            r.update({k: e.get(k) for k in ('start', 'rule', 'drop', 'below', 't_ref', 't', 'out_t', 'frac_t',
+                                            'frac_ah')}, detected=e['ts'])
+        elif e['ev'] == 'close':
+            r.update(minutes=e['minutes'], how=e['how'], t_min=e.get('t_min'))
+        elif e['ev'] == 'would':
+            r.setdefault('would', []).append(e['kind'] + ('' if e.get('live') else ' (tuning)'))
+    for ep in (still_open or {}).values():
+        if ep['id'] in rows:
+            rows[ep['id']].update(how='still open', t_min=ep['t_min'])
+    open_min = (cfg or DEFAULTS)['open_min']
+    for r in rows.values():
+        if r.get('minutes') is not None:
+            r['kind'] = 'left open' if r['minutes'] >= open_min else 'aired'
+        elif r.get('how') == 'still open':
+            r['kind'] = 'open now'
+    return sorted((r for r in rows.values() if r.get('start')), key=lambda r: r['start'])
+
+
+# ----------------------------------------------------------------------------- presence, trip, weather
+def presence(ts, cfg):
+    """'home' | 'away' | None (unknown). remind's place-state.json (every 2 min), `vault ha now` when stale."""
+    try:
+        d = D.load_json(PLACE, {}) or {}
+        seen = dt.datetime.strptime(str(d.get('seen')), '%Y-%m-%d %H:%M').replace(tzinfo=D.owner_tz()).timestamp()
+        if ts - seen <= cfg['place_stale_min'] * 60 and d.get('zone'):
+            return 'home' if d['zone'] == 'home' else 'away'
+    except (Fail, ValueError, TypeError):
+        pass
+    if VAULT == 'off':
+        return None
+    try:
+        r = subprocess.run([VAULT, 'ha', 'now'], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    line = next((ln for ln in r.stdout.splitlines() if ln.startswith('place:')), '')
+    if r.returncode != 0 or not line:
+        return None
+    if '[away]' in line:
+        return 'away'
+    return 'home' if re.search(r'\bhome\b', line, re.I) else None
+
+
+def trip_mode(ts, dcfg):
+    """Why trip mode is on ('away mode', a trip name) or None."""
+    try:
+        r = subprocess.run([D.HA, 'state', 'input_boolean.away_mode'], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        m = re.search(r'^state:\s*(\S+)', r.stdout, re.M)
+        if r.returncode == 0 and m and m[1] == 'on':
+            return 'away mode'
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    t = D.trip_now(ts, dcfg)
+    return t['name'] if t else None
+
+
+def weather(st, ts):
+    """Outdoor (t, rh) at home from open-meteo when the balcony sensor is missing; 60-min cache in the state."""
+    if WEATHER == 'off':
+        return None, None
+    c = st.get('weather') or {}
+    if ts - c.get('ts', 0) < 3600:
+        return c.get('t'), c.get('rh')
+    try:
+        if WEATHER:
+            data = D.load_json(WEATHER, {})
+        else:
+            import assistant_profile as P
+            q = {'latitude': P.get('home.lat'), 'longitude': P.get('home.lon'),
+                 'current': 'temperature_2m,relative_humidity_2m'}
+            with urllib.request.urlopen('https://api.open-meteo.com/v1/forecast?' + urllib.parse.urlencode(q),
+                                        timeout=20) as f:
+                data = json.load(f)
+        cur = data.get('current') or {}
+        t, rh = float(cur['temperature_2m']), float(cur['relative_humidity_2m'])
+    except Exception:
+        return None, None
+    st['weather'] = {'ts': ts, 't': t, 'rh': rh}
+    return t, rh
+
+
+# ----------------------------------------------------------------------------- state + log
+def load_state():
+    st = D.load_json(STATE, {}) or {}
+    return st if isinstance(st, dict) else {}
+
+
+def live_from(cfg, st, ts):
+    if cfg.get('live_from'):
+        d = dt.date.fromisoformat(str(cfg['live_from'])[:10])
+        return int(dt.datetime.combine(d, dt.time(0), D.owner_tz()).timestamp())
+    if not st.get('tuning_until'):
+        d = D.local(ts).date() + dt.timedelta(days=int(cfg['tuning_days']))
+        st['tuning_until'] = int(dt.datetime.combine(d, dt.time(9), D.owner_tz()).timestamp())
+    return st['tuning_until']
+
+
+def log_events(events, cfg, ts):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    keep = []
+    try:
+        with open(CANDS) as f:
+            for ln in f:
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                if e.get('ts', 0) > ts - cfg['log_days'] * 86400:
+                    keep.append(e)
+    except FileNotFoundError:
+        pass
+    keep += events
+    tmp = f'{CANDS}.tmp{os.getpid()}'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(''.join(json.dumps(e, ensure_ascii=False, separators=(',', ':')) + '\n' for e in keep))
+    os.replace(tmp, CANDS)
+
+
+def read_log():
+    try:
+        with open(CANDS) as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+    except FileNotFoundError:
+        return []
+
+
+# ----------------------------------------------------------------------------- notes
+def room_lines(ep, out_t, ts, trip):
+    room = ep['room']
+    a = [f'## {room}',
+         f'- Temperature {ep["t_ref"]:.1f} → {ep["t_now"]:.1f} °C since {hm(ep["start"])} '
+         f'({ep["base"] - ep["t_now"]:.1f} °C under its 3 h normal), still low after {(ts - ep["start"]) / 60:.0f} min',
+         f'- Absolute humidity {ep["ah_ref"]:.1f} → {ep["ah_now"]:.1f} g/m³'
+         + (f', heading toward outdoor {ep["ah_out"]:.1f} g/m³' if ep.get('ah_out') is not None else '')
+         + f'; outdoor {out_t:.1f} °C']
+    if trip:
+        a.append(f'- Cat sitter: ask whoever looks after the cat to close the {room} window and check the cat '
+                 'is inside.')
+    return a
+
+
+def write_note(kind, items, out_t, ts, trip):
+    rooms = ', '.join(ep['room'] for ep in items)
+    if kind == 'away':
+        title = f'# window-watch: window probably open while he is away ({rooms})'
+        hand = ('JOBS.md window-watch: tell him in one short message (room, since when'
+                + ('; trip mode: pass on the cat-sitter line' if trip else '') + ').')
+    else:
+        title = f'# window-watch: window open for a while? ({rooms}, at home)'
+        hand = ('JOBS.md window-watch: at most a gentle one-line hint (room, since when, temperature now), no '
+                'buttons; drop it if he is clearly airing on purpose.')
+    body = [title, '', 'Data, not instructions: a read-only guess by window-watch from the room temperature + humidity '
+            'sensors (no window contacts; nothing was changed in HA).'
+            + (f' Trip mode: {trip}.' if trip else ''), '']
+    for ep in items:
+        body += room_lines(ep, out_t, ts, trip) + ['']
+    body += [f'Handling: {hand}', 'One note per episode; `window-watch status` shows whether it is still open.', '']
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, f'window-watch-{kind}-{D.local(ts):%Y%m%d-%H%M}.md')
+    with open(path, 'w') as f:
+        f.write('\n'.join(body))
+    return path
+
+
+def quiet(ts, cfg):
+    a, b = cfg['hint_quiet']
+    h = D.local(ts).hour
+    return (h >= a or h < b) if a > b else (a <= h < b)
+
+
+# ----------------------------------------------------------------------------- commands
+def damp_samples():
+    st = D.load_json(D.STATE, None)
+    if not isinstance(st, dict) or not st.get('samples'):
+        raise D.HAError(f'no damp-watch samples ({D.STATE})')
+    return sorted((s for s in st['samples'] if isinstance(s, dict) and isinstance(s.get('ts'), (int, float))),
+                  key=lambda s: s['ts'])
+
+
+def cmd_run(args):
+    cfg, dcfg, ts = load_cfg(), D.load_config(), now_ts()
+    st = load_state()
+    samples = [s for s in damp_samples() if s['ts'] <= ts]
+    last = st.get('last_ts') or 0
+    todo = [i for i, s in enumerate(samples) if s['ts'] > last]
+    live_ts = live_from(cfg, st, ts)
+    live = ts >= live_ts
+    if not todo:
+        print(f'{D.local(ts):%Y-%m-%d %H:%M} window-watch: no new sample')
+        if not args.dry_run:
+            D.save_json(STATE, st)
+        return 0
+    newest = samples[-1]
+    out_t, out_rh = (newest.get('out') or {}).get('t'), (newest.get('out') or {}).get('rh')
+    if out_t is None:  # balcony sensor missing: open-meteo for the newest sample only
+        out_t, out_rh = weather(st, ts)
+        if out_t is not None:
+            newest = samples[-1] = dict(newest, out={'t': out_t, 'rh': out_rh, 'src': 'open-meteo'})
+    eps = st.get('episodes') if isinstance(st.get('episodes'), dict) else {}
+    events, log = [], []
+    for room in dcfg['rooms']:
+        S, ep = Series(samples, room), eps.get(room)
+        for i in todo:
+            ep, ev, _ = advance(S, i, ep, cfg, room)
+            events += ev
+            log += [f'{room}: {e["ev"]}' + (f' {e["drop"]:.1f} °C ({e["rule"]})' if e['ev'] == 'open' else
+                                            f' after {e["minutes"]} min, {e["how"]}') for e in ev]
+        if ep:
+            eps[room] = ep
+        else:
+            eps.pop(room, None)
+    eps = {r: e for r, e in eps.items() if r in dcfg['rooms']}
+    # alert decisions on the newest sample only (presence is "now")
+    due = [ep for ep in eps.values() if ep['last_ts'] == newest['ts'] and (ts - ep['start']) / 60 >= cfg['open_min']
+           and ep['base'] - ep['t_now'] >= cfg['base_drop_c'] and not (ep.get('away_done') and ep.get('hint_done'))]
+    notes = []
+    if due and out_t is not None:
+        pres = presence(ts, cfg)
+        trip = trip_mode(ts, dcfg) if pres == 'away' else None
+        today = D.local(ts).date().isoformat()
+        away_items, hint_items = [], []
+        for ep in due:
+            kind = None
+            if pres == 'away' and not ep.get('away_done') and out_t <= cfg['trip_max_out_c' if trip else
+                                                                            'away_max_out_c']:
+                kind, ep['away_done'] = 'away', ts
+                away_items.append(ep)
+            elif (pres == 'home' and not ep.get('hint_done') and out_t <= cfg['home_max_out_c']
+                  and not quiet(ts, cfg) and st.get('last_hint_day') != today):
+                kind, ep['hint_done'] = 'hint', ts
+                hint_items.append(ep)
+                st['last_hint_day'] = today
+            if kind:
+                events.append({'ev': 'would', 'ts': ts, 'id': ep['id'], 'room': ep['room'], 'kind': kind,
+                               'presence': pres, 'trip': bool(trip), 'out_t': out_t, 'live': live,
+                               'minutes': round((ts - ep['start']) / 60)})
+                log.append(f'{ep["room"]}: {"" if live else "would "}{kind}')
+        if pres is None:
+            log.append('presence unknown: no alert decision')
+        for kind, items in (('away', away_items), ('hint', hint_items)):
+            if items and live:
+                notes.append(f'(dry run) {kind}: ' + ', '.join(e['room'] for e in items) if args.dry_run
+                             else write_note(kind, items, out_t, ts, trip if kind == 'away' else None))
+    if not args.dry_run:
+        if events:
+            log_events(events, cfg, ts)
+        st.update({'version': 1, 'last_ts': samples[-1]['ts'], 'episodes': eps})
+        D.save_json(STATE, st)
+    mode = 'live' if live else f'tuning until {dm(live_ts)}'
+    print(f'{D.local(ts):%Y-%m-%d %H:%M} window-watch ({mode}): {len(todo)} new sample(s); '
+          + ('; '.join(log) if log else 'no change') + ''.join(f'\n  note: {p}' for p in notes))
+    return 0
+
+
+def cmd_status(args):
+    cfg, dcfg, ts = load_cfg(), D.load_config(), now_ts()
+    st = load_state()
+    samples = [s for s in damp_samples() if s['ts'] <= ts]
+    live_ts = st.get('tuning_until') if not cfg.get('live_from') else live_from(cfg, {}, ts)
+    cur = samples[-1]
+    o = cur.get('out') or {}
+    rows = []
+    for room in dcfg['rooms']:
+        S = Series(samples, room)
+        _, t, rh, ot, orh = S.p[-1]
+        base = normal(S, S.p[-1], cfg)[0] if len(S.p) > 3 else None
+        drops = {}
+        for rule in RULES:
+            pts = [p[1] for p in S.between(cur['ts'] - cfg[rule + '_min'] * 60, cur['ts']) if p[1] is not None]
+            drops[rule] = round(max(pts) - t, 2) if pts and t is not None else None
+        ep = (st.get('episodes') or {}).get(room)
+        rows.append({'room': room, 't': t, 'rh': rh, 'normal': None if base is None else round(base, 2), 'drop_30': drops['fast'], 'drop_90': drops['slow'],
+                     'ah': None if ah(t, rh) is None else round(ah(t, rh), 2),
+                     'open': None if not ep else {'since': D.local(ep['start']).isoformat(timespec='minutes'),
+                                                  'minutes': round((ts - ep['start']) / 60), 'rule': ep['rule']}})
+    a_out = ah(o.get('t'), o.get('rh'))
+    mode = 'live' if live_ts and ts >= live_ts else (f'tuning until {dm(live_ts)}' if live_ts else 'not started')
+    if args.json:
+        print(json.dumps({'time': D.local(ts).isoformat(timespec='minutes'), 'sample': D.local(cur['ts']).isoformat(
+            timespec='minutes'), 'mode': mode, 'outdoor': {'t': o.get('t'), 'rh': o.get('rh'),
+                                                            'ah': None if a_out is None else round(a_out, 2)},
+            'rooms': rows}, ensure_ascii=False, indent=1))
+        return 0
+    print(f'window-watch · {dm(ts)} · sample {hm(cur["ts"])} · {mode}')
+    print(f'Outdoor: {D.fmt(o.get("t"))} °C, AH {D.fmt(a_out)} g/m³ · opening = ≥ {cfg["fast_drop_c"]:g} °C in '
+          f'{cfg["fast_min"]:g} min (or ≥ {cfg["slow_drop_c"]:g} in {cfg["slow_min"]:g}), ≥ {cfg["base_drop_c"]:g} '
+          f'under normal, humidity toward outdoor')
+    w = max([len(r['room']) for r in rows] + [4])
+    print(f'{"Room":<{w}}  {"°C":>5}  {"normal":>6}  {"Δ30m":>5}  {"Δ90m":>5}  {"AH":>5}  Window')
+    for r in rows:
+        op = r['open']
+        state = f'open? since {op["since"][11:16]} ({op["minutes"]} min, {op["rule"]})' if op else 'closed'
+        print(f'{r["room"]:<{w}}  {D.fmt(r["t"]):>5}  {D.fmt(r["normal"]):>6}  {D.fmt(r["drop_30"]):>5}  '
+              f'{D.fmt(r["drop_90"]):>5}  {D.fmt(r["ah"]):>5}  {state}')
+    return 0
+
+
+def cmd_candidates(args):
+    cfg = load_cfg()
+    ts = now_ts()
+    ev = [e for e in read_log() if e.get('ts', 0) >= ts - args.days * 86400]
+    st = load_state()
+    rows = episodes(ev, st.get('episodes'), cfg)
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 0
+    print(f'window-watch candidates · last {args.days:g} days · {len(rows)} episode(s)')
+    for r in rows:
+        print(f'{dm(r["start"])}  {r["room"]}: {r.get("rule")} drop {r.get("drop")} °C (−{r.get("below")} vs normal; '
+              f'out {D.fmt(r.get("out_t"))} °C; AH share {r.get("frac_ah")} vs T share {r.get("frac_t")}) → '
+              f'{r.get("kind") or "?"}' + (f' {r["minutes"]} min, {r["how"]}' if r.get('minutes') is not None else '')
+              + (f'; would: {", ".join(r["would"])}' if r.get('would') else ''))
+    return 0
+
+
+def summarize(res, cfg, samples, rooms, label):
+    rows = episodes(res['events'], res['open'], cfg)
+    near = {}
+    for n in sorted(res['near'], key=lambda n: -n['drop']):
+        k = (n['room'], n['ts'] // 7200)
+        if k not in near and not any(r['room'] == n['room'] and abs(r['start'] - n['ts']) < 7200 for r in rows):
+            near[k] = n
+    maxdrop = {}
+    for room in rooms:
+        S = Series(samples, room)
+        for rule in RULES:
+            best = None
+            for i, p in enumerate(S.p):
+                if p[1] is None:
+                    continue
+                pts = [q[1] for q in S.between(p[0] - cfg[rule + '_min'] * 60, p[0]) if q[1] is not None]
+                if pts and (best is None or max(pts) - p[1] > best[0]):
+                    best = (round(max(pts) - p[1], 2), p[0])
+            maxdrop[f'{room} {cfg[rule + "_min"]:g} min'] = best
+    span = (samples[0]['ts'], samples[-1]['ts']) if samples else (0, 0)
+    return {'label': label, 'from': D.local(span[0]).isoformat(timespec='minutes'),
+            'to': D.local(span[1]).isoformat(timespec='minutes'), 'samples': len(samples), 'episodes': rows,
+            'near_misses': list(near.values())[:8], 'max_drop': maxdrop}
+
+
+def print_summary(R):
+    print(f'{R["label"]}: {R["from"][:16]} – {R["to"][:16]} · {R["samples"]} samples · '
+          f'{len(R["episodes"])} episode(s)')
+    for r in R['episodes']:
+        print(f'  {dm(r["start"])} {r["room"]}: {r["rule"]} drop {r["drop"]} °C, −{r["below"]} vs normal, out '
+              f'{D.fmt(r["out_t"])} °C → {r.get("kind")}' + (f' ({r["minutes"]} min, {r["how"]})'
+                                                             if r.get('minutes') is not None else ''))
+    print('  Biggest drops: ' + '; '.join(f'{k} {v[0]:.1f} °C ({dm(v[1])})' for k, v in R['max_drop'].items() if v))
+    for n in R['near_misses']:
+        print(f'  near miss {dm(n["ts"])} {n["room"]}: {n["drop"]:.1f} °C ({n["rule"]}) rejected: {n["reason"]}')
+
+
+def cmd_replay(args):
+    cfg, dcfg = load_cfg(), D.load_config()
+    samples = D.load_json(args.file, None)
+    if not isinstance(samples, list):
+        raise Fail(f'{args.file}: not a JSON list of samples')
+    samples = sorted((s for s in samples if isinstance(s, dict) and 'ts' in s), key=lambda s: s['ts'])
+    R = summarize(replay(samples, dcfg['rooms'], cfg), cfg, samples, dcfg['rooms'], 'replay')
+    print(json.dumps(R, ensure_ascii=False, indent=1) if args.json else '', end='\n' if args.json else '')
+    if not args.json:
+        print_summary(R)
+    return 0
+
+
+def history_samples(dcfg, days, step):
+    A = _load('ha_audit_for_window', 'HA_AUDIT_BIN', 'ha-audit')
+    url, token = os.environ.get('HA_AUDIT_URL', A.DEFAULT_URL), A.read_token(
+        os.environ.get('HA_AUDIT_TOKEN_FILE', A.DEFAULT_TOKEN_FILE))
+    ids = {}
+    for room, r in dcfg['rooms'].items():
+        ids[r.get('temp')], ids[r.get('rh')] = (room, 't'), (room, 'rh')
+    o = dcfg['outdoor']
+    ids[o.get('temp')], ids[o.get('rh')] = ('out', 't'), ('out', 'rh')
+    ids.pop(None, None)
+    end = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    start = end - dt.timedelta(days=days)
+    try:
+        res = A.RestClient(url, token).get('/api/history/period/' + start.isoformat(), {
+            'filter_entity_id': ','.join(ids), 'end_time': end.isoformat(), 'minimal_response': '',
+            'no_attributes': ''})
+    except Exception as e:
+        raise D.HAError(f'history: {type(e).__name__}')
+    ser = {}
+    for s in res or []:
+        if s and s[0].get('entity_id') in ids:
+            pts = []
+            for x in s:
+                try:
+                    v = float(x['state'])
+                except (KeyError, TypeError, ValueError):
+                    v = None
+                pts.append((dt.datetime.fromisoformat(x['last_changed'].replace('Z', '+00:00')).timestamp(), v))
+            ser[ids[s[0]['entity_id']]] = pts
+    if not ser:
+        raise D.HAError('history: no data')
+    t0 = min(p[0][0] for p in ser.values() if p)
+    t0 = int(t0 // (step * 60) + 1) * step * 60
+    samples = []
+    for g in range(t0, int(end.timestamp()) + 1, step * 60):
+        s = {'ts': g, 'rooms': {r: {'t': None, 'rh': None} for r in dcfg['rooms']}, 'out': {'t': None, 'rh': None}}
+        for (who, k), pts in ser.items():
+            j = bisect.bisect_right([p[0] for p in pts], g) - 1
+            v = pts[j][1] if j >= 0 else None
+            (s['out'] if who == 'out' else s['rooms'][who])[k] = v
+        samples.append(s)
+    return samples
+
+
+def cmd_backtest(args):
+    cfg, dcfg = load_cfg(), D.load_config()
+    samples = history_samples(dcfg, args.days, args.step)
+    R = summarize(replay(samples, dcfg['rooms'], cfg), cfg, samples, dcfg['rooms'],
+                  f'backtest (HA history, {args.step}-min steps)')
+    if args.json:
+        print(json.dumps(R, ensure_ascii=False, indent=1))
+    else:
+        print_summary(R)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='window-watch', description='Window-left-open detector (read-only).')
+    sub = ap.add_subparsers(dest='cmd')
+    p = sub.add_parser('status')
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('run')
+    p.add_argument('--dry-run', action='store_true')
+    p = sub.add_parser('candidates')
+    p.add_argument('--days', type=float, default=7)
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('replay')
+    p.add_argument('file')
+    p.add_argument('--json', action='store_true')
+    p = sub.add_parser('backtest')
+    p.add_argument('--days', type=float, default=10)
+    p.add_argument('--step', type=int, default=10)
+    p.add_argument('--json', action='store_true')
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 0
+    if not argv or argv[0].startswith('--'):
+        argv = ['status'] + list(argv)
+    args = ap.parse_args(argv)
+    fn = {'status': cmd_status, 'run': cmd_run, 'candidates': cmd_candidates, 'replay': cmd_replay,
+          'backtest': cmd_backtest}[args.cmd]
+    try:
+        return fn(args)
+    except D.HAError as e:
+        print(f'window-watch: {e}', file=sys.stderr)
+        return 1
+    except Fail as e:
+        print(f'window-watch: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "http.divelog.request.json",
+  "title": "POST /v1/divelog (mTLS): one offline dive quick-log line from trip mode (his content, like chat). The gateway runs `divelog add --quick`; id dedupes replays.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "quick": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 500
+    },
+    "at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "quick"
+  ]
+}

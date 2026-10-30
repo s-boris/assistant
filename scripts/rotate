@@ -1,0 +1,33 @@
+#!/usr/local/bin/python3.13 -I
+"""rotate: the brain's nightly session rotation: quiet-slot checks, the hand-off from durable
+state, the promise ledger and the fresh-start flag; `rotate --help`. Source: ~/opt/assistant (packages/rotation).
+
+Finds its libraries next to itself: deployed, ~/bin/lib/{core,rotation}; in the repo, ../core and ../packages/rotation.
+$ASSISTANT_LIB (a directory holding core/ and rotation/) overrides both. Stdlib only.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [
+    os.environ.get("ASSISTANT_LIB", ""),
+    os.path.join(_here, "lib"),
+    os.path.join(_here, ".."),
+    os.path.join(_here, "..", "packages"),
+]
+for _pkg in ("core", "rotation"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+if __name__ == "__main__":
+    from rotation import cli
+
+    try:
+        sys.exit(cli.main())
+    except BrokenPipeError:  # a reader that quit early (| head)
+        sys.exit(0)

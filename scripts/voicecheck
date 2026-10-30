@@ -1,0 +1,445 @@
+#!/usr/bin/env -S python3 -I
+"""voicecheck [run [--no-tg] [--dry-run] [--if-pending] [--json]] | status [--json] | help
+Token-free daily health check of the voice stack. Places no call and sends no audio. The relay runs in
+claude-hub-voice, the phone gateway in claude-hub-phone.
+  relay     `hub voice status` (hub unreachable, hold set, voiceloader not running or silent > 2 min = relay-down) +
+            `voice-relay status` (voice-hub -> the hub gateway's voice.status: the hub relay's own bridge state;
+            not "on" = bridge-off, a real fault). No call-account session check (the bridge state is the verdict).
+  gemini    the key and the model setting live in claude-hub-voice (this container keeps no key file), so the
+            verdict comes from voice.status (read-only, no call): the newest finished call failed at the provider
+            start ("provider failed: ...") while call_failures > 0 = crit gemini-hub-key ("no Gemini API key": the
+            hub's key file is missing or empty) or gemini-hub-start (billing, invalid key, refused model); any other
+            end = Gemini started (closes them); no finished call, or call_failures 0 after a failed one (the relay
+            restarted since) = no verdict. stats_7d.model_fallbacks > 0 = warn gemini-hub-fallback. The hub relay
+            also writes its own voicerelay-call-failed notes (voice.alert).
+  calls     call quality over 7 days from the same voice.status (stats_7d: the hub relay's own numbers, counts only;
+            no call, no words): an outgoing ring that failed (the call client errored; his unanswered rings are no
+            fault) = warn call-ring-failed; his audio never reached the voice model (>= 2 s in, nothing sent) = warn
+            call-audio-lost; the model dropped and did not come back (reconnect or mute-resume reopen failed) = warn
+            call-model-drop. Info: 7-day calls, outgoing answered / not answered, the newest call's outcome
+            (`voice-relay calls` shows each call, metadata only).
+  phone     `hub phone status --json` first (hub unreachable, hold set, phoneloader not running or silent > 2 min =
+            phonegw-down, with its reason), then `phone status` (the CLI asks claude-hub-phone). Warn.
+  fastlane  `voice-relay fastlane --json`: every quick tool answers (only names, ms and error texts are kept); the
+            fast lane runs here (the hub relay's quick tools run the same CLIs in this container through
+            voice.lookup).
+Levels: crit = calls fail right now (relay down, bridge not up, Gemini key missing or start refused); warn = the
+rest.
+Notify only on problems: ONE ~/inbox/voicecheck-<id>-<stamp>.md per new problem (state: open problems; a problem
+whose check did not run stays open, its title/detail/fix follow the latest run; one that passes again is closed
+silently). New crit problems also get ONE `tg`
+text, outside quiet hours (0-8 in the owner's zone) and not on a sleep-in morning (`sleepin active`); held ones are
+sent by a later run (`run --if-pending` = a file-only exit unless a text is held) if still open. --no-tg never texts
+(held texts stay held); --dry-run writes no note, no state and sends nothing.
+status  prints the last run and the open problems (no checks).
+Exit: run 0 = all ok, 3 = a problem (noted; cron-fail --ok 3), 1 = voicecheck itself crashed; status 0; 2 usage.
+Seams (tests): VOICECHECK_RELAY (voice-relay), VOICECHECK_PHONE (phone), VOICECHECK_TG (tg), VOICECHECK_SLEEPIN
+(sleepin), VOICECHECK_STATE (~/.local/state/voicecheck), VOICECHECK_INBOX (~/inbox), VOICECHECK_NOW (epoch),
+VOICECHECK_QUIET ("0-8"), VOICECHECK_TZ, VOICECHECK_HUB (hub).
+Tests: ~/opt/assistant/tests/legacy/voicecheck/run.sh (VOICECHECK_BIN=/copy tests a copy)
+"""
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+H = os.path.expanduser("~")
+E = os.environ.get
+RELAY = E("VOICECHECK_RELAY", "voice-relay")
+PHONE = E("VOICECHECK_PHONE", "phone")
+TG = E("VOICECHECK_TG", "tg")
+SLEEPIN = E("VOICECHECK_SLEEPIN", "sleepin")
+STATE_DIR = E("VOICECHECK_STATE", os.path.join(H, ".local/state/voicecheck"))
+INBOX = E("VOICECHECK_INBOX", os.path.join(H, "inbox"))
+QUIET = E("VOICECHECK_QUIET", "0-8")
+HUB = E("VOICECHECK_HUB", "hub")
+LOADER_STALE_S = 120
+
+
+def now():
+    return float(E("VOICECHECK_NOW") or time.time())
+
+
+def zone():
+    if E("VOICECHECK_TZ"):
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(E("VOICECHECK_TZ"))
+    try:
+        sys.path.insert(0, os.path.join(H, "bin/lib"))
+        import assistant_profile
+        return assistant_profile.tz()
+    except Exception:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("UTC")
+
+
+def local(ts=None):
+    return datetime.datetime.fromtimestamp(now() if ts is None else ts, zone())
+
+
+def quiet_now():
+    m = re.fullmatch(r"\s*(\d{1,2})-(\d{1,2})\s*", QUIET or "")
+    if not m:
+        return False
+    h, a, b = local().hour, int(m.group(1)), int(m.group(2))
+    return a <= h < b if a <= b else (h >= a or h < b)
+
+
+def sh(argv, timeout=60):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except OSError as e:
+        return 127, "", type(e).__name__
+
+
+def jload(text):
+    try:
+        return json.loads((text or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def short(text, n=140):
+    return " ".join(str(text or "").split())[:n]
+
+
+def problem(pid, level, check, title, fix, detail="", owner=""):
+    """owner = the plain line for his Telegram text (crit only); fix = what the main session does."""
+    return {"id": pid, "level": level, "check": check, "title": title, "fix": fix, "detail": short(detail),
+            "owner": owner or "I'm on it."}
+
+
+# --- checks: each returns (ran, problems, info) ---------------------------------------------------------------
+
+HUB_FIX = ("hub voice status; held = released only with hub voice start once its reason is cleared; else the "
+           "voiceloader (backoff, bad releases), docker logs claude-hub-voice (read-only)")
+PHONE_HUB_FIX = ("hub phone status; held = released only with hub phone start once its reason is cleared; else the "
+                 "phoneloader (backoff, bad releases), docker logs claude-hub-phone (read-only)")
+
+
+def hub_part(part, what):
+    """`hub <part> status --json` (voice | phone): None while its loader runs and reported within 2 min, else
+    (title, detail, state) with state down | held."""
+    rc, out, err = sh([HUB, part, "status", "--json"], 20)
+    hv = jload(out) if rc == 0 else None
+    ld = hv.get("loader") if isinstance(hv, dict) and isinstance(hv.get("loader"), dict) else {}
+    age = ld.get("age_s") if isinstance(ld.get("age_s"), (int, float)) else None
+    if not isinstance(hv, dict):
+        return "the hub does not answer (the %s runs there)" % what, err or out or "exit %s" % rc, "down"
+    if hv.get("held"):
+        return "the %s in the hub is held (%s)" % (what, short(hv.get("why") or "no reason", 60)), hv.get("why"), "held"
+    if ld.get("state") != "running" or age is None or age > LOADER_STALE_S:
+        seen = ld.get("state") or "%sloader not seen" % part
+        seen += (": %s" % short(ld["why"], 50)) if ld.get("why") and ld.get("state") != "running" else ""
+        return ("the %s in the hub is not running (%s%s)" % (
+            what, short(seen, 90), "" if age is None or age <= LOADER_STALE_S else ", last report %d min ago" % (
+                age // 60)), seen, "down")
+    return None
+
+
+def check_relay():
+    extra = {"mode": "hub"}
+    why = hub_part("voice", "voice relay")
+    if why:
+        return True, [problem("relay-down", "crit", "relay", why[0], HUB_FIX, why[1])], dict(extra, relay=why[2])
+    rc, out, err = sh([RELAY, "status"], 20)
+    st = jload(out) if rc == 0 else None
+    if not isinstance(st, dict):
+        return True, [problem("relay-down", "crit", "relay", "the voice relay does not answer through the hub gateway",
+                              HUB_FIX, err or "exit %s" % rc)], dict(extra, relay="down")
+    b = st.get("tg_calls") or "off"
+    info = dict(extra, relay="up", bridge=b, live=st.get("live", 0), call_failures=st.get("call_failures", 0))
+    info["_status"] = st   # voice.status's call digest + 7-day numbers: the Gemini verdict (run() pops it before saving)
+    if b != "on":
+        return True, [problem("bridge-off", "crit", "relay", "the Telegram call bridge is not up (%s)" % short(b, 60),
+                              "voice-relay status (tg_calls), docker logs claude-hub-voice (read-only); this is the "
+                              "hub relay's own bridge state (\"no session file\" = the call account's session is "
+                              "missing in its session dir, HUB_ROOT/secrets/voice); a relay restart = hub voice stop, "
+                              "then hub voice start, only while live is 0", b)], info
+    return True, [], info
+
+
+HUB_KEY_FIX = ("the key lives only in claude-hub-voice (secret voice_gemini_key, HUB_ROOT/secrets/voice_gemini_key; "
+               "this container has none): docker logs claude-hub-voice (read-only) and the hub "
+               "relay's voicerelay-call-failed note confirm it; a new key from AI Studio goes onto the server by his "
+               "console step, then hub voice stop + start while live is 0")
+HUB_START_FIX = ("voice-relay status (calls[].end.reason, call_failures); the hub relay's voicerelay-call-failed note and "
+                 "docker logs claude-hub-voice (read-only) name the cause: close 1011 / billing = he tops up AI Studio "
+                 "> Billing; key invalid = a new key (his console step); model refused = VOICE_GEMINI_MODEL in the "
+                 "hub relay's env (his paste); restart only while live is 0")
+HUB_MODEL_FIX = ("the configured Live model was refused and the relay fell back (Gemini deprecations page): set "
+                 "VOICE_GEMINI_MODEL in the hub relay's env to a current Live model (his paste), "
+                 "restart only while live is 0; voice-relay status (stats_7d.model_fallbacks)")
+
+
+def check_gemini_hub(st):
+    """The key and the model setting live in claude-hub-voice and this container has no key, so the verdict comes
+    from voice.status: the newest finished call in its call digest (the provider starts before the
+    call rings or is accepted, so any end other than "provider failed" means Gemini started) and call_failures
+    (provider failures since the relay started). Newest call failed at the provider start while call_failures > 0 =
+    calls fail now: crit (a "no Gemini API key" reason = the hub's key file is missing or empty). call_failures 0 =
+    the relay restarted since (a fix): no verdict until the next call. stats_7d.model_fallbacks > 0 = warn.
+    Returns (ran_start, ran_model, problems, info)."""
+    if not isinstance(st, dict):
+        return False, False, [], {"gemini_hub": "no verdict (voice.status did not answer)"}
+    probs, info = [], {}
+    fb = (st.get("stats_7d") or {}).get("model_fallbacks") if isinstance(st.get("stats_7d"), dict) else None
+    ran_model = isinstance(fb, int)
+    if ran_model and fb > 0:
+        probs.append(problem("gemini-hub-fallback", "warn", "gemini-hub-model",
+                             "the configured Gemini model was refused on %d call(s) in 7 days (the hub relay fell "
+                             "back to the next model)" % fb, HUB_MODEL_FIX, "stats_7d.model_fallbacks %d" % fb))
+    calls = [c for c in (st.get("calls") or []) if isinstance(c, dict) and isinstance(c.get("end"), dict)]
+    last = max(calls, key=lambda c: c.get("start") or 0, default=None)
+    if last is None:
+        return False, ran_model, probs, dict(info, gemini_hub="no verdict (no finished call in the hub's log)")
+    when = local(last["start"]).strftime("%Y-%m-%d %H:%M") if isinstance(last.get("start"), (int, float)) else "?"
+    reason = str(last["end"].get("reason") or "")
+    fails = st.get("call_failures") if isinstance(st.get("call_failures"), int) else 0
+    if not reason.startswith("provider failed"):
+        return True, ran_model, probs, dict(info, gemini_hub="last call %s started ok" % when)
+    if fails <= 0:
+        return False, ran_model, probs, dict(info, gemini_hub="no verdict (last call %s failed at the start; the "
+                                                              "relay restarted since)" % when)
+    detail = "last call %s (%s): %s; provider failures since the relay started: %d" % (
+        when, last.get("kind") or "?", short(reason, 60), fails)
+    if "api key" in reason.lower():
+        probs.append(problem("gemini-hub-key", "crit", "gemini-hub", "the Gemini API key is missing in the hub "
+                             "(the last call could not start)", HUB_KEY_FIX, detail,
+                             owner="The Gemini key on the server is missing; it needs a new key from AI Studio."))
+        return True, ran_model, probs, dict(info, gemini_hub="key missing (last call %s)" % when)
+    probs.append(problem("gemini-hub-start", "crit", "gemini-hub", "Gemini did not start on the last call (%s)"
+                         % short(reason[len("provider failed"):].lstrip(": "), 50), HUB_START_FIX, detail,
+                         owner="The voice service (Gemini) refuses to start calls."))
+    return True, ran_model, probs, dict(info, gemini_hub="start failed (last call %s)" % when)
+
+
+CALLS_FIX = ("voice-relay calls --last 10 (the hub relay's call log, metadata only: which call, its ring outcome and "
+             "end) and voice-relay stats --days 7; docker logs claude-hub-voice (read-only) around that call's time")
+
+
+def check_calls(st):
+    """Call quality over 7 days from voice.status's stats_7d (calllog.week in claude-hub-voice: counts only). Warn on
+    real faults only: a ring that failed (ring.failed), his audio not reaching the model (not_sent), a model drop
+    that did not come back (reconnect_failed + resume_fallback_failed). Returns (ran, problems, info)."""
+    w = st.get("stats_7d") if isinstance(st, dict) else None
+    if not isinstance(w, dict):
+        return False, [], {"calls": "no numbers (voice.status had no stats_7d)"}
+    n = lambda k: w[k] if isinstance(w.get(k), int) and not isinstance(w.get(k), bool) else 0  # noqa: E731
+    ring = w.get("ring") if isinstance(w.get("ring"), dict) else {}
+    rf = ring.get("failed") if isinstance(ring.get("failed"), int) else 0
+    probs = []
+    if rf > 0:
+        probs.append(problem("call-ring-failed", "warn", "calls", "%d call(s) to him could not ring in 7 days (the "
+                             "call client failed; not a missed call)" % rf, CALLS_FIX, "stats_7d.ring.failed %d" % rf))
+    if n("not_sent") > 0:
+        probs.append(problem("call-audio-lost", "warn", "calls", "his audio did not reach the voice model on %d "
+                             "call(s) in 7 days" % n("not_sent"), CALLS_FIX, "stats_7d.not_sent %d" % n("not_sent")))
+    drops = n("reconnect_failed") + n("resume_fallback_failed")
+    if drops > 0:
+        probs.append(problem("call-model-drop", "warn", "calls", "the voice model dropped and did not come back on %d "
+                             "call(s) in 7 days" % drops, CALLS_FIX,
+                             "stats_7d.reconnect_failed %d, resume_fallback_failed %d" % (
+                                 n("reconnect_failed"), n("resume_fallback_failed"))))
+    line = "%d in 7 days" % n("calls")
+    if "out_calls" in w:
+        line += ", outgoing %d: answered %d, not answered %d" % (n("out_calls"), n("out_answered"),
+                                                                  n("out_not_answered"))
+    calls = [c for c in (st.get("calls") or []) if isinstance(c, dict)]
+    last = max(calls, key=lambda c: c.get("start") or 0, default=None)
+    if last is not None and isinstance(last.get("start"), (int, float)):
+        oc = last.get("outcome") or (last.get("end") or {}).get("reason") or "no end yet"
+        line += "; newest %s %s (%s)" % (local(last["start"]).strftime("%d.%m %H:%M"), last.get("kind") or "?",
+                                         short(oc, 40))
+    return True, probs, {"calls": line}
+
+
+def check_phone():
+    why = hub_part("phone", "phone gateway")   # the gateway runs in claude-hub-phone; its loader first
+    if why:
+        return True, [problem("phonegw-down", "warn", "phone", why[0], PHONE_HUB_FIX, why[1])], {
+            "phone": "%s (hub)" % why[2]}
+    rc, out, err = sh([PHONE, "status"], 30)
+    if rc == 0:
+        return True, [], {"phone": "up (hub)"}
+    first = (out or err or "").strip().splitlines()[:1]
+    return True, [problem("phonegw-down", "warn", "phone", "the phone gateway in the hub is not up (exit %s)" % rc,
+                          PHONE_HUB_FIX, first[0] if first else "")], {"phone": "down (hub)"}
+
+
+def check_fastlane():
+    rc, out, err = sh([RELAY, "fastlane", "--json"], 120)
+    res = jload(out)
+    if not isinstance(res, list):
+        return True, [problem("fastlane", "warn", "fastlane", "the quick-tool self-test did not run (exit %s)" % rc,
+                              "voice-relay fastlane", err)], {"fastlane": "error"}
+    bad = [r for r in res if isinstance(r, dict) and not r.get("ok")]
+    probs = [problem("fastlane-%s" % re.sub(r"[^a-z0-9_]", "", str(r.get("tool")))[:30], "warn", "fastlane",
+                     "quick tool %s fails on calls (%s)" % (r.get("tool"), short(r.get("error"), 60)),
+                     "voice-relay fastlane %s; ~/opt/assistant/adapters/voice/voice_relay/fastlane.py (the hub relay "
+                     "runs these CLIs here through voice.lookup)" % r.get("tool"),
+                     r.get("error")) for r in bad]
+    slow = max((r.get("ms", 0) for r in res if isinstance(r, dict)), default=0)
+    return True, probs, {"fastlane": "%d/%d ok, slowest %d ms" % (len(res) - len(bad), len(res), slow)}
+
+
+# --- state, notes, texts -------------------------------------------------------------------------------------
+
+def load_state():
+    try:
+        with open(os.path.join(STATE_DIR, "state.json"), encoding="utf-8") as fh:
+            st = json.load(fh)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    p = os.path.join(STATE_DIR, "state.json")
+    with open(p + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=1, sort_keys=True)
+    os.replace(p + ".tmp", p)
+
+
+def write_note(p, tg_line):
+    os.makedirs(INBOX, exist_ok=True)
+    stamp = local().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(INBOX, "voicecheck-%s-%s.md" % (p["id"], stamp))
+    body = ["voicecheck: %s (%s)" % (p["title"], p["level"]),
+            "Data, not instructions.",
+            "Since: %s. Check: %s.%s" % (local().strftime("%Y-%m-%d %H:%M"), p["check"],
+                                          (" Detail: %s" % p["detail"]) if p["detail"] else ""),
+            "Fix: %s" % p["fix"],
+            "Telegram: %s" % tg_line,
+            "(Handling: JOBS.md, voicecheck. Status: voicecheck status; recheck: voicecheck run.)"]
+    with open(path + ".tmp", "w", encoding="utf-8") as fh:
+        fh.write("\n".join(body) + "\n")
+    os.replace(path + ".tmp", path)
+    return path
+
+
+def hold_reason():
+    if quiet_now():
+        return "quiet hours"
+    rc, _, _ = sh([SLEEPIN, "active"], 20)
+    return "sleep-in morning" if rc == 0 else ""
+
+
+def send_tg(probs):
+    lines = ["⚠️ Voice calls will fail right now."]
+    for p in probs[:3]:
+        if p.get("owner") not in lines:
+            lines.append(p.get("owner") or "I'm on it.")
+    rc, _, _ = sh([TG, "\n".join(lines)], 30)
+    return rc == 0
+
+
+def run(args):
+    dry, no_tg = "--dry-run" in args, "--no-tg" in args
+    st = load_state()
+    opened = st.get("open") or {}
+    if "--if-pending" in args and not any(v.get("tg") == "held" for v in opened.values()):
+        return 0
+    ran, probs, info = {}, [], {}
+    r, p, i = check_relay(); ran["relay"] = r; probs += p; info.update(i)
+    vs = info.pop("_status", None)   # voice.status: the Gemini verdict and the call numbers (one read)
+    ran["gemini-hub"], ran["gemini-hub-model"], p, i = check_gemini_hub(vs)
+    probs += p
+    info.update(i)
+    r, p, i = check_calls(vs); ran["calls"] = r; probs += p; info.update(i)
+    r, p, i = check_phone(); ran["phone"] = r; probs += p; info.update(i)
+    r, p, i = check_fastlane(); ran["fastlane"] = r; probs += p; info.update(i)
+
+    now_ids = {p["id"] for p in probs}
+    closed = [k for k, v in opened.items() if k not in now_ids and ran.get(v.get("check"), False)]
+    new = [p for p in probs if p["id"] not in opened]
+    new_ids = {p["id"] for p in new}
+    hold ="" if no_tg or dry else hold_reason()
+    crit_new = [p for p in new if p["level"] == "crit"]
+    held = [opened[k] for k in opened if opened[k].get("tg") == "held" and k in now_ids]
+    to_text = crit_new + [h for h in held if h.get("level") == "crit"]
+    tg_state = ""
+    if to_text:
+        if dry:
+            tg_state = "dry run"
+        elif no_tg:
+            tg_state = "held"
+        elif hold:
+            tg_state = "held"
+        else:
+            tg_state = "sent" if send_tg(to_text) else "held"
+    notes = []
+    for p in new:
+        line = ("not needed (%s)" % p["level"]) if p["level"] != "crit" else {
+            "sent": "sent", "held": "held (%s); a later run sends it if still open" % (
+                hold or "--no-tg"), "dry run": "dry run"}.get(tg_state, tg_state)
+        if not dry:
+            notes.append(write_note(p, line))
+        opened[p["id"]] = dict(p, since=now(), tg=(tg_state if p["level"] == "crit" else "n/a"))
+    for p in probs:   # still open: the latest wording (e.g. the hub's view); since/tg stay
+        if p["id"] not in new_ids:
+            opened[p["id"]].update({k: p[k] for k in ("title", "detail", "fix", "owner")})
+    for h in held:
+        if h.get("level") == "crit" and tg_state == "sent":
+            opened[h["id"]]["tg"] = "sent"
+    for k in closed:
+        opened.pop(k, None)
+    summary = {"at": local().strftime("%Y-%m-%d %H:%M"), "ok": not probs, "problems": sorted(now_ids),
+               "new": [p["id"] for p in new], "closed": closed, "tg": tg_state, "info": info}
+    if not dry:
+        st.update(open=opened, last=summary)
+        save_state(st)
+    if "--json" in args:
+        print(json.dumps(dict(summary, notes=notes, details=probs)))
+    else:
+        print("voicecheck %s: %s" % (summary["at"], "all ok" if not probs else "%d problem(s)" % len(probs)))
+        print("  relay %s (hub), bridge %s, phone %s, fastlane %s" % (
+            info.get("relay"), info.get("bridge", "-"), info.get("phone", "-"), info.get("fastlane", "-")))
+        print("  gemini (hub, from voice.status; key and model live in claude-hub-voice): %s; provider failures "
+              "since the relay started: %s" % (info.get("gemini_hub", "-"), info.get("call_failures", "-")))
+        print("  calls (the hub relay's log, metadata only): %s" % info.get("calls", "-"))
+        for p in probs:
+            print("  %s %s%s" % (p["level"].upper(), p["title"], " [new]" if p["id"] in summary["new"] else ""))
+        if closed:
+            print("  closed: %s" % ", ".join(closed))
+        if tg_state:
+            print("  telegram: %s" % tg_state)
+        for n in notes:
+            print("  note: %s" % n)
+    return 3 if probs else 0
+
+
+def status(args):
+    st = load_state()
+    if "--json" in args:
+        print(json.dumps({"last": st.get("last"), "open": st.get("open") or {}}))
+        return 0
+    last = st.get("last") or {}
+    print("last run: %s (%s)" % (last.get("at", "never"), "ok" if last.get("ok") else "problems"))
+    for k, v in sorted((st.get("open") or {}).items()):
+        print("open %s %s: %s (telegram %s)" % (v.get("level"), k, v.get("title"), v.get("tg")))
+    return 0
+
+
+def main(argv):
+    cmd = argv[0] if argv else "run"
+    if cmd == "run":
+        return run(argv[1:])
+    if cmd == "status":
+        return status(argv[1:])
+    if cmd in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    print(__doc__.strip().splitlines()[0], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

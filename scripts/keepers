@@ -1,0 +1,240 @@
+#!/usr/local/bin/python3.13 -I
+"""keepers: the daemons that must stay up even while the hub is down, from ONE cron line.
+
+  keepers ensure [--only a,b] [--now EPOCH]   run every due keeper once (cron: every minute); each keeper's `every`
+                                              (minutes, from the registry) gates it like its old */N line
+  keepers status [--json]                     each keeper: every, off?, last exit, when, failure streak
+  keepers off NAME [--why TEXT] · keepers on NAME   one keeper's own switch (no restart; `ensure` skips it)
+
+The keepers are the registry's entries with keeper = true (core/schedules.toml): tool worker, hub feed tunnel,
+browser, whisper server, llm idle-check, cputemp-log, the event-window fallback (`eventwf fallback`). Each runs its
+argv (no shell) with cron's environment, its own time limit and the old line's redirections (stdout/stderr files,
+else /dev/null; never a pipe: a daemon it starts inherits the files and the run does not wait for it).
+Stderr the old line sent to /dev/null goes to ~/.local/state/keepers/NAME.err (overwritten each run) when the
+keeper has a failure streak (after > 0), as cron-fail kept it; no err in the registry = that file too. A failure
+note names the real file. Keepers run
+in parallel; one ensure at a time (lock; a still-running one makes the next skip). A failure streak (the old
+cron-fail --after/--ok) emits one job.failed event, the next good run job.recovered (core.jobfail); each run of a
+keeper with after > 0 also writes cron-fail's usage run row (core.jobfail.usage_run, spool src keepers). Nothing
+here talks to the hub.
+Switches: ~/.config/assistant/keepers/NAME.off (one keeper), ~/.config/assistant/keepers/all.off (all).
+State/log: ~/.local/state/keepers/ (last.json, keepers.log: one JSON line per run, names + codes only; NAME.err).
+Exit: 0 ok (cron: always 0 for keeper failures; they become events) · 2 usage · 3 registry unreadable.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _r in (os.environ.get("ASSISTANT_LIB", ""), os.path.join(_here, "lib"), os.path.join(_here, "..")):
+    if _r and os.path.isfile(os.path.join(_r, "core", "__init__.py")):
+        sys.path.insert(0, os.path.abspath(_r))
+        break
+
+import argparse  # noqa: E402
+import json  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from core import jobfail, jsonstate, locks, schedules  # noqa: E402
+
+CRON_PATH = "{home}/bin:{home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+
+def home() -> Path:
+    return Path(os.path.expanduser("~"))
+
+
+def sdir() -> Path:
+    return home() / ".local" / "state" / "keepers"
+
+
+def cdir() -> Path:
+    return home() / ".config" / "assistant" / "keepers"
+
+
+def keepers(only: set[str] | None = None) -> list[schedules.Entry]:
+    ks = schedules.load().keepers()
+    return [k for k in ks if not only or k.name in only]
+
+
+def is_off(name: str) -> bool:
+    return (cdir() / "all.off").exists() or (cdir() / f"{name}.off").exists()
+
+
+def due(k: schedules.Entry, now: float) -> bool:
+    minute = int(time.localtime(now).tm_hour) * 60 + int(time.localtime(now).tm_min)
+    return k.every <= 1 or minute % k.every == 0
+
+
+def _argv(k: schedules.Entry) -> list[str]:
+    h = str(home())
+    return [os.path.join(h, a[2:]) if a.startswith("~/") else a for a in k.argv]
+
+
+def _env(k: schedules.Entry) -> dict[str, str]:
+    h = str(home())
+    e = dict(os.environ)
+    e.setdefault("PATH", CRON_PATH.format(home=h))
+    e.update({"HOME": h, "USAGE_JOB": k.name, "KEEPER": k.name})
+    e.update(dict(k.env))
+    return e
+
+
+def err_file(k: schedules.Entry) -> str | None:
+    """Where a run's stderr goes, relative to ~/.local/state; None = discarded (with stdout to /dev/null).
+    err "out" keeps the old line's 2>&1: with stdout's file when it has one. A keeper whose old line was
+    `cron-fail ... >/dev/null 2>&1` (after > 0) had its stderr in cron-fail's NAME.err: here keepers/NAME.err."""
+    if k.err == "out":
+        if k.out:
+            return k.out
+        return f"keepers/{k.name}.err" if k.after > 0 else None
+    return k.err or f"keepers/{k.name}.err"
+
+
+def run_one(k: schedules.Entry, res: dict) -> None:
+    st = home() / ".local" / "state"
+    t0 = time.monotonic()
+    files = []
+    try:
+        for d in k.dirs:
+            (st / d).mkdir(parents=True, exist_ok=True)
+        out = open(st / k.out, "ab") if k.out else subprocess.DEVNULL  # noqa: SIM115
+        if out is not subprocess.DEVNULL:
+            files.append(out)
+        ef = err_file(k)
+        if ef is None:
+            err = subprocess.DEVNULL
+        elif k.err == "out" and k.out:
+            err = subprocess.STDOUT
+        else:
+            (st / ef).parent.mkdir(parents=True, exist_ok=True)
+            err = open(st / ef, "ab" if k.err and k.err != "out" else "wb")  # noqa: SIM115  # own file: 2>>
+            files.append(err)
+        p = subprocess.run(_argv(k), stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=_env(k), cwd=str(home()),
+                           timeout=k.timeout, check=False)  # fmt: skip
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+    except OSError:
+        rc = 127
+    finally:
+        for f in files:
+            f.close()
+    # cron-fail's usage run row (job.<name>; spool src keepers): once per run, only for a keeper with after > 0
+    jobfail.usage_run(k.name, rc, after=k.after, ok=k.ok, ms=(time.monotonic() - t0) * 1000, src="keepers")
+    ev = None
+    ef = err_file(k)
+    try:
+        ev = jobfail.record(k.name, rc, after=k.after, ok=k.ok, cmd=" ".join(k.argv),
+                            err=f"~/.local/state/{ef}" if ef else "none kept (it goes to /dev/null)")  # fmt: skip
+    except (OSError, ValueError):
+        ev = "record failed"
+    res[k.name] = {"rc": rc, "secs": round(time.monotonic() - t0, 2), "event": ev}
+
+
+def ensure(only: set[str] | None, now: float) -> int:
+    sdir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = locks.acquire(sdir() / "ensure.lock", wait=0)
+    if fd is None:
+        _log({"skip": "busy"})
+        return 0
+    try:
+        ks = [k for k in keepers(only) if due(k, now)]
+        res: dict[str, dict] = {}
+        ts = []
+        for k in ks:
+            if is_off(k.name):
+                res[k.name] = {"off": True}
+                continue
+            t = threading.Thread(target=run_one, args=(k, res), name=k.name, daemon=True)
+            t.start()
+            ts.append((k, t))
+        for k, t in ts:
+            t.join(k.timeout + 30)
+            if t.is_alive():
+                res[k.name] = {"rc": None, "stuck": True}
+        last = jsonstate.load(sdir() / "last.json", {}) or {}
+        for n, r in res.items():
+            last[n] = {**r, "at": int(now)}
+        jsonstate.save(sdir() / "last.json", last, mode=0o600)
+        _log({"ran": {n: r.get("rc") for n, r in res.items()}})
+        return 0
+    finally:
+        locks.release(fd)
+
+
+def _log(rec: dict) -> None:
+    try:
+        p = sdir() / "keepers.log"
+        if p.exists() and p.stat().st_size > 1 << 20:
+            p.write_bytes(p.read_bytes()[-(256 << 10) :])
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": int(time.time()), **rec}) + "\n")
+    except OSError:
+        pass
+
+
+def status(as_json: bool) -> int:
+    last = jsonstate.load(sdir() / "last.json", {}) or {}
+    rows = []
+    for k in keepers():
+        s = jobfail.streak(k.name)
+        rows.append({"name": k.name, "every": k.every, "off": is_off(k.name), "argv": " ".join(k.argv),
+                     "last": last.get(k.name), "streak": s.get("count", 0), "after": k.after})  # fmt: skip
+    if as_json:
+        print(json.dumps(rows))
+        return 0
+    for r in rows:
+        la = r["last"] or {}
+        when = time.strftime("%d.%m %H:%M", time.localtime(la["at"])) if la.get("at") else "-"
+        print(f"{r['name']}: every {r['every']} min{' · OFF' if r['off'] else ''} · last exit {la.get('rc', '-')}"
+              f" at {when} · streak {r['streak']}/{r['after']} · {r['argv']}")  # fmt: skip
+    return 0
+
+
+def switch(name: str, off: bool, why: str) -> int:
+    names = {k.name for k in keepers()} | {"all"}
+    if name not in names:
+        print(f"keepers: no keeper {name!r} (known: {', '.join(sorted(names))})", file=sys.stderr)
+        return 2
+    cdir().mkdir(parents=True, exist_ok=True)
+    f = cdir() / f"{name}.off"
+    if off:
+        f.write_text((why or "off") + "\n", encoding="utf-8")
+    else:
+        f.unlink(missing_ok=True)
+    print(f"keepers: {name} {'off' if off else 'on'}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="keepers", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("ensure")
+    e.add_argument("--only", default="")
+    e.add_argument("--now", type=float)
+    e.add_argument("--cron", action="store_true")
+    s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true")
+    for c in ("off", "on"):
+        x = sub.add_parser(c)
+        x.add_argument("name")
+        x.add_argument("--why", default="")
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "ensure":
+            only = {x for x in a.only.split(",") if x} or None
+            return ensure(only, a.now if a.now is not None else time.time())
+        if a.cmd == "status":
+            return status(a.json)
+        return switch(a.name, a.cmd == "off", a.why)
+    except schedules.RegistryError as x:
+        print(f"keepers: registry: {x}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

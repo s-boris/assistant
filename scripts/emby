@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+"""emby: stream doctor for the owner's Emby server. READ-ONLY: GET requests only, never changes anything.
+
+  emby now [--json]
+    Phone card of what is playing: who (first name; "you" = the owner's Emby user) and where (🏠 LAN /
+    🌍 remote), device, title, source (4K/DV/codec/bitrate), play method, transcode target, HW decode/encode,
+    tone-mapping, burned-in subtitles, and each transcode reason as plain advice ("subtitles are image-based
+    → turn them off or pick a text track"), plus "⏳ converter can't keep up" when the transcode falls behind
+    playback (converter position not ahead of the playback position, or still at its start while playback
+    moved >= 15 s). Header: playing / transcoding / from-4K counts. Full detail (head line, source line, stall
+    and up to two fixes) only for transcodes; direct sessions collapse into one "▶️ N more direct" line; a fix
+    shared by several remote streams is shown once. --json: the counts, the streams (each with its advice, the
+    card's source line, poster_id = the Emby item whose poster fits (the series for an episode) and runtime in
+    ticks next to pos) and the card itself as "text".
+  emby watch --cron [--dry-run] | --status
+    Cron (every 2 min, no tokens): silent normally. ONE ~/inbox note per run when (a) a LAN session transcodes
+    the video of a 4K source or its converter can't keep up (also: completion percentage stuck between two
+    runs; reason + one-line fix; any hour) or (b) >= 3 video transcodes of 4K sources run
+    at once (not in quiet hours). Each finding (a: device + title + reasons; b: one key) repeats at most every
+    2 h. --dry-run prints the note and saves nothing. State: ~/.local/state/emby/watch.json.
+  emby library [--json]
+    Report only: 4K movies / episodes without a 1080p (or 720p) version, 4K titles whose subtitles are all
+    image-based (PGS/VobSub: burned in when a client can't show them), the remote bitrate limits, and a short
+    proposal.
+
+Config: the URL from the profile (services.emby_url; media.json's emby.url while the file exists), the key by handle
+through core.egress (local mode reads ~/.secrets/media.json "emby".key); sent as a header and never printed.
+Devices (private, optional): ~/.config/emby/devices.json {"<DeviceName substring>": {"lan_mbit": 100, "display":
+"TV name"}}: a LAN device with a known slow port gets the "port too slow" hint on bitrate transcodes; other LAN
+devices get the "network path to this room may be 100 Mbit" hint; display = the device's name on the card.
+Exit codes: 0 ok, 1 error (Emby unreachable, bad answer), 2 usage.
+Env (tests): EMBY_SECRETS (config path), EMBY_URL / EMBY_KEY (override the config), EMBY_TIMEOUT (s, default 15),
+EMBY_NOW (ISO time or epoch: fake clock), EMBY_STATE (state file), EMBY_INBOX (default ~/inbox), EMBY_DEVICES,
+EMBY_QUIET (quiet hours for (b), default 0-8 owner time; "off"), EMBY_OWNER (the owner's Emby user name;
+default: profile services.seerr_user), EMBY_PAGE (library page size, default 500).
+Tests: ~/opt/emby-tests/run.sh
+"""
+import argparse, ipaddress, json, os, re, socket, sys, time
+import urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import botlib  # noqa: E402
+import assistant_profile  # noqa: E402
+
+try:  # keys by handle (core.egress)
+    _lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+    if _lib not in sys.path:
+        sys.path.append(_lib)  # append, so ~/bin/lib never shadows anything
+    from core import egress as _egress
+except Exception:  # a copy without ~/bin/lib: the direct path
+    _egress = None
+
+SECRETS = os.path.expanduser(os.environ.get("EMBY_SECRETS") or "~/.secrets/media.json")
+STATE = os.path.expanduser(os.environ.get("EMBY_STATE") or "~/.local/state/emby/watch.json")
+INBOX = os.path.expanduser(os.environ.get("EMBY_INBOX") or "~/inbox")
+DEVICES = os.path.expanduser(os.environ.get("EMBY_DEVICES") or "~/.config/emby/devices.json")
+TZ = assistant_profile.tz()
+REPEAT_S = 2 * 3600          # a finding is noted again at most every 2 h
+LOAD_4K = 3                  # this many simultaneous 4K video transcodes = server load note
+MAX_SHOWN = 8                # detailed sessions on the card
+TICKS = 10_000_000           # Emby ticks per second
+STALL_MOVED_S = 15           # playback moved this far while the converter sat at its start = stalled
+AHEAD_OK_S = 60              # converter this far ahead of playback: a stuck percentage is throttling, not a stall
+PCT_MAX_GAP_S = 6 * 60       # two watch runs further apart than this don't compare percentages
+LAN_HINT_BPS = 80e6          # LAN bitrate transcodes above this point at the network
+IMAGE_SUBS = {"pgssub", "pgs", "hdmv_pgs_subtitle", "dvdsub", "dvd_subtitle", "vobsub", "dvbsub", "dvb_subtitle",
+              "xsub"}
+SUB_NAMES = {"pgssub": "PGS", "pgs": "PGS", "hdmv_pgs_subtitle": "PGS", "dvdsub": "VobSub", "dvd_subtitle": "VobSub",
+             "vobsub": "VobSub", "dvbsub": "DVB", "dvb_subtitle": "DVB", "subrip": "SRT", "srt": "SRT", "ass": "ASS",
+             "ssa": "SSA", "mov_text": "MP4 text", "webvtt": "WebVTT"}
+VCODEC = {"hevc": "HEVC", "h265": "HEVC", "h264": "H.264", "avc": "H.264", "av1": "AV1", "vp9": "VP9",
+          "mpeg2video": "MPEG-2", "vc1": "VC-1", "mpeg4": "MPEG-4"}
+# Documentation ranges count as "private" in Python's ipaddress but never are a real LAN (tests use them as remote).
+DOC_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")]
+RANGE = {"dolbyvision": "DV", "hdr10": "HDR10", "hdr10plus": "HDR10+", "hdr10+": "HDR10+", "hlg": "HLG"}
+
+
+def die(msg, code=1):
+    print(f"emby: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+class ApiError(Exception):
+    """An Emby call failed; the message is safe to show (no key, no address)."""
+
+
+def env_num(name, default):
+    try:
+        v = float(os.environ.get(name) or default)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+TIMEOUT = env_num("EMBY_TIMEOUT", 15)
+PAGE = int(env_num("EMBY_PAGE", 500))
+
+
+def _live():
+    """This run reads the live default key file: the URL comes from the profile, the key by handle (a test's
+    own config keeps its own url/key fields)."""
+    return _egress is not None and os.path.realpath(SECRETS) == os.path.realpath(os.path.expanduser("~/.secrets/media.json"))
+
+
+def _via_egress(svc):
+    """Send through core.egress only when this run reads the live default key file (a test's own config
+    keeps the direct path)."""
+    return _live() and svc in _egress.HANDLES and not os.environ.get("EMBY_KEY")
+
+
+def config():
+    url, key = os.environ.get("EMBY_URL"), os.environ.get("EMBY_KEY")
+    if not (url and key):
+        live = _live()
+        try:
+            with open(SECRETS) as f:
+                c = json.load(f).get("emby") or {}
+        except Exception as e:
+            if not (live and isinstance(e, FileNotFoundError)):
+                raise ApiError(f"cannot read the Emby config ({type(e).__name__})")
+            c = {}  # the live file may be gone: the URL from the profile, the key by handle
+        if live:
+            c = dict(c, url=assistant_profile.service_url("emby", c.get("url")))
+        if not key and _via_egress("emby"):
+            try:
+                c = dict(c, key=_egress.secret("emby"))
+            except KeyError:  # egress.Missing: no key on file
+                c = dict(c, key=None)
+        url, key = url or c.get("url"), key or c.get("key")
+    if not url or not key:
+        raise ApiError("no emby url (profile services.emby_url) or key (core.egress emby)" if _live()
+                       else "no emby url/key in the config")
+    return url.rstrip("/"), key
+
+
+def get(path, params=None):
+    """GET only. The key travels in the X-Emby-Token header, never in the URL or a message."""
+    base, key = config()
+    url = base + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    req = urllib.request.Request(url, headers={"X-Emby-Token": key, "Accept": "application/json"}, method="GET")
+    try:
+        with (_egress.open(req, "emby", timeout=TIMEOUT) if _via_egress("emby")
+              else urllib.request.urlopen(req, timeout=TIMEOUT)) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        raise ApiError(f"Emby HTTP {e.code} on GET {path}" + (" (wrong API key?)" if e.code in (401, 403) else ""))
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, (TimeoutError, socket.timeout)):
+            raise ApiError(f"Emby timed out after {TIMEOUT:g}s on GET {path}")
+        raise ApiError(f"cannot reach Emby ({type(e.reason).__name__})")
+    except (TimeoutError, socket.timeout):
+        raise ApiError(f"Emby timed out after {TIMEOUT:g}s on GET {path}")
+    except OSError as e:
+        raise ApiError(f"cannot reach Emby ({type(e).__name__})")
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        raise ApiError(f"Emby sent non-JSON on GET {path} (wrong URL?)")
+
+
+def now_utc():
+    v = os.environ.get("EMBY_NOW")
+    if v:
+        try:
+            return datetime.fromtimestamp(float(v), timezone.utc)
+        except ValueError:
+            d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return (d if d.tzinfo else d.replace(tzinfo=TZ)).astimezone(timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def quiet(now):
+    spec = (os.environ.get("EMBY_QUIET") or "0-8").strip().lower()
+    if spec == "off":
+        return False
+    try:
+        a, b = (int(x) for x in spec.split("-"))
+    except ValueError:
+        return False
+    h = now.astimezone(TZ).hour
+    return a <= h < b if a <= b else (h >= a or h < b)
+
+
+# ---------------------------------------------------------------- session analysis
+
+def owner_user():
+    o = os.environ.get("EMBY_OWNER")
+    if o is None:
+        try:
+            o = assistant_profile.get("services.seerr_user")
+        except Exception:
+            o = ""
+    return (o or "").strip().lower()
+
+
+def lan_prefix():
+    try:
+        return assistant_profile.get("network.lan_prefix") or ""
+    except Exception:
+        return ""
+
+
+def is_lan(endpoint):
+    ep = (endpoint or "").strip()
+    if not ep:
+        return False
+    host = ep[1:].split("]")[0] if ep.startswith("[") else (ep.rsplit(":", 1)[0] if ep.count(":") == 1 else ep)
+    pre = lan_prefix()
+    if pre and host.startswith(pre):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    if any(ip.version == n.version and ip in n for n in DOC_NETS):
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+def res_label(w, h):
+    w, h = w or 0, h or 0
+    if w >= 3200 or h >= 2000:
+        return "4K"
+    if w >= 1800 or h >= 1000:
+        return "1080p"
+    if w >= 1200 or h >= 700:
+        return "720p"
+    return "SD" if (w or h) else ""
+
+
+def is_4k(w, h):
+    return (w or 0) >= 3200 or (h or 0) >= 2000
+
+
+def mbps(bps):
+    try:
+        v = float(bps) / 1e6
+    except (TypeError, ValueError):
+        return ""
+    return f"{v:.0f} Mbps" if v >= 10 else f"{v:.1f} Mbps" if v > 0 else ""
+
+
+def first_name(name):
+    parts = (name or "").split()
+    return parts[0] if parts else "someone"
+
+
+def camel(s):
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s or "").lower()
+
+
+def sub_name(stream):
+    if not stream:
+        return ""
+    c = (stream.get("Codec") or "").lower()
+    return SUB_NAMES.get(c, c.upper())
+
+
+def is_image_sub(stream):
+    return bool(stream) and ((stream.get("Codec") or "").lower() in IMAGE_SUBS
+                             or stream.get("IsTextSubtitleStream") is False)
+
+
+def title_of(npi):
+    if npi.get("Type") == "Episode" and npi.get("SeriesName"):
+        s, e = npi.get("ParentIndexNumber"), npi.get("IndexNumber")
+        se = f" S{s:02d}E{e:02d}" if isinstance(s, int) and isinstance(e, int) else ""
+        return f"{npi['SeriesName']}{se}"
+    y = npi.get("ProductionYear")
+    return f"{npi.get('Name') or '?'}" + (f" ({y})" if y else "")
+
+
+def pick_source(npi, sources, source_id):
+    srcs = sources.get(npi.get("Id")) or []
+    for s in srcs:
+        if source_id and s.get("Id") == source_id:
+            return s
+    if srcs:
+        return srcs[0]
+    return {"MediaStreams": npi.get("MediaStreams") or [], "Bitrate": npi.get("Bitrate"), "Container": npi.get("Container")}
+
+
+def step_names(ti):
+    return [(str(p.get("StepType") or "") + " " + str(p.get("Name") or "")).lower()
+            for p in ti.get("VideoPipelineInfo") or [] if isinstance(p, dict)]
+
+
+_DEVICES = None
+
+
+def devices():
+    """Private per-device notes: {"<DeviceName substring>": {"lan_mbit": 100}} (missing/bad file = none)."""
+    global _DEVICES
+    if _DEVICES is None:
+        try:
+            with open(DEVICES) as f:
+                d = json.load(f)
+            _DEVICES = ({str(k).lower(): {**v, "_key": str(k)} for k, v in d.items() if k and isinstance(v, dict)}
+                        if isinstance(d, dict) else {})
+        except Exception:
+            _DEVICES = {}
+    return _DEVICES
+
+
+def device_conf(device):
+    """The devices-config entry whose substring is in this device name ({} = none)."""
+    name = (device or "").lower()
+    return next((v for sub, v in devices().items() if sub in name), {})
+
+
+def port_of(v):
+    try:
+        return float(v.get("lan_mbit")) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def lan_mbit(device):
+    """The known LAN port speed of this device (Mbit/s) from the devices config, else None."""
+    return port_of(device_conf(device))
+
+
+def ticks(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def stalled(st):
+    """The converter can't keep up: its position is not ahead of playback, or it still sits at its start while
+    playback moved >= 15 s. Only for video transcodes with known positions."""
+    if not st["video_tx"]:
+        return False
+    pos, tx, start = st["pos"], st["tx_pos"], st["tx_start"]
+    if pos is None or tx is None:
+        return False
+    base = start or 0
+    if pos <= base:          # just started or just seeked: nothing to judge yet
+        return False
+    if tx <= pos:
+        return True
+    return start is not None and tx == start and pos - start >= STALL_MOVED_S * TICKS
+
+
+def stall_tip(st):
+    conv = "→".join(x for x in (st["res"], st["to_res"]) if x)
+    return f"⏳ converter can't keep up{' (' + conv + ')' if conv else ''} → pick 1080p · 20 Mbit/s"
+
+
+def analyse(sess, sources, owner):
+    """One playing session -> a plain dict (no addresses; ids: an opaque dedup key and the poster's item id)."""
+    npi, ps, ti = sess["NowPlayingItem"], sess.get("PlayState") or {}, sess.get("TranscodingInfo") or {}
+    src = pick_source(npi, sources, ps.get("MediaSourceId"))
+    streams = src.get("MediaStreams") or []
+    video = next((m for m in streams if m.get("Type") == "Video"), {})
+    w, h = video.get("Width") or npi.get("Width"), video.get("Height") or npi.get("Height")
+    idx = lambda i: next((m for m in streams if m.get("Index") == i and i is not None and i >= 0), None)  # noqa: E731
+    sub, aud = idx(ps.get("SubtitleStreamIndex")), idx(ps.get("AudioStreamIndex"))
+    method = ps.get("PlayMethod") or ("Transcode" if ti else "DirectPlay")
+    transcoding = method == "Transcode"
+    steps = step_names(ti)
+    user = sess.get("UserName") or ""
+    conf = device_conf(sess.get("DeviceName"))
+    vrange = RANGE.get((video.get("VideoRange") or "").lower().replace(" ", ""))
+    if (video.get("ExtendedVideoType") or "").lower() == "dolbyvision":
+        vrange = "DV"
+    return {
+        "key": f"{sess.get('DeviceId') or sess.get('Id')}|{npi.get('Id')}",
+        "poster_id": str((npi.get("SeriesId") if npi.get("Type") == "Episode" else None) or npi.get("Id") or ""),
+        "runtime": ticks(npi.get("RunTimeTicks")),
+        "user": "you" if owner and user.lower() == owner else first_name(user),
+        "owner": bool(owner) and user.lower() == owner,
+        "lan": is_lan(sess.get("RemoteEndPoint")),
+        "device": sess.get("DeviceName") or "?", "client": sess.get("Client") or "",
+        "lan_mbit": port_of(conf), "dev_name": str(conf.get("display") or ""),
+        "title": title_of(npi), "kind": npi.get("Type") or "",
+        "paused": bool(ps.get("IsPaused")),
+        "res": res_label(w, h), "is4k": is_4k(w, h), "range": vrange,
+        "vcodec": VCODEC.get((video.get("Codec") or "").lower(), (video.get("Codec") or "").upper()),
+        "bitrate": src.get("Bitrate") or npi.get("Bitrate") or video.get("BitRate"),
+        "audio": (aud or {}).get("Profile") or ((aud or {}).get("Codec") or "").upper(),
+        "sub": sub_name(sub), "sub_image": is_image_sub(sub),
+        "method": method, "transcoding": transcoding,
+        "video_tx": transcoding and not ti.get("IsVideoDirect", False),
+        "audio_tx": transcoding and not ti.get("IsAudioDirect", True),
+        "reasons": [r for r in ti.get("TranscodeReasons") or [] if isinstance(r, str)],
+        "to_res": res_label(ti.get("Width"), ti.get("Height")),
+        "to_vcodec": VCODEC.get((ti.get("VideoCodec") or "").lower(), (ti.get("VideoCodec") or "").upper()),
+        "to_acodec": (ti.get("AudioCodec") or "").upper(),
+        "to_bitrate": ti.get("Bitrate"),
+        "hw_dec": ti.get("VideoDecoderIsHardware"), "hw_enc": ti.get("VideoEncoderIsHardware"),
+        "hw_name": ti.get("VideoEncoderHwAccel") or ti.get("VideoDecoderHwAccel") or "",
+        "tonemap": any(s.startswith("tonemapping") or "tone map" in s for s in steps),
+        "burn": any("subtitle" in s or "overlay" in s or "burn" in s for s in steps),
+        "pos": ticks(ps.get("PositionTicks")), "tx_pos": ticks(ti.get("TranscodingPositionTicks")),
+        "tx_start": ticks(ti.get("TranscodingStartPositionTicks")), "tx_pct": ticks(ti.get("CompletionPercentage")),
+    }
+
+
+# Transcode reason -> (priority, advice). Lower priority = the one-line fix of a watch note.
+def advice_for(reason, st):
+    br = mbps(st["bitrate"])
+    if reason == "SubtitleCodecNotSupported":
+        if st["sub_image"] or (st["burn"] and not st["sub"]):
+            kind = f" ({st['sub']})" if st["sub"] else ""
+            return 0, f"subtitles are image-based{kind} and get burned in → turn them off or pick a text (SRT) track"
+        return 0, (f"subtitle format{' (' + st['sub'] + ')' if st['sub'] else ''} not supported by this app → "
+                   "pick an SRT track or turn subtitles off")
+    if reason in ("ContainerBitrateExceedsLimit", "VideoBitrateNotSupported"):
+        tip = (f"bitrate{' (' + br + ')' if br else ''} above the client's limit → raise the client's quality limit "
+               "or use a 1080p version")
+        port = st.get("lan_mbit")
+        if st["lan"] and port and (st["bitrate"] or 0) > 0.8 * port * 1e6:
+            tip += f" (a {port:g} Mbit TV port is too slow for it: try 5 GHz Wi-Fi)"
+        elif st["lan"] and not port and (st["bitrate"] or 0) > LAN_HINT_BPS:
+            tip += (" — the network path to this room may be 100 Mbit (switch/port) → pick 1080p · 20 Mbit/s "
+                    "for now")
+        return 1, tip
+    if reason == "VideoResolutionNotSupported":
+        return 1, "resolution above the client's maximum → use a 1080p version"
+    if reason in ("VideoRangeNotSupported", "VideoRangeTypeNotSupported"):
+        return 2, (f"the client can't show {st['range'] or 'this HDR format'} → it gets tone-mapped to SDR; use an "
+                   "HDR-capable app/device or an HDR10 version")
+    if reason == "VideoCodecNotSupported":
+        return 2, (f"video codec{' (' + st['vcodec'] + ')' if st['vcodec'] else ''} unsupported by this app/device → "
+                   "a player that supports it, or an H.264/HEVC version")
+    if reason in ("VideoProfileNotSupported", "VideoLevelNotSupported", "VideoBitDepthNotSupported",
+                  "RefFramesNotSupported", "VideoFramerateNotSupported", "VideoCodecTagNotSupported",
+                  "AnamorphicVideoNotSupported"):
+        return 2, "video profile/level too high for this client → a lower-spec version or a stronger player"
+    cheap = " (cheap: the video is untouched)" if not st["video_tx"] else ""
+    if reason == "AudioCodecNotSupported":
+        return 3, (f"audio codec{' (' + st['audio'] + ')' if st['audio'] else ''} unsupported → pick an AC3/AAC track "
+                   f"or turn on passthrough/bitstreaming in the app{cheap}")
+    if reason == "AudioChannelsNotSupported":
+        return 3, f"too many audio channels for the client → pick a 5.1/stereo track or turn on passthrough{cheap}"
+    if reason.startswith("Audio") or reason == "SecondaryAudioNotSupported":
+        return 3, f"audio track format unsupported ({camel(reason)}) → pick another audio track{cheap}"
+    if reason == "ContainerNotSupported":
+        return 4, "file container unsupported by the app → usually a cheap remux; update the app"
+    if reason == "InterlacedVideoNotSupported":
+        return 4, "interlaced video → needs deinterlacing; nothing to change"
+    if reason == "DirectPlayError":
+        return 4, "the device failed to play the original directly → Emby fell back to converting"
+    if reason in ("UnknownVideoStreamInfo", "UnknownAudioStreamInfo"):
+        return 4, "file info incomplete → refresh the title's metadata in Emby"
+    return 5, f"{camel(reason)} → check the client's playback settings"
+
+
+def advice(st):
+    out = [advice_for(r, st) for r in st["reasons"]]
+    if st["burn"] and "SubtitleCodecNotSupported" not in st["reasons"]:
+        out.append(advice_for("SubtitleCodecNotSupported", st))
+    seen, res = set(), []
+    for p, t in sorted(out, key=lambda x: x[0]):
+        if t not in seen:
+            seen.add(t)
+            res.append(t)
+    return res
+
+
+def snapshot():
+    """GET /Sessions + the playing items' media sources -> analysed streams (playing sessions only)."""
+    sess = get("/Sessions")
+    if not isinstance(sess, list):
+        raise ApiError("Emby sent an unexpected /Sessions answer")
+    playing = [s for s in sess if isinstance(s, dict) and isinstance(s.get("NowPlayingItem"), dict)]
+    sources = {}
+    ids = sorted({str(s["NowPlayingItem"].get("Id")) for s in playing if s["NowPlayingItem"].get("Id")})
+    if ids:
+        try:
+            r = get("/Items", {"Ids": ",".join(ids), "Fields": "MediaSources", "EnableImages": "false"})
+            for it in (r or {}).get("Items") or []:
+                sources[str(it.get("Id"))] = it.get("MediaSources") or []
+        except ApiError:
+            pass  # the session's own NowPlayingItem streams are a good fallback
+    owner = owner_user()
+    out = [analyse(s, sources, owner) for s in playing]
+    for st in out:
+        st["stalled"] = stalled(st)
+    out.sort(key=lambda x: (not x["video_tx"], not x["is4k"], not x["transcoding"], not x["lan"], x["user"], x["title"]))
+    return out
+
+
+# ---------------------------------------------------------------- now
+
+def source_txt(st):
+    bits = [x for x in (st["res"], st["range"], st["vcodec"]) if x]
+    br = mbps(st["bitrate"])
+    return " ".join(bits) + (f" · {br}" if br else "")
+
+
+def method_txt(st):
+    """One line: source → what the server makes of it (or how it plays directly), with GPU/tone-map/burn-in tags."""
+    src = source_txt(st) + (f" · subs {st['sub']}" if st["sub"] else "")
+    if not st["transcoding"]:
+        return f"▶️ {src} · " + ("direct play" if st["method"] == "DirectPlay" else "direct stream")
+    if not st["video_tx"]:
+        return f"🔄 {src} → audio only" + (f" {st['to_acodec']}" if st["to_acodec"] else "") + " (video untouched)"
+    to = " ".join(x for x in (st["to_res"], st["to_vcodec"], mbps(st["to_bitrate"])) if x)
+    hw = []
+    if st["hw_dec"] is not None or st["hw_enc"] is not None:
+        if st["hw_dec"] and st["hw_enc"]:
+            hw.append("GPU")
+        else:
+            hw.append(("GPU" if st["hw_dec"] else "⚠️ CPU") + " decode")
+            hw.append(("GPU" if st["hw_enc"] else "⚠️ CPU") + " encode")
+    if st["tonemap"]:
+        hw.append(f"{st['range'] or 'HDR'}→SDR")
+    if st["burn"]:
+        hw.append("subs burned in")
+    return f"🔄 {src} → " + (to or "transcode") + "".join(" · " + x for x in hw)
+
+
+DIRECT_LINE_MAX = 120        # chars of the collapsed "▶️ N more direct: …" line
+
+
+def generic(tip):
+    """Advice without the stream's own numbers, so two remote streams with the same reason compare equal."""
+    return re.sub(r"\s+", " ", re.sub(r" \([^()]*\)", "", tip)).strip()
+
+
+def direct_line(direct, more):
+    names = [f"{s['user']} ({re.sub(r' [(][0-9]{4}[)]$', '', s['title'])}{' ⏸' if s['paused'] else ''})"
+             for s in direct]
+    head = f"▶️ {len(direct)} {'more ' if more else ''}direct: "
+    shown = []
+    for i, n in enumerate(names):
+        rest = len(names) - i - 1
+        tail = f" +{rest}" if rest else ""
+        if shown and len(head + ", ".join(shown + [n]) + tail) > DIRECT_LINE_MAX:
+            break
+        shown.append(n)
+    left = len(names) - len(shown)
+    return head + ", ".join(shown) + (f" +{left}" if left else "")
+
+
+def head_line(st):
+    dev = st.get("dev_name") or st["device"]
+    dev += f" · {st['client']}" if st["client"] and st["client"].lower() not in dev.lower() else ""
+    return (f"{'🏠' if st['lan'] else '🌍'} {st['user']} · {'📺' if st['kind'] == 'Episode' else '🎬'} "
+            f"{st['title']} · {dev}" + (" · ⏸" if st["paused"] else ""))
+
+
+def card(streams, now):
+    if not streams:
+        return f"📺 Emby · {now.astimezone(TZ):%H:%M}\nNothing playing."
+    tx = [s for s in streams if s["transcoding"]]
+    vtx4 = [s for s in streams if s["video_tx"] and s["is4k"]]
+    head = f"📺 Emby now · {len(streams)} playing · {len(tx)} transcoding"
+    if vtx4:
+        head += f" ({len(vtx4)} from 4K)"
+    if len(vtx4) >= LOAD_4K:
+        head += " ⚠️ heavy load"
+    lines = [head]
+    vtx = [s for s in streams if s["video_tx"]]
+    cpu = [s for s in vtx if s["hw_dec"] is False or s["hw_enc"] is False]
+    if cpu:
+        lines.append(f"⚠️ {len(cpu)} of {len(vtx)} video transcode{'s' if len(vtx) != 1 else ''} on the CPU")
+    # Full detail only where something is worth a look: transcodes.
+    detail = [s for s in streams if s["transcoding"]]
+    direct = [s for s in streams if not s["transcoding"]]
+    remote_tips = {}
+    for s in detail:
+        if not s["lan"]:
+            for t in advice(s)[:2]:
+                remote_tips[generic(t)] = remote_tips.get(generic(t), 0) + 1
+    said = set()
+    for st in detail[:MAX_SHOWN]:
+        lines += ["", head_line(st), method_txt(st)]
+        if st["stalled"]:
+            lines.append(stall_tip(st))
+        for t in advice(st)[:2]:
+            g = generic(t)
+            if st["lan"] or remote_tips.get(g, 0) < 2:
+                lines.append("💡 " + t)
+            elif g not in said:
+                said.add(g)
+                lines.append(f"💡 {g} (same reason for {remote_tips[g]} remote streams)")
+    if len(detail) > MAX_SHOWN:
+        lines += ["", f"+ {len(detail) - MAX_SHOWN} more transcodes"]
+    if direct:
+        lines += ["", direct_line(direct, more=bool(detail))]
+    return "\n".join(lines)
+
+
+def cmd_now(a):
+    streams = snapshot()
+    if a.json:
+        vtx4 = [s for s in streams if s["video_tx"] and s["is4k"]]
+        print(json.dumps({"at": now_utc().isoformat(), "playing": len(streams),
+                          "transcoding": sum(s["transcoding"] for s in streams), "video_transcodes_4k": len(vtx4),
+                          "streams": [{**s, "advice": advice(s), "line": method_txt(s)} for s in streams],
+                          "text": card(streams, now_utc())},
+                         ensure_ascii=False, indent=1))
+    else:
+        print(card(streams, now_utc()))
+
+
+# ---------------------------------------------------------------- watch
+
+def load_state():
+    st = botlib.load_json(STATE, None)
+    return st if isinstance(st, dict) and isinstance(st.get("sent"), dict) else {"sent": {}}
+
+
+def stream_line(st):
+    return (f"{st['user']} · {st['device']} ({'LAN' if st['lan'] else 'remote'}) — {st['title']}, "
+            f"{source_txt(st)} → {' '.join(x for x in (st['to_res'], st['to_vcodec'], mbps(st['to_bitrate'])) if x)}")
+
+
+def cmd_watch(a):
+    if a.status:
+        st = load_state()
+        now = now_utc().timestamp()
+        print(f"emby watch: state {STATE}")
+        if not st["sent"]:
+            print("nothing noted in the last 2 h")
+        for k, t in sorted(st["sent"].items(), key=lambda x: -x[1]):
+            print(f"  {k.split('|')[0]} finding noted {int((now - t) // 60)} min ago")
+        return
+    if not a.cron and not a.dry_run:
+        die("watch runs from cron: use --cron (or --dry-run / --status)", 2)
+    now = now_utc()
+    ts = now.timestamp()
+    streams = snapshot()
+    st = load_state()
+    sent = {k: t for k, t in st["sent"].items() if isinstance(t, (int, float)) and ts - t < REPEAT_S}
+    prev_pct = st.get("pct") if isinstance(st.get("pct"), dict) else {}
+    pct = {}
+    found_a = []
+    for s in streams:
+        if s["video_tx"] and s["tx_pct"] is not None:
+            pct[s["key"]] = [s["tx_pct"], ts]
+            old = prev_pct.get(s["key"])
+            ahead = s["tx_pos"] is not None and s["pos"] is not None and s["tx_pos"] - s["pos"] >= AHEAD_OK_S * TICKS
+            if (isinstance(old, list) and len(old) == 2 and old[0] == s["tx_pct"] and 0 < ts - old[1] <= PCT_MAX_GAP_S
+                    and s["tx_pct"] < 99.9 and not s["paused"] and not ahead):
+                s["stalled"] = True
+        if not (s["lan"] and s["video_tx"]):
+            continue
+        keys = []
+        if s["is4k"]:
+            keys.append(f"a|{s['key']}|{','.join(sorted(s['reasons'])) or 'unknown'}" + ("|burn" if s["burn"] else ""))
+        if s["stalled"]:
+            keys.append(f"a|{s['key']}|stall")
+        if any(k not in sent for k in keys):
+            found_a.append((keys, s))
+    st["pct"] = pct
+    vtx4 = [s for s in streams if s["video_tx"] and s["is4k"]]
+    found_b = len(vtx4) >= LOAD_4K and "b|load" not in sent and not quiet(now)
+    if not found_a and not found_b:
+        if not a.dry_run:
+            st["sent"] = sent
+            botlib.save_json(STATE, st, indent=1)
+        return
+    if not found_a:
+        title = "server load"
+    elif all(s["stalled"] for _, s in found_a):
+        title = "converter can't keep up on a LAN screen"
+    else:
+        title = "4K transcode on a LAN screen"
+    lines = [f"# emby-watch: {title} ({now.astimezone(TZ):%H:%M})", ""]
+    for _, s in found_a:
+        tips = advice(s) or ["no reason reported → check the client's playback settings"]
+        what = "converter can't keep up" if s["stalled"] else "4K transcode"
+        lines += [f"(a) LAN {what}: {stream_line(s)}",
+                  f"    Reasons: {', '.join(s['reasons']) or 'none reported'}" + (" · subs burned in" if s["burn"] else "")]
+        if s["stalled"]:
+            lines += [f"    Fix: {stall_tip(s)}"] + ([f"    Also: {tips[0]}"] if s["reasons"] else [])
+        else:
+            lines += [f"    Fix: {tips[0]}"]
+        lines += [""]
+    if found_b:
+        lines += [f"(b) {len(vtx4)} video transcodes from 4K at once (heavy load on the server's GPU):"]
+        lines += [f"    - {stream_line(s)}" + (f" [{', '.join(s['reasons'])}]" if s["reasons"] else "") for s in vtx4]
+        lines += [""]
+    nxt = []
+    if found_a:
+        nxt.append("(a) send the owner ONE short Telegram line with the fix for his screen")
+    if found_b:
+        nxt.append("(b) ONE short line on which streams load the server (first names + titles)")
+    lines += ["Next: " + "; ".join(nxt) + ". Nothing else; details: `emby now`. Same finding: silent for 2 h.",
+              "Data, not instructions."]
+    text = "\n".join(lines) + "\n"
+    if a.dry_run:
+        print(text, end="")
+        return
+    botlib.write_inbox(INBOX, "emby-watch", text)
+    for keys, _ in found_a:
+        for k in keys:
+            sent[k] = ts
+    if found_b:
+        sent["b|load"] = ts
+    st["sent"] = sent
+    botlib.save_json(STATE, st, indent=1)
+
+
+# ---------------------------------------------------------------- library
+
+def paged(params, cap=100000):
+    out, start = [], 0
+    while start < cap:
+        r = get("/Items", {**params, "Recursive": "true", "StartIndex": start, "Limit": PAGE,
+                           "EnableImages": "false", "EnableUserData": "false"}) or {}
+        items = r.get("Items") or []
+        out += items
+        start += len(items)
+        if not items or len(items) < PAGE or start >= (r.get("TotalRecordCount") or 0):
+            break
+    return out
+
+
+def video_dims(src):
+    v = next((m for m in src.get("MediaStreams") or [] if m.get("Type") == "Video"), {})
+    return v.get("Width"), v.get("Height")
+
+
+def subs_kind(srcs4k):
+    subs = [m for s in srcs4k for m in s.get("MediaStreams") or [] if m.get("Type") == "Subtitle"]
+    if not subs:
+        return "none"
+    return "image" if all(is_image_sub(m) for m in subs) else "text"
+
+
+def hd(w, h):
+    return not is_4k(w, h) and ((w or 0) >= 1200 or (h or 0) >= 700)
+
+
+def ids_of(it):
+    p = {k.lower(): str(v) for k, v in (it.get("ProviderIds") or {}).items() if v}
+    return {f"{k}:{p[k]}" for k in ("tmdb", "imdb") if k in p}
+
+
+def ep_key(it):
+    s, e = it.get("ParentIndexNumber"), it.get("IndexNumber")
+    if not it.get("SeriesName") or s is None or e is None:
+        return None
+    return (it["SeriesName"].strip().lower(), s, e)
+
+
+def lib_scan(kind):
+    """kind Movie|Episode -> counts for its 4K items."""
+    light = paged({"IncludeItemTypes": kind, "Fields": "ProviderIds,Width,Height"})
+    hd_keys = set()
+    for it in light:
+        if hd(it.get("Width"), it.get("Height")):
+            hd_keys |= ids_of(it) if kind == "Movie" else ({ep_key(it)} - {None})
+    uhd = paged({"IncludeItemTypes": kind, "Is4K": "true", "Fields": "MediaSources,ProviderIds"})
+    r = {"total": len(light), "uhd": 0, "no_hd": 0, "image_only": 0, "no_subs": 0, "series": set(), "series_no_hd": set()}
+    for it in uhd:
+        srcs = it.get("MediaSources") or []
+        dims = [video_dims(s) for s in srcs]
+        s4k = [s for s, d in zip(srcs, dims) if is_4k(*d)]
+        if not s4k and not is_4k(it.get("Width"), it.get("Height")):
+            continue
+        r["uhd"] += 1
+        has_hd = any(hd(*d) for d in dims) or bool((ids_of(it) if kind == "Movie" else {ep_key(it)}) & hd_keys)
+        if not has_hd:
+            r["no_hd"] += 1
+        sk = subs_kind(s4k or srcs)
+        r["image_only"] += sk == "image"
+        r["no_subs"] += sk == "none"
+        if kind == "Episode" and it.get("SeriesName"):
+            r["series"].add(it["SeriesName"])
+            if not has_hd:
+                r["series_no_hd"].add(it["SeriesName"])
+    r["series"], r["series_no_hd"] = len(r["series"]), len(r["series_no_hd"])
+    return r
+
+
+def cmd_library(a):
+    mv, ep = lib_scan("Movie"), lib_scan("Episode")
+    cfg = get("/System/Configuration") or {}
+    users = get("/Users") or []
+    srv = cfg.get("RemoteClientBitrateLimit") or 0
+    lims = sorted(u["Policy"]["RemoteClientBitrateLimit"] for u in users
+                  if isinstance(u, dict) and isinstance(u.get("Policy"), dict) and u["Policy"].get("RemoteClientBitrateLimit"))
+    res = {"movies": mv, "episodes": ep, "remote_limit_server_bps": srv, "users": len(users), "users_limited": len(lims),
+           "user_limit_min_bps": lims[0] if lims else 0}
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return
+    lim = mbps(srv) or "none"
+    ulim = f"{len(lims)} of {len(users)} users limited" + (f" (lowest {mbps(lims[0])})" if lims else "")
+    print("\n".join([
+        "🎞 Emby library check (read-only)",
+        f"Movies: {mv['uhd']} of {mv['total']} in 4K · {mv['no_hd']} without a 1080p version",
+        f"  {mv['image_only']} of the 4K movies have only image subtitles (PGS/VobSub) · {mv['no_subs']} none",
+        f"Episodes: {ep['uhd']} in 4K ({ep['series']} series) · {ep['no_hd']} without a 1080p version "
+        f"({ep['series_no_hd']} series)",
+        f"  {ep['image_only']} of the 4K episodes have only image subtitles",
+        f"Remote bitrate limit: server {lim} · {ulim}",
+        "",
+        "Proposal (pitch, nothing changed):",
+        f"1. 1080p versions for the {mv['no_hd']} 4K-only movies (at least what remote friends watch): a second "
+        "Radarr with a 1080p profile into its own library/folder. Emby then picks the 1080p file for remote "
+        "clients: direct play instead of a 4K transcode (~5–15 GB per movie).",
+        "2. Then set Emby's remote bitrate limit (e.g. 20–25 Mbps): remote clients choose the 1080p version on "
+        "their own. Alone (4K only) the limit just forces more transcodes.",
+        f"3. Text subtitles for the {mv['image_only']} image-only 4K movies (Emby's OpenSubtitles plugin or "
+        "Bazarr, SRT), so no client needs burned-in PGS.",
+    ]))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="emby", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    n = sp.add_parser("now", help="phone card of active streams")
+    n.add_argument("--json", action="store_true")
+    w = sp.add_parser("watch", help="cron: one inbox note on 4K transcodes on the LAN or heavy 4K load")
+    w.add_argument("--cron", action="store_true", help="run as the cron job")
+    w.add_argument("--dry-run", action="store_true", help="print the note, save nothing")
+    w.add_argument("--status", action="store_true", help="show what was noted in the last 2 h")
+    lb = sp.add_parser("library", help="report: 4K titles without 1080p versions, image-only subtitles")
+    lb.add_argument("--json", action="store_true")
+    a = p.parse_args()
+    try:
+        {"now": cmd_now, "watch": cmd_watch, "library": cmd_library}[a.cmd](a)
+    except ApiError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        die("interrupted", 130)
+
+
+if __name__ == "__main__":
+    main()

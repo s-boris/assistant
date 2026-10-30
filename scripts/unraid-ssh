@@ -1,0 +1,149 @@
+#!/bin/bash
+# unraid-ssh: how my scripts reach the server across the owner's SSH lockdown (plan
+# ~/reports/security/vault-lockdown-plan-2026-10-13.md, files in ~/opt/unraid-lockdown).
+#   verbs    the lockdown: my key is forced into /boot/config/ssh/claude-bot-cmd; scripts send one
+#            allowlisted read-only verb (`ssh unraid health`) and the collectors run server-side.
+#   root     a full-root key (no lockdown): scripts use direct commands (`bash -s` + embedded collector).
+#   emulate  tests the verbs path over a root key: runs my LOCAL copy of the dispatcher on the
+#            server (nothing is installed there). Read-only verbs only; `unraid-lockdown preflight` uses it.
+# Mode: $UNRAID_LOCKDOWN_MODE, else ~/.config/unraid-lockdown/mode (root|verbs|emulate|auto), else auto.
+#   auto = one probe, `ssh unraid hello`: the dispatcher answers "claude-bot-cmd ..." -> verbs, anything else
+#   -> root. Cached in ~/.local/state/unraid-lockdown/probe (root 10 min, verbs 60 min); an unreachable server
+#   keeps the last answer (none: root).
+#   --strict: no guessing in auto. verbs only from the dispatcher's own answer (live, or cached when unreachable);
+#   no cached verbs while unreachable, or a reply that isn't the dispatcher's -> exit 4, nothing on stdout, the
+#   reason on stderr. A cached root is that same guess, so strict probes again. A set mode is printed as is.
+#
+# Usage: unraid-ssh mode [--refresh] [--strict]   print the resolved mode: root | verbs | emulate
+#        unraid-ssh run VERB [ARG...]      run one dispatcher verb (verbs/emulate); stdin is passed through,
+#                                          exit code = ssh's (255 = connection) or the verb's (1 = rejected)
+#        unraid-ssh status                 configured + resolved mode, probe cache, the dispatcher's hello
+# Options (before the subcommand): --host H (default $UNRAID_SSH_HOST, else unraid)
+# Env for tests: UNRAID_LOCKDOWN_CONF, UNRAID_LOCKDOWN_STATE, UNRAID_LOCKDOWN_DISPATCHER (emulate's local copy).
+set -u
+case "${1:-}" in
+  -h|--help|help) ;;
+  *) pg="$(dirname "$(readlink -f "$0")")/profile-get"   # feature switch: features.unraid in the profile
+     if [ -x "$pg" ] && [ "$("$pg" --feature unraid 2>/dev/null)" = off ]; then
+       echo "unraid-ssh: feature unraid is off (features.unraid in the profile)" >&2; exit 3
+     fi ;;
+esac
+HOST=${UNRAID_SSH_HOST:-unraid}
+CONF=${UNRAID_LOCKDOWN_CONF:-$HOME/.config/unraid-lockdown}
+STATE=${UNRAID_LOCKDOWN_STATE:-$HOME/.local/state/unraid-lockdown}
+DISPATCHER=${UNRAID_LOCKDOWN_DISPATCHER:-$HOME/opt/unraid-lockdown/server/claude-bot-cmd}
+SSH_OPTS=(-T -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+TTL_ROOT=600 TTL_VERBS=3600
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --host) HOST=${2:?--host needs a value}; shift 2 ;;
+    --host=*) HOST=${1#*=}; shift ;;
+    *) break ;;
+  esac
+done
+
+configured() {  # mode word from env / config file; default auto
+  local m=${UNRAID_LOCKDOWN_MODE:-}
+  [ -n "$m" ] || m=$(head -n 1 "$CONF/mode" 2>/dev/null | tr -d ' \t\r')
+  case $m in
+    root|verbs|emulate|auto) echo "$m" ;;
+    '') echo auto ;;
+    *) echo "unraid-ssh: unknown mode '$m' (root|verbs|emulate|auto); using auto" >&2; echo auto ;;
+  esac
+}
+
+probe() {  # -> verbs | root | "" (server unreachable)
+  local out rc
+  out=$(timeout 40 ssh "${SSH_OPTS[@]}" "$HOST" hello </dev/null 2>/dev/null); rc=$?
+  case $out in "claude-bot-cmd "*) echo verbs; return ;; esac
+  if [ $rc -eq 255 ] || [ $rc -eq 124 ]; then echo ""; else echo root; fi
+}
+
+unclear() {  # --strict refusal: one line on stderr, exit 4, nothing on stdout
+  echo "unraid-ssh: no clear mode (--strict): $*" >&2
+  exit 4
+}
+
+resolve() {  # [--refresh] [--strict] -> root | verbs | emulate
+  local m now cm='' ct=0 ttl age p a refresh='' strict=''
+  for a in "$@"; do
+    case $a in
+      --refresh) refresh=1 ;;
+      --strict) strict=1 ;;
+      *) echo "usage: unraid-ssh mode [--refresh] [--strict]" >&2; exit 2 ;;
+    esac
+  done
+  m=$(configured)
+  [ "$m" = auto ] || { echo "$m"; return; }
+  now=$(date +%s)
+  read -r cm ct 2>/dev/null < "$STATE/probe"
+  case $ct in ''|*[!0-9]*) ct=0 ;; esac
+  [ -n "$strict" ] && [ "$cm" = root ] && cm=''   # a cached root came from a reply that wasn't the dispatcher's
+  if [ -z "$refresh" ]; then
+    case $cm in verbs) ttl=$TTL_VERBS ;; root) ttl=$TTL_ROOT ;; *) ttl=0 ;; esac
+    age=$((now - ct))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then echo "$cm"; return; fi
+  fi
+  p=$(probe)
+  if [ -z "$p" ]; then   # unreachable: keep the last answer (the real call will report the outage)
+    case $cm in verbs|root) echo "$cm"; return ;; esac
+    [ -z "$strict" ] || unclear "server unreachable and no cached probe"
+    echo root
+    return
+  fi
+  [ -z "$strict" ] || [ "$p" = verbs ] ||
+    unclear "the server's reply is not the dispatcher's; unlocked? set UNRAID_LOCKDOWN_MODE or the mode file"
+  mkdir -p "$STATE" 2>/dev/null && printf '%s %s\n' "$p" "$now" > "$STATE/probe.$$" 2>/dev/null &&
+    mv -f "$STATE/probe.$$" "$STATE/probe" 2>/dev/null
+  echo "$p"
+}
+
+valid_req() {  # the dispatcher accepts only [A-Za-z0-9._ -]; fail early with the same rule
+  case $1 in *[!A-Za-z0-9._\ -]*|'') return 1 ;; esac
+}
+
+run() {
+  [ $# -ge 1 ] || { echo "usage: unraid-ssh run VERB [ARG...]" >&2; exit 2; }
+  local req="$*" m b64
+  valid_req "$req" || { echo "unraid-ssh: '$req' is not a valid verb request ([A-Za-z0-9._ -] only)" >&2; exit 2; }
+  m=$(resolve)
+  case $1 in backup-store|emby-sql|cputemp|appdata-put) ;; *) SSH_OPTS+=(-n) ;; esac   # only these read stdin (cputemp: one request line per sample; appdata-put: the new file); keep the caller's
+  case $m in
+    verbs)
+      exec ssh "${SSH_OPTS[@]}" "$HOST" "$req" ;;
+    emulate)
+      [ -r "$DISPATCHER" ] || { echo "unraid-ssh: no local dispatcher at $DISPATCHER (run ~/opt/unraid-lockdown/build)" >&2; exit 2; }
+      b64=$(gzip -9c < "$DISPATCHER" | base64 -w0) || exit 2
+      # root's shell on the server runs the local dispatcher text with the same SSH_ORIGINAL_COMMAND a forced
+      # command would get; stdin stays free for emby-sql / backup-store data. Nothing is written there. gzip keeps
+      # the command under the kernel's 128 KiB limit for one argument (plain base64 of the dispatcher passed it)
+      exec ssh "${SSH_OPTS[@]}" "$HOST" \
+        "SSH_ORIGINAL_COMMAND='$req' exec /bin/bash -c \"\$(printf %s '$b64' | base64 -d | gzip -dc)\" claude-bot-cmd" ;;
+    *)
+      echo "unraid-ssh: mode is root (my key is not locked yet); scripts use their root-key commands there." \
+           "Test a verb over the root key with: UNRAID_LOCKDOWN_MODE=emulate unraid-ssh run $req" >&2
+      exit 2 ;;
+  esac
+}
+
+status() {
+  local c m line
+  c=$(configured); m=$(resolve)
+  echo "configured: $c ($( [ -n "${UNRAID_LOCKDOWN_MODE:-}" ] && echo "env UNRAID_LOCKDOWN_MODE" || \
+       { [ -f "$CONF/mode" ] && echo "$CONF/mode" || echo "default"; } ))"
+  echo "resolved:   $m"
+  [ -f "$STATE/probe" ] && read -r line < "$STATE/probe" && echo "probe:      $line (mode epoch)"
+  if [ "$m" != root ]; then
+    echo "hello:      $(UNRAID_LOCKDOWN_MODE=$m "$0" --host "$HOST" run hello 2>&1 | head -n 1)"
+  fi
+  [ -r "$DISPATCHER" ] && echo "local copy: sha256=$(sha256sum < "$DISPATCHER" | cut -d' ' -f1) ($DISPATCHER)"
+}
+
+case ${1:-} in
+  mode) shift; resolve "$@" ;;
+  run) shift; run "$@" ;;
+  status) status ;;
+  -h|--help|help|'') sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \{0,1\}//p' ;;
+  *) echo "unraid-ssh: unknown subcommand '$1' (mode|run|status)" >&2; exit 2 ;;
+esac

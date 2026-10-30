@@ -1,0 +1,10 @@
+[project]
+name = "assistant-tools"
+version = "0.1.0"
+description = "Typed tool registry: Pydantic in/out per tool; generates the FastMCP server `hub`, the `tool` CLI, docs and tools.toml."
+requires-python = ">=3.11,<3.14"
+# Exact pins under the repo's two-week rule (bump deliberately; FastMCP breaks between minors).
+dependencies = ["fastmcp==4.1.3", "pydantic==2.13.5", "cedarpy==4.12.2"]
+
+[tool.uv]
+package = false

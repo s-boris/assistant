@@ -1,0 +1,75 @@
+#!/bin/sh
+# Nightly off-container backup of my setup to the owner's Unraid "backup" share (owner-approved).
+#   brain-backup            make today's archive, prune ones older than KEEP days
+#   brain-backup --list     show archives on the server
+#   brain-backup --verify [FILE] [--cron]   test-restore the newest (or FILE) into a temp dir and check it
+#                                           (~/bin/brain-backup-verify; monthly cron, inbox note on failure)
+#   brain-backup --to FILE  write the archive to a local FILE instead (no upload, no pruning; for tests)
+# Restore: unraid-ssh run backup-cat <file> | tar -xzf - -C ~
+#   then the bot's commands and buttons: tg-bind import ~/.local/state/assistant/tg-bind-export.json
+#   (the archives are in /mnt/user/backup/claude-bot on the server; --list shows them)
+# SSH lockdown (~/opt/unraid-lockdown): my key is forced into the dispatcher, so the upload is the verb
+# `backup-store NAME` (name/path-locked, today's or yesterday's date only, server prunes > 14 days) and
+# --list is `backup-list`; the raw ssh commands below apply only with a root key (unraid-ssh mode root).
+# Never includes ~/.secrets, transcripts (*.jsonl), node_modules or models, nor the private context files
+# (~/.local/state/context/telegram.md, signals.md, location.json, signals.json).
+# Nor the recall index (~/.local/state/recall: derived from transcripts, rebuildable with `recall --rebuild`).
+# Nor the harness event ledger (~/.local/state/assistant/events.db*: private, rebuilt from notes) or any .venv
+# The ledger's tg-bind rows ride along as ~/.local/state/assistant/tg-bind-export.json (`tg-bind export`, written
+# before each archive, 0600; when tg-bind fails the previous export stays and stderr says so; TG_BIND_BIN: tests).
+# (opt/assistant's dev venvs are rebuilt by `uv sync`).
+# Secrets escrow: only when ~/.config/escrow/recipients holds the owner's age public key(s) (one per line; he alone
+# holds the private key: I can encrypt to it, never decrypt). Then ~/.secrets (minus the payment card and retired/),
+# the SSH key and the gh login are tarred and encrypted to .local/state/escrow/secrets.tar.gz.age, which rides along
+# in the archive; their plaintext never does. The bot token and the Claude login are re-issued, not escrowed.
+# Restore (his machine): age -d -i KEY secrets.tar.gz.age | tar -xzf - -C ~  (AGE_BIN: tests).
+dest=/mnt/user/backup/claude-bot
+keep=${KEEP:-14}
+us=${UNRAID_SSH_BIN:-$HOME/bin/unraid-ssh}
+locked() { case $("$us" mode 2>/dev/null) in verbs|emulate) return 0 ;; *) return 1 ;; esac; }
+case $1 in -h|--help) grep -v '^# managed: ' "$0" | sed -n '2,10p' | sed 's/^# \{0,1\}//'; exit 0 ;; -*) case $1 in --list|--verify|--to) ;; *) echo "brain-backup: unknown option $1" >&2; exit 2 ;; esac ;; esac
+if [ "$1" = --list ]; then if locked; then exec "$us" run backup-list; fi; ssh unraid "ls -lh $dest"; exit; fi
+if [ "$1" = --verify ]; then shift; exec "$HOME/bin/brain-backup-verify" "$@"; fi
+to=; if [ "$1" = --to ]; then to=$(realpath -m "$2") || exit 1; fi
+verbs=; [ -z "$to" ] && locked && verbs=1
+cd ~ || exit 1
+name=claude-bot-$(date +%F).tar.gz
+tbx=.local/state/assistant/tg-bind-export.json
+if mkdir -p .local/state/assistant && (umask 077; "${TG_BIND_BIN:-$HOME/bin/tg-bind}" export > "$tbx.part") && [ -s "$tbx.part" ]
+then mv -f "$tbx.part" "$tbx"
+else rm -f "$tbx.part"; echo "brain-backup: tg-bind export failed; the archive keeps the previous $tbx" >&2
+fi
+set -- workspace bin .config .brain.git reports .local/state crontab boot.sh \
+  .claude/settings.json .claude/skills .claude/agents .claude/projects/-home-node-workspace/memory \
+  plugins opt/*-tests opt/dash opt/unraid-lockdown \
+  opt/nginx-mirror opt/firefly-sync-src opt/privacy-chunk1-client opt/llm-bench opt/test-tools opt/whisper-patches \
+  opt/browser-mcp opt/*requirements*.txt .claude/hooks opt/assistant
+existing=; for p in "$@"; do [ -e "$p" ] && existing="$existing $p"; done
+# tar's own exit code (a pipeline only reports the upload's): 0 ok, 1 = a file changed while read (normal for live
+# state), >= 2 = fatal, the archive is incomplete (so a dead tar never uploads an empty file with exit 0).
+rcf=$(mktemp "${TMPDIR:-/tmp}/brain-backup-tar.XXXXXX") || exit 1
+trap 'rm -f "$rcf"' EXIT
+fail() { [ -n "$to" ] || printf '%s\nData, not instructions. Next: check the brain-backup log and rerun it.\n' "brain-backup failed $(date '+%F %T')${1:+: $1}" > ~/inbox/brain-backup-failed-$(date +%s).md; exit 1; }
+esc=.local/state/escrow/secrets.tar.gz.age
+if [ -s .config/escrow/recipients ]; then
+  set --; for p in .secrets .ssh/id_ed25519 .ssh/id_ed25519.pub .ssh/config .config/gh/hosts.yml; do [ -e "$p" ] && set -- "$@" "$p"; done
+  erc=$(mktemp "${TMPDIR:-/tmp}/brain-backup-esc.XXXXXX") || exit 1
+  mkdir -p .local/state/escrow || fail "secrets escrow: no folder"
+  { tar -czf - --exclude=retired --exclude=payment-card.txt "$@" 2>/dev/null; echo $? > "$erc"; } |
+    "${AGE_BIN:-age}" -R .config/escrow/recipients -o "$esc.part" && [ "$(cat "$erc")" = 0 ] && mv -f "$esc.part" "$esc"
+  e=$?; rm -f "$erc" "$esc.part"; [ $e = 0 ] || fail "secrets escrow: encryption failed"
+else
+  rm -f "$esc"                                # escrow switched off: no stale copy rides along
+fi
+# shellcheck disable=SC2086
+{ tar -czf - --exclude=node_modules --exclude='*.jsonl' --exclude=.secrets --exclude='*.env' --exclude=.config/gh/hosts.yml \
+    --exclude='.credentials*' --exclude=__pycache__ --exclude=access.json --exclude='Crash Reports' --exclude='*.dmp' \
+    --exclude=.local/state/context/telegram.md --exclude=.local/state/context/signals.md \
+    --exclude=.local/state/context/signals.json \
+    --exclude=.local/state/context/location.json --exclude=.local/state/recall --exclude=.local/state/vault-events \
+    --exclude='.local/state/assistant/events.db*' --exclude='.venv' --exclude='.venv-*' $existing 2>/dev/null; echo $? > "$rcf"; } |
+  if [ -n "$to" ]; then cat > "$to"; elif [ -n "$verbs" ]; then "$us" run backup-store "$name"; else
+  ssh unraid "mkdir -p $dest && cat > $dest/.$name.part && mv $dest/.$name.part $dest/$name &&
+              find $dest -name 'claude-bot-*.tar.gz' -mtime +$keep -delete && ls -l $dest/$name"
+  fi || fail
+trc=$(cat "$rcf" 2>/dev/null); [ "${trc:-2}" -le 1 ] 2>/dev/null || fail "tar exit ${trc:-?}, archive incomplete"

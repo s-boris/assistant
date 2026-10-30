@@ -1,0 +1,80 @@
+#!/usr/local/bin/python3.13 -I
+# managed: ~/opt/assistant — edit there, deploy with assistant land
+"""scorecard: the continuous scorecard: speed and health per hour against a rolling 7-day baseline.
+
+  scorecard [show] [--json]        live: first reply p95, helper run p95, cost and tokens per day, land time p95,
+        failed lands, vault LLM wait p95 (live lane, from the last samples), failed cron runs; each with n, its
+        7-day baseline and status ok | high | regressed | no-data (no data = never a made-up number)
+  scorecard run [--quiet] [--no-targets]   (cron, hourly) one vault sample, the dashboard section
+        ~/.local/state/scorecard/scorecard.json, spans to Phoenix (a "scorecard" span with every number, one "land"
+        span per new land), and ONE inbox note per regressed metric per day (scorecard-*.md; the heartbeat decides)
+  scorecard targets [--days 7] [--json]   the loop / exit targets (G1 = E7 tokens per beat, G2 = E8 first reply,
+        G3/G3h/G3p = E13, G4, E9, E10) measured now: value, target, met | miss | no-data
+  scorecard feed [--json]          the dashboard section (the last run's result while under 2 h old; else none)
+Regression: at each of the last 3 full hours, the stat over its trailing window > 1.5 x the 7-day baseline, above it
+by the metric's floor, n >= min_n. Sources: traces.db (what Phoenix also gets), deploys.jsonl, `vault metrics`,
+cron-fail's run log. Counts and timings only. Source: ~/opt/assistant (packages/loop/scorecard.py).
+Exit: 0 ok · 2 usage.
+"""
+
+import os
+import sys
+
+_here = os.path.dirname(os.path.realpath(__file__))
+_roots = [
+    os.environ.get("ASSISTANT_LIB", ""),
+    os.path.join(_here, "lib"),
+    os.path.join(_here, ".."),
+    os.path.join(_here, "..", "packages"),
+]
+for _pkg in ("core", "loop"):
+    for _r in _roots:
+        if _r and os.path.isfile(os.path.join(_r, _pkg, "__init__.py")):
+            _r = os.path.abspath(_r)
+            if _r not in sys.path:
+                sys.path.insert(0, _r)
+            break
+
+
+def main(argv):
+    import argparse
+    import json
+
+    from loop import scorecard as sc
+
+    ap = argparse.ArgumentParser(
+        prog="scorecard",
+        description=__doc__.split("\n\n")[0],
+        epilog=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("what", nargs="?", choices=("show", "run", "targets", "feed"), default="show")
+    ap.add_argument("--days", type=float, default=7.0)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-targets", action="store_true")
+    a = ap.parse_args(argv)
+    if not 0 < a.days <= 30:
+        ap.error("--days: 0 < days <= 30")
+    if a.what == "run":
+        res = sc.run(with_targets=not a.no_targets)
+        if not a.quiet:
+            print(json.dumps(res, indent=1) if a.json else sc.render(res))
+        return 0
+    if a.what == "targets":
+        tg = sc.targets(a.days)
+        print(json.dumps(tg, indent=1) if a.json else sc.render_targets(tg))
+        return 0
+    if a.what == "feed":
+        d = sc.feed()
+        print(json.dumps(d) if a.json else ("feed: none (no run or older than 2 h)" if d is None else sc.render(d)))
+        return 0
+    st = sc.load_state()
+    vault = {"samples": st.get("vault") or [], "base": st.get("vault_base")}
+    res = sc.compute(vault=vault)
+    print(json.dumps(res, indent=1) if a.json else sc.render(res))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "c2s.call.state.json",
+  "title": "in-app call state (M3): ringing on screen, answered (the app then opens /v1/voice?call_id=), declined, missed (timeout), ended; declined may carry reply = his quick reply on the ring screen (busy, later, text = text me instead)",
+  "type": "object",
+  "properties": {
+    "call_id": {
+      "type": "string",
+      "pattern": "^k_[A-Za-z0-9]{8,32}$"
+    },
+    "state": {
+      "enum": [
+        "ringing",
+        "answered",
+        "declined",
+        "missed",
+        "ended"
+      ]
+    },
+    "at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4102444800
+    },
+    "reply": {
+      "enum": [
+        "busy",
+        "later",
+        "text"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "call_id",
+    "state"
+  ]
+}

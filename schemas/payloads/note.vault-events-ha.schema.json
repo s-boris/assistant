@@ -1,0 +1,67 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.vault-events-ha.schema.json",
+ "title": "vault-events: merged Home Assistant whereabouts changes; counts and coarse flags only (no zone, town or band text)",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "changes",
+  "drives",
+  "zones",
+  "dropped",
+  "overnight"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.vault-events-ha"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "changes": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "drives": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "zones": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "dropped": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "overnight": {
+   "type": "boolean"
+  },
+  "last": {
+   "enum": [
+    "drive_start",
+    "drive_end",
+    "home",
+    "zone",
+    "away",
+    "unknown",
+    null
+   ]
+  },
+  "cursors": {
+   "type": "array",
+   "items": {
+    "type": "integer"
+   }
+  }
+ }
+}

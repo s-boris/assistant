@@ -1,0 +1,45 @@
+# claude-hub tg (v2 Phase 2 H6): the Telegram adapter in the hub. An override of compose.yaml, installed and started
+# only by the owner's tg paste (`hub kit paste tg-install`), which runs
+#   docker compose -f compose.yaml -f compose.tg.yaml --profile tg up -d tg
+# (the hub install paste adds this file too once it exists, so a later hub update keeps hub's files mount).
+# - hub gets the shared files folder (HUB_ROOT/tgfiles: in/ = the adapter's downloads, out/ = the brain's uploads).
+# - tg runs ops/hub/tgloader.ts (installed by the paste into HUB_ROOT/loader), which runs the release's tg/adapter.js
+#   (adapters/tg as one bun bundle) in hub mode with its own local journal in HUB_ROOT/tg/state.
+# - Secrets: the bot token (HUB_ROOT/secrets/tg_live_token, copied by the paste from the brain's token file) and the
+#   hub API token token_tg reach only this container (compose secrets at /run/secrets). Nothing is published.
+# - One poller per token: the paste refuses while the brain's own live adapter runs; a 409 stops the adapter and the
+#   loader keeps it stopped (unhealthy, saying why) until a new release or a container restart.
+services:
+  hub:
+    environment:
+      HUB_TGFILES: /srv/tgfiles
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/tgfiles", target: /srv/tgfiles, bind: {create_host_path: false}}
+
+  tg:
+    command: ["bun", "/opt/hub-loader/tgloader.ts", "--releases", "/srv/releases", "--state", "/srv/tg/state", "--config", "/srv/tg/config/live.json"]
+    environment:
+      TZ: ${TZ:-UTC}
+      HOME: /tmp
+    secrets: [tg_live_token, token_tg]
+    volumes:
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/loader", target: /opt/hub-loader, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${BOT_HOME:?BOT_HOME missing}/.local/share/claude-hub/releases", target: /srv/releases, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/tg/config", target: /srv/tg/config, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/tg/state", target: /srv/tg/state, bind: {create_host_path: false}}
+      - {type: bind, source: "${HUB_ROOT:?HUB_ROOT missing}/tgfiles", target: /srv/tgfiles, bind: {create_host_path: false}}
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const s = JSON.parse(require('fs').readFileSync('/srv/tg/state/tgloader-status.json', 'utf8')); process.exit(s.state === 'running' && Date.now() / 1000 - s.ts < 90 ? 0 : 1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits: {cpus: "1", memory: 512m, pids: 128}
+
+secrets:
+  tg_live_token:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/tg_live_token
+  token_tg:
+    file: ${HUB_ROOT:?HUB_ROOT missing}/secrets/token_tg

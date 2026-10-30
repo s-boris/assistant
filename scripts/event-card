@@ -1,0 +1,1173 @@
+#!/usr/bin/env python3
+"""event-card: one live card, pinned in the owner's Telegram chat, for an event night (token-free; Bot API direct,
+or the live outbox while the live tg-adapter runs).
+
+  event-card run [--dry-run] [--now ISO]   cron, every 2 min. On an event night, from the first leg's departure minus
+                                           90 min: send ONE silent message and pin it silently, then edit it every run
+                                           until he is home or the cutoff; then a final edit and unpin: the message
+                                           stays in the chat as a record (never deleted); with tracks IDed that night
+                                           the final edit is the night recap instead (below). Cheap exit (file reads
+                                           only; an open recap adds the local `trackid list` + `lists show`) when no
+                                           card is due. --dry-run prints the card and the actions; it sends
+                                           nothing and writes no state.
+  event-card status [--json] [--now ISO]   tonight's event night, its window, the card's message id and phase;
+                                          --json also lists missed_legs {train-watch leg id: planned departure}
+                                          (legs home he stayed past, last 2 days): drop train-watch notes on them
+  event-card off [--now ISO]               end tonight's card now (final edit + unpin) and skip the rest of tonight;
+                                           an open night recap is unpinned too
+
+Event night: a timed calcache event (no travel leg, not all-day, not in the home town) with a 🚆/🚌 leg there
+(departing up to 6 h before it starts) or a leg home (departing from its start up to 10 h after its end), or, without
+legs, a rave/concert by its title (rave/club/concert words or a rave-radar artist, typos too).
+Window: the first leg's departure − 90 min (no legs: the event start − 90 min) until the later of the next 04:45 and
+the last leg's arrival + 15 min. It ends earlier when `vault ha now --json` says home after he was seen away (or once
+the event has started).
+Card: line 1 = what the pinned header shows (event, next train or way home; 🔴 on a broken leg); the next leg with live
+delay and platform (`train-watch status ID --json`, from 3 h before departure); leave by (a leg from home: the door
+departure; else 10 min before); from the event start the next 3 connections home + the last one tonight (`gohome STOP
+--json`, STOP = the start stop of the leg home, else the event's town; arrival at the door, a final walk of 5 min or
+more as "→ <last stop> 00:57, 🚶 home 01:14"); weather at the venue (open-meteo, 30 min cache);
+the update time; one "📞 Talk" button (callback call:talk: telegram-plus runs ~/bin/talk-button and the voice relay
+rings him; marked "keep" in buttons.json), which the final edit drops.
+Pins: sendMessage + pinChatMessage both with disable_notification; editMessageText never notifies; unpinChatMessage
+always names this card's message_id (never unpinAll), so tg-status's pinned board (it pins only its own new messages and
+unpins only by id) keeps working. Telegram keeps several pins; the header shows the newest.
+Night recap: when the card ends at home or the cutoff and trackid named tracks that night (`trackid list 200 --json`:
+an ID whose last identification falls between the card's start and the recap's end), the final edit turns the card into
+a recap instead: the event, the way home (home time, plus the connection it most likely was: the planned leg home or a
+connection the card showed, arriving at most 40 min before he was home) and the night's tracks (up to 8, linked), with
+one "➕ Crate" button (callback rr:crate:tid-…, rave-radar's) per track not yet on the crate list (`lists show crate
+--json`). It stays pinned and is re-edited when new IDs come in or a track reaches the crate, until 18:00 on the morning
+after (or the next card), then unpinned by id. No IDs at the end: the final edit + unpin; IDs that still come
+in before the recap's end turn the (unpinned) record into the recap. The recap only edits: it never sends a new message
+(a missing card ends it), so nothing notifies during the sleep-in guard. Its keyboard is marked "keep" in
+telegram-plus's buttons.json so he can tap several.
+Alerts: a cancelled leg or a delay >= 10 min turns line 1 red. train-watch already writes one inbox note per problem (the
+session sends it on), so event-card sends its own ONE normal message for a leg only when train-watch is not covering it:
+the problem is not in its noted keys and its last check of that leg is missing or older than 25 min.
+One sender: while the live tg-adapter runs (core.tg's gate; switch ~/.config/tg-adapter/direct-event-card
+or direct-all = always direct), each Bot API call becomes a row in the live outbox and the adapter sends it: cards,
+edits and pins are never held or deduped, an alert is urgent, keyboards are marked "keep" by the adapter; no token is
+read. Otherwise, or when the adapter goes away mid-run, the call goes to the Bot API directly.
+Files: ~/.local/state/event-card/ (0700): state.json (message id, night key, alert keys, connections home seen tonight;
+no titles, except an open recap's event title until it ends), geo.json, weather.json, artists.json caches, log.
+Env (tests): EVENT_CARD_DIR, EVENT_CARD_NOW, EVENT_CARD_API + EVENT_CARD_TEST_TOKEN /
+EVENT_CARD_TEST_CHAT (a mock Bot API; the real token only goes to api.telegram.org), EVENT_CARD_CALCACHE (events.json),
+EVENT_CARD_TW_DIR (train-watch's state dir), EVENT_CARD_TRAIN_WATCH / EVENT_CARD_GOHOME / EVENT_CARD_VAULT /
+EVENT_CARD_RAVE_RADAR / EVENT_CARD_TRACKID / EVENT_CARD_LISTS (commands, or "off"), EVENT_CARD_BUTTONS (telegram-plus's
+buttons.json, or "off"; with a mock Bot API only when set), EVENT_CARD_TALK ("off" = no Talk button), EVENT_CARD_WEATHER (an open-meteo forecast JSON file, or "off"),
+EVENT_CARD_GEO (geocoding URL or "off"). A simulated --now / EVENT_CARD_NOW passes the time on to train-watch and gohome
+and skips the vault unless EVENT_CARD_VAULT is set. Tests ~/opt/event-card-tests/run.sh.
+"""
+import argparse
+import datetime as dt
+import hashlib
+import html
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+
+sys.dont_write_bytecode = True
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import drive as drive_rule, http as web, jsonstate, locks, tg as tgout  # noqa: E402
+import assistant_profile as profile  # noqa: E402
+
+HOME = os.path.expanduser('~')
+TZ = profile.tz()
+DIR = os.environ.get('EVENT_CARD_DIR') or os.path.join(HOME, '.local/state/event-card')
+STATE_F = os.path.join(DIR, 'state.json')
+CAL_F = os.environ.get('EVENT_CARD_CALCACHE') or os.path.join(HOME, '.local/state/calcache/events.json')
+TW_DIR = os.environ.get('EVENT_CARD_TW_DIR') or os.path.join(HOME, '.local/state/trains')
+TG_DIR = os.path.join(HOME, '.claude/channels/telegram')
+REAL_API = 'https://api.telegram.org'
+API = os.environ.get('EVENT_CARD_API') or REAL_API
+# The live card's "📞 Talk" button: callback call:talk, run by telegram-plus as an instant button (callbacks.json →
+# ~/bin/talk-button: the voice relay rings him). EVENT_CARD_TALK=off hides it. The final edit and the recap drop it.
+TALK = (os.environ.get('EVENT_CARD_TALK') or 'on').strip().lower() not in ('0', 'off', 'no', 'false')
+TALK_MARKUP = {'inline_keyboard': [[{'text': '📞 Talk', 'callback_data': 'call:talk'}]]}
+
+
+def talk_markup():
+    return TALK_MARKUP if TALK else None
+LEAD = dt.timedelta(minutes=90)
+CUTOFF = dt.time(4, 45)
+AFTER_ARR = dt.timedelta(minutes=15)
+OUT_WINDOW, BACK_WINDOW = dt.timedelta(hours=6), dt.timedelta(hours=10)
+LIVE_FROM = dt.timedelta(hours=3)      # train-watch's own window
+BUFFER = dt.timedelta(minutes=10)      # leave by, for a leg that doesn't start at the door
+ALERT_DELAY = 10
+TW_STALE = dt.timedelta(minutes=25)
+WEATHER_TTL = 30 * 60
+RAVE_RE = re.compile(r'\brave|\bclub|techno|festival|open[- ]?air|afterhour|warehouse|boiler room|concert|konzert'
+                     r'|\bgig\b|\blive\b|\btour\b|\bdj\b', re.I)
+TOKEN_RE = re.compile(r'\b\d{6,12}:[A-Za-z0-9_-]{30,}\b')
+RAVE_GRACE = dt.timedelta(hours=3)        # a live rave-only night is still found after its cutoff: ends as 'cutoff'
+RECAP_UNTIL = dt.time(18, 0)               # the recap stays pinned until 18:00 on the morning after
+RECAP_MAX = 8                              # tracks listed (and ➕ buttons) on the recap
+RECAP_MATCH = dt.timedelta(minutes=40)     # a connection home counts as taken: it arrives ≤ 40 min before home
+DRY = False
+SIMULATED = False
+LAST_GH = None                             # the last gohome answer render() used (the recap's way home)
+LAST_PLACE = None                          # this run's `vault ha now` answer (None: no place source)
+MISSED_KEEP = dt.timedelta(days=2)         # missed legs stay listed in state (and status --json) this long
+WALK_SHOW = 5                              # a final walk this long (gohome's walk_min) is named on the line
+MISSED_GRACE = dt.timedelta(minutes=5)     # still in the venue town this long after the leg home left = missed it
+MOVING = {'vehicle', 'bicycle', 'in_vehicle', 'on_bicycle', 'driving'}
+
+
+# ------------------------------------------------------------------------------------------------ small helpers
+def fixed(t):
+    """Owner wall time with a fixed UTC offset. Two times in one ZoneInfo subtract and compare as wall clocks (the
+    fold is ignored), so in the repeated autumn hour a leg that left at 02:08 CEST looked due again at 02:00 CET; with
+    fixed offsets all arithmetic is real elapsed time. Display goes through hm() (back to his zone)."""
+    t = t.astimezone(TZ)
+    return t.replace(tzinfo=dt.timezone(t.utcoffset()))
+
+
+def iso(s):
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(str(s).strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return fixed(t.replace(tzinfo=TZ) if t.tzinfo is None else t)
+
+
+def hm(t):
+    return t.astimezone(TZ).strftime('%H:%M')
+
+
+def until(t, now):
+    m = int((t - now).total_seconds() // 60)
+    if m < 1:
+        return 'now'
+    return f'in {m // 60} h {m % 60:02d}' if m >= 60 else f'in {m} min'
+
+
+def esc(s):
+    return html.escape(str(s), quote=False)
+
+
+def plain(text):
+    return html.unescape(re.sub(r'</?[a-z][^>]*>', '', text))
+
+
+def log(msg):
+    if DRY:
+        return
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    with open(os.path.join(DIR, 'log'), 'a') as f:
+        f.write('%s %s\n' % (dt.datetime.now(TZ).strftime('%F %T'), TOKEN_RE.sub('<token>', msg)))
+
+
+def read_json(path, default=None):
+    return jsonstate.load(path, default)          # missing, unreadable or broken = default (core.jsonstate)
+
+
+def write_json(path, obj):
+    if DRY:
+        return
+    jsonstate.save(path, obj, mode=0o600, dir_mode=0o700, ensure_ascii=False, indent=1)
+
+
+def cmd_of(env, default):
+    v = os.environ.get(env)
+    if v == 'off':
+        return None
+    return v or default
+
+
+def run_json(argv, extra_env=None, timeout=60):
+    env = dict(os.environ, **(extra_env or {}))
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def is_home_place(s):
+    try:
+        import home_place
+        return home_place.is_home(s)
+    except Exception:
+        return str(s or '').strip().casefold() == 'home'
+
+
+def home_towns():
+    names = [profile.get('home.town', '')] + list(profile.get('home.town_aliases', []) or [])
+    return {str(n).strip().casefold() for n in names if n}
+
+
+# ------------------------------------------------------------------------------------------------ event nights
+def load_events():
+    d = read_json(CAL_F, {})
+    ev = d.get('events', d) if isinstance(d, dict) else d
+    if isinstance(ev, dict):
+        ev = list(ev.values())
+    out = []
+    for e in ev if isinstance(ev, list) else []:
+        if isinstance(e, dict) and iso(e.get('start')) and iso(e.get('end')):
+            out.append(dict(e, _s=iso(e['start']), _e=iso(e['end'])))
+    return sorted(out, key=lambda e: e['_s'])
+
+
+def rave_artists():
+    cache = os.path.join(DIR, 'artists.json')
+    c = read_json(cache, {})
+    if isinstance(c, dict) and time.time() - c.get('at', 0) < 12 * 3600:
+        return c.get('names', [])
+    bin_ = cmd_of('EVENT_CARD_RAVE_RADAR', os.path.join(HOME, 'bin/rave-radar'))
+    rows = run_json([bin_, 'artists', 'list', '--json'], timeout=15) if bin_ and os.path.exists(bin_) else None
+    names = []
+    for a in rows if isinstance(rows, list) else []:
+        if isinstance(a, dict):
+            names += [n.strip().lower() for n in [a.get('name'), *(a.get('aliases') or [])]
+                      if isinstance(n, str) and len(n.strip()) >= 3]
+    if rows is not None:
+        write_json(cache, {'at': time.time(), 'names': names})
+    return names
+
+
+def artist_hit(text, names):
+    import difflib
+    low = text.lower()
+    toks = re.findall(r"[\w'&.-]+", low)
+    for n in names:
+        if re.search(r'(?<!\w)' + re.escape(n) + r'(?!\w)', low):
+            return True
+        k = len(n.split())
+        if len(n) >= 6 and any(difflib.SequenceMatcher(None, ' '.join(toks[i:i + k]), n).ratio() >= 0.85
+                               for i in range(len(toks) - k + 1)):
+            return True
+    return False
+
+
+def next_cutoff(t):
+    """The next CUTOFF wall time after t (set on his wall clock, so 04:45 stays 04:45 across a clock change)."""
+    c = t.astimezone(TZ).replace(hour=CUTOFF.hour, minute=CUTOFF.minute, second=0, microsecond=0, fold=0)
+    return fixed(c) if fixed(c) > t else fixed(c + dt.timedelta(days=1))
+
+
+def find_nights(events, now, rave_check=True):
+    """Every event night in the cache: {key, ev, legs (sorted), back (leg home or None), start, end}."""
+    legs = [e for e in events if isinstance(e.get('train'), dict) and (e.get('flags') or {}).get('travel') in
+            ('train', 'bus')]
+    towns = home_towns()
+    nights = []
+    for m in events:
+        fl = m.get('flags') or {}
+        if m.get('all_day') or fl.get('travel') or isinstance(m.get('train'), dict):
+            continue
+        if str(m.get('town') or '').strip().casefold() in towns:
+            continue
+        s, e = m['_s'], m['_e']
+        out = [g for g in legs if s - OUT_WINDOW <= g['_s'] <= s and not is_home_place(g['train'].get('to'))]
+        back = [g for g in legs if s <= g['_s'] <= e + BACK_WINDOW and is_home_place(g['train'].get('to'))]
+        mine = sorted(out[-1:] + back[:1], key=lambda g: g['_s'])
+        if mine:
+            start = mine[0]['_s'] - LEAD
+        else:
+            start = s - LEAD
+            if not (rave_check and start <= now < next_cutoff(s) + RAVE_GRACE and
+                    (RAVE_RE.search(m.get('title') or '') or artist_hit(m.get('title') or '', rave_artists()))):
+                continue
+        end = max([next_cutoff(max(s, start + LEAD))] + [g['_e'] + AFTER_ARR for g in mine])
+        nights.append({'key': '%s@%s' % (m.get('id'), s.date().isoformat()), 'ev': m, 'legs': mine,
+                       'back': back[0] if back else None, 'start': start, 'end': end})
+    return nights
+
+
+# ------------------------------------------------------------------------------------------------ live sources
+def tw_leg_ids():
+    d = read_json(os.path.join(TW_DIR, 'legs.json'), {})
+    rows = d.get('legs', d) if isinstance(d, dict) else d
+    return {r.get('event_id'): r.get('id') for r in rows if isinstance(r, dict) and r.get('event_id')} \
+        if isinstance(rows, list) else {}
+
+
+def tw_status(leg_id, now):
+    bin_ = cmd_of('EVENT_CARD_TRAIN_WATCH', os.path.join(HOME, 'bin/train-watch'))
+    if not bin_ or not leg_id:
+        return None
+    env = {'TRAIN_WATCH_NOW': now.isoformat()} if SIMULATED else None
+    return run_json([bin_, 'status', leg_id, '--json'], env)
+
+
+def tw_covers(leg_id, keys, now):
+    """True when train-watch is on this problem: noted already, or it checked the leg in the last 25 min."""
+    st = (read_json(os.path.join(TW_DIR, 'state.json'), {}) or {}).get('legs', {}).get(leg_id) or {}
+    if set(keys) & set(st.get('noted') or []):
+        return True
+    last = iso(st.get('last'))
+    return bool(last and now - last <= TW_STALE)
+
+
+def go_home(stop, now):
+    bin_ = cmd_of('EVENT_CARD_GOHOME', os.path.join(HOME, 'bin/gohome'))
+    if not bin_ or not stop:
+        return None
+    env = {'GOHOME_NOW': now.astimezone(TZ).strftime('%Y-%m-%d %H:%M')} if SIMULATED else None
+    return run_json([bin_, stop, '--json'], env)
+
+
+def place_info():
+    """`vault ha now --json` (place, drive, activity), or None."""
+    default = None if SIMULATED else os.path.join(HOME, 'bin/vault')
+    bin_ = cmd_of('EVENT_CARD_VAULT', default)
+    if not bin_:
+        return None
+    d = run_json([bin_, 'ha', 'now', '--json'], timeout=40)
+    return d if isinstance(d, dict) and isinstance(d.get('place'), dict) else None
+
+
+def place_kind(d):
+    return d['place'].get('kind') if d else None
+
+
+def norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode().casefold()
+    return ' '.join(s.replace('-', ' ').replace(',', ' ').split())
+
+
+def still_here(d, m):
+    """True: in the event's town and not moving; False: moving or in another town; None: can't say."""
+    if not d:
+        return None
+    pl = d['place']
+    if pl.get('kind') == 'home' or drive_rule.active(d) or \
+            str(d.get('activity') or '').casefold() in MOVING:
+        return False
+    a, t = norm(pl.get('town')), norm(m.get('town'))
+    if not a or not t:
+        return None
+    return a == t or a.startswith(t + ' ') or t.startswith(a + ' ')
+
+
+def riding(conns, now, since=None):
+    """The remembered connection home he is most likely on: left after he was last seen at the venue (since), not
+    arrived yet; the latest such one. None when none fits."""
+    best = None
+    for c in (conns or {}).values():
+        d, a = iso(c.get('dep')), iso(c.get('arr'))
+        if d and a and d <= now < a and (since is None or d >= since - dt.timedelta(minutes=2)) and \
+                (best is None or d > iso(best['dep'])):
+            best = c
+    return best
+
+
+URLLIB_UA = 'Python-urllib/%d.%d' % sys.version_info[:2]   # the UA the Bot API calls always sent
+
+
+def http_json(url, timeout=15):
+    with web.open(url, headers={'User-Agent': 'event-card/1'}, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def geocode(town):
+    cache_f = os.path.join(DIR, 'geo.json')
+    cache = read_json(cache_f, {}) or {}
+    if town in cache:
+        return cache[town]
+    base = os.environ.get('EVENT_CARD_GEO') or 'https://geocoding-api.open-meteo.com/v1/search'
+    if base == 'off':
+        return None
+    try:
+        res = http_json(base + '?' + urllib.parse.urlencode({'name': town, 'count': 5, 'format': 'json'}))
+    except Exception:
+        return None
+    rows = [r for r in res.get('results') or [] if 'latitude' in r]
+    if not rows:
+        return None
+    hl, ho = profile.get('home.lat', None), profile.get('home.lon', None)
+    if hl is not None and ho is not None:   # the one nearest home (Bern CH, not Bern US)
+        rows.sort(key=lambda r: (r['latitude'] - float(hl)) ** 2 + (r['longitude'] - float(ho)) ** 2)
+    cache[town] = [round(rows[0]['latitude'], 3), round(rows[0]['longitude'], 3)]
+    write_json(cache_f, cache)
+    return cache[town]
+
+
+WMO = ((0, '☀️'), (2, '🌤'), (3, '☁️'), (48, '🌫'), (57, '🌦'), (67, '🌧'), (77, '🌨'), (82, '🌧'), (86, '🌨'), (99, '⛈'))
+
+
+def weather_line(town, a, b):
+    """'🌧 Zürich 19–22 h: 9–7°, rain 60 %' for the hours a..b (local), or None."""
+    if not town:
+        return None
+    fix = os.environ.get('EVENT_CARD_WEATHER')
+    if fix == 'off':
+        return None
+    key = '%s|%s' % (town, a.date().isoformat())
+    if fix:
+        data = read_json(fix)
+    else:
+        cache_f = os.path.join(DIR, 'weather.json')
+        cache = read_json(cache_f, {}) or {}
+        c = cache.get(key)
+        if c and time.time() - c.get('at', 0) < WEATHER_TTL:
+            data = c['data']
+        else:
+            ll = geocode(town)
+            if not ll:
+                return None
+            q = {'latitude': ll[0], 'longitude': ll[1], 'timezone': str(TZ),
+                 'hourly': 'temperature_2m,precipitation_probability,weather_code',
+                 'start_date': a.date().isoformat(), 'end_date': (b.date() + dt.timedelta(days=0)).isoformat()}
+            try:
+                data = http_json('https://api.open-meteo.com/v1/forecast?' + urllib.parse.urlencode(q))
+            except Exception:
+                return None
+            cache = {k: v for k, v in cache.items() if time.time() - v.get('at', 0) < 86400}
+            cache[key] = {'at': time.time(), 'data': data}
+            write_json(cache_f, cache)
+    h = (data or {}).get('hourly') or {}
+    rows = []
+    for i, t in enumerate(h.get('time') or []):
+        tt = fixed(dt.datetime.fromisoformat(t).replace(tzinfo=TZ))
+        if a.replace(minute=0, second=0, microsecond=0) <= tt <= b:
+            try:
+                rows.append((tt, h['temperature_2m'][i], (h.get('precipitation_probability') or [0] * 999)[i] or 0,
+                             h['weather_code'][i]))
+            except (KeyError, IndexError, TypeError):
+                pass
+    rows = [r for r in rows if r[1] is not None]
+    if not rows:
+        return None
+    temps = [r[1] for r in rows]
+    rain = max(r[2] for r in rows)
+    code = max(r[3] or 0 for r in rows)
+    emo = next((e for lim, e in WMO if code <= lim), '🌡')
+    if code <= 1 and not 7 <= rows[0][0].hour < 19:
+        emo = '🌙'
+    t0, t1 = round(temps[0]), round(temps[-1])
+    span = f'{t0}°' if t0 == t1 else f'{t0}–{t1}°'
+    hrs = f'{rows[0][0].hour}–{rows[-1][0].hour} h' if len(rows) > 1 else f'{rows[0][0].hour} h'
+    return f'{emo} {town} {hrs}: {span}' + (f', rain {rain} %' if rain >= 20 else '')
+
+
+# ------------------------------------------------------------------------------------------------ the card
+def leg_route(g):
+    t = g['train']
+    f = 'home' if is_home_place(t.get('from')) else t.get('from') or '?'
+    to = 'home' if is_home_place(t.get('to')) else t.get('to') or '?'
+    return f'{f} → {to}'
+
+
+def leg_lines(g, live=None):
+    ls = (live or {}).get('lines') or g['train'].get('lines') or []
+    return ' '.join(ls[:3]) + (' …' if len(ls) > 3 else '')
+
+
+def leg_block(g, now, live, problem):
+    """(head bit, card lines) for the next leg."""
+    dep, arr = g['_s'], g['_e']
+    lines_ = leg_lines(g, live)
+    plat = (live or {}).get('platform')
+    pl = f' · pl {esc(plat)}' if plat else ''
+    if problem:
+        state = '❌ cancelled' if problem == 'cancel' else f"🔴 +{live['delay']} min"
+    elif live:
+        state = 'on time' if not live.get('delay') else f"+{live['delay']} min"
+    else:
+        state = 'planned'
+    if now >= dep:   # on board
+        eta = arr + dt.timedelta(minutes=(live or {}).get('delay') or 0)
+        head = f'🚆 {lines_} → {"home" if is_home_place(g["train"].get("to")) else esc(g["train"].get("to"))} {hm(eta)}'
+        return head, [f'🚆 On the way: {esc(lines_)} {esc(leg_route(g))}, arrives {hm(eta)}'
+                      + (f' ({state})' if live else '')]
+    out = [f'🚆 Next: {hm(dep)} {esc(lines_)} {esc(leg_route(g))}{pl} · {state}']
+    if problem and live and (live.get('text') or '').strip():
+        out.append(f'   live: {esc(live["text"])}')
+    alt = (live or {}).get('alt') if problem else None
+    if alt:
+        link = alt.get('link')
+        t = esc(alt.get('text') or '')
+        out.append('   ↪ ' + (f'<a href="{esc(link)}">{t}</a>' if link else t))
+    if is_home_place(g['train'].get('from')):
+        lb = dep
+        out.append(f'🚶 Leave by {hm(lb)} ({until(lb, now)})')
+    else:
+        lb = dep - BUFFER
+        out.append(f'🚶 Leave for {esc(g["train"].get("from"))} by {hm(lb)} ({until(lb, now)})')
+    if is_home_place(g['train'].get('from')):   # a door leg: the header says when to leave
+        head = f'🚶 leave {hm(dep)} · {plain(state)}'
+    else:
+        head = f'🚆 {lines_} {hm(dep)}' + (f' pl {plat}' if plat else '') + f' · {plain(state)}'
+    return head, out
+
+
+def conn_line(c, tag=''):
+    t = fixed(dt.datetime.fromisoformat(c['dep']))
+    a = fixed(dt.datetime.fromisoformat(c['arr']))
+    dep = f'<a href="{esc(c["link"])}">{hm(t)}</a>' if c.get('link') else hm(t)
+    ls = ' '.join((c.get('lines') or [])[:3])
+    pl = f' pl {esc(c["platform"])}' if c.get('platform') else ''
+    ch = f' · {c["changes"]}×' if c.get('changes') else ''
+    w, off, oa = c.get('walk_min'), c.get('off'), c.get('off_arr')
+    if isinstance(w, int) and w >= WALK_SHOW and off and oa:   # gohome's arr is at the door: name a long last mile
+        oa = fixed(dt.datetime.fromisoformat(oa))
+        return f'{tag}{dep} {esc(ls)}{pl} → {esc(off)} {hm(oa)}, 🚶 home {hm(a)}{ch}'
+    return f'{tag}{dep} {esc(ls)}{pl} → {hm(a)}{ch}'
+
+
+def home_block(gh, now, night_end):
+    """(head bit, lines) from gohome --json. A 'last' after the card's window belongs to the next night: dropped."""
+    if not isinstance(gh, dict):
+        return None, ['🏠 Way home: not checked (/gohome)']
+    if gh.get('home'):
+        return None, []
+    nxt, last = gh.get('next') or [], gh.get('last')
+    ld = fixed(dt.datetime.fromisoformat(last['dep'])) if last and last.get('dep') else None
+    if ld and ld > night_end:
+        last, ld = None, None
+    if not nxt and not last:
+        return None, ['🏠 No connection home found (/gohome)']
+    last_dep = last and last.get('dep')
+    out = [f'🏠 Home from {esc(gh.get("origin") or "?")}:']
+    for c in nxt[:3]:
+        out.append('   ' + conn_line(c, '🌙 ' if c.get('dep') == last_dep else ''))
+    head = '🏠 next ' + hm(dt.datetime.fromisoformat(nxt[0]['dep'])) if nxt else '🏠'
+    if ld and last_dep not in [c.get('dep') for c in nxt[:3]]:
+        out.append(('🌙 Last ' + conn_line(last)) if ld > now else f'🌙 Last one left at {hm(ld)}')
+    if ld and ld > now:
+        head += f' · last {hm(ld)}'
+    return head, out
+
+
+def problem_of(live):
+    if not live or not isinstance(live.get('live'), dict) and not live.get('problems'):
+        return None
+    lv = live.get('live') or {}
+    if lv.get('cancelled') or any('cancel' in str(p.get('key', '')) or 'gone' in str(p.get('key', ''))
+                                  for p in live.get('problems') or []):
+        return 'cancel'
+    if (lv.get('delay') or 0) >= ALERT_DELAY:
+        return 'delay'
+    return None
+
+
+def render(n, now, tw_ids, missed=False, here=None, conns=None, here_at=None):
+    """missed: he stayed in the venue town past the leg home's departure (the card then keeps the way home and
+    never claims he is on that leg); here: still_here() of this run; conns: the remembered connections home."""
+    global LAST_GH
+    LAST_GH = None
+    m, legs = n['ev'], n['legs']
+    title = (m.get('title') or 'Event').strip()
+    nxt = next((g for g in legs if (g['_e'] or g['_s']) > now), None)
+    head_bits, body, alert = [], [], None
+    back = n.get('back')
+    missed_leg = bool(missed and back is not None and now >= back['_s'])
+    if nxt and missed_leg and nxt.get('id') == back.get('id'):
+        nxt = None                                # not his train any more
+    if nxt:
+        st = None
+        lid = tw_ids.get(nxt.get('id'))
+        if nxt['_s'] - LIVE_FROM <= now <= nxt['_e']:
+            st = tw_status(lid, now)
+        live = dict((st or {}).get('live') or {}, alt=(st or {}).get('alt')) if st and st.get('live') else None
+        prob = problem_of(st)
+        if prob == 'cancel' and live is None:
+            live = {'cancelled': True, 'alt': (st or {}).get('alt')}
+        hb, lines_ = leg_block(nxt, now, live, prob)
+        if prob:
+            alert = {'leg': lid, 'kind': prob, 'keys': [p.get('key') for p in st.get('problems') or []],
+                     'line': plain(lines_[0]), 'alt': (st or {}).get('alt')}
+        head_bits.append(hb)
+        body += lines_
+    if missed_leg:
+        c = riding(conns, now, here_at) if here is False else None
+        if c:
+            ls = esc(' '.join(c.get('lines') or []) or 'train')
+            head_bits.append(f'🚆 {plain(ls)} → home {hm(iso(c["arr"]))}')
+            body.append(f'🚆 On the way (likely): {ls} {hm(iso(c["dep"]))}'
+                        + (f' from {esc(c["from"])}' if c.get('from') else '') + f', arrives {hm(iso(c["arr"]))}')
+        elif here is not False:
+            body.append(f'🚆 Planned {hm(back["_s"])} {esc(leg_lines(back))} left without you')
+    started = now >= m['_s']
+    on_way_home = back is not None and now >= back['_s'] and not (missed_leg and here is not False)
+    if started and not on_way_home:
+        stop = back['train'].get('from') if back else m.get('town')
+        LAST_GH = go_home(stop, now)
+        hb, lines_ = home_block(LAST_GH, now, n["end"])
+        if hb and not alert:                     # the header: the way home once the event is on, a broken leg first
+            head_bits = [hb]
+        body += lines_
+    wl = weather_line(m.get('town'), max(now, m['_s'] - dt.timedelta(hours=1)),
+                      min(m['_e'], max(now, m['_s']) + dt.timedelta(hours=6)))
+    if wl:
+        body.append(wl)
+    when = f'{hm(m["_s"])}–{hm(m["_e"])}'
+    top = ('🔴 ' if alert else '🎟 ') + esc(title) + (' · ' + esc(head_bits[0]) if head_bits else f' · {when}')
+    text = '\n'.join([f'<b>{top}</b>', f'📍 {esc(m.get("town") or "?")} · {when}'] + body
+                     + [f'<i>🕑 live · {hm(now)}</i>'])
+    return text, alert
+
+
+def final_text(n, now, why):
+    m = n['ev']
+    title = esc((m.get('title') or 'Event').strip())
+    legs = ' · '.join(f'{hm(g["_s"])}→{hm(g["_e"])}' for g in n['legs'])
+    first = {'home': f'✅ {title} · home {hm(now)}', 'off': f'⏹ {title} · live card stopped {hm(now)}',
+             'gone': f'⏹ {title} · no longer in the calendar'}.get(why, f'🌙 {title} · live card ended {hm(now)}')
+    return '\n'.join([f'<b>{first}</b>'] + ([f'🚆 {legs}'] if legs else []) + ['<i>Live card ended; kept as a record.</i>'])
+
+
+# ------------------------------------------------------------------------------------------------ Telegram
+class TgError(Exception):
+    def __init__(self, code, desc):
+        super().__init__('%s %s' % (code, desc))
+        self.code, self.desc = code, desc
+
+
+_creds = None
+
+
+def creds():
+    global _creds
+    if _creds:
+        return _creds
+    if API != REAL_API:   # a test server never gets the real token
+        _creds = (os.environ['EVENT_CARD_TEST_TOKEN'], os.environ.get('EVENT_CARD_TEST_CHAT', '1'))
+        return _creds
+    tok = None
+    with open(os.path.join(TG_DIR, '.env')) as f:
+        for ln in f:
+            k, _, v = ln.strip().partition('=')
+            if k.strip().replace('export ', '') == 'TELEGRAM_BOT_TOKEN':
+                tok = v.strip().strip('"\'')
+    with open(os.path.join(TG_DIR, 'access.json')) as f:
+        chat = str(json.load(f)['allowFrom'][0])
+    if not tok:
+        raise RuntimeError('no bot token')
+    _creds = (tok, chat)
+    return _creds
+
+
+_OUTBOX = None
+
+
+def outbox():
+    """One sender: True = this run's Bot API calls go through the live outbox (core.tg; the live tg-adapter sends
+    them, holding no card and deduping nothing; alerts are urgent), decided once per run: while the live adapter runs
+    and ~/.config/tg-adapter/direct-event-card (or direct-all) is absent. Never with a test API (EVENT_CARD_API)."""
+    global _OUTBOX
+    if _OUTBOX is None:
+        _OUTBOX = False
+        if API == REAL_API and not DRY:
+            try:
+                _OUTBOX = tgout.outbox_on('event-card')[0]
+            except Exception as e:  # noqa: BLE001 (the direct path is the safe default)
+                log('outbox gate: %s' % type(e).__name__)
+    return _OUTBOX
+
+
+def call(method, **params):
+    if outbox():
+        mk = params.get('reply_markup') or {}
+        try:
+            return tgout.bot_call(method, params, sender='event-card', hold=False, dedupe=False,
+                                  urgent=method == 'sendMessage' and not params.get('disable_notification'),
+                                  on_press='keep' if mk.get('inline_keyboard') else None)
+        except tgout.TgError as e:
+            if e.code != -1:
+                raise TgError(e.code, TOKEN_RE.sub('<token>', e.desc))
+            log('outbox: %s; direct path' % e.desc)   # the live adapter went away: the direct call below
+    tok, chat = creds()
+    params.setdefault('chat_id', chat)
+    try:
+        with web.open('%s/bot%s/%s' % (API, tok, method), json.dumps(params).encode(),
+                      headers={'Content-Type': 'application/json'}, timeout=15, ua=URLLIB_UA) as r:
+            body = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {'ok': False, 'error_code': e.code, 'description': 'HTTP %s' % e.code}
+    except Exception as e:   # never let a URL (with the token) reach a log
+        raise TgError(0, TOKEN_RE.sub('<token>', '%s: %s' % (type(e).__name__, e)))
+    if not body.get('ok'):
+        raise TgError(body.get('error_code', 0), TOKEN_RE.sub('<token>', str(body.get('description', ''))))
+    return body.get('result')
+
+
+def send_card(text):
+    mk = {'reply_markup': talk_markup()} if talk_markup() else {}
+    try:
+        m = call('sendMessage', text=text, parse_mode='HTML', disable_notification=True,
+                 link_preview_options={'is_disabled': True}, **mk)
+    except TgError as e:
+        if "can't parse entities" not in e.desc.lower():
+            raise
+        m = call('sendMessage', text=plain(text), disable_notification=True,
+                 link_preview_options={'is_disabled': True}, **mk)
+    return m['message_id']
+
+
+def pin(mid):
+    try:
+        call('pinChatMessage', message_id=mid, disable_notification=True)
+    except TgError as e:
+        log('pin failed: %s' % e.desc)
+
+
+def unpin(mid):
+    try:
+        call('unpinChatMessage', message_id=mid)
+    except TgError as e:
+        log('unpin %s: %s' % (mid, e.desc))
+
+
+def edit(mid, text, markup=None):
+    """True = edited (or unchanged); False = the message is gone (send a new one). markup: an inline keyboard."""
+    for t, mode in ((text, 'HTML'), (plain(text), None)):
+        try:
+            call('editMessageText', message_id=mid, text=t, link_preview_options={'is_disabled': True},
+                 **({'parse_mode': mode} if mode else {}), **({'reply_markup': markup} if markup else {}))
+            return True
+        except TgError as e:
+            d = e.desc.lower()
+            if 'not modified' in d:
+                return True
+            if mode and "can't parse entities" in d:
+                continue
+            if 'message to edit not found' in d or "can't be edited" in d or 'message_id_invalid' in d:
+                return False
+            raise
+    return True
+
+
+# ------------------------------------------------------------------------------------------------ night recap
+def remember_conns(st, gh):
+    """Keep the connections home the card showed tonight (dep, arr, lines, from): the recap's way home."""
+    if not isinstance(gh, dict) or gh.get('home'):
+        return
+    seen = st.setdefault('conns', {})
+    for c in (gh.get('next') or [])[:3] + ([gh['last']] if isinstance(gh.get('last'), dict) else []):
+        if isinstance(c, dict) and iso(c.get('dep')) and iso(c.get('arr')):
+            seen[c['dep']] = {'dep': c['dep'], 'arr': c['arr'], 'lines': list(c.get('lines') or [])[:3],
+                              'from': gh.get('origin')}
+    st['conns'] = dict(sorted(seen.items(), key=lambda kv: iso(kv[0]))[-16:])
+
+
+def night_hits(since, until):
+    """trackid IDs last identified in [since, until), oldest first; None when trackid can't say."""
+    bin_ = cmd_of('EVENT_CARD_TRACKID', os.path.join(HOME, 'bin/trackid'))
+    if not bin_:
+        return []
+    rows = run_json([bin_, 'list', '200', '--json'], timeout=30)
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows:
+        t = iso(r.get('ts')) if isinstance(r, dict) else None
+        if t and since <= t < until and str(r.get('id') or '').startswith('tid-') and r.get('crate'):
+            out.append(dict(r, _t=t))
+    return sorted(out, key=lambda r: r['_t'])
+
+
+def crate_key(s):
+    return ' '.join(re.sub(r'\s*[–—-]\s*', ' - ', str(s or '')).casefold().split())
+
+
+def crate_items():
+    """The crate list's items (open and checked) as crate_key()s; None when lists can't say (then every ➕ shows)."""
+    bin_ = cmd_of('EVENT_CARD_LISTS', os.path.join(HOME, 'bin/lists'))
+    d = run_json([bin_, 'show', 'crate', '--json'], timeout=20) if bin_ else None
+    if not isinstance(d, dict):
+        return None
+    items = list(d.get('open') or []) + list(d.get('done') or [])
+    return {crate_key(x.get('text') if isinstance(x, dict) else x) for x in items} - {''}
+
+
+def new_recap(st, n, now, why):
+    m = n['ev']
+    until = max(fixed(dt.datetime.combine(next_cutoff(m['_s']).date(), RECAP_UNTIL, tzinfo=TZ)),
+                now + dt.timedelta(hours=2))
+    conns = list((st.get('conns') or {}).values())
+    b = n.get('back')
+    if b and not is_home_place(b['train'].get('from')):
+        conns.append({'dep': b['_s'].isoformat(), 'arr': b['_e'].isoformat(),
+                      'lines': list(b['train'].get('lines') or [])[:3], 'from': b['train'].get('from')})
+    return {'night': n['key'], 'message_id': st.get('message_id'), 'title': (m.get('title') or 'Event').strip(),
+            'town': m.get('town'), 'ev_start': m['_s'].isoformat(), 'since': n['start'].isoformat(),
+            'until': until.isoformat(), 'home_at': now.isoformat() if why == 'home' else None,
+            'conns': conns[-17:], 'pinned': False, 'hash': None}
+
+
+def way_home(rc):
+    """'🏠 Home 02:31 · 🚆 S9 01:45 from X → 02:24' (the connection that most likely got him home), or None."""
+    home = iso(rc.get('home_at'))
+    if not home:
+        return None
+    best = None
+    for c in rc.get('conns') or []:
+        d, a = iso(c.get('dep')), iso(c.get('arr'))
+        if d and a and home - RECAP_MATCH <= a <= home + dt.timedelta(minutes=5) and (best is None or a > best[1]):
+            best = (d, a, c)
+    if not best:
+        return f'🏠 Home {hm(home)}'
+    d, a, c = best
+    frm = f' from {esc(c["from"])}' if c.get('from') else ''
+    return f'🏠 Home {hm(home)} · 🚆 {esc(" ".join(c.get("lines") or []) or "train")} {hm(d)}{frm} → {hm(a)}'
+
+
+def recap_text(rc, hits, crate):
+    """(HTML text, inline keyboard or None). Line 1 is what the pinned header shows."""
+    n = len(hits)
+    lines = [f'<b>🌙 {esc(rc.get("title") or "Event")} · {n} track{"" if n == 1 else "s"} IDed</b>']
+    s = iso(rc.get('ev_start'))
+    if s:
+        lines.append(f'📍 {esc(rc.get("town") or "?")} · {s.astimezone(TZ).strftime("%a %d.%m")} {hm(s)}')
+    wh = way_home(rc)
+    if wh:
+        lines.append(wh)
+    rows = []
+    for i, r in enumerate(hits[:RECAP_MAX], 1):
+        url = r.get('deezer_url') or r.get('shazam_url')
+        name = (f'<a href="{html.escape(str(url), quote=True)}">{esc(r["crate"])}</a>' if url else esc(r['crate']))
+        have = crate is not None and crate_key(r['crate']) in crate
+        lines.append(f'{i}. {hm(r["_t"])} {name}' + (' · ✓ crate' if have else ''))
+        if not have:
+            label = f'➕ {i}. {r.get("title") or r["crate"]}'
+            rows.append([{'text': label if len(label) <= 32 else label[:31] + '…',
+                          'callback_data': 'rr:crate:' + r['id']}])
+    if n > RECAP_MAX:
+        lines.append(f'… and {n - RECAP_MAX} more')
+    lines.append('<i>Night recap' + (' · ➕ puts a track on your crate list</i>' if rows else '</i>'))
+    return '\n'.join(lines), ({'inline_keyboard': rows} if rows else None)
+
+
+def keep_buttons(mid):
+    """Mark a keyboard "keep" in telegram-plus's buttons.json (the recap's ➕ buttons, the live card's Talk)."""
+    path = os.environ.get('EVENT_CARD_BUTTONS')
+    if DRY or path == 'off' or (not path and API != REAL_API) or outbox():   # outbox: the adapter marks it (on_press)
+        return
+    path = path or os.path.join(os.environ.get('TELEGRAM_STATE_DIR') or TG_DIR, 'buttons.json')
+    try:
+        d = read_json(path, {})
+        d = d if isinstance(d, dict) else {}
+        d['%s:%s' % (creds()[1], mid)] = {'on_press': 'keep', 'ts': int(time.time() * 1000)}
+        tmp = '%s.tmp%d' % (path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(d, f)
+        os.replace(tmp, path)
+    except (OSError, RuntimeError, KeyError, ValueError) as e:
+        log('keep buttons %s: %s' % (mid, type(e).__name__))
+
+
+def recap_show(rc, hits, why):
+    """Edit the card into the recap when it changed. False = the card is gone (the recap ends: never a new message)."""
+    text, markup = recap_text(rc, hits, crate_items())
+    h = hashlib.sha256((text + json.dumps(markup)).encode()).hexdigest()[:16]
+    if h == rc.get('hash'):
+        return True
+    mid = rc['message_id']
+    act(f'edit message {mid} into the night recap ({len(hits)} tracks, {why}; silent)')
+    if DRY:
+        print(plain(text))
+        for row in (markup or {}).get('inline_keyboard', []):
+            print('  [%s] -> %s' % (row[0]['text'], row[0]['callback_data']))
+    else:
+        try:
+            if not edit(mid, text, markup):
+                log('recap card %s gone' % mid)
+                return False
+        except TgError as e:
+            log('recap edit: %s' % e.desc)
+            return True
+        if markup:
+            keep_buttons(mid)
+    rc['hash'] = h
+    return True
+
+
+def recap_tick(st, now, end=False):
+    """An open recap: re-edit on new IDs or crate changes; at its end (or end=True: the next card, `off`) unpin it."""
+    rc = st.get('recap')
+    if not rc:
+        return
+    end = end or now >= iso(rc['until'])
+    hits = night_hits(iso(rc['since']), iso(rc['until']))
+    gone = bool(hits) and not recap_show(rc, hits, 'update')
+    if end or gone:
+        if rc.get('pinned') and not gone:
+            act(f'unpin the recap {rc["message_id"]} by id')
+            if not DRY:
+                unpin(rc['message_id'])
+        st.pop('recap', None)
+
+
+# ------------------------------------------------------------------------------------------------ commands
+def get_now(a):
+    global SIMULATED
+    s = getattr(a, 'now', None) or os.environ.get('EVENT_CARD_NOW')
+    if s:
+        SIMULATED = True
+        t = iso(s)
+        if not t:
+            sys.exit('event-card: bad --now %r (ISO, e.g. 2026-10-22T16:44)' % s)
+        return t
+    return fixed(dt.datetime.now(TZ)).replace(second=0, microsecond=0)
+
+
+def load_state():
+    st = read_json(STATE_F, {}) or {}
+    st.setdefault('done', {})
+    st.setdefault('alerts', [])
+    return st
+
+
+def save_state(st, now):
+    keep = sorted(st['done'].items(), key=lambda kv: kv[1].get('at', ''))[-20:]
+    st['done'] = dict(keep)
+    st['alerts'] = st['alerts'][-40:]
+    write_json(STATE_F, st)
+
+
+def act(msg):
+    if DRY:
+        print('[dry-run] would ' + msg)
+    else:
+        log(msg)
+
+
+def finish(st, n, now, why):
+    mid = st.get('message_id')
+    if st.get('recap'):
+        recap_tick(st, now, end=True)             # an older recap still open: close it first
+    rc = new_recap(st, n, now, why) if mid and n and why in ('home', 'cutoff') else None
+    hits = night_hits(iso(rc['since']), iso(rc['until'])) if rc else None
+    shown = recap_show(rc, hits, why) if hits else None
+    if shown:
+        rc['pinned'] = True                       # the recap stays pinned until its end (recap_tick)
+    elif mid:
+        text = final_text(n, now, why) if n else '<b>⏹ Live card ended</b>'
+        act(f'edit message {mid} (final, {why}) and unpin it by id')
+        if DRY:
+            print(plain(text))
+        else:
+            if shown is None:
+                try:
+                    edit(mid, text)
+                except TgError as e:
+                    log('final edit: %s' % e.desc)
+            unpin(mid)
+        if shown is False:                        # the card is gone: no recap
+            rc = None
+    if rc:
+        st['recap'] = rc                          # unpinned: IDs that still come in edit the record into the recap
+    key = st.get('night') or (n and n['key'])
+    if key:
+        st['done'][key] = {'why': why, 'at': now.isoformat()}
+    for k in ('night', 'message_id', 'seen_away', 'resends', 'last_hash', 'last_edit', 'conns', 'missed', 'here_at'):
+        st.pop(k, None)
+
+
+def maybe_alert(st, alert, now):
+    if not alert or not alert.get('leg'):
+        return
+    akey = '%s:%s' % (alert['leg'], alert['kind'])
+    if akey in st['alerts']:
+        return
+    if tw_covers(alert['leg'], [k for k in alert['keys'] if k], now):
+        return                                   # train-watch's note (→ the session) covers it
+    alt = alert.get('alt') or {}
+    text = '🔴 ' + esc(alert['line'].replace('🚆 Next: ', '')) + (
+        f'\n↪ <a href="{esc(alt["link"])}">{esc(alt.get("text") or "")}</a>' if alt.get('link') else
+        (f'\n↪ {esc(alt.get("text"))}' if alt.get('text') else ''))
+    act(f'send ONE alert (notifies): {plain(text)}')
+    if not DRY:
+        try:
+            call('sendMessage', text=text, parse_mode='HTML', link_preview_options={'is_disabled': True})
+        except TgError as e:
+            log('alert failed: %s' % e.desc)
+            return
+    st['alerts'].append(akey)
+
+
+def cmd_run(a):
+    now = get_now(a)
+    st = load_state()
+    if st.get('recap') and not st.get('message_id'):
+        recap_tick(st, now)
+        save_state(st, now)
+    events = load_events()
+    active = st.get('night') if st.get('message_id') else None
+    if not active and not events:
+        return 0
+    nights = find_nights(events, now)
+    if active:
+        n = next((x for x in nights if x['key'] == active), None)
+        if n is None:
+            finish(st, None, now, 'gone')
+            save_state(st, now)
+            return 0
+    else:
+        n = next((x for x in nights if x['start'] <= now < x['end'] and x['key'] not in st['done']), None)
+        if n is None:
+            return 0                              # the cheap exit: no card due
+    if now >= n['end']:
+        finish(st, n, now, 'cutoff')
+        save_state(st, now)
+        return 0
+    global LAST_PLACE
+    LAST_PLACE = place_info()
+    kind = place_kind(LAST_PLACE)
+    if kind and kind != 'home':
+        st['seen_away'] = True
+    if kind == 'home' and (st.get('seen_away') or now >= n['ev']['_s']):
+        if active:
+            finish(st, n, now, 'home')
+        else:
+            st['done'][n['key']] = {'why': 'home', 'at': now.isoformat()}
+            if DRY:
+                print('[dry-run] home already after the start: no card tonight')
+        save_state(st, now)
+        return 0
+    here = still_here(LAST_PLACE, n['ev'])
+    b = n.get('back')
+    if b and here is True and b['_s'] + MISSED_GRACE <= now < b['_e'] and st.get('missed') != n['key']:
+        st['missed'] = n['key']                   # he stayed: the card shows the way home, not the planned leg
+        lid = tw_leg_ids().get(b.get('id'))       # train-watch's id for it: its notes on this leg are moot now
+        if lid:
+            ml = {k: v for k, v in (st.get('missed_legs') or {}).items()
+                  if (iso(v) or now) > now - MISSED_KEEP}
+            ml[lid] = b['_s'].isoformat()
+            st['missed_legs'] = ml
+        log('%s: still in the venue town after the leg home left' % n['key'])
+    if here is True:
+        st['here_at'] = now.isoformat()
+    text, alert = render(n, now, tw_leg_ids(), missed=st.get('missed') == n['key'], here=here, conns=st.get('conns'),
+                         here_at=iso(st.get('here_at')))
+    if DRY:
+        lt = lambda t, f: t.astimezone(TZ).strftime(f)
+        print('[dry-run] %s · %s · window %s–%s' % (lt(now, '%a %d.%m %H:%M'), n['ev'].get('title'),
+                                                     lt(n['start'], '%d.%m %H:%M'), lt(n['end'], '%d.%m %H:%M')))
+    h = hashlib.sha256(text.encode()).hexdigest()[:16]
+    mid = st.get('message_id')
+    if mid and h != st.get('last_hash'):
+        act(f'edit message {mid} (silent)')
+        if not DRY and not edit(mid, text, talk_markup()):   # an edit without the markup would drop the button
+            log('card %s gone; sending a new one' % mid)
+            mid = None
+            st['resends'] = st.get('resends', 0) + 1
+    if not mid:
+        if st.get('resends', 0) > 3:
+            finish(st, n, now, 'off')
+            save_state(st, now)
+            return 1
+        if st.get('recap'):
+            recap_tick(st, now, end=True)         # last night's recap makes way for tonight's card
+        act('send the card (disable_notification) and pin it silently')
+        if not DRY:
+            mid = send_card(text)
+            st.update(night=n['key'], message_id=mid)
+            write_json(STATE_F, st)              # remember it before pinning: no duplicates on a failure below
+            if talk_markup():
+                keep_buttons(mid)                # a Talk tap (session path) never strips the keyboard
+            pin(mid)
+            log('sent and pinned card %s' % mid)
+    st.update(last_hash=h, last_edit=now.isoformat())
+    remember_conns(st, LAST_GH)
+    if DRY:
+        print(plain(text))
+    maybe_alert(st, alert, now)
+    save_state(st, now)
+    return 0
+
+
+def cmd_status(a):
+    now = get_now(a)
+    st = load_state()
+    nights = [n for n in find_nights(load_events(), now, rave_check=False) if n['end'] > now]
+    rows = [{'title': n['ev'].get('title'), 'town': n['ev'].get('town'), 'start': n['start'].isoformat(),
+             'end': n['end'].isoformat(), 'legs': len(n['legs']), 'done': (st['done'].get(n['key']) or {}).get('why'),
+             'active': st.get('night') == n['key']} for n in nights[:5]]
+    rc = st.get('recap')
+    out = {'message_id': st.get('message_id'), 'night': st.get('night'), 'last_edit': st.get('last_edit'),
+           'seen_away': bool(st.get('seen_away')), 'upcoming': rows,
+           'missed_legs': {k: v for k, v in (st.get('missed_legs') or {}).items()
+                           if (iso(v) or now) > now - MISSED_KEEP},
+           'recap': {'message_id': rc.get('message_id'), 'night': rc.get('night'), 'until': rc.get('until'),
+                     'pinned': bool(rc.get('pinned'))} if rc else None}
+    if getattr(a, 'json', False):
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    print('Card: %s' % ('message %s, last edit %s' % (st['message_id'], st.get('last_edit'))
+                        if st.get('message_id') else 'none live'))
+    if rc:
+        print('Recap: message %s, %s until %s' % (rc.get('message_id'), 'pinned' if rc.get('pinned') else 'not pinned',
+                                                  str(rc.get('until'))[5:16].replace('T', ' ')))
+    for r in rows:
+        print('- %s (%s): card %s → %s, %d legs%s' % (
+            r['title'], r['town'], r['start'][5:16].replace('T', ' '), r['end'][5:16].replace('T', ' '), r['legs'],
+            ' · live' if r['active'] else (' · ' + r['done'] if r['done'] else '')))
+    if not rows:
+        print('No event night with legs in the cache (rave-only nights are found on the day).')
+    return 0
+
+
+def cmd_off(a):
+    now = get_now(a)
+    st = load_state()
+    nights = find_nights(load_events(), now, rave_check=False)
+    n = next((x for x in nights if x['key'] == st.get('night')), None)
+    if st.get('recap'):
+        recap_tick(st, now, end=True)
+    if st.get('message_id'):
+        finish(st, n, now, 'off')
+    else:
+        for x in nights:
+            if x['start'].date() <= now.date() <= x['end'].date() and x['end'] > now:
+                st['done'][x['key']] = {'why': 'off', 'at': now.isoformat()}
+    save_state(st, now)
+    print('event-card: off for tonight')
+    return 0
+
+
+def main(argv):
+    global DRY
+    p = argparse.ArgumentParser(prog='event-card', description=__doc__.split('\n')[0])
+    sub = p.add_subparsers(dest='cmd')
+    r = sub.add_parser('run')
+    r.add_argument('--dry-run', action='store_true')
+    r.add_argument('--now')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--now')
+    o = sub.add_parser('off')
+    o.add_argument('--now')
+    a = p.parse_args(argv)
+    if not a.cmd:
+        print(__doc__.strip())
+        return 2
+    DRY = bool(getattr(a, 'dry_run', False))
+    if a.cmd == 'status':
+        return cmd_status(a)
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    fd = locks.acquire(os.path.join(DIR, '.lock'), wait=0 if a.cmd == 'run' and not DRY else None)
+    if fd is None:
+        return 0                                  # another run is busy (fd stays open until exit: core.locks)
+    try:
+        return cmd_run(a) if a.cmd == 'run' else cmd_off(a)
+    except (TgError, RuntimeError, OSError) as e:
+        print('event-card: %s' % TOKEN_RE.sub('<token>', str(e)), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

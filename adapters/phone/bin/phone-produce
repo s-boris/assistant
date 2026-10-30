@@ -1,0 +1,46 @@
+#!/usr/bin/env -S python3 -I
+"""phone-produce KIND [ARGS...]: the phone gateway's widget producers (phonegw.producers: tiles, board, leg, trip,
+trip_sites, home, fences, depart, geo, leaving VIEW_JSON), run in this container where their inputs live (the brain's
+files and CLIs); prints the producer's JSON. claude-hub-phone asks for them through the hub gateway's phone.lookup.
+The code comes from the hub's current release (RELEASES/<id>/phone/app); PHONE_PRODUCE_APP names the dir
+that holds phonegw/ instead (tests); there is no fallback. PHONEGW_CONFIG / PHONEGW_STATE pass on
+(the gateway's config and its caches; defaults ~/.config/phonegw/config.json, ~/.local/state/phonegw).
+Exit: the producer's (0 ok, 2 usage) · 3 no producer code found.
+"""
+import os
+import sys
+
+HOME = os.environ.get("HOME") or os.path.expanduser("~")
+RELEASES = os.path.join(HOME, ".local/share/claude-hub/releases")
+
+
+def app_dir():
+    v = os.environ.get("PHONE_PRODUCE_APP")
+    if v:
+        return v
+    try:
+        with open(os.path.join(RELEASES, "CURRENT"), encoding="utf-8") as fh:
+            d = os.path.join(RELEASES, fh.read().split()[0], "phone", "app")
+        if os.path.isfile(os.path.join(d, "phonegw", "producers.py")):
+            return d
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    d = app_dir()
+    if not d:
+        print("phone-produce: no producer code (no phone in the hub release)", file=sys.stderr)
+        return 3
+    sys.path.insert(0, d)
+    from phonegw.producers import main as produce
+
+    return produce(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

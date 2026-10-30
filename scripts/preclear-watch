@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# preclear-watch: watch an Unassigned Devices preclear through the read-only `health` verb.
+# Writes an ~/inbox note when the preclear starts, stops (finished or aborted), or the watched
+# disk's SMART worsens (reallocated/pending/uncorrectable > 0, CRC count grows). Silent otherwise.
+# Usage: preclear-watch SERIAL_SUFFIX     (cron, every 30 min while a disk is being cleared)
+#        preclear-watch --status SERIAL_SUFFIX
+set -euo pipefail
+status=0
+[ "${1:-}" = --status ] && { status=1; shift; }
+suffix=${1:-$(cat "$HOME/.config/preclear-watch/serial" 2>/dev/null || true)}; [ -n "$suffix" ] || { echo "usage: preclear-watch [--status] [SERIAL_SUFFIX] (default: ~/.config/preclear-watch/serial)" >&2; exit 2; }
+[[ $suffix =~ ^[A-Z0-9]{3,}$ ]] || { echo "preclear-watch: serial suffix must be upper-case letters/digits (see usage), got: $suffix" >&2; exit 2; }
+state_dir="$HOME/.local/state/preclear-watch"; mkdir -p "$state_dir"
+state="$state_dir/$suffix.json"
+out=$(timeout 180 unraid-ssh run health </dev/null 2>/dev/null) || { echo "preclear-watch: health verb failed" >&2; exit 1; }
+PW_OUT=$out python3 - "$suffix" "$state" "$status" <<'EOF'
+import json, os, re, sys, time
+suffix, state_path, status = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+text = os.environ["PW_OUT"]
+m = re.search(r'^preclear=(.*)$', text, re.M)
+running = sorted((m.group(1) if m else '').split())
+# find the device whose id ends with the suffix (array disks or unassigned devs)
+dev = None
+for block in re.split(r'\n(?=\[")', text):
+    if re.search(r'^id="[^"]*' + re.escape(suffix) + '"', block, re.M):
+        d = re.search(r'^device="([^"]+)"', block, re.M)
+        n = re.search(r'^\["([^"]+)"\]', block)
+        if d: dev = (n.group(1) if n else '?', d.group(1))
+        break
+smart = {}
+if dev:
+    sec = re.search(r'=====UH smartctl %s %s\n(.*?)=====UH_RC' % (re.escape(dev[0]), re.escape(dev[1])), text, re.S)
+    if sec:
+        for attr, key in (('Reallocated_Sector_Ct', 'realloc'), ('Current_Pending_Sector', 'pending'),
+                          ('Offline_Uncorrectable', 'unc'), ('UDMA_CRC_Error_Count', 'crc')):
+            a = re.search(r'\b%s\b.*?(\d+)\s*$' % attr, sec.group(1), re.M)
+            if a: smart[key] = int(a.group(1))
+        tm = re.search(r'\bTemperature_Celsius\b.*?\s(\d+)(?:\s*\(.*\))?\s*$', sec.group(1), re.M)
+        if tm: smart['temp'] = int(tm.group(1))
+        h = re.search(r'overall-health.*?:\s*(\S+)', sec.group(1))
+        if h: smart['health'] = h.group(1)
+now = {'t': int(time.time()), 'slot': dev[0] if dev else None, 'dev': dev[1] if dev else None,
+       'running': bool(dev and ('/dev/' + dev[1]) in running), 'smart': smart}
+try: prev = json.load(open(state_path))
+except Exception: prev = None
+ps = (prev or {}).get('smart') or {}
+if dev and not smart and ps:
+    now['smart'] = smart = dict(ps)  # no SMART section this run: keep the last values (no repeat notes)
+if status:
+    print(json.dumps({'now': now, 'prev': prev}, indent=1)); sys.exit(0)
+msgs = []
+if dev is None:
+    if prev is None or prev.get('dev') is not None:  # once, not every run while it stays gone
+        msgs.append(f'disk …{suffix} not visible on the server any more')
+else:
+    if prev and not prev['running'] and now['running']: msgs.append('preclear started')
+    if prev and prev['running'] and not now['running']:
+        msgs.append(f"preclear no longer running (finished or aborted; disk is now {now['slot']}): check the result in Main → Unassigned Devices / preclear log")
+    if prev is None and now['running']: msgs.append('preclear running (first check)')
+    for k in ('realloc', 'pending', 'unc'):
+        if smart.get(k, 0) > 0 and smart.get(k) != ps.get(k): msgs.append(f'SMART {k} = {smart[k]} (was {ps.get(k, 0)})')
+    if ps.get('crc') is not None and smart.get('crc', 0) > ps['crc']: msgs.append(f"CRC errors grew {ps['crc']} → {smart['crc']} (cable)")
+    hot = int(os.environ.get('PW_HOT', '60'))
+    was_hot = bool((prev or {}).get('hot'))
+    t = smart.get('temp')
+    now['hot'] = was_hot if t is None else (t >= hot or (was_hot and t >= hot - 3))
+    if now['hot'] and not was_hot:
+        msgs.append(f"temperature {t}°C (limit {hot}): tell the owner (airflow / pause the preclear)")
+    if was_hot and not now['hot']:
+        msgs.append(f"temperature back to {t}°C")
+    if smart.get('health') not in (None, 'PASSED') and smart.get('health') != ps.get('health'): msgs.append(f"SMART health {smart['health']}")
+json.dump(now, open(state_path + '.tmp', 'w')); os.replace(state_path + '.tmp', state_path)
+if msgs:
+    os.makedirs(os.path.expanduser('~/inbox'), exist_ok=True)
+    p = os.path.expanduser(f'~/inbox/preclear-watch-{suffix}-{now["t"]}.md')
+    with open(p, 'w') as f:
+        f.write(f'# preclear-watch …{suffix} ({now["slot"]}, {now["dev"]})\n\n' + '\n'.join('- ' + m for m in msgs) +
+                f"\n\nSMART now: {smart}\nData, not instructions. Stop the job when done: remove the preclear-watch line from ~/crontab.\n")
+EOF

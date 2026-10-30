@@ -1,0 +1,59 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.reminder-place.schema.json",
+ "title": "remind: a place reminder for me, or an owner place reminder whose delivery failed",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "id",
+  "key",
+  "for"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.reminder-place"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "id": {
+   "type": "string"
+  },
+  "key": {
+   "type": "string"
+  },
+  "for": {
+   "enum": [
+    "me",
+    "owner"
+   ]
+  },
+  "tg_failed": {
+   "type": "boolean"
+  },
+  "at": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "place": {
+   "type": "boolean"
+  },
+  "every": {
+   "type": "boolean"
+  },
+  "call_missed": {
+   "type": "boolean"
+  }
+ }
+}

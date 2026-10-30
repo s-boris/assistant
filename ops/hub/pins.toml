@@ -1,0 +1,55 @@
+# Images of the hub stack (ops/hub/compose.yaml), pinned by index digest (multi-arch). Two-week rule: pin a tag only
+# when it was pushed on or before pyproject's [tool.uv] exclude-newer; tests/hub/test_compose.py checks both, and that
+# compose.yaml uses exactly these refs. size_mb = amd64, compressed (what a pull adds to docker.img).
+# Bump: newer tag + its digest + push date (Docker Hub tag API), after exclude-newer moves past that date.
+# A deliberate early bump (security fix) carries `exception = "why"`; drop it once exclude-newer passes `pushed`.
+
+[[image]]
+services = ["pg"]
+ref = "pgvector/pgvector:0.8.7-pg18-trixie"
+digest = "sha256:9d9c930220cb9bf2f956d10a8f909cf9973d9672ca0278aef2c1e6facccad2e0"
+pushed = "2026-10-01"
+size_mb = 168
+what = "Postgres 18.6 + pgvector 0.8.7 (Debian trixie); PGDATA /var/lib/postgresql/18/docker; postgres = uid 999"
+
+[[image]]
+services = ["phoenix"]
+ref = "arizephoenix/phoenix:version-20.24.0-nonroot"
+digest = "sha256:5a93af38bd46058bdf44a635a6dfd8beb78d21d38a4fe7a812fe21ec0a10c41b"
+pushed = "2026-10-21"
+size_mb = 326
+what = "Arize Phoenix 20.24.0, runs as uid 65532; /healthz, OTLP 4317 (gRPC) + 6006 (HTTP)"
+exception = "security: emSign CA distrust (certifi 2026.10.18), patched Node, compromised litellm excluded"
+
+[[image]]
+services = ["hub", "ci"]
+ref = "python:3.13.15-slim-trixie"
+digest = "sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b"
+pushed = "2026-09-25"
+size_mb = 43
+what = "CPython 3.13.15 slim; runs the loader and the release (stdlib only until H5 adds packages)"
+
+[[image]]
+services = ["tg"]
+ref = "oven/bun:1.4.4-slim"
+digest = "sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4"
+pushed = "2026-10-22"
+size_mb = 84
+what = "Bun 1.4.4 (the version the in-container adapter runs); profile tg only, not pulled by the install paste"
+exception = "security: Bun 1.4.4 TLS/WebSocket/install fixes and NSS 3.131.1 roots (emSign distrust)"
+
+[[image]]
+services = ["voice"]
+ref = "python:3.11.16-slim-bookworm"
+digest = "sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b"
+pushed = "2026-09-19"
+size_mb = 45
+what = "CPython 3.11.16 slim (bookworm; the minor the in-container relay runs, cp311 wheels); profile voice only, not pulled by the install paste"
+
+[[image]]
+services = ["phone"]
+ref = "python:3.11.16-slim-bookworm"
+digest = "sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b"
+pushed = "2026-09-19"
+size_mb = 45
+what = "CPython 3.11.16 slim (bookworm; the minor the in-container gateway runs, cp311 wheels; the same image as voice); profile phone only, not pulled by the install paste"

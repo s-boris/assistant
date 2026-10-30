@@ -1,0 +1,217 @@
+{
+ "openapi": "3.0.4",
+ "info": {
+  "title": "Sonarr",
+  "version": "3.0.0"
+ },
+ "paths": {
+  "/api/v3/series": {
+   "get": {
+    "parameters": [
+     {
+      "name": "tvdbId",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/series/{id}": {
+   "get": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   },
+   "put": {
+    "parameters": [
+     {
+      "name": "moveFiles",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/queue": {
+   "get": {
+    "parameters": [
+     {
+      "name": "page",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "pageSize",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "includeSeries",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "includeEpisode",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/queue/{id}": {
+   "delete": {
+    "parameters": [
+     {
+      "name": "removeFromClient",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "blocklist",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "skipRedownload",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/parse": {
+   "get": {
+    "parameters": [
+     {
+      "name": "title",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "path",
+      "in": "query",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/command": {
+   "get": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   },
+   "post": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  },
+  "/api/v3/health": {
+   "get": {
+    "parameters": [
+     {
+      "name": "X-Api-Key",
+      "in": "header"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "OK"
+     }
+    }
+   }
+  }
+ }
+}

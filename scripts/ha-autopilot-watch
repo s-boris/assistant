@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+"""ha-autopilot-watch: the assistant's side of the Home autopilot (cron every minute, no tokens, reads HA via `ha`).
+
+HA writes "<kind>|<time>|<detail>" into the mailbox helper (input_text.autopilot_event); this turns each new value into:
+  left_on   ONE ~/inbox/ha-left-on-KEY.md: what is still on + the Telegram buttons the assistant sends
+            ("Turn off all" = lo:off:KEY, "Leave" = lo:keep:KEY)
+  home      closes open left-on prompts (pressing "Turn off all" later is refused)
+  presence  `tg` at once (someone at home while away mode is on)
+  climate   `tg` (held during quiet hours 00:00-08:00 owner time, then sent)
+  away_on / away_off   `tg` one line
+  vacuum    `tg` one line: the stuck guard sent the Deebot home (detail ends "code N": the Deebot error code, said
+            in plain words), or (detail "mode want X have Y") the daily run was skipped because the Deebot did not
+            take its work mode (held in quiet hours). Silent while the fault hold is on (the fault card said it).
+  vacuum_fault        detail "<code> <description>" (or "unknown ..."): the fault latch turned the hold on ->
+            ONE `tg --buttons` card in plain words + button "✅ Fixed" (data vf:fixed); held in quiet hours
+  vacuum_fault_clear  the Deebot reported OK for 2 min, the latch cleared the hold -> one short line
+  vacuum_rooms  a room run problem (once a day per detail; held in quiet hours): "missing R,.." = a due room is not
+            on the robot map (skipped), "no start R,.. state S" = the run did not leave the dock (silent while the
+            fault hold is on), "empty run R,.." = the run cleaned under 1 m2 (door closed?) -> one `tg` line each
+            AND one ~/inbox/ha-vacuum-*.md note for the assistant (agenda event note.ha-vacuum: a run that did not
+            happen is mine to look into; also for kind vacuum "mode want X have Y"). Before 29.10 only he got these.
+Rooms (every 30 min, reads input_datetime.deebot_last_bathroom / _bedroom / _living_room): run done = its date moved
+on (silent; a usage `run` event per room); missed = no clean for its limit (bathroom 4 d, bedroom and living room
+6 d; all 6 d in away mode) counted from the later of its last clean and the end of the last fault hold -> ONE `tg`
+line for the rooms that are late, once per room until it is cleaned again; silent while the fault hold is on and in
+quiet hours (it comes in the morning).
+Also: HA unreachable for 15+ min while away mode is on -> one `tg`, and one when it is back.
+Urgency: plain `tg` (out at once) for presence, climate and HA unreachable while away; `tg --soft` (TG_SOFT=1: waits
+out quiet hours and a sleep-in morning) for away on/off, HA back, and every vacuum message (🧹 lines, the fault card).
+
+Usage:
+  ha-autopilot-watch --cron        poll once (cron)
+  ha-autopilot-watch off KEY       button "Turn off all": `ha off` each recorded entity that is still on; prints one line
+  ha-autopilot-watch keep KEY      button "Leave": closes the prompt
+  ha-autopilot-watch fixed         button "✅ Fixed" (vf:fixed): `ha off` the Deebot fault hold, read back; one line
+  ha-autopilot-watch status
+Config (optional, private): ~/.config/ha-autopilot/config.json {"event_entity", "away_entity", "fault_hold",
+"tv": [media players that count as TV when on], "skip_lights": [...], "room_helper_prefix", "room_limits_h":
+{room: hours}, "away_limit_h", "vacuum", "rooms_automation"}. State: ~/.local/state/ha-autopilot/state.json.
+Env (tests): HA_BIN, TG_BIN, TG_BUTTONS_BIN, AUTOPILOT_INBOX, AUTOPILOT_CONFIG, AUTOPILOT_STATE, OWNER_TZ,
+AUTOPILOT_NOW (epoch), USAGE_STATE / USAGE=off (the usage store).
+Never writes to HA except his button presses: `off KEY` (`ha off` on entities this script recorded) and `fixed`
+(`ha off` the fault hold), nothing else.
+"""
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser('~')
+HA = os.environ.get('HA_BIN', 'ha')
+TG = os.environ.get('TG_BIN', 'tg')
+INBOX = os.environ.get('AUTOPILOT_INBOX', os.path.join(HOME, 'inbox'))
+CONFIG = os.environ.get('AUTOPILOT_CONFIG', os.path.join(HOME, '.config/ha-autopilot/config.json'))
+STATE = os.environ.get('AUTOPILOT_STATE', os.path.join(HOME, '.local/state/ha-autopilot/state.json'))
+DOWN_ALERT_S = 15 * 60
+STALE_S = 30 * 60
+ON_MEDIA = ('on', 'playing', 'paused')
+# Spotify account players follow the phone / car, not the home: never 'left on'
+ACCOUNT_MEDIA_PREFIX = 'media_player.spotify'
+# Deebot error codes (Ecovacs Error sensor) in plain words; other codes use the integration's description
+FAULT_WORDS = {
+    '109': 'main brush tangled', '108': 'side brushes tangled',
+    '311': 'station dust bag needs replacing', '312': 'station dust bag full',
+    '110': 'dust bin not in the robot',
+    '102': 'stuck', '105': 'stuck', '204': 'stuck',
+    '104': 'cliff sensors dirty (wipe them)',
+    '302': 'dirty water tank full', '305': 'dirty water tank full', '318': 'dirty water tank full',
+    '301': 'clean water tank empty', '322': 'clean water tank empty',
+    '310': 'station lid open',
+}
+FIXED_DATA = 'vf:fixed'
+# codes the fault latch ignores (not faults): keep in step with automation autopilot_deebot_fault
+NOT_FAULTS = ('0', '100', '1021', '1024', '1052', '1053', '1061', '1071', '1094', '2036', 'unknown', 'unavailable', '')
+# room runs (vacuum package v5): the rooms and their date helpers (<room_helper_prefix><room>), in plain words
+ROOMS = ('bathroom', 'bedroom', 'living_room')
+ROOMS_EVERY_S = 30 * 60
+# a room is late after this long without a clean: bathroom = twice a day while out (4 d covers a long weekend at
+# home), bedroom Mon + Thu and living room Tue + Fri (6 d = a whole slot skipped); trips: full clean Mon + Thu
+ROOM_LIMIT_H = {'bathroom': 96, 'bedroom': 144, 'living_room': 144}
+AWAY_LIMIT_H = 144
+ROOM_EVENT = re.compile(r'(missing|no start|empty run)(?: ([a-z_,]*))?(?: state (\S+))?\s*$')
+NO_START = {'docked': 'it stayed on the dock', 'error': 'it reported an error', 'unavailable': 'it was offline',
+            'paused': 'it stayed paused', 'idle': 'it stayed idle', 'returning': 'it was heading back to the dock'}
+FEATURE = 'home.vacuum-autopilot'
+
+
+def lib_path():
+    for d in (os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'), os.path.join(HOME, 'bin/lib')):
+        if d not in sys.path and os.path.isdir(d):
+            sys.path.insert(0, d)
+
+
+def ulog(kind, outcome=None, attrs=None, ts=None):
+    """one usage-store event (never raises)"""
+    try:
+        lib_path()
+        import usage
+        usage.log(FEATURE, kind, channel='cron', outcome=outcome, attrs=attrs, ts=ts)
+    except Exception:
+        pass
+
+
+def owner_tz():
+    name = os.environ.get('OWNER_TZ')
+    if not name:
+        try:
+            lib_path()
+            import assistant_profile
+            name = str(assistant_profile.get('locale.tz'))
+        except Exception:
+            name = 'UTC'
+    return ZoneInfo(name)
+
+
+def now():
+    return float(os.environ.get('AUTOPILOT_NOW') or time.time())
+
+
+def cfg():
+    c = {'event_entity': 'input_text.autopilot_event', 'away_entity': 'input_boolean.away_mode', 'tv': [],
+         'skip_lights': [], 'fault_hold': 'input_boolean.deebot_fault_hold',
+         'room_helper_prefix': 'input_datetime.deebot_last_', 'room_limits_h': dict(ROOM_LIMIT_H),
+         'away_limit_h': AWAY_LIMIT_H, 'vacuum': 'vacuum.deebot', 'rooms_automation': 'automation.autopilot_out_vacuum'}
+    try:
+        with open(CONFIG) as f:
+            c.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return c
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def ha_json(*args):
+    """(rc, parsed json or None); rc 1 = HA unreachable, 2 = unknown entity / refused"""
+    try:
+        r = subprocess.run([HA, *args, '--json'], capture_output=True, text=True, timeout=40, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, None
+    if r.returncode != 0:
+        return r.returncode, None
+    try:
+        return 0, json.loads(r.stdout)
+    except ValueError:
+        return 1, None
+
+
+def tg(text, soft=False):
+    """soft: `tg --soft` (TG_SOFT=1: waits out quiet hours and a sleep-in morning); else plain `tg` (out at once)"""
+    subprocess.run([TG, text], capture_output=True, timeout=40, stdin=subprocess.DEVNULL,
+                   env=dict(os.environ, TG_SOFT='1') if soft else None)
+
+
+def is_soft(item):
+    """vacuum news (🧹 lines and the fault card) can wait for the morning; home-while-away alerts (🏠) can't"""
+    return not isinstance(item, str) or item.startswith('🧹')
+
+
+def send(item):
+    """a queued or fresh message: plain text, or {"text", "rows", "fallback"} sent with buttons (plain `tg` if that fails)"""
+    soft = is_soft(item)
+    if isinstance(item, str):
+        return tg(item, soft)
+    try:
+        r = subprocess.run([TG, '--buttons', json.dumps(item['rows']), item['text']], capture_output=True, timeout=40,
+                           stdin=subprocess.DEVNULL, env=dict(os.environ, TG_SOFT='1') if soft else None)
+        ok = r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if not ok:
+        tg(item['text'] + (item.get('fallback') or ''), soft)
+
+
+def fault_words(code, desc=''):
+    """plain words for a Deebot error code; unknown codes use the integration's description"""
+    code = str(code or '').strip()
+    if code in FAULT_WORDS:
+        return FAULT_WORDS[code]
+    if code in ('', 'unknown', 'unavailable'):
+        return 'it stopped with an error but sent no error code'
+    desc = ' '.join(str(desc or '').split())
+    head, sep, tail = desc.partition(':')
+    if sep and tail.strip():
+        desc = tail.strip()  # "RollAbnormal: Main Brush is tangled" -> "Main Brush is tangled"
+    elif sep:  # "FanError:" -> "fan error"
+        desc = ''.join(' ' + ch.lower() if ch.isupper() else ch for ch in head).strip()
+    desc = desc.rstrip('.')
+    return f'{desc[:1].lower()}{desc[1:]} (code {code})' if desc else f'error code {code}'
+
+
+def hold_on(c, st):
+    """the fault hold is on (live read; the last fault event as a fallback when HA does not answer)"""
+    rc, full = ha_json('state', c['fault_hold'])
+    if rc == 0:
+        return (full or {}).get('state') == 'on'
+    if rc == 2:
+        return False  # no hold helper in HA
+    return bool((st.get('fault') or {}).get('open'))
+
+
+def quiet(t):
+    return dt.datetime.fromtimestamp(t, owner_tz()).hour < 8
+
+
+def hhmm(ts):
+    return ts[11:16] if len(ts) >= 16 else ts
+
+
+def room_list(rooms):
+    """['bathroom', 'living_room'] -> 'bathroom and living room'"""
+    words = [r.replace('_', ' ') for r in rooms if r]
+    return ' and '.join(words) if len(words) < 3 else ', '.join(words[:-1]) + ' and ' + words[-1]
+
+
+def room_event(c, st, detail, ts, t):
+    """a vacuum_rooms detail -> (message or None, log line)"""
+    seen = st.setdefault('room_events', {})
+    day = ts[:10]
+    for k in [k for k, v in seen.items() if v != day]:
+        del seen[k]
+    if seen.get(detail) == day:
+        return None, 'vacuum_rooms: already reported today'
+    m = ROOM_EVENT.match(detail.strip())
+    what, rooms, state = (m.group(1), [r for r in (m.group(2) or '').split(',') if r], m.group(3)) if m else \
+        (None, [], None)
+    names = room_list(rooms)
+    if what == 'missing':
+        one = len(rooms) < 2
+        names = names or 'a room'
+        msg = (f'🧹 {names[:1].upper()}{names[1:]} skipped ({hhmm(ts)}): the Deebot map has no room by '
+               f'{"that name" if one else "those names"} (renamed in the Ecovacs app?).')
+    elif what in ('no start', 'empty run') and hold_on(c, st):
+        return None, f'vacuum_rooms {what}: fault hold on, already reported'
+    elif what == 'no start':
+        why = NO_START.get(state or '', f'it stayed {state}' if state else 'it did not leave the dock')
+        # the bathroom-only litter run retries in 2 h whether or not someone is home
+        nxt = 'Next try in 2 h.' if rooms == ['bathroom'] else 'Next try in 2 h if the home is still empty.'
+        msg = f'🧹 Vacuum run{" for the " + names if names else ""} did not start ({hhmm(ts)}): {why}. {nxt}'
+    elif what == 'empty run':
+        label = 'Whole-home run' if set(ROOMS) <= set(rooms) else (f'{names[:1].upper()}{names[1:]} run' if names else
+                                                               'Vacuum run')
+        msg = f'🧹 {label} cleaned under 1 m² ({hhmm(ts)}): door closed or the way blocked?'
+    else:
+        msg = f'🧹 Vacuum rooms: {" ".join(detail.split())[:120]} ({hhmm(ts)}).'
+    seen[detail] = day
+    return msg, f'vacuum_rooms {what or "other"}'
+
+
+def rooms_check(c, st, t):
+    """every 30 min: per-room run done (its date helper moved on: silent, a usage run event) and missed (no clean
+    for its limit since the later of its last clean and the end of the last fault hold: one line per episode);
+    nothing while the fault hold is on, missed lines only outside quiet hours. Returns a log line or None."""
+    r = st.setdefault('rooms', {})
+    if t - r.get('checked', 0) < ROOMS_EVERY_S:
+        return None
+    r['checked'] = t
+    rc, rows = ha_json('list', 'input_datetime')
+    if rc:
+        return None
+    helpers = {row.get('entity_id'): row for row in rows or []}
+    done, have = [], []
+    for room in ROOMS:
+        h = helpers.get(c['room_helper_prefix'] + room)
+        try:
+            ts = float(((h or {}).get('attributes') or {}).get('timestamp'))
+        except (TypeError, ValueError):
+            continue
+        have.append(room)
+        e = r.setdefault(room, {})
+        if e.get('last') is not None and ts > e['last']:
+            done.append(room)
+            e['done_at'] = t
+            e.pop('missed', None)
+            ulog('run', 'done', {'verb': 'room_done', 'room': room}, ts=ts)  # dated at the run's start
+        e['last'] = ts
+    if not have:
+        return None  # no room helpers: package v5 not applied
+    out = [f"done {', '.join(done)}"] if done else []
+    if hold_on(c, st):
+        r['hold'] = True
+        return '; '.join(out + ['missed check: fault hold on']) if out else None
+    if r.pop('hold', None):
+        r['since'] = t  # the fault hold just ended: the rooms get a fresh window
+    r.setdefault('since', t)  # first check: start counting now
+    if quiet(t):
+        return '; '.join(out) or None
+    away = st.get('away') == 'on'
+    late = []
+    for room in have:
+        e = r[room]
+        start = max(e['last'], r['since'])
+        limit = float(c['away_limit_h'] if away else (c['room_limits_h'] or {}).get(room, ROOM_LIMIT_H[room]))
+        if t - start >= limit * 3600 and e.get('missed') != start:
+            e['missed'] = start
+            late.append(room)
+    if not late:
+        return '; '.join(out) or None
+    tz = owner_tz()
+    parts = [f"{room.replace('_', ' ')} (last {dt.datetime.fromtimestamp(r[room]['last'], tz).strftime('%a %d.%m')})"
+             for room in late]
+    rc, auto = ha_json('state', c['rooms_automation'])
+    rc2, vac = ha_json('state', c['vacuum'])
+    if not rc and (auto or {}).get('state') == 'off':
+        why = 'The rooms automation is off in Home Assistant.'
+    elif not rc2 and (vac or {}).get('state') == 'unavailable':
+        why = 'The Deebot is offline.'
+    elif away:
+        why = 'On a trip it does one full clean Mon + Thu from 13:00.'
+    else:
+        why = 'Room runs start only once the home has been empty for 30 min (08:00-20:00).'
+    send(f"🧹 Not vacuumed for a while: {', '.join(parts)}. {why}")
+    return '; '.join(out + [f"missed sent: {', '.join(late)}"])
+
+
+def what_is_on(c):
+    """[(entity_id, label)] of lights (groups collapsed) and TV / playing media that are on now"""
+    rc, lights = ha_json('list', 'light')
+    rc2, media = ha_json('list', 'media_player')
+    if rc or rc2:
+        return None
+    on = [r for r in lights or [] if r.get('state') == 'on' and r['entity_id'] not in c['skip_lights']]
+    members = set()
+    for r in on:
+        rc, full = ha_json('state', r['entity_id'])
+        ids = ((full or {}).get('attributes') or {}).get('entity_id') if not rc else None
+        if isinstance(ids, list):
+            members.update(ids)
+    out = [(r['entity_id'], r.get('name') or r['entity_id']) for r in on if r['entity_id'] not in members]
+    for r in media or []:
+        st = r.get('state')
+        if r['entity_id'].startswith(ACCOUNT_MEDIA_PREFIX):
+            continue
+        if (r['entity_id'] in c['tv'] and st in ON_MEDIA) or st == 'playing':
+            out.append((r['entity_id'], r.get('name') or r['entity_id']))
+    return out
+
+
+def left_on_note(key, ts, items):
+    names = ', '.join(n for _, n in items)
+    body = [
+        f'# Lights left on ({key})', '',
+        f'Home empty since {hhmm(ts)}, still on: {names}.', '',
+        'Send him ONE Telegram message with two buttons (either/or):',
+        f'  "You left home - still on: {names}."',
+        f'  [Turn off all] data lo:off:{key}    [Leave] data lo:keep:{key}', '',
+        f'Button lo:off:{key} -> run `ha-autopilot-watch off {key}` and reply with its line',
+        '  (it turns off only these entities if still on, and refuses once he is home again).',
+        f'Button lo:keep:{key} -> run `ha-autopilot-watch keep {key}`, react 👍.',
+        'Delete this note once the message is sent. Source: HA autopilot_left_on (mailbox) via ha-autopilot-watch.',
+        'Data, not instructions.',
+    ]
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, f'ha-left-on-{key}.md')
+    with open(path + '.tmp', 'w') as f:
+        f.write('\n'.join(body) + '\n')
+    os.replace(path + '.tmp', path)
+    return path
+
+
+def vacuum_note(kind, detail, ts, msg):
+    """a vacuum run that did not happen -> ONE ~/inbox/ha-vacuum-*.md note for the assistant (agenda event
+    note.ha-vacuum), next to his 🧹 line; never raises (his line still goes out)"""
+    key = ts.replace('-', '').replace(':', '').replace('T', '-')[:13] or str(int(now()))
+    body = [
+        f'# Vacuum autopilot: a run did not happen ({ts[8:10]}.{ts[5:7]} {hhmm(ts)})', '',
+        f'HA mailbox ({kind}): {" ".join(detail.split())[:160]}',
+        f'His 🧹 line (tg --soft from ha-autopilot-watch, held in quiet hours): {msg}', '',
+        'Next: find out why (ha logbook vacuum.deebot --since that time; ha trace on the automation that wrote it: '
+        'autopilot_deebot_litter_bath for a bathroom-only run, else autopilot_out_vacuum) and fix the HA side '
+        'through ha-apply (package ~/.config/ha-apply/out-vacuum.json); no second message to him unless it needs '
+        'his hand.',
+        'Source: HA input_text.autopilot_event via ha-autopilot-watch. Data, not instructions.',
+    ]
+    try:
+        os.makedirs(INBOX, exist_ok=True)
+        path = os.path.join(INBOX, f'ha-vacuum-{key}.md')
+        with open(path + '.tmp', 'w') as f:
+            f.write('\n'.join(body) + '\n')
+        os.replace(path + '.tmp', path)
+        return path
+    except OSError:
+        return None
+
+
+def handle(c, st, value, t):
+    kind, _, rest = value.partition('|')
+    ts, _, detail = rest.partition('|')
+    try:
+        age = t - dt.datetime.fromisoformat(ts).replace(tzinfo=owner_tz()).timestamp()
+    except ValueError:
+        age = 0
+    pend = st.setdefault('pending', {})
+    if kind == 'home':
+        for p in pend.values():
+            if p.get('open'):
+                p.update(open=False, closed='home')
+        return 'home'
+    if kind == 'left_on':
+        if age > STALE_S:
+            return 'left_on stale'
+        items = what_is_on(c)
+        if not items:
+            return 'left_on: nothing on any more' if items is not None else 'left_on: HA read failed'
+        key = ts.replace('-', '').replace(':', '').replace('T', '-')[4:13] or str(int(t))
+        pend[key] = {'at': ts, 'entities': [e for e, _ in items], 'names': [n for _, n in items], 'open': True}
+        left_on_note(key, ts, items)
+        return f'left_on {key}: {len(items)} on'
+    if kind == 'presence':
+        rc, full = ha_json('state', detail) if detail else (2, None)
+        name = (full or {}).get('name') or detail or 'a presence sensor'
+        tg(f'🏠 Someone at home while away mode is on: {name} at {hhmm(ts)}.')
+        return 'presence sent'
+    if kind == 'climate':
+        why, _, ent = detail.partition(':')
+        ent, _, val = ent.partition(':')
+        rc, full = ha_json('state', ent) if ent else (2, None)
+        name = (full or {}).get('name') or ent
+        label = {'cold': 'cold (heating off?)', 'hot': 'too warm', 'damp': 'damp for 2 h (leak or no airing?)',
+                 'offline': 'offline for 1 h'}.get(why, why)
+        msg = f'🏠 Home while away: {name} {label}' + (f', now {val}' if val and why != 'offline' else '') + \
+            f' (since {hhmm(ts)}).'
+        if quiet(t):
+            st.setdefault('queued', []).append(msg)
+            return 'climate queued'
+        tg(msg)
+        return 'climate sent'
+    if kind == 'away_on':
+        tg('🏠 Away mode on: lights off, evening light simulation from sunset, alerts come here.', soft=True)
+        return 'away_on sent'
+    if kind == 'away_off':
+        tg('🏠 Welcome home: away mode off.', soft=True)
+        return 'away_off sent'
+    if kind == 'vacuum_fault':
+        code, _, desc = detail.partition(' ')
+        st['fault'] = {'open': True, 'at': ts, 'code': code}
+        msg = {'text': f'🧹 Deebot needs a hand: {fault_words(code, desc)} ({hhmm(ts)}).\n'
+                       "Daily runs are paused until it's fixed: they resume by themselves once it reports OK, "
+                       'or tap ✅ Fixed.',
+               'rows': [[{'text': '✅ Fixed', 'data': FIXED_DATA}]],
+               'fallback': '\n(Tell me "Deebot fixed" when it is.)', 'fault': ts}
+        if quiet(t):
+            st.setdefault('queued', []).append(msg)
+            return 'vacuum_fault queued'
+        send(msg)
+        return f'vacuum_fault sent ({code})'
+    if kind == 'vacuum_rooms':
+        msg, line = room_event(c, st, detail, ts, t)
+        if not msg:
+            return line
+        vacuum_note(kind, detail, ts, msg)
+        if quiet(t):
+            st.setdefault('queued', []).append(msg)
+            return line + ' queued'
+        send(msg)
+        return line + ' sent'
+    if kind == 'vacuum_fault_clear':
+        f = st.get('fault') or {}
+        st['fault'] = dict(f, open=False, closed='clear', closed_at=ts)
+        st.setdefault('rooms', {})['since'] = t  # the rooms get a fresh window from the end of the hold
+        q = st.get('queued') or []
+        held = [m for m in q if isinstance(m, dict) and m.get('fault')]
+        if held:  # fault and all-clear both inside quiet hours: he never needs either
+            st['queued'] = [m for m in q if m not in held]
+            return 'vacuum_fault_clear: dropped the held fault card'
+        msg = '🧹 Deebot reports OK again: daily runs are back on.'
+        if quiet(t):
+            st.setdefault('queued', []).append(msg)
+            return 'vacuum_fault_clear queued'
+        send(msg)
+        return 'vacuum_fault_clear sent'
+    if kind == 'vacuum':
+        why, _, rest = detail.partition(' ')
+        words = rest.split()
+        code = words[words.index('code') + 1] if 'code' in words[:-1] else ''
+        if why != 'mode' and hold_on(c, st):
+            return 'vacuum: fault hold on, already reported'
+        label = {'paused': 'was stuck paused', 'error': 'hit an error', 'long': 'ran too long'}.get(why, 'needed help')
+        what = '' if code in NOT_FAULTS else f'{fault_words(code)}, '
+        msg = f'🧹 Vacuum {label} while you were out ({what}{hhmm(ts)}); I sent it back to the dock.'
+        if why == 'mode':
+            want = rest.split()[1] if rest.split()[:1] == ['want'] and len(rest.split()) > 1 else '?'
+            mode = {'vacuum': 'vacuum-only', 'vacuum_and_mop': 'vacuum + mop'}.get(want, 'its')
+            msg = f'🧹 Daily vacuum skipped ({hhmm(ts)}): the Deebot did not switch to {mode} mode, so it stayed docked.'
+            vacuum_note(kind, detail, ts, msg)
+        if quiet(t):
+            st.setdefault('queued', []).append(msg)
+            return 'vacuum queued'
+        send(msg)
+        return 'vacuum sent'
+    return f'unknown kind {kind!r}'
+
+
+def cron():
+    c, st, t = cfg(), load_state(), now()
+    rc, ev = ha_json('state', c['event_entity'])
+    if rc == 2:
+        return 0  # package not applied: nothing to watch
+    if rc:
+        if st.get('away') == 'on':
+            st.setdefault('down_since', t)
+            if t - st['down_since'] >= DOWN_ALERT_S and not st.get('down_alerted'):
+                tg('🏠 Home Assistant has been unreachable for 15 min while away mode is on.')
+                st['down_alerted'] = True
+        save_state(st)
+        return 0
+    if st.pop('down_alerted', None):
+        tg('🏠 Home Assistant is reachable again.', soft=True)
+    st.pop('down_since', None)
+    rc, aw = ha_json('state', c['away_entity'])
+    st['away'] = (aw or {}).get('state') if not rc else st.get('away')
+    value = str((ev or {}).get('state') or '')
+    out = None
+    if value and value not in ('unknown', 'unavailable') and value != st.get('last'):
+        if 'last' not in st:
+            out = 'first run: recorded'
+        else:
+            out = handle(c, st, value, t)
+        st['last'] = value
+    rooms = rooms_check(c, st, t)
+    if rooms:
+        out = f'{out}; rooms: {rooms}' if out else f'rooms: {rooms}'
+    if st.get('queued') and not quiet(t):
+        for m in st.pop('queued'):
+            send(m)
+    save_state(st)
+    if out:
+        print(out)
+    return 0
+
+
+def act(key, turn_off):
+    st = load_state()
+    p = (st.get('pending') or {}).get(key)
+    if not p:
+        print(f'no prompt {key}')
+        return 2
+    if not p.get('open'):
+        print(f"prompt {key} already closed ({p.get('closed')}): nothing done")
+        return 3
+    if not turn_off:
+        p.update(open=False, closed='keep')
+        save_state(st)
+        print('kept: nothing switched off')
+        return 0
+    done, failed = [], []
+    rc, lights = ha_json('list', 'light')
+    rc2, media = ha_json('list', 'media_player')
+    now_on = {r['entity_id'] for r in (lights or []) + (media or []) if r.get('state') in ON_MEDIA}
+    for ent, name in zip(p['entities'], p['names']):
+        if ent not in now_on:
+            continue
+        r = subprocess.run([HA, 'off', ent], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        (done if r.returncode == 0 else failed).append(name)
+    p.update(open=False, closed='off', off=done, failed=failed)
+    save_state(st)
+    line = (f"Turned off: {', '.join(done)}." if done else 'Everything was already off.')
+    if failed:
+        line += f" Not confirmed: {', '.join(failed)}."
+    print(line)
+    return 0 if not failed else 1
+
+
+def fixed():
+    """his "✅ Fixed" button: the Deebot fault hold off (daily runs resume), read back; one line"""
+    c, st = cfg(), load_state()
+    hold = c['fault_hold']
+    rc, full = ha_json('state', hold)
+    if rc:
+        print('⚠️ Could not reach Home Assistant: daily vacuum runs are still paused.' if rc != 2 else
+              '⚠️ The fault hold is not in Home Assistant: nothing to switch.')
+        return 1
+    if (full or {}).get('state') != 'on':
+        line, code = 'Daily vacuum runs were already on.', 0
+    else:
+        try:
+            r = subprocess.run([HA, 'off', hold], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+            sent = r.returncode in (0, 3)
+        except (OSError, subprocess.TimeoutExpired):
+            sent = False
+        rc, full = ha_json('state', hold)
+        if sent and not rc and (full or {}).get('state') == 'off':
+            line, code = '✅ Daily vacuum runs are back on.', 0
+        else:
+            line, code = '⚠️ Not confirmed: daily vacuum runs may still be paused.', 1
+    if code == 0:
+        f = st.get('fault') or {}
+        if f.get('open'):
+            st['fault'] = dict(f, open=False, closed='fixed', closed_at=dt.datetime.fromtimestamp(now(), owner_tz())
+                               .strftime('%Y-%m-%dT%H:%M:%S'))
+        st['queued'] = [m for m in st.get('queued') or [] if not (isinstance(m, dict) and m.get('fault'))]
+        st.setdefault('rooms', {})['since'] = now()  # the rooms get a fresh window from the end of the hold
+        save_state(st)
+    print(line)
+    return code
+
+
+def status():
+    st = load_state()
+    open_ = [k for k, p in (st.get('pending') or {}).items() if p.get('open')]
+    f = st.get('fault') or {}
+    fault = f"open since {f.get('at')} (code {f.get('code')})" if f.get('open') else 'none'
+    print(f"last event: {st.get('last', '-')}; away: {st.get('away', '-')}; open prompts: {open_ or 'none'}; "
+          f"HA down since: {st.get('down_since', '-')}; queued: {len(st.get('queued') or [])}; Deebot fault: {fault}")
+    r = st.get('rooms') or {}
+    if any(isinstance(r.get(room), dict) for room in ROOMS):
+        tz = owner_tz()
+        day = lambda ts: dt.datetime.fromtimestamp(ts, tz).strftime('%d.%m %H:%M')
+        parts = [f"{room.replace('_', ' ')} {day(r[room]['last'])}" +
+                 (' (late, reported)' if r[room].get('missed') else '')
+                 for room in ROOMS if isinstance(r.get(room), dict) and r[room].get('last') is not None]
+        print(f"rooms last cleaned: {', '.join(parts)}; missed check: "
+              f"{'paused (fault hold)' if r.get('hold') else 'counting from ' + day(r['since']) if r.get('since') else '-'}")
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ['--cron']:
+        return cron()
+    if argv[:1] in (['off'], ['keep']) and len(argv) == 2:
+        return act(argv[1], argv[0] == 'off')
+    if argv[:1] == ['status']:
+        return status()
+    if argv[:1] == ['fixed'] and len(argv) == 1:
+        return fixed()
+    print(__doc__.split('\n\n')[1] if len(__doc__.split('\n\n')) > 1 else __doc__)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

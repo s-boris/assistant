@@ -1,0 +1,1794 @@
+#!/usr/bin/env python3
+"""rave-radar: shows of the owner's favourite electronic artists near his home and work towns, festival lineups that
+include them, presale / on-sale dates, and their new releases. Token-free (no Claude); the cron runs write ONE ~/inbox
+note only when something is new, and the assistant decides what to tell him.
+
+  rave-radar scan [--json] [--dry-run] [--refresh]   fetch every source, print what is new since the last scan
+  rave-radar list [--days 180] [--json] [--all]      known upcoming shows and lineups (muted ones only with --all)
+  rave-radar artists list [--json]                   the artist list with where each one came from
+  rave-radar artists add NAME [--alias A]... [--note "where from"]  |  rave-radar artists rm NAME
+  rave-radar mute EVENTID  |  rave-radar unmute EVENTID
+  rave-radar sources [--json]                        source health from the last scan
+  rave-radar --cron                                  scan, then ONE ~/inbox/rave-radar-<epoch>.md when something is new
+  rave-radar releases [--json] [--dry-run] [--refresh] [--days 10] [--all] [--remap]
+                                                     new tracks/EPs/albums of the artists (Deezer), since the last run
+  rave-radar releases --cron                         the same, then ONE ~/inbox/rave-radar-releases-<epoch>.md if new
+  rave-radar releases map [--json]  |  rave-radar releases map "NAME" DEEZER_ID|none   show / pin the artist mapping
+  rave-radar releases crate ID [--dry-run]           lists add crate "Artist – Title" for a reported release (or a trackid tid-… id)
+  rave-radar preshow [ARTIST] [--event ID] [--days 90] [--json|--note] [--dry-run] [--refresh]
+                                                     pre-show card: what the artist plays in recent sets (below)
+  rave-radar preshow --cron                          ONE ~/inbox/preshow-<epoch>.md per show on the Wednesday before it
+Event ids: 10 hex characters, stable per show (kind, artist, date, place); the cron note gives each dated show a
+`plan: night-plan ID` line, so an alert can carry a "Plan it" button with callback np:ID (~/bin/night-plan).
+
+Private config (0600, never in a public path): artists.json (name, aliases, source note) and config.json (region and
+sources) in ~/.config/rave-radar/. Region: a show counts when its venue (the source's lat/lon; for a `multi: true`
+source such as a ticket shop, the first place of the config's `places` gazetteer named in the event card: a city
+[lat, lon] or a venue [lat, lon, "City"]) is within `max_km` of the profile's home or work coordinates.
+Lineup sources marked `travel: true` (big festivals abroad he would travel to) count as in range.
+Source kinds:
+  html     venue or ticket-shop calendar page; the text is cut into cards at each date, `date_side` says whether a
+           card's date comes before (default) or after its title, `span` caps a card's lines (default 8; 1 = the
+           date line alone, for 'Title @ Venue, City (date)' lists); each card is matched against the artist names
+  wp       WordPress REST list (e.g. /wp-json/wp/v2/events); title + content matched, first future date in the text
+  jsonld   schema.org Event JSON-LD on a page (name, performers, location, offers.validFrom = on-sale date)
+  lineup   festival page: which artists appear on it (one item per festival and artist), plus a presale date if any;
+           `require` (e.g. the next edition's year) must appear on the page, else the old lineup is ignored; the
+           first successful scan of a lineup page is a silent baseline (`baseline: false` reports it), so only
+           artists added to the page later count as newly announced
+Presales: "Presale / Vorverkauf / VVK / on sale / Tickets ab / Verkaufsstart" followed by a future date in a card or
+on the event's own page (at most 8 detail pages per scan, cached 3 days) -> a presale item, once per date.
+Releases: each artist (name or alias, exact match) is mapped once to a Deezer artist (api.deezer.com/search/artist; the
+most fans among candidates whose releases are mostly Electro/Dance; doubtful picks are flagged; names that read like a
+festival or event are not mapped), cached in releases.json; `releases map` pins or clears one. Each run reads every
+album/EP/single of the mapped artists (/artist/ID/albums, all pages); a release counts as new when its date lies in the
+last --days days (default 10) and its id was never seen. An artist's first fetch is a silent seed (all listed releases
+count as seen, no note), so the first run reports nothing. Weekly radio-show episodes are skipped (built-in patterns
+plus config.json `releases_skip`, a list of regexes). --all also lists every release in the window, seen or not.
+Deezer's API is public and keyless; its robots.txt targets crawlers, so API hosts skip it but keep a 1 s gap.
+Preshow: the artist's MixesDB category page (/w/Category:Name, robots.txt allows /w/ pages, Crawl-delay honoured)
+lists dated mixes; the sets of the last --days days (fewer than 2: the newest of the last year, flagged) are read, at
+most 4 (Tracklist "[min] Artist - Title [Label]"; "?" / "ID" = an unidentified ID). Card: the most-played tracks
+across them (sets counted once each), the IDs, one Deezer track search per listed track (link; 🆕 when its release is
+under 120 days old; ❓ when Deezer doesn't have it: unreleased or brand new), his latest releases and the set
+videos MixesDB embeds. No set in a year: latest releases + Deezer top tracks. Buttons rr:crate:ps-<id> (ids kept 60
+days in preshow.json, which also keeps each show's track list). 1001Tracklists, YouTube and trackid.net are refused
+(REFUSED); the note names them and gives the 1001Tracklists page to open by hand. --cron writes notes only; it never
+messages anyone. No --event: the artist's next known show, if any.
+Politeness: own User-Agent, robots.txt honoured (cached 7 days), refused hosts whose terms forbid automated access or
+that need an API key (REFUSED below), >= 3 s between requests to one host, responses cached (`cache_hours`, default
+20; ETag / Last-Modified on refetch; --refresh ignores the age). Nothing is bought, no account is used.
+State ~/.local/state/rave-radar/ (state.json, releases.json + preshow.json 0600, rave-radar.log);
+cache ~/.cache/rave-radar/.
+Env (tests): RAVE_RADAR_CONFIG_DIR, RAVE_RADAR_STATE_DIR, RAVE_RADAR_CACHE_DIR, RAVE_RADAR_INBOX, RAVE_RADAR_NOW
+(YYYY-MM-DD), RAVE_RADAR_FIXTURES (dir with urls.json {url: file}; no network at all), RAVE_RADAR_HOST_GAP (s),
+ASSISTANT_PROFILE (profile fixture), RAVE_RADAR_DEEZER_API (API base), RAVE_RADAR_API_GAP (s),
+RAVE_RADAR_LISTS (the lists script), RAVE_RADAR_MIXESDB (MixesDB base URL).
+Exit: 0 ok, 1 every source failed, 2 usage or config error.
+"""
+import argparse
+import datetime as dt
+import fcntl
+import gzip
+import hashlib
+import html
+import json
+import math
+import os
+import pwd
+import re
+import shlex
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+import assistant_profile  # noqa: E402
+import botlib  # noqa: E402
+
+HOME = os.path.expanduser('~')
+CONFIG_DIR = os.environ.get('RAVE_RADAR_CONFIG_DIR') or f'{HOME}/.config/rave-radar'
+STATE_DIR = os.environ.get('RAVE_RADAR_STATE_DIR') or f'{HOME}/.local/state/rave-radar'
+CACHE_DIR = os.environ.get('RAVE_RADAR_CACHE_DIR') or f'{HOME}/.cache/rave-radar'
+INBOX = os.environ.get('RAVE_RADAR_INBOX') or f'{HOME}/inbox'
+FIXTURES = os.environ.get('RAVE_RADAR_FIXTURES') or ''
+HOST_GAP = float(os.environ.get('RAVE_RADAR_HOST_GAP', '3'))
+DEEZER_API = (os.environ.get('RAVE_RADAR_DEEZER_API') or 'https://api.deezer.com').rstrip('/')
+API_GAP = float(os.environ.get('RAVE_RADAR_API_GAP', '1'))
+LISTS_BIN = os.environ.get('RAVE_RADAR_LISTS') or os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lists')
+ARTISTS_F = os.path.join(CONFIG_DIR, 'artists.json')
+CONFIG_F = os.path.join(CONFIG_DIR, 'config.json')
+STATE_F = os.path.join(STATE_DIR, 'state.json')
+LOG_F = os.path.join(STATE_DIR, 'rave-radar.log')
+REL_F = os.path.join(STATE_DIR, 'releases.json')
+TRACKID_IDS_F = os.path.join(os.environ.get('TRACKID_STATE_DIR') or f'{HOME}/.local/state/trackid', 'ids.json')
+
+UA = 'rave-radar/1.0 (personal low-frequency gig tracker; honours robots.txt)'
+UA_TOKEN = 'rave-radar'
+TIMEOUT, MAX_BYTES, ROBOTS_TTL = 20, 4_000_000, 7 * 86400
+DETAIL_MAX, DETAIL_TTL = 8, 3 * 86400
+FAIL_REPORT = 3                       # consecutive failed scans before a source shows up in a note
+REFUSED = {
+    'ra.co': "Resident Advisor's terms (4.4(f)) forbid automated access",
+    'residentadvisor.net': "Resident Advisor's terms forbid automated access",
+    'songkick.com': "Songkick's terms (3.3.6) forbid robots, scrapers and monitoring",
+    'bandsintown.com': 'Bandsintown answers only registered API keys (HTTP 403 for others)',
+    'facebook.com': "Meta's terms forbid automated data collection",
+    'instagram.com': "Meta's terms forbid automated data collection",
+    'ticketcorner.ch': 'bot protection drops automated clients; not bypassed',
+    '1001tracklists.com': ('answers automated clients with a JavaScript bot check (HTTP 206 "please wait, you will '
+                           'be forwarded") and blocks data-center ranges against scraping; not bypassed'),
+    'youtube.com': "YouTube's terms forbid automated access outside the keyed Data API (robots.txt also bars feeds)",
+    'trackid.net': 'its robots.txt answers HTTP 403, so automated access is not allowed',
+}
+MONTHS = {'jan': 1, 'januar': 1, 'january': 1, 'feb': 2, 'februar': 2, 'february': 2, 'mar': 3, 'mär': 3, 'märz': 3,
+          'maerz': 3, 'march': 3, 'apr': 4, 'april': 4, 'mai': 5, 'may': 5, 'jun': 6, 'juni': 6, 'june': 6, 'jul': 7,
+          'juli': 7, 'july': 7, 'aug': 8, 'august': 8, 'sep': 9, 'sept': 9, 'september': 9, 'okt': 10, 'oct': 10,
+          'oktober': 10, 'october': 10, 'nov': 11, 'november': 11, 'dez': 12, 'dec': 12, 'dezember': 12,
+          'december': 12}
+_MON = '|'.join(sorted(map(re.escape, MONTHS), key=len, reverse=True))
+DATE_RES = [
+    ('iso', re.compile(r'(?<!\d)(20\d\d)-(\d\d)-(\d\d)(?!\d)')),
+    ('range', re.compile(r'(?<![\d.])(\d{1,2})\.?\s*[–—-]\s*\d{1,2}\.(\d{1,2})\.(\d{4}|\d{2}(?!\d))?')),
+    ('num', re.compile(r'(?<![\d.])(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2}(?![\d.:]))?')),
+    ('dmy', re.compile(r'(?<![\d.])(\d{1,2})\.?\s+(' + _MON + r')\.?(?:\s+(\d{4}))?(?![a-zäöü])', re.I)),
+    ('mdy', re.compile(r'\b(' + _MON + r')\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?(?![\d])', re.I)),
+]
+PRESALE_RE = re.compile(r'(pre-?sale|vorverkauf(?:sstart)?|\bvvk\b|ticketverkauf|verkaufsstart|ticket ?sale|on ?sale|'
+                        r'sale starts?|tickets? (?:ab|from)|early ?bird|registration)', re.I)
+SOLDOUT_RE = re.compile(r'\b(sold ?out|ausverkauft)\b', re.I)
+BLOCK_RE = re.compile(r'</?(?:p|div|br|li|tr|td|th|ul|ol|table|section|article|header|footer|nav|main|aside|'
+                      r'h[1-6]|dt|dd|pre|blockquote|hr|form|button|option|figcaption|label|time|span)\b[^>]*>', re.I)
+SKIP_LINK = re.compile(r'^(?:#|mailto:|tel:|javascript:)|(?:facebook|instagram|twitter|x|tiktok|youtube|spotify|'
+                       r'soundcloud|google)\.com', re.I)
+WEEKDAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+
+
+class FetchError(Exception):
+    pass
+
+
+def die(msg, code=2):
+    print(f'rave-radar: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def today():
+    v = os.environ.get('RAVE_RADAR_NOW')
+    return dt.date.fromisoformat(v) if v else dt.date.today()
+
+
+def log(msg):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_F, 'a') as f:
+            f.write(f'{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n')
+    except OSError:
+        pass
+
+
+def norm(s):
+    """Lower case, accents stripped, '&' -> 'and', punctuation -> spaces: 'Tiësto' == 'TIESTO', 'A&B' == 'a and b'."""
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode().lower().replace('&', ' and ')
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', s).split())
+
+
+def fmt_day(iso):
+    if not iso:
+        return 'date tba'
+    d = dt.date.fromisoformat(iso)
+    return f'{WEEKDAYS[d.weekday()]} {d:%d.%m.%Y}'
+
+
+# ------------------------------------------------------------------------------------------------ config + state
+def save_private(path, obj):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f'{path}.tmp{os.getpid()}'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+        f.write('\n')
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def load_artists():
+    d = botlib.load_json(ARTISTS_F, None)
+    if d is None:
+        return {'version': 1, 'artists': []}
+    if not isinstance(d, dict) or not isinstance(d.get('artists'), list):
+        die(f'{ARTISTS_F}: expected {{"artists": [...]}}')
+    return d
+
+
+def load_config():
+    c = botlib.load_json(CONFIG_F, None)
+    if c is None:
+        die(f'no config at {CONFIG_F} (region and sources); see --help')
+    if not isinstance(c, dict) or not isinstance(c.get('sources'), list):
+        die(f'{CONFIG_F}: expected {{"sources": [...]}}')
+    return c
+
+
+def centers():
+    """Home and work coordinates from the owner's profile (public placeholders when there is none)."""
+    out = []
+    for k in ('home', 'work'):
+        lat, lon = assistant_profile.get(f'{k}.lat', None), assistant_profile.get(f'{k}.lon', None)
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            out.append((float(lat), float(lon)))
+    return out
+
+
+def km_between(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(h))
+
+
+def km_from_centers(lat, lon, cs):
+    if lat is None or lon is None or not cs:
+        return None
+    return round(min(km_between((lat, lon), c) for c in cs))
+
+
+def load_state():
+    s = botlib.load_json(STATE_F, None) or {}
+    for k in ('events', 'muted', 'presales', 'sources', 'details'):
+        s.setdefault(k, {})
+    return s
+
+
+def save_state(s):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    botlib.save_json(STATE_F, s, indent=1, ensure_ascii=False)
+
+
+class Lock:
+    def __enter__(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.f = open(os.path.join(STATE_DIR, '.lock'), 'w')
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            die('another scan is running', 1)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+# ------------------------------------------------------------------------------------------------ fetching
+def host_of(url):
+    return (urllib.parse.urlsplit(url).hostname or '').lower()
+
+
+def refused(url):
+    h = host_of(url)
+    for dom, why in REFUSED.items():
+        if h == dom or h.endswith('.' + dom):
+            return why
+    return None
+
+
+class Fetcher:
+    def __init__(self, refresh=False, offline=False):
+        self.refresh, self.offline = refresh, offline
+        self.last = {}
+        self.fixtures = None
+        if FIXTURES:
+            self.fixtures = botlib.load_json(os.path.join(FIXTURES, 'urls.json'), {})
+        self.requests = 0
+        self.api_hosts = set()        # documented public APIs: their own gap, no robots.txt (aimed at crawlers)
+        self.delay = {}               # host -> robots.txt Crawl-delay (s)
+
+    def _cache_path(self, url):
+        return os.path.join(CACHE_DIR, 'http', hashlib.sha1(url.encode()).hexdigest() + '.json')
+
+    def _raw(self, url, headers):
+        """(status, body text, headers dict). Fixtures: urls.json maps a URL to a file (or {"status": N})."""
+        if self.fixtures is not None:
+            v = self.fixtures.get(url)
+            if v is None:
+                if url.endswith('/robots.txt'):
+                    return 404, '', {}
+                raise FetchError('no fixture (network is off in tests)')
+            if isinstance(v, dict):
+                if 'file' not in v:
+                    return int(v.get('status', 500)), '', {}
+                v = v['file']
+            with open(os.path.join(FIXTURES, v), encoding='utf-8') as f:
+                return 200, f.read(), {}
+        if self.offline:
+            raise FetchError('offline')
+        h = host_of(url)
+        gap = API_GAP if h in self.api_hosts else max(HOST_GAP, self.delay.get(h, 0))
+        wait = self.last.get(h, 0) + gap - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        self.last[h] = time.time()
+        self.requests += 1
+        req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept-Encoding': 'gzip',
+                                                   'Accept-Language': 'de,en;q=0.8', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                b = r.read(MAX_BYTES + 1)
+                if r.headers.get('Content-Encoding') == 'gzip':
+                    b = gzip.decompress(b)
+                return r.status, b[:MAX_BYTES].decode('utf-8', 'replace'), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, '', dict(e.headers or {})
+        except Exception as e:  # noqa: BLE001 - network errors of every kind become one FetchError
+            raise FetchError(f'{type(e).__name__}: {str(e)[:120]}')
+
+    def robots_ok(self, url):
+        parts = urllib.parse.urlsplit(url)
+        path = os.path.join(CACHE_DIR, 'robots', f'{parts.netloc}.json')
+        rb = botlib.load_json(path, None)
+        if not rb or time.time() - rb.get('fetched', 0) > ROBOTS_TTL or self.fixtures is not None:
+            st, body, _ = self._raw(f'{parts.scheme}://{parts.netloc}/robots.txt', {})
+            if st >= 500:
+                raise FetchError(f'robots.txt: HTTP {st}')
+            rb = {'fetched': time.time(), 'status': st, 'text': body[:200_000] if st == 200 else ''}
+            if self.fixtures is None:
+                botlib.save_json(path, rb)
+        self.delay[(parts.hostname or '').lower()] = robots_delay(rb['text'], UA_TOKEN) if rb['status'] == 200 else 0
+        if rb['status'] in (401, 403):
+            return False
+        return rb['status'] != 200 or robots_allowed(rb['text'], UA_TOKEN, url)
+
+    def get(self, url, max_age, check=None):
+        """Body text of url: from the cache when younger than max_age seconds, else fetched (conditional GET).
+        check(body) may raise FetchError: such a body is neither cached nor returned."""
+        why = refused(url)
+        if why:
+            raise FetchError(f'refused: {why}')
+        cp = self._cache_path(url)
+        c = None if self.fixtures is not None else botlib.load_json(cp, None)
+        if c and not self.refresh and time.time() - c.get('fetched', 0) < max_age:
+            return c['body']
+        if host_of(url) not in self.api_hosts and not self.robots_ok(url):
+            raise FetchError(f"refused: {host_of(url)}'s robots.txt disallows this path")
+        hdr = {}
+        if c and c.get('etag'):
+            hdr['If-None-Match'] = c['etag']
+        if c and c.get('lastmod'):
+            hdr['If-Modified-Since'] = c['lastmod']
+        st, body, h = self._raw(url, hdr)
+        if st == 304 and c:
+            c['fetched'] = time.time()
+            botlib.save_json(cp, c)
+            return c['body']
+        if st != 200:
+            raise FetchError(f'HTTP {st}')
+        if check:
+            check(body)
+        if self.fixtures is None:
+            hl = {k.lower(): v for k, v in h.items()}
+            botlib.save_json(cp, {'url': url, 'fetched': time.time(), 'etag': hl.get('etag'),
+                                  'lastmod': hl.get('last-modified'), 'body': body})
+        return body
+
+
+def robots_groups(text, token):
+    """RFC 9309 groups that apply to us: those naming our token, else the '*' ones (each {agents, rules, delay})."""
+    groups, cur, in_rules = [], None, False
+    for raw in text.splitlines():
+        k, sep, v = raw.split('#', 1)[0].strip().partition(':')
+        if not sep:
+            continue
+        k, v = k.strip().lower(), v.strip()
+        if k == 'user-agent':
+            if cur is None or in_rules:
+                cur, in_rules = {'agents': [], 'rules': [], 'delay': None}, False
+                groups.append(cur)
+            cur['agents'].append(v.lower())
+        elif cur is not None and k in ('allow', 'disallow', 'crawl-delay'):
+            in_rules = True
+            if k == 'crawl-delay':
+                try:
+                    cur['delay'] = float(v)
+                except ValueError:
+                    pass
+            elif v:
+                cur['rules'].append((k == 'allow', v))
+    mine = [g for g in groups if any(a not in ('*', '') and a in token.lower() for a in g['agents'])]
+    return mine or [g for g in groups if '*' in g['agents']]
+
+
+def robots_delay(text, token):
+    """The Crawl-delay (s, capped at 10) that applies to us; 0 when none."""
+    ds = [g['delay'] for g in robots_groups(text, token) if g.get('delay') is not None]
+    return min(max(ds), 10.0) if ds else 0.0
+
+
+def robots_allowed(text, token, url):
+    """RFC 9309: the groups naming our token (else '*'); longest matching rule wins, Allow on a tie; '*' and '$'."""
+    rules = [r for g in robots_groups(text, token) for r in g['rules']]
+    p = urllib.parse.urlsplit(url)
+    path = (p.path or '/') + (f'?{p.query}' if p.query else '')
+    best = None
+    for allow, pat in rules:
+        rx = re.escape(pat).replace(r'\*', '.*')
+        if rx.endswith(r'\$'):
+            rx = rx[:-2] + '$'
+        if re.match(rx, path):
+            cand = (len(pat), allow)
+            if best is None or cand[0] > best[0] or (cand[0] == best[0] and allow):
+                best = cand
+    return best is None or best[1]
+
+
+# ------------------------------------------------------------------------------------------------ parsing
+def _mk_date(y, m, d):
+    try:
+        return dt.date(y, m, d)
+    except ValueError:
+        return None
+
+
+def _year(d, m, y, ref):
+    if y:
+        y = int(y)
+        return _mk_date(y + 2000 if y < 100 else y, m, d)
+    for yy in (ref.year, ref.year + 1):        # no year: the next occurrence (up to 30 days back counts as this one)
+        c = _mk_date(yy, m, d)
+        if c and c >= ref - dt.timedelta(days=30):
+            return c
+    return None
+
+
+def find_dates(text, ref):
+    """[(pos, date)] for every date in text, in order. German and English forms; a range gives its first day."""
+    hits, taken = [], []
+    for kind, rx in DATE_RES:
+        for m in rx.finditer(text):
+            if any(a <= m.start() < b for a, b in taken):
+                continue
+            g = m.groups()
+            if kind == 'iso':
+                d = _mk_date(int(g[0]), int(g[1]), int(g[2]))
+            elif kind in ('range', 'num'):
+                if not (1 <= int(g[1]) <= 12):
+                    continue
+                d = _year(int(g[0]), int(g[1]), g[2], ref)
+            elif kind == 'dmy':
+                d = _year(int(g[0]), MONTHS[g[1].lower()], g[2], ref)
+            else:
+                d = _year(int(g[1]), MONTHS[g[0].lower()], g[2], ref)
+            if d:
+                hits.append((m.start(), d))
+                taken.append((m.start(), m.end()))
+    return sorted(hits)
+
+
+def page_lines(doc, base):
+    """Visible text lines of an HTML page, each with the links that open just before it: [(text, [urls])]."""
+    d = re.sub(r'<(script|style|noscript|svg|template|head)\b.*?</\1\s*>', ' ', doc, flags=re.S | re.I)
+    d = re.sub(r'<!--.*?-->', ' ', d, flags=re.S)
+    d = re.sub(r'<a\b[^>]*?\bhref\s*=\s*["\']([^"\']+)["\'][^>]*>', lambda m: f'\n\x01{m.group(1)}\x01\n', d,
+               flags=re.I)
+    d = BLOCK_RE.sub('\n', d)
+    out, pending = [], []
+    for raw in d.split('\n'):
+        for link in re.findall('\x01(.*?)\x01', raw):
+            link = html.unescape(link).strip()
+            if link and not SKIP_LINK.search(link):
+                pending.append(urllib.parse.urljoin(base, link))
+        t = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', re.sub('\x01.*?\x01', ' ', raw)))).strip()
+        if t:
+            out.append((t, pending))
+            pending = []
+    return out
+
+
+def cards(lines, ref, side='before', span=8):
+    """Cut the lines into event cards at each date line: [(date, [(text, links)])]. A date repeated within 3 lines
+    (e.g. '18.10.2026' then 'Sonntag, 18.10.2026') is one boundary; a date after a presale phrase is none."""
+    bounds = []
+    for i, (t, _) in enumerate(lines):
+        ds = find_dates(t, ref)
+        if not ds or PRESALE_RE.search(t[:ds[0][0]]):      # 'Vorverkauf ab 20.10.' is no event date
+            continue
+        if bounds and ds[0][1] == bounds[-1][1] and i - bounds[-1][0] <= 3:
+            continue
+        bounds.append((i, ds[0][1]))
+    out = []
+    for k, (i, d) in enumerate(bounds):
+        if side == 'after':
+            lo = bounds[k - 1][0] + 1 if k else max(0, i - span + 1)
+            lo, hi = max(lo, i - span + 1), i + 1
+        else:
+            hi = bounds[k + 1][0] if k + 1 < len(bounds) else len(lines)
+            lo, hi = i, min(hi, i + span)
+        out.append((d, lines[lo:hi]))
+    return out
+
+
+def jsonld_events(doc):
+    out = []
+    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', doc, re.S | re.I):
+        try:
+            j = json.loads(m.group(1).strip())
+        except ValueError:
+            continue
+        stack = [j]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, list):
+                stack.extend(x)
+            elif isinstance(x, dict):
+                t = x.get('@type')
+                if any(isinstance(tt, str) and tt.endswith('Event') for tt in (t if isinstance(t, list) else [t])):
+                    out.append(x)
+                else:
+                    stack.extend(v for v in x.values() if isinstance(v, (list, dict)))
+    return out
+
+
+def _names(v):
+    vs = v if isinstance(v, list) else [v]
+    return [x.get('name', '') if isinstance(x, dict) else str(x) for x in vs if x]
+
+
+class Matcher:
+    def __init__(self, artists):
+        self.items = []
+        for a in artists:
+            keys = {norm(a['name'])} | {norm(x) for x in a.get('aliases') or []}
+            self.items.append((a['name'], sorted(k for k in keys if len(k) >= 3)))
+
+    def find(self, text):
+        t = f' {norm(text)} '
+        return [name for name, keys in self.items if any(f' {k} ' in t for k in keys)]
+
+
+def presale_in(text, ref):
+    """(date, snippet) of the first presale / on-sale phrase followed within 60 chars by a date today or later."""
+    for m in PRESALE_RE.finditer(text):
+        tail = text[m.start():m.end() + 60]
+        for _, d in find_dates(tail, ref):
+            if d >= ref:
+                return d.isoformat(), re.sub(r'\s+', ' ', tail).strip()[:90]
+    return None, None
+
+
+def place_in(text, places):
+    """(venue, city, lat, lon) from the configured places named in text. A place is a city [lat, lon] or a venue
+    [lat, lon, "City"]. The first venue named gives the venue; a city named in the text wins over the venue's own
+    city (then the city's coordinates count); no city named: the venue's city and coordinates."""
+    t = f' {norm(text)} '
+    first = {}
+    for name, ll in (places or {}).items():
+        i = t.find(f' {norm(name)} ')
+        kind = 'venue' if len(ll) > 2 else 'city'
+        if i >= 0 and (kind not in first or i < first[kind][0]):
+            first[kind] = (i, name, ll)
+    v, c = first.get('venue'), first.get('city')
+    if c and not (v and norm(v[2][2]) == norm(c[1])):
+        return (v[1] if v else None), c[1], c[2][0], c[2][1]
+    if v:
+        return v[1], v[2][2], v[2][0], v[2][1]
+    return None, None, None, None
+
+
+def pick_link(links, page_url):
+    """The card's event link: prefer one on the page's own host or a ticket path, never the page itself."""
+    cands = [u for u in links if u.split('#')[0] != page_url]
+    for u in cands:
+        if host_of(u) == host_of(page_url) or re.search(r'ticket|event|/p/|/e/', u, re.I):
+            return u
+    return cands[0] if cands else page_url
+
+
+# ------------------------------------------------------------------------------------------------ sources
+def event_id(kind, artist, date, where):
+    return hashlib.sha1(f'{kind}|{norm(artist)}|{date or ""}|{norm(where)}'.encode()).hexdigest()[:10]
+
+
+def make_event(src, artist, date, title, url, venue, city, lat, lon, kind='show', presale=None, soldout=False):
+    if presale and date and presale['date'] >= date:      # a sale date counts only before the event itself
+        presale = None
+    place = src.get('name', src['id']) if kind == 'lineup' else (city or venue or src.get('name', ''))
+    return {'id': event_id(kind, artist, date, place), 'kind': kind,
+            'artist': artist, 'date': date, 'title': (title or '')[:140], 'venue': venue, 'city': city,
+            'lat': lat, 'lon': lon, 'url': url, 'source': src['id'], 'presale': presale, 'soldout': soldout}
+
+
+def parse_html(src, doc, matcher, ref, places):
+    out = []
+    lines = page_lines(doc, src['url'])
+    cs = cards(lines, ref, src.get('date_side', 'before'), int(src.get('span', 8)))
+    if not cs:
+        raise FetchError('no dated entries on the page (layout changed or it needs JavaScript)')
+    for d, card in cs:
+        text = ' | '.join(t for t, _ in card)
+        for artist in matcher.find(text):
+            title = next((t for t, _ in card if matcher.find(t)), card[0][0])
+            link = pick_link([u for _, ls in card for u in ls], src['url'])
+            pven, pcity, lat, lon = place_in(text, places) if src.get('multi') else (None, None, None, None)
+            if pcity:
+                venue, city = pven or src.get('venue') or src.get('name'), pcity
+            else:
+                venue, city, lat, lon = src.get('venue') or src.get('name'), src.get('city'), src.get('lat'), src.get('lon')
+            ps = presale_in(text, ref)
+            out.append(make_event(src, artist, d.isoformat(), title, link, venue, city, lat, lon,
+                                  presale={'date': ps[0], 'text': ps[1]} if ps[0] else None,
+                                  soldout=bool(SOLDOUT_RE.search(text))))
+    return out
+
+
+def parse_wp(src, doc, matcher, ref, places):
+    try:
+        items = json.loads(doc)
+    except ValueError:
+        raise FetchError('not JSON')
+    if not isinstance(items, list):
+        raise FetchError('unexpected JSON (no list)')
+    out = []
+    for it in items:
+        title = html.unescape(re.sub(r'<[^>]+>', ' ', ((it.get('title') or {}).get('rendered') or '')))
+        body = html.unescape(re.sub(r'<[^>]+>', ' ', ((it.get('content') or {}).get('rendered') or '')))
+        text = re.sub(r'\s+', ' ', f'{title} | {body}')
+        future = [d for _, d in find_dates(text, ref) if d >= ref - dt.timedelta(days=1)]
+        for artist in matcher.find(text):
+            ps = presale_in(text, ref)
+            out.append(make_event(src, artist, future[0].isoformat() if future else None, title.strip(),
+                                  it.get('link') or src['url'], src.get('venue') or src.get('name'), src.get('city'),
+                                  src.get('lat'), src.get('lon'),
+                                  presale={'date': ps[0], 'text': ps[1]} if ps[0] else None,
+                                  soldout=bool(SOLDOUT_RE.search(text))))
+    return out
+
+
+def ld_details(e, ref):
+    """(start date, venue, city, lat, lon, onsale date, soldout, url) from one JSON-LD Event."""
+    start = None
+    for _, d in find_dates(str(e.get('startDate') or ''), ref)[:1]:
+        start = d
+    loc = e.get('location') if isinstance(e.get('location'), dict) else {}
+    addr = loc.get('address') if isinstance(loc.get('address'), dict) else {}
+    geo = loc.get('geo') if isinstance(loc.get('geo'), dict) else {}
+    offers = e.get('offers')
+    offers = offers if isinstance(offers, list) else [offers] if isinstance(offers, dict) else []
+    onsale = None
+    soldout = False
+    for o in offers:
+        for _, d in find_dates(str(o.get('validFrom') or ''), ref)[:1]:
+            if d >= ref and (onsale is None or d < onsale):
+                onsale = d
+        soldout = soldout or 'soldout' in str(o.get('availability', '')).lower().replace(' ', '')
+    try:
+        lat, lon = float(geo.get('latitude')), float(geo.get('longitude'))
+    except (TypeError, ValueError):
+        lat = lon = None
+    url = e.get('url') or next((o.get('url') for o in offers if o.get('url')), None)
+    return start, loc.get('name'), addr.get('addressLocality'), lat, lon, onsale, soldout, url
+
+
+def parse_jsonld(src, doc, matcher, ref, places):
+    evs = jsonld_events(doc)
+    if not evs:
+        raise FetchError('no JSON-LD events on the page')
+    out = []
+    for e in evs:
+        text = ' | '.join([str(e.get('name') or ''), *_names(e.get('performer')), str(e.get('description') or '')[:2000]])
+        start, venue, city, lat, lon, onsale, soldout, url = ld_details(e, ref)
+        if lat is None and city:
+            lat, lon = place_in(city, places)[2:]
+        if lat is None:
+            lat, lon = src.get('lat'), src.get('lon')
+        for artist in matcher.find(text):
+            out.append(make_event(src, artist, start.isoformat() if start else None, str(e.get('name') or ''),
+                                  urllib.parse.urljoin(src['url'], url) if url else src['url'],
+                                  venue or src.get('venue') or src.get('name'), city or src.get('city'), lat, lon,
+                                  presale={'date': onsale.isoformat(), 'text': 'on sale (offers.validFrom)'}
+                                  if onsale else None, soldout=soldout))
+    return out
+
+
+def parse_lineup(src, doc, matcher, ref, places):
+    lines = page_lines(doc, src['url'])
+    text = ' | '.join(t for t, _ in lines)
+    if len(text) < 200:
+        raise FetchError('almost no text on the page (it needs JavaScript or the lineup moved)')
+    if src.get('require') and norm(src['require']) not in norm(text):
+        return []                                   # the next edition's lineup is not out yet (old one still shown)
+    ps = presale_in(text, ref)
+    out = []
+    for artist in matcher.find(text):
+        out.append(make_event(src, artist, src.get('date'), src.get('name'), src.get('tickets') or src['url'],
+                              src.get('name'), src.get('city'), src.get('lat'), src.get('lon'), kind='lineup',
+                              presale={'date': ps[0], 'text': ps[1]} if ps[0] else None))
+    return out
+
+
+PARSERS = {'html': parse_html, 'wp': parse_wp, 'jsonld': parse_jsonld, 'lineup': parse_lineup}
+
+
+def detail_presale(fetcher, ev, ref, state):
+    """Look at the event's own page once every few days for an on-sale / presale date (JSON-LD offers or text)."""
+    url = ev.get('url')
+    if not url or refused(url):
+        return None
+    seen = state['details'].get(url)
+    if seen and time.time() - seen.get('at', 0) < DETAIL_TTL:
+        return seen.get('presale')
+    try:
+        doc = fetcher.get(url, DETAIL_TTL)
+    except FetchError as e:
+        log(f'detail {url}: {e}')
+        state['details'][url] = {'at': time.time(), 'presale': None}
+        return None
+    ps = None
+    for e in jsonld_events(doc):
+        onsale = ld_details(e, ref)[5]
+        if onsale:
+            ps = {'date': onsale.isoformat(), 'text': 'on sale (offers.validFrom)'}
+            break
+    if not ps:
+        d, snip = presale_in(' | '.join(t for t, _ in page_lines(doc, url)), ref)
+        ps = {'date': d, 'text': snip} if d else None
+    state['details'][url] = {'at': time.time(), 'presale': ps}
+    return ps
+
+
+# ------------------------------------------------------------------------------------------------ scan
+def in_range(ev, src, max_km):
+    if ev['kind'] == 'lineup' and src.get('travel'):
+        return True
+    return ev.get('km') is not None and ev['km'] <= max_km
+
+
+def scan(refresh=False, dry_run=False):
+    cfg, artists = load_config(), load_artists()['artists']
+    if not artists:
+        die(f'no artists yet: rave-radar artists add NAME (file {ARTISTS_F})')
+    ref, now = today(), time.time()
+    cs, max_km = centers(), float(cfg.get('max_km', 150))
+    places, max_age = cfg.get('places') or {}, float(cfg.get('cache_hours', 20)) * 3600
+    matcher, fetcher = Matcher(artists), Fetcher(refresh=refresh)
+    state = load_state()
+    found, health, baseline = {}, {}, set()
+    for src in cfg['sources']:
+        if src.get('disabled'):
+            continue
+        sid, kind = src['id'], src.get('kind', 'html')
+        h = dict(state['sources'].get(sid) or {})
+        if kind == 'lineup' and not h.get('last_ok') and src.get('baseline', True):
+            baseline.add(sid)
+        try:
+            if kind not in PARSERS:
+                raise FetchError(f'unknown kind {kind}')
+            evs = PARSERS[kind](src, fetcher.get(src['url'], max_age), matcher, ref, places)
+            h.update(ok=True, last_ok=now, error=None, fails=0, matches=len(evs), reported=False)
+        except FetchError as e:
+            evs = []
+            h.update(ok=False, error=str(e)[:200], fails=int(h.get('fails') or 0) + 1)
+            log(f'source {sid}: {e}')
+        health[sid] = h
+        for ev in evs:
+            ev['km'] = km_from_centers(ev.get('lat'), ev.get('lon'), cs)
+            if ev['date'] and ev['date'] < ref.isoformat():
+                continue
+            if not in_range(ev, src, max_km):
+                continue
+            old = found.get(ev['id'])
+            if old is None or (not old.get('presale') and ev.get('presale')):
+                found[ev['id']] = ev
+    # new shows / lineups, then presale dates (from the card, or the event's own page for new shows)
+    new, presales, details = [], [], 0
+    for eid, ev in sorted(found.items(), key=lambda kv: (kv[1]['date'] or '9999', kv[1]['artist'])):
+        prev = state['events'].get(eid)
+        ev['first_seen'] = (prev or {}).get('first_seen') or ref.isoformat()
+        if not ev.get('presale') and prev and prev.get('presale') and (prev['presale'].get('date') or '') >= ref.isoformat():
+            ev['presale'] = prev['presale']
+        if eid in state['muted']:
+            continue
+        if prev is None and ev['kind'] == 'lineup' and ev['source'] in baseline and health[ev['source']]['ok']:
+            pass                                    # first look at this festival page: baseline, not "announced"
+        elif prev is None:
+            if ev['kind'] == 'show' and not ev.get('presale') and details < DETAIL_MAX and ev.get('url') not in (
+                    None, *(s['url'] for s in cfg['sources'])):
+                details += 1
+                ps = detail_presale(fetcher, ev, ref, state)
+                ev['presale'] = ps if ps and (not ev['date'] or ps['date'] < ev['date']) else None
+            new.append(ev)
+        ps = ev.get('presale')
+        if ps and ps.get('date') and ps['date'] >= ref.isoformat() and f"{eid}|{ps['date']}" not in state['presales']:
+            presales.append(ev)
+    broken = [(sid, h) for sid, h in health.items() if not h['ok'] and h['fails'] >= FAIL_REPORT and not h.get('reported')]
+    result = {'today': ref.isoformat(), 'sources': len(health), 'sources_ok': sum(h['ok'] for h in health.values()),
+              'artists': len(artists), 'found': len(found), 'requests': fetcher.requests,
+              'new': new, 'presales': presales, 'broken': [{'id': s, 'error': h['error'], 'fails': h['fails']}
+                                                         for s, h in broken],
+              'failed': {s: h['error'] for s, h in health.items() if not h['ok']}}
+    if not dry_run:
+        for eid, ev in found.items():
+            state['events'][eid] = {**ev, 'last_seen': ref.isoformat()}
+        for ev in presales:
+            state['presales'][f"{ev['id']}|{ev['presale']['date']}"] = ref.isoformat()
+        for sid, h in broken:
+            health[sid]['reported'] = True
+        state['sources'].update(health)
+        cut = (ref - dt.timedelta(days=3)).isoformat()
+        state['events'] = {k: v for k, v in state['events'].items() if (v.get('date') or '9999') >= cut}
+        old = now - 400 * 86400
+        state['muted'] = {k: v for k, v in state['muted'].items() if v >= old}
+        state['details'] = {k: v for k, v in state['details'].items() if now - v.get('at', 0) < 30 * 86400}
+        state['last_scan'] = now
+        save_state(state)
+    log(f"scan: {result['sources_ok']}/{result['sources']} sources ok, {len(found)} in range, {len(new)} new, "
+        f"{len(presales)} presale, {fetcher.requests} requests{' (dry run)' if dry_run else ''}")
+    return result
+
+
+# ------------------------------------------------------------------------------------------------ output
+def where(ev):
+    v, c = ev.get('venue') or '', ev.get('city') or ''
+    s = v if (not c or f' {norm(c)} ' in f' {norm(v)} ') else (f'{v}, {c}' if v else c)
+    return s + (f" (~{ev['km']} km)" if ev.get('km') is not None else '')
+
+
+def line(ev, tag):
+    extra = ' · SOLD OUT' if ev.get('soldout') else ''
+    if tag == 'PRESALE':
+        extra += f" · presale {fmt_day(ev['presale']['date'])} (\"{ev['presale']['text']}\")"
+    what = f"{ev['artist']} in the {ev['title']} lineup" if ev['kind'] == 'lineup' else ev['artist']
+    return f"{tag:8} {ev['id']}  {fmt_day(ev['date'])}  {what} · {where(ev)}{extra} · {ev.get('url') or ''}"
+
+
+def watch_cmd(ev):
+    until = ev.get('date') or (ev.get('presale') or {}).get('date') or (today() + dt.timedelta(days=60)).isoformat()
+    label = f"{ev['artist']} {dt.date.fromisoformat(ev['date']):%d.%m}" if ev.get('date') else ev['artist']
+    return (f"watch add page {shlex.quote(ev['url'])} --changed --owner --once --until {until} "
+            f"--name {shlex.quote(label)}")
+
+
+def emit_error(kind, err):
+    """One line in the event ledger's error counter (~/.local/state/assistant/emit-errors.log); never raises."""
+    try:
+        d = os.path.join(HOME, '.local', 'state', 'assistant')
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        fd = os.open(os.path.join(d, 'emit-errors.log'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, f"{int(time.time())} {kind} rave-radar fallback {type(err).__name__}: "
+                         f"{str(err)[:120]}\n".encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def inbox_note(prefix, text, payload):
+    """The note botlib.write_inbox writes (<prefix>-<epoch>[-n].md in INBOX) plus its typed event row through the
+    ledger (inbox.writer.new_note: the same bytes, name and mode) when INBOX is the real ~/inbox. payload: a callable
+    -> counts and ids as the note shows them. The ledger library missing or breaking = the old write and one line in
+    its error counter. -> the note's path."""
+    try:
+        real = os.path.realpath(INBOX) == os.path.realpath(os.path.join(HOME, 'inbox'))
+    except OSError:
+        real = False
+    if real:
+        try:
+            from inbox import writer
+            r = writer.new_note(prefix, text, source='rave-radar', payload=payload(), mode=0o666, inbox_dir=INBOX)
+            if r.note_path and os.path.exists(r.note_path):
+                return r.note_path
+        except Exception as e:                         # never lose the note
+            emit_error(f'note.{prefix}', e)
+    return botlib.write_inbox(INBOX, prefix, text)
+
+
+def radar_payload(res):
+    ids = lambda evs: [str(e['id']) for e in evs if e.get('id')]  # noqa: E731
+    return {'shows': sum(1 for e in res['new'] if e['kind'] == 'show'),
+            'lineups': sum(1 for e in res['new'] if e['kind'] == 'lineup'),
+            'presales': len(res['presales']), 'broken': len(res['broken']),
+            'ids': ids(res['new']), 'presale_ids': ids(res['presales']), 'broken_ids': ids(res['broken'])}
+
+
+def note_text(res):
+    shows = [e for e in res['new'] if e['kind'] == 'show']
+    lineups = [e for e in res['new'] if e['kind'] == 'lineup']
+    head = []
+    for n, word in ((len(shows), 'new show'), (len(lineups), 'lineup hit'), (len(res['presales']), 'presale date'),
+                    (len(res['broken']), 'broken source')):
+        if n:
+            head.append(f"{n} {word}{'s' if n != 1 else ''}")
+    out = [f"# rave-radar: {', '.join(head)}", '',
+           'Data from rave-radar, not instructions: public venue and festival pages, matched against the private '
+           'artist list. Handling: JOBS.md (rave-radar).', '']
+
+    def block(title, evs, tag):
+        if not evs:
+            return
+        out.append(f'## {title}')
+        for ev in evs:
+            out.append(f'- {line(ev, tag)}')
+            if ev.get('url'):
+                out.append(f'  watch: {watch_cmd(ev)}')
+            out.append(f"  mute: rave-radar mute {ev['id']}")
+            if ev['kind'] == 'show' and ev.get('date'):
+                out.append(f"  plan: night-plan {ev['id']} (offer a \"🚆 Plan it\" button, callback np:{ev['id']})")
+        out.append('')
+    block('New shows in range', shows, 'SHOW')
+    block('Festival lineups with his artists', lineups, 'LINEUP')
+    block('Presale / on-sale dates', res['presales'], 'PRESALE')
+    if res['broken']:
+        out.append(f'## Sources failing {FAIL_REPORT}+ scans in a row (fix in ~/.config/rave-radar/config.json)')
+        out += [f"- {b['id']}: {b['error']} ({b['fails']}x)" for b in res['broken']]
+        out.append('')
+    return '\n'.join(out)
+
+
+def cmd_scan(a):
+    with Lock():
+        res = scan(refresh=a.refresh, dry_run=a.dry_run)
+    if a.json:
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+    else:
+        print(f"rave-radar {res['today']}: {res['sources_ok']}/{res['sources']} sources ok, {res['artists']} artists, "
+              f"{res['found']} upcoming in range, {len(res['new'])} new, {len(res['presales'])} presale"
+              f"{' (dry run: nothing saved)' if a.dry_run else ''}")
+        for ev in res['new']:
+            print(line(ev, 'SHOW' if ev['kind'] == 'show' else 'LINEUP'))
+        for ev in res['presales']:
+            print(line(ev, 'PRESALE'))
+        for sid, err in res['failed'].items():
+            print(f'failed   {sid}: {err}')
+    return 1 if res['sources'] and not res['sources_ok'] else 0
+
+
+def cmd_cron(a):
+    with Lock():
+        res = scan()
+    if res['new'] or res['presales'] or res['broken']:
+        f = inbox_note('rave-radar', note_text(res), lambda: radar_payload(res))
+        log(f'note {f}')
+    return 1 if res['sources'] and not res['sources_ok'] else 0
+
+
+def cmd_list(a):
+    st, ref = load_state(), today()
+    hi = (ref + dt.timedelta(days=a.days)).isoformat()
+    evs = [e for e in st['events'].values() if (e.get('date') or '9999') >= ref.isoformat()
+           and (e.get('date') or '') <= hi and (a.all or e['id'] not in st['muted'])]
+    evs.sort(key=lambda e: (e.get('date') or '9999', e['artist']))
+    if a.json:
+        print(json.dumps(evs, indent=1, ensure_ascii=False))
+        return 0
+    if not evs:
+        print(f'nothing known in the next {a.days} days (last scan: '
+              f"{dt.datetime.fromtimestamp(st['last_scan']):%Y-%m-%d %H:%M})" if st.get('last_scan') else
+              'nothing known yet: run rave-radar scan')
+    for e in evs:
+        tag = 'MUTED' if e['id'] in st['muted'] else ('LINEUP' if e['kind'] == 'lineup' else 'SHOW')
+        print(line(e, tag) + (f" · presale {fmt_day(e['presale']['date'])}" if e.get('presale') else ''))
+    return 0
+
+
+def cmd_artists(a):
+    d = load_artists()
+    if a.action == 'list':
+        if a.json:
+            print(json.dumps(d['artists'], indent=1, ensure_ascii=False))
+        else:
+            for x in sorted(d['artists'], key=lambda x: norm(x['name'])):
+                al = f" (also: {', '.join(x['aliases'])})" if x.get('aliases') else ''
+                print(f"{x['name']}{al} — {x.get('source') or '?'}")
+            print(f"{len(d['artists'])} artists")
+        return 0
+    if not a.name:
+        die(f'artists {a.action} needs a NAME')
+    name = ' '.join(a.name).strip()
+    hit = [x for x in d['artists'] if norm(x['name']) == norm(name)]
+    if a.action == 'add':
+        if hit:
+            x = hit[0]
+            x['aliases'] = sorted(set(x.get('aliases') or []) | set(a.alias or []))
+            if a.note:
+                x['source'] = f"{x.get('source')}; {a.note}" if x.get('source') else a.note
+            print(f"updated {x['name']}")
+        else:
+            d['artists'].append({'name': name, 'aliases': sorted(set(a.alias or [])), 'source': a.note or 'added by hand',
+                                 'added': today().isoformat()})
+            print(f'added {name}')
+    else:
+        if not hit:
+            die(f'no artist named {name}', 1)
+        d['artists'] = [x for x in d['artists'] if norm(x['name']) != norm(name)]
+        print(f"removed {hit[0]['name']}")
+    save_private(ARTISTS_F, d)
+    return 0
+
+
+def cmd_mute(a, on):
+    with Lock():
+        st = load_state()
+        eid = a.eventid.strip().lower()
+        if not re.fullmatch(r'[0-9a-f]{10}', eid):
+            die('EVENTID is the 10-character id that scan/list print')
+        if on:
+            st['muted'][eid] = time.time()
+        else:
+            st['muted'].pop(eid, None)
+        save_state(st)
+    ev = st['events'].get(eid)
+    print(f"{'muted' if on else 'unmuted'} {eid}" + (f" ({ev['artist']}, {fmt_day(ev['date'])})" if ev else
+                                                      ' (not a known event yet; muted anyway)' if on else ''))
+    return 0
+
+
+def cmd_sources(a):
+    cfg, st = load_config(), load_state()
+    rows = []
+    for src in cfg['sources']:
+        h = st['sources'].get(src['id']) or {}
+        rows.append({'id': src['id'], 'kind': src.get('kind', 'html'), 'url': src['url'],
+                     'disabled': bool(src.get('disabled')), 'ok': h.get('ok'), 'error': h.get('error'),
+                     'fails': h.get('fails', 0), 'matches': h.get('matches'),
+                     'last_ok': dt.datetime.fromtimestamp(h['last_ok']).strftime('%Y-%m-%d %H:%M')
+                     if h.get('last_ok') else None})
+    if a.json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    for r in rows:
+        status = 'off' if r['disabled'] else ('?' if r['ok'] is None else 'ok' if r['ok'] else f"FAIL x{r['fails']}")
+        print(f"{status:8} {r['kind']:6} {r['id']:22} {r['url']}" + (f"  ({r['error']})" if r['error'] else ''))
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ releases (Deezer)
+REL_DAYS, REL_KEEP_DAYS, REL_PAGES, REL_PAGE = 10, 120, 10, 500
+MAP_TTL, ALBUM_TTL = 30 * 86400, 20 * 3600
+ELECTRONIC = {106, 113}                       # Deezer genre ids: Electro, Dance
+REL_TYPES = {'single': 'Single', 'ep': 'EP', 'album': 'Album', 'compile': 'Compilation'}
+EVENT_RE = re.compile(r'\b(festival|fest|events?|outdoor|open ?air|weekender)\b', re.I)
+SKIP_TITLE = [r'\bepisode\s*\d{2,}\b', r'(?-i:^[A-Z]{2,8} \d{3,4} - )', r'\bradio (?:top|show|episode)\b',
+              r'\bpodcast\b', r'(?-i:^[A-Z]{4,} \d{3}$)',   # weekly radio-show episodes, numbered spin-offs
+              r'\b(?!(?:19|20)\d\d\b)\d{3,4} \((?:dj )?mix(?:ed)?\)']
+
+
+def load_rel():
+    s = botlib.load_json(REL_F, None) or {}
+    for k in ('map', 'seen', 'releases'):
+        s.setdefault(k, {})
+    return s
+
+
+def deezer(fetcher, path, max_age):
+    """Parsed JSON of a Deezer API path; an {"error": ...} answer is a FetchError (quota code 4: one retry)."""
+    def check(body):
+        try:
+            d = json.loads(body)
+        except ValueError:
+            raise FetchError('Deezer: not JSON')
+        if isinstance(d, dict) and d.get('error'):
+            e = d['error'] if isinstance(d['error'], dict) else {'message': d['error']}
+            raise FetchError(f"Deezer error {e.get('code')}: {str(e.get('message'))[:80]}")
+    for attempt in (0, 1):
+        try:
+            return json.loads(fetcher.get(f'{DEEZER_API}{path}', max_age, check=check))
+        except FetchError as e:
+            if attempt or 'error 4:' not in str(e):
+                raise
+            time.sleep(5 if fetcher.fixtures is None else 0)
+
+
+def artist_albums(fetcher, aid):
+    """Every album/EP/single of a Deezer artist (the API groups them by type, not by date)."""
+    out, idx = [], 0
+    for _ in range(REL_PAGES):
+        d = deezer(fetcher, f'/artist/{aid}/albums?limit={REL_PAGE}' + (f'&index={idx}' if idx else ''), ALBUM_TTL)
+        rows = [a for a in d.get('data') or [] if isinstance(a, dict) and a.get('id')]
+        out += rows
+        idx += len(rows)
+        if not d.get('next') or not rows:
+            break
+    return out
+
+
+def electronic_share(albums):
+    g = [a.get('genre_id') for a in albums if isinstance(a.get('genre_id'), int) and a['genre_id'] > 0]
+    return round(sum(x in ELECTRONIC for x in g) / len(g), 2) if g else None
+
+
+def map_artist(fetcher, x):
+    """(mapping, albums of the pick): exact name/alias matches only; the most fans among the electronic ones wins."""
+    names = [x['name'], *(x.get('aliases') or [])]
+    base = {'artist': x['name'], 'mapped': today().isoformat()}
+    if any(EVENT_RE.search(n) for n in names):
+        return {**base, 'id': None, 'status': 'event', 'why': 'festival/event name: no releases of its own'}, []
+    keys = {norm(n) for n in names}
+    found = deezer(fetcher, f"/search/artist?q={urllib.parse.quote(x['name'])}&limit=25", MAP_TTL).get('data') or []
+    cands = sorted((a for a in found if isinstance(a, dict) and norm(a.get('name')) in keys),
+                   key=lambda a: -(a.get('nb_fan') or 0))
+    if not cands:
+        close = f" (closest: {found[0].get('name')}, {found[0].get('nb_fan')} fans)" if found else ''
+        return {**base, 'id': None, 'status': 'none', 'why': 'no exact Deezer match' + close}, []
+    scored = []
+    for a in cands[:3]:
+        albums = artist_albums(fetcher, a['id'])
+        scored.append((a, electronic_share(albums), albums))
+    pick = next((t for t in scored if (t[1] or 0) >= 0.5), None)
+    why = []
+    if pick is None and any(t[1] is not None for t in scored):
+        return {**base, 'id': None, 'status': 'none', 'why': 'only non-electronic same-name artists: ' + ', '.join(
+            f"#{t[0]['id']} ({t[0].get('nb_fan')} fans, electronic {t[1]})" for t in scored)}, []
+    if pick is None:
+        pick = scored[0]
+        why.append('no genre data on Deezer')
+    a = pick[0]
+    if a is not cands[0]:
+        why.append(f"more fans but not electronic: #{cands[0]['id']} ({cands[0].get('nb_fan')} fans)")
+    rivals = [c for c in cands if c is not a and c is not cands[0]
+              and (c.get('nb_fan') or 0) >= 0.2 * max(1, a.get('nb_fan') or 0)]
+    if rivals:
+        why.append('same-name rivals: ' + ', '.join(f"#{c['id']} ({c.get('nb_fan')} fans)" for c in rivals[:3]))
+    if (a.get('nb_fan') or 0) < 1000:
+        why.append(f"only {a.get('nb_fan') or 0} fans")
+    return {**base, 'id': a['id'], 'name': a.get('name'), 'fans': a.get('nb_fan'), 'electronic': pick[1],
+            'link': a.get('link') or f"https://www.deezer.com/artist/{a['id']}",
+            'status': 'doubtful' if why else 'ok', 'why': '; '.join(why)}, pick[2]
+
+
+def release_of(artist, al):
+    title = ' '.join(str(al.get('title') or '?').split())
+    q = f'{artist} {title}'
+    return {'id': str(al['id']), 'artist': artist, 'title': title,
+            'type': REL_TYPES.get(al.get('record_type'), str(al.get('record_type') or '?').title()),
+            'date': al.get('release_date'), 'link': al.get('link') or f"https://www.deezer.com/album/{al['id']}",
+            'spotify': 'https://open.spotify.com/search/' + urllib.parse.quote(q),
+            'beatport': 'https://www.beatport.com/search?q=' + urllib.parse.quote_plus(q),
+            'crate': f'{artist} – {title}'}
+
+
+def releases_scan(refresh=False, dry_run=False, days=REL_DAYS, show_all=False, remap=False):
+    """New releases (date within the last `days` days, never seen) of every mapped artist. An artist's first
+    successful fetch is a silent seed: what Deezer already lists then counts as seen."""
+    arts = load_artists()['artists']
+    if not arts:
+        die('no artists yet: rave-radar artists add NAME')
+    cfg = botlib.load_json(CONFIG_F, None) or {}
+    skip = re.compile('|'.join(SKIP_TITLE + list(cfg.get('releases_skip') or [])), re.I)
+    st, ref = load_rel(), today()
+    hi, lo = ref.isoformat(), (ref - dt.timedelta(days=days)).isoformat()
+    keep = (ref - dt.timedelta(days=max(days, REL_KEEP_DAYS))).isoformat()
+    first_run = not st.get('seeded_at')
+    fetcher = Fetcher(refresh=refresh)
+    fetcher.api_hosts.add(host_of(DEEZER_API))
+    res = {'today': hi, 'window': [lo, hi], 'artists': len(arts), 'mapped': 0, 'new': [], 'in_window': [],
+           'seeded': 0, 'skipped': 0, 'failed': {}, 'new_mappings': [], 'first_run': first_run}
+    live = set()
+    for x in arts:
+        key = norm(x['name'])
+        live.add(key)
+        m, albums = st['map'].get(key), None
+        try:
+            if m is None or (remap and not m.get('pinned')):
+                m, albums = map_artist(fetcher, x)
+                st['map'][key] = m
+                res['new_mappings'].append(m)
+            if not m.get('id'):
+                continue
+            if albums is None:
+                albums = artist_albums(fetcher, m['id'])
+        except FetchError as e:
+            res['failed'][x['name']] = str(e)
+            log(f"releases {x['name']}: {e}")
+            continue
+        res['mapped'] += 1
+        seed = not m.get('seeded')
+        for al in sorted(albums, key=lambda a: (str(a.get('release_date') or ''), str(a['id']))):
+            d = str(al.get('release_date') or '')
+            if not re.fullmatch(r'\d{4}-\d\d-\d\d', d) or d > hi or d < keep:
+                continue                      # undated, not out yet (reported once it is), or long past
+            rel = release_of(x['name'], al)
+            if skip.search(rel['title']):
+                res['skipped'] += 1
+                continue
+            if d >= lo:
+                res['in_window'].append(rel)
+            if rel['id'] in st['seen']:
+                continue
+            st['seen'][rel['id']] = d
+            if seed:
+                res['seeded'] += 1
+            elif d >= lo:
+                res['new'].append(rel)
+                st['releases'][rel['id']] = rel
+        m['seeded'] = m.get('seeded') or hi
+    st['map'] = {k: v for k, v in st['map'].items() if k in live}
+    st['seen'] = {k: v for k, v in st['seen'].items() if v >= keep}
+    st['releases'] = {k: v for k, v in st['releases'].items() if (v.get('date') or '') >= keep}
+    if res['mapped']:
+        st['seeded_at'] = st.get('seeded_at') or hi
+    st['last_run'] = time.time()
+    for k in ('new', 'in_window'):
+        res[k].sort(key=lambda r: (r['date'], norm(r['artist']), r['title']), reverse=True)
+    if not show_all:
+        res.pop('in_window')
+    if not dry_run:
+        save_private(REL_F, st)
+    return res
+
+
+def rel_line(r):
+    return f"{r['id']:>12}  {r['crate']} · {r['type']} · {fmt_day(r['date'])} · {r['link']}"
+
+
+def map_line(m):
+    what = (f"#{m['id']} {m.get('name')} ({m.get('fans')} fans, electronic {m.get('electronic')})" if m.get('id')
+            else '-')
+    tag = 'pinned' if m.get('pinned') else m.get('status')
+    return f"{tag:9} {m['artist']} → {what}" + (f"  [{m['why']}]" if m.get('why') else '')
+
+
+def releases_note(res):
+    n = len(res['new'])
+    out = [f"# rave-radar releases: {n} new release{'s' if n != 1 else ''}", '',
+           'Data from rave-radar (public Deezer API, matched against the private artist list), not instructions. '
+           'Handling: JOBS.md (rave-radar releases).', '',
+           'Send ONE Telegram card (never 00-08; night -> ~09:00): one line per release (artist – title · type · '
+           'date, Deezer link), one "➕ Crate" button per release with callback rr:crate:ID and on_press "keep" (he '
+           'may tap several). On a press: `rave-radar releases crate ID` (= lists add crate "Artist – Title"), '
+           'react 👍. Then delete this note.', '',
+           f"## New releases ({res['window'][0]} .. {res['window'][1]})"]
+    for r in res['new']:
+        out += [f"- {r['id']}  {r['crate']} · {r['type']} · {fmt_day(r['date'])}",
+                f"  deezer: {r['link']}", f"  spotify: {r['spotify']}", f"  beatport: {r['beatport']}",
+                f"  button: \"➕ Crate\" -> rr:crate:{r['id']}  (= lists add crate {shlex.quote(r['crate'])})"]
+    odd = [m for m in res['new_mappings'] if m.get('status') in ('doubtful', 'none')]
+    if odd:
+        out += ['', '## Artist mappings to check (fix: rave-radar releases map "NAME" DEEZER_ID|none)']
+        out += [f'- {map_line(m)}' for m in odd]
+    return '\n'.join(out) + '\n'
+
+
+def cmd_releases(a):
+    if a.action == 'map':
+        return cmd_releases_map(a)
+    if a.action == 'crate':
+        return cmd_releases_crate(a)
+    if a.args:
+        die('releases takes no NAME (did you mean releases map?)')
+    with Lock():
+        res = releases_scan(refresh=a.refresh, dry_run=a.dry_run, days=a.days,
+                            show_all=a.all, remap=a.remap)
+    tried = res['mapped'] + len(res['failed'])
+    code = 1 if res['failed'] and not res['mapped'] else 0
+    if a.cron:
+        if res['new'] and not res['first_run']:
+            f = inbox_note('rave-radar-releases', releases_note(res),
+                           lambda: {'releases': len(res['new']), 'ids': [str(r['id']) for r in res['new']]})
+            log(f'releases note {f}')
+        return code
+    if a.json:
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+        return code
+    print(f"rave-radar releases {res['today']}: {res['mapped']}/{tried} artists fetched "
+          f"({res['artists']} in the list), {len(res['new'])} new, {res['seeded']} seeded as seen, "
+          f"{res['skipped']} radio episodes skipped" + (' (dry run: nothing saved)' if a.dry_run else ''))
+    for m in res['new_mappings']:
+        print('map      ' + map_line(m))
+    for r in res['new']:
+        print('NEW  ' + rel_line(r))
+    for r in res.get('in_window') or []:
+        print('IN   ' + rel_line(r))
+    for name, err in res['failed'].items():
+        print(f'failed   {name}: {err}')
+    return code
+
+
+def cmd_releases_map(a):
+    with Lock():
+        st = load_rel()
+        if a.args:
+            if len(a.args) < 2 or not re.fullmatch(r'\d+|none', a.args[-1]):
+                die('releases map "NAME" DEEZER_ID|none')
+            name = ' '.join(a.args[:-1]).strip()
+            x = next((x for x in load_artists()['artists'] if norm(x['name']) == norm(name)), None)
+            if not x:
+                die(f'no artist named {name}', 1)
+            v = a.args[-1]
+            old = st['map'].get(norm(x['name'])) or {}
+            st['map'][norm(x['name'])] = {'artist': x['name'], 'id': int(v) if v != 'none' else None, 'pinned': True,
+                                          'status': 'pinned', 'mapped': today().isoformat(), 'why': '',
+                                          'seeded': old.get('seeded') if str(old.get('id')) == v else None}
+            if not a.dry_run:
+                save_private(REL_F, st)
+            print(f"pinned {x['name']} → {v} (a new id seeds silently on the next run)")
+            return 0
+    rows = sorted(st['map'].values(), key=lambda m: norm(m['artist']))
+    if a.json:
+        print(json.dumps(rows, indent=1, ensure_ascii=False))
+    else:
+        for m in rows:
+            print(map_line(m))
+        print(f"{sum(1 for m in rows if m.get('id'))}/{len(rows)} mapped")
+    return 0
+
+
+def cmd_releases_crate(a):
+    rid = (a.args[0] if a.args else '').strip().rsplit(':', 1)[-1]
+    r = load_rel()['releases'].get(rid)
+    if not r and rid.startswith('tid-'):          # a track trackid named from a clip (same ➕ Crate button)
+        r = (botlib.load_json(TRACKID_IDS_F, None) or {}).get('ids', {}).get(rid)
+    if not r and rid.startswith('ps-'):           # a track from a preshow card
+        r = load_preshow()['tracks'].get(rid)
+    if not r:
+        die(f'unknown release {rid!r} (ids come from the releases note, a preshow card or trackid)', 1)
+    cmd = [LISTS_BIN, 'add', 'crate', r['crate']]
+    if a.dry_run:
+        print(shlex.join(cmd))
+        return 0
+    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    sys.stdout.write(p.stdout)
+    sys.stderr.write(p.stderr)
+    return p.returncode
+
+
+# ------------------------------------------------------------------------------------------------ preshow
+PRESHOW_F = os.path.join(STATE_DIR, 'preshow.json')
+MIXESDB = (os.environ.get('RAVE_RADAR_MIXESDB') or 'https://www.mixesdb.com').rstrip('/')
+PS_DAYS, PS_WIDEN_DAYS, PS_MIN_SETS, PS_MAX_SETS, PS_TOP, PS_IDS = 90, 365, 2, 4, 12, 4
+PS_CAT_TTL, PS_SET_TTL, PS_TRACK_TTL, PS_NEW_DAYS, PS_KEEP_DAYS = 20 * 3600, 3 * 86400, 7 * 86400, 120, 60
+PS_NOT_USED = ['1001tracklists.com', 'youtube.com', 'trackid.net']      # REFUSED entries the card names honestly
+SET_LINK_RE = re.compile(r'<a [^>]*?href="/w/((\d{4})-(\d{2}|[0-9X]{2})(?:-([0-9X]{2}))?_-_[^"#?]+)"[^>]*>([^<]+)</a>')
+MIX_SUFFIX_RE = re.compile(r'\s*[(\[](?:(?:original|extended|club|radio|album|vip)\s+)?(?:mix|edit|version)[)\]]', re.I)
+FEAT_RE = re.compile(r'\s*[(\[](?:feat|ft)\.?\s[^)\]]*[)\]]', re.I)
+ID_RE = re.compile(r'^(?:id|unknown|untitled|unreleased)$', re.I)
+YT_RE = re.compile(r'youtube(?:-nocookie)?\.com/embed/([\w-]{11})')
+
+
+def load_preshow():
+    s = botlib.load_json(PRESHOW_F, None) or {}
+    for k in ('sent', 'tracks', 'events'):
+        s.setdefault(k, {})
+    return s
+
+
+def wed_before(iso):
+    """The last Wednesday strictly before the show day (the card's day)."""
+    d = dt.date.fromisoformat(iso)
+    return d - dt.timedelta(days=(d.weekday() - 2) % 7 or 7)
+
+
+def ps_primary(artist):
+    return re.split(r'\s+(?:&|and|feat\.?|ft\.?|vs\.?|x|with|b2b)\s+|\s*,\s*', artist.strip(), flags=re.I)[0].strip()
+
+
+def ps_title_key(title):
+    return norm(FEAT_RE.sub('', MIX_SUFFIX_RE.sub('', title)))
+
+
+def ps_is_id(s):
+    s = (s or '').strip()
+    return not s.strip('?. ') or bool(ID_RE.match(s))
+
+
+def mixesdb_cat_url(artist):
+    return f"{MIXESDB}/w/Category:{urllib.parse.quote(artist.strip().replace(' ', '_'))}"
+
+
+def mixesdb_sets(doc, artist):
+    """Dated mixes of the artist on a MixesDB category page, newest first: {date, url, title, short}."""
+    i = doc.find('id="Mixes"')
+    seg = doc[i:] if i >= 0 else doc
+    out, seen = [], set()
+    for m in SET_LINK_RE.finditer(seg):
+        path, y, mo, d, text = m.groups()
+        title = ' '.join(html.unescape(text).split())
+        if path in seen or not mo.isdigit() or not 1 <= int(mo) <= 12 or norm(artist) not in norm(title):
+            continue
+        seen.add(path)
+        day = int(d.replace('X', '0')) if d and d[0].isdigit() else 1
+        try:
+            date = dt.date(int(y), int(mo), max(1, day))
+        except ValueError:
+            date = dt.date(int(y), int(mo), 1)
+        name = title.split(' - ', 1)[1] if ' - ' in title else title
+        short = name.split(' @ ', 1)[1] if ' @ ' in name else (name.split(' - ', 1)[1] if ' - ' in name else name)
+        out.append({'date': date.isoformat(), 'url': f'{MIXESDB}/w/{path}', 'title': title,
+                    'short': short.strip()[:40]})
+    return sorted(out, key=lambda s: s['date'], reverse=True)
+
+
+def parse_tracklist(doc):
+    """The numbered tracks under a MixesDB page's Tracklist heading: {artist, title, label, minute, id}."""
+    i = doc.find('id="Tracklist"')
+    if i < 0:
+        return []
+    seg = doc[i:]
+    end = re.search(r'<h2|id="bodyBottom"|class="printfooter"', seg[20:])
+    seg = seg[:end.start() + 20] if end else seg[:60000]
+    rows = []
+    for raw in re.findall(r'<li[^>]*>(.*?)</li>', seg, re.S):
+        t = ' '.join(html.unescape(re.sub(r'<[^>]+>', ' ', raw)).split())
+        m = re.match(r'\[(\d{1,3}(?::\d{2})?|\?+)\]\s*', t)
+        minute = m.group(1) if m and m.group(1)[0].isdigit() else None
+        t = t[m.end():] if m else t
+        m = re.search(r'\s*\[([^\[\]]+)\]$', t)
+        label = m.group(1).strip() if m else None
+        t = t[:m.start()] if m else t
+        artist, _, title = t.partition(' - ')
+        artist, title = artist.strip() or '?', title.strip() or '?'
+        if not t.strip():
+            continue
+        rows.append({'artist': artist, 'title': title, 'label': label, 'minute': minute,
+                     'id': ps_is_id(title) or ps_is_id(artist)})
+    return rows
+
+
+def deezer_track(fetcher, artist, title):
+    """The Deezer track whose title (mix suffixes and feat. dropped) and artist match, else None."""
+    q = f'{ps_primary(artist)} {FEAT_RE.sub("", MIX_SUFFIX_RE.sub("", title))}'
+    d = deezer(fetcher, f'/search/track?q={urllib.parse.quote(q)}&limit=10', PS_TRACK_TTL)
+    want, who = ps_title_key(title), norm(ps_primary(artist))
+    for t in d.get('data') or []:
+        if not isinstance(t, dict) or ps_title_key(t.get('title') or '') != want:
+            continue
+        credit = norm(f"{(t.get('artist') or {}).get('name') or ''} {t.get('title') or ''}")
+        if f' {who} ' in f' {credit} ':
+            return t
+    return None
+
+
+def ps_key(artist, title):
+    return norm(ps_primary(artist)) + '|' + ps_title_key(title)
+
+
+def crate_keys():
+    """ps_key()s of the crate list's items, open and checked ("Artist – Title"); empty when lists can't answer."""
+    try:
+        p = subprocess.run([LISTS_BIN, 'show', 'crate', '--json'], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=30)
+        d = json.loads(p.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return set()
+    out = set()
+    for i in (i for k in ('open', 'done') for i in (d.get(k) or []) if isinstance(i, dict)):
+        text = str(i.get('text') or '')
+        a, sep, t = text.partition(' – ')
+        if not sep:
+            a, sep, t = text.partition(' - ')
+        out.add(ps_key(a, t) if sep else norm(text))
+    return out
+
+
+def ps_item(kind, artist, title, link=None, **kw):
+    crate = f'{artist} – {title}'
+    return {'kind': kind, 'artist': artist, 'title': title, 'link': link, 'crate': crate,
+            'id': 'ps-' + hashlib.sha1(norm(crate).encode()).hexdigest()[:10], **kw}
+
+
+def preshow_build(fetcher, artist, event=None, days=PS_DAYS):
+    """Most-played tracks of the artist's newest public set tracklists (MixesDB), unidentified IDs, what is not on
+    Deezer yet, and the latest releases; without any set in a year: latest releases + Deezer top tracks."""
+    fetcher.api_hosts.add(host_of(DEEZER_API))
+    ref = today()
+    res = {'artist': artist, 'today': ref.isoformat(), 'event': event, 'days': days, 'widened': False,
+           'sets': [], 'top': [], 'ids': [], 'releases': [], 'classics': [], 'sources': {}, 'mode': 'sets'}
+    cands = []
+    try:
+        cands = [s for s in mixesdb_sets(fetcher.get(mixesdb_cat_url(artist), PS_CAT_TTL), artist)
+                 if s['date'] <= ref.isoformat()]
+    except FetchError as e:
+        res['sources']['mixesdb'] = ('no MixesDB category for this name' if 'HTTP 404' in str(e)
+                                     else f'failed: {e}')
+    lo, wlo, reads = [(ref - dt.timedelta(days=n)).isoformat() for n in (days, PS_WIDEN_DAYS)] + [0]
+    for s in (s for s in cands if s['date'] >= wlo):    # the window's sets; fewer than 2 with a list: older ones
+        if reads >= PS_MAX_SETS or (s['date'] < lo and len(res['sets']) >= PS_MIN_SETS):
+            break
+        reads += 1
+        try:
+            doc = fetcher.get(s['url'], PS_SET_TTL)
+        except FetchError as e:
+            s['error'] = str(e)
+            continue
+        s['tracks'] = parse_tracklist(doc)
+        yt = YT_RE.search(doc)
+        s['listen'] = f'https://www.youtube.com/watch?v={yt.group(1)}' if yt else None
+        if s['tracks']:
+            res['sets'].append(s)
+            res['widened'] = res['widened'] or s['date'] < lo
+    if 'mixesdb' not in res['sources']:
+        res['sources']['mixesdb'] = (f"{reads} set pages read, {len(res['sets'])} with a tracklist "
+                                     f"({len(cands)} dated mixes listed)")
+    tally, head = {}, norm(artist)
+    for si, s in enumerate(res['sets']):
+        seen = set()
+        for pos, t in enumerate(s['tracks']):
+            if t['id']:
+                if len(res['ids']) < PS_IDS:
+                    who = t['artist'] if not ps_is_id(t['artist']) else None
+                    res['ids'].append({'artist': who, 'set': s['short'], 'date': s['date'], 'minute': t['minute']})
+                continue
+            k = ps_key(t['artist'], t['title'])
+            if k in seen:
+                continue
+            seen.add(k)
+            x = tally.setdefault(k, {'artist': t['artist'], 'title': MIX_SUFFIX_RE.sub('', t['title']).strip()
+                                     or t['title'], 'label': t['label'], 'sets': [], 'first': (si, pos)})
+            x['sets'].append(s['short'])
+    top = sorted(tally.values(), key=lambda x: (-len(x['sets']), x['first']))[:PS_TOP]
+    # Deezer: the artist's releases (dates for "new"), one track search per listed track
+    mp = load_rel()['map'].get(head) or {}
+    albums, deez_err = {}, None
+    try:
+        if 'id' not in mp:                          # not a followed artist: map it now (not saved)
+            mp, al = map_artist(fetcher, {'name': artist})
+            albums = {str(a['id']): a for a in al}
+        if mp.get('id') and not albums:
+            albums = {str(a['id']): a for a in artist_albums(fetcher, mp['id'])}
+    except FetchError as e:
+        deez_err = str(e)
+    cutoff = (ref - dt.timedelta(days=PS_NEW_DAYS)).isoformat()
+    found = 0
+    for x in top:
+        tag, link, rel = '', None, None
+        if not deez_err:
+            try:
+                t = deezer_track(fetcher, x['artist'], x['title'])
+            except FetchError as e:
+                t, deez_err = None, str(e)
+            if t:
+                found += 1
+                link = t.get('link')
+                rel = (albums.get(str((t.get('album') or {}).get('id'))) or {}).get('release_date')
+                tag = 'new' if rel and rel >= cutoff else ''
+            elif not deez_err:
+                tag = 'missing'
+        res['top'].append(ps_item('set', x['artist'], x['title'], link, label=x['label'], sets=x['sets'],
+                                  plays=len(x['sets']), tag=tag, released=rel))
+    if not res['top']:
+        res['mode'] = 'fallback'
+    keep = 3 if res['mode'] == 'sets' else 5
+    win = (ref - dt.timedelta(days=180 if res['mode'] == 'sets' else 365)).isoformat()
+    rels = sorted((a for a in albums.values() if win <= (a.get('release_date') or '') <= ref.isoformat()
+                   and not any(re.search(p, a.get('title') or '', re.I) for p in SKIP_TITLE)),
+                  key=lambda a: a.get('release_date') or '', reverse=True)[:keep]
+    for al in rels:
+        r = release_of(artist, al)
+        res['releases'].append(ps_item('release', artist, r['title'], r['link'], type=r['type'], released=r['date']))
+    if res['mode'] == 'fallback' and mp.get('id') and not deez_err:
+        try:
+            d = deezer(fetcher, f"/artist/{mp['id']}/top?limit=8", PS_TRACK_TTL)
+            for t in (d.get('data') or [])[:8]:
+                if isinstance(t, dict) and t.get('title'):
+                    who = (t.get('artist') or {}).get('name') or artist
+                    res['classics'].append(ps_item('classic', who, t['title'], t.get('link')))
+        except FetchError as e:
+            deez_err = str(e)
+    res['sources']['deezer'] = (f'failed: {deez_err}' if deez_err else
+                                f"#{mp.get('id')} {len(albums)} releases; {found}/{len(top)} set tracks found"
+                                if mp.get('id') else 'artist not on Deezer')
+    res['sources']['not used'] = '; '.join(f'{h}: {REFUSED[h]}' for h in PS_NOT_USED)
+    res['by_hand'] = f"https://www.1001tracklists.com/dj/{norm(artist).replace(' ', '')}/index.html"
+    inc = crate_keys()
+    for it in res['top'] + res['releases'] + res['classics']:
+        it['in_crate'] = ps_key(it['artist'], it['title']) in inc
+    return res
+
+
+def ps_short(title, n=26):
+    t = title if len(title) <= n else MIX_SUFFIX_RE.sub('', FEAT_RE.sub('', title))
+    return t if len(t) <= n else t[:n - 1].rstrip() + '…'
+
+
+def ps_label(it, head):
+    return it['title'] if norm(it['artist']) == head else f"{it['artist']} – {it['title']}"
+
+
+def preshow_card(res):
+    head, ev = norm(res['artist']), res.get('event')
+    when = f" ({ev.get('city') or ev.get('venue') or '?'}, {fmt_day(ev['date'])})" if ev and ev.get('date') else ''
+    out = [f"🎧 {res['artist']}: what's in the sets{when}"]
+    if res['sets']:
+        out.append('From ' + ' · '.join(f"{s['short']} {fmt_day(s['date'])[4:9]}" for s in res['sets']))
+        if res['widened']:
+            age = (dt.date.fromisoformat(res['today']) - dt.date.fromisoformat(res['sets'][0]['date'])).days // 7
+            out.append(f"(no tracklist from the last {res['days']} days; newest is {age} weeks old)")
+        n = len(res['sets'])
+        out += ['', f'Most played ({n} sets)' if n > 1 else f"Setlist ({res['sets'][0]['short']})"]
+        for i, it in enumerate(res['top'], 1):
+            bits = [f"{i}. {ps_label(it, head)}"]
+            if it['plays'] > 1:
+                bits.append(f"{it['plays']}×")
+            if it['tag'] == 'new':
+                bits.append(f"🆕 out {fmt_day(it['released'])[4:9]}")
+            elif it['tag'] == 'missing':
+                bits.append('❓')
+            if it['in_crate']:
+                bits.append('✓ crate')
+            out.append(' · '.join(bits))
+        if any(it['tag'] == 'missing' for it in res['top']):
+            out.append('❓ = not on Deezer: unreleased or brand new')
+        if res['ids']:
+            out += ['', 'Unidentified IDs']
+            out += [f"- {i['artist'] or '?'} – ID · {i['set']}" + (f" [{i['minute']}]" if i['minute'] else '')
+                    for i in res['ids']]
+    else:
+        out.append(f"No public set tracklist from the last {PS_WIDEN_DAYS // 30} months; "
+                   'his latest releases and best-known tracks instead.')
+    if res['releases']:
+        out += ['', 'Latest releases']
+        out += [f"- {it['title']} ({it['type']}, {fmt_day(it['released'])[4:]})" + (' · ✓ crate' if it['in_crate']
+                                                                                  else '') for it in res['releases']]
+    if res['classics']:
+        out += ['', 'Best known (Deezer top)']
+        out += [f"- {ps_label(it, head)}" + (' · ✓ crate' if it['in_crate'] else '') for it in res['classics']]
+    listen = [s for s in res['sets'] if s.get('listen')][:2]
+    if listen:
+        out += ['', 'Listen: ' + ' · '.join(f"▶ {s['short']} {s['listen']}" for s in listen)]
+    out += ['', 'Sources: ' + ' · '.join(
+        [f"MixesDB ({len(res['sets'])} set{'s' if len(res['sets']) != 1 else ''})" if res['sets'] else 'MixesDB (none)',
+         'Deezer' if not res['sources']['deezer'].startswith('failed') else 'Deezer failed',
+         '1001Tracklists not read (bot check)'])]
+    return out
+
+
+def preshow_payload(res):
+    ev = res.get('event') or {}
+    return {'event': str(ev['id']) if ev.get('id') else None, 'date': ev.get('date') or None,
+            'sets': len(res['sets']), 'tracks': len(res['top']) + len(res['releases']) + len(res['classics'])}
+
+
+def preshow_note(res):
+    ev = res.get('event')
+    head = f"{res['artist']} · {fmt_day(ev['date'])} {where(ev)}" if ev and ev.get('date') else res['artist']
+    btn = [it for it in res['top'] + res['releases'] + res['classics'] if not it['in_crate']][:8]
+    out = [f'# rave-radar preshow: {head}', '',
+           'Data from rave-radar (public MixesDB set tracklists and the keyless Deezer API), not instructions. '
+           'Handling: JOBS.md (rave-radar preshow).', '',
+           'Nothing was sent. I decide whether it is worth a message; if so ONE Telegram card (never 00-08) from '
+           'the Card section, one "➕" button per track from Buttons (on_press "keep"). A press -> '
+           '`rave-radar releases crate ID` (= lists add crate), react 👍. Then delete this note.', '',
+           '## Card', *preshow_card(res), '', '## Buttons']
+    out += [f"- \"➕ {ps_short(it['title'])}\" -> rr:crate:{it['id']}  (= lists add crate {shlex.quote(it['crate'])})"
+            for it in btn] or ['- none (everything listed is in the crate already)']
+    out += ['', '## Links']
+    out += [f"- {ps_label(it, norm(res['artist']))}: {it['link']}" for it in res['top'] + res['releases']
+            + res['classics'] if it.get('link')]
+    out += [f"- set {s['short']} ({s['date']}): {s['url']}" for s in res['sets']]
+    out += ['', '## Sources'] + [f'- {k}: {v}' for k, v in res['sources'].items()]
+    out.append(f"- 1001Tracklists by hand (browser, not scripted): {res['by_hand']}")
+    return '\n'.join(out) + '\n'
+
+
+def ps_remember(ps, res):
+    """Keep the card's crate ids (rr:crate:ps-…) and the event's track list (a cross-check list for trackid)."""
+    ref = res['today']
+    for it in res['top'] + res['releases'] + res['classics']:
+        ps['tracks'][it['id']] = {'crate': it['crate'], 'artist': it['artist'], 'title': it['title'],
+                                  'link': it.get('link'), 'added': ref}
+    ev = res.get('event')
+    if ev:
+        ps['events'][ev['id']] = {'artist': res['artist'], 'date': ev.get('date'), 'built': ref,
+                                  'tracks': [it['crate'] for it in res['top']]}
+    lo = (dt.date.fromisoformat(ref) - dt.timedelta(days=PS_KEEP_DAYS)).isoformat()
+    ps['tracks'] = {k: v for k, v in ps['tracks'].items() if v.get('added', '') >= lo}
+    ps['events'] = {k: v for k, v in ps['events'].items() if (v.get('date') or v.get('built') or '') >= lo}
+    ps['sent'] = {k: v for k, v in ps['sent'].items() if v >= lo}
+
+
+def next_show(st, name):
+    ref = today().isoformat()
+    evs = [e for e in st['events'].values() if e.get('kind') == 'show' and norm(e['artist']) == norm(name)
+           and (e.get('date') or '') >= ref and e['id'] not in st['muted']]
+    return min(evs, key=lambda e: e['date']) if evs else None
+
+
+def cmd_preshow(a):
+    st = load_state()
+    if a.cron:
+        ref, ps, code = today(), load_preshow(), 0
+        due = sorted((e for e in st['events'].values() if e.get('kind') == 'show' and e.get('date')
+                      and e['id'] not in st['muted'] and e['id'] not in ps['sent']
+                      and wed_before(e['date']) == ref), key=lambda e: (e['date'], e['artist']))
+        for e in due:
+            res = preshow_build(Fetcher(refresh=a.refresh), e['artist'], e, a.days)
+            if not a.dry_run:
+                f = inbox_note('preshow', preshow_note(res), lambda: preshow_payload(res))
+                ps['sent'][e['id']] = ref.isoformat()
+                ps_remember(ps, res)
+                save_private(PRESHOW_F, ps)
+                log(f"preshow note {f} ({e['artist']}, {e['date']}, {len(res['sets'])} sets)")
+            else:
+                print(preshow_note(res))
+        return code
+    ev = None
+    if a.event:
+        ev = st['events'].get(a.event)
+        if not ev:
+            die(f'unknown event {a.event} (rave-radar list shows the ids)', 1)
+    name = ' '.join(a.artist).strip() or (ev or {}).get('artist')
+    if not name:
+        die('preshow ARTIST [--event ID]')
+    x = next((x for x in load_artists()['artists'] if norm(name) in {norm(n) for n in [x['name'],
+                                                                                         *(x.get('aliases') or [])]}),
+             None)
+    name = x['name'] if x else name
+    if ev is None:
+        ev = next_show(st, name)
+    res = preshow_build(Fetcher(refresh=a.refresh), name, ev, a.days)
+    if not a.dry_run:
+        ps = load_preshow()
+        ps_remember(ps, res)
+        save_private(PRESHOW_F, ps)
+    if a.json:
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+    elif a.note and not a.dry_run:
+        print(inbox_note('preshow', preshow_note(res), lambda: preshow_payload(res)))
+    else:
+        print(preshow_note(res), end='')
+    return 0 if res['sets'] or res['releases'] or res['classics'] else 1
+
+
+def main(argv):
+    if argv[:1] == ['--cron']:
+        return cmd_cron(None)
+    p = argparse.ArgumentParser(prog='rave-radar', description=__doc__.split('\n')[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd')
+    s = sub.add_parser('scan')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--dry-run', action='store_true')
+    s.add_argument('--refresh', action='store_true')
+    s = sub.add_parser('list')
+    s.add_argument('--days', type=int, default=180)
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--all', action='store_true')
+    s = sub.add_parser('artists')
+    s.add_argument('action', choices=('list', 'add', 'rm'))
+    s.add_argument('name', nargs='*')
+    s.add_argument('--alias', action='append')
+    s.add_argument('--note')
+    s.add_argument('--json', action='store_true')
+    for c in ('mute', 'unmute'):
+        sub.add_parser(c).add_argument('eventid')
+    sub.add_parser('sources').add_argument('--json', action='store_true')
+    s = sub.add_parser('releases')
+    s.add_argument('action', nargs='?', default='scan', choices=('scan', 'map', 'crate'))
+    s.add_argument('args', nargs='*')
+    s.add_argument('--days', type=int, default=REL_DAYS)
+    for f in ('--json', '--dry-run', '--refresh', '--remap', '--all', '--cron'):
+        s.add_argument(f, action='store_true')
+    s = sub.add_parser('preshow')
+    s.add_argument('artist', nargs='*')
+    s.add_argument('--event')
+    s.add_argument('--days', type=int, default=PS_DAYS)
+    for f in ('--json', '--dry-run', '--refresh', '--cron', '--note'):
+        s.add_argument(f, action='store_true')
+    if not argv or argv[0] in ('-h', '--help', 'help'):
+        print(__doc__)
+        return 0
+    a = p.parse_args(argv)
+    if a.cmd == 'scan':
+        return cmd_scan(a)
+    if a.cmd == 'list':
+        return cmd_list(a)
+    if a.cmd == 'artists':
+        return cmd_artists(a)
+    if a.cmd in ('mute', 'unmute'):
+        return cmd_mute(a, a.cmd == 'mute')
+    if a.cmd == 'sources':
+        return cmd_sources(a)
+    if a.cmd == 'releases':
+        return cmd_releases(a)
+    if a.cmd == 'preshow':
+        return cmd_preshow(a)
+    p.print_usage(sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

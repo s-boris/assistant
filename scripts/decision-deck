@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""decision-deck: TODO.md's "Waiting on you" items as short spoken either/or prompts for a decision call.
+
+  decision-deck [--json] [--list] [--todo PATH] [--max N]
+
+--json (default): the deck for the voice relay: {"items": [{id, title, say, options, kind, due, status}],
+"skipped": [{title, why}]}. The relay sends Gemini only id, say and options (never title or status).
+--list: the same for me, one line per item, then the skipped ones with the reason.
+
+Each prompt is one sentence with no identifiers, codes, amounts, times or dates. Items that need something
+outside a yes/no (a login code, a number, a file or export he must send, a test call, trying a feature, a free
+list like symbols) are skipped. Kinds: choice (the item already asks "A or B?" / "A / B / C?"), order (he orders
+himself: now or wait), done (he must do a step: done or still to do), poll (an open Telegram poll: answer there
+or drop), keep (anything else: keep or drop). Read-only: never writes anything.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import unicodedata
+from datetime import datetime
+
+DEFAULT_TODO = os.path.expanduser("~/workspace/TODO.md")
+SECTION = "waiting on you"
+
+SKIP = [  # (pattern on title + status, why); first match wins
+    (r"\btest call\b|\blive test\b", "needs a live test call"),
+    (r"\bfirst try\b|\btry (?:it|them|the)\b", "needs him to try it"),
+    (r"\blogin\b|\bcode\b|\bsim\b|\bphone number\b|\bnumber\b\s*(?:→|->)", "needs a login, code or number"),
+    (r"\basked him for\b|\bsymbols?\b|\bsend (?:me |us )?(?:a|an|the|his|your)?\s*[\w/ ]{0,30}"
+     r"(?:export|file|photo|scan|pdf|document)s?\b|\bto the vault bot\b",
+     "needs something only he can send"),
+]
+ORDER = re.compile(r"(?i)\bhe orders\b|\bbasket\b")
+DONE = re.compile(r"(?i)\bhe runs\b|\bhis done\b|\bsteps sent\b|\bhe chose\b|\bstaged\b|\bhe books?\b|"
+                  r"\bhe does\b|\bhis turn\b")
+POLL = re.compile(r"(?i)\bpoll\b")
+DEADLINE = re.compile(r"(?i)\b(?:deadline|due|by)\s+(\d{1,2}\.\d{1,2})\b")
+EMOJI_NOUN = {"✈": "the flight", "🚆": "the train", "🎫": "the tickets", "🏝": "the trip"}
+
+KIND_ORDER = {"choice": 0, "order": 1, "done": 2, "poll": 3, "keep": 4}
+
+
+def parse_waiting(text):
+    """[(title, status, sub_lines)] from the '## Waiting on you' section."""
+    out, on = [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            on = line[3:].strip().lower().startswith(SECTION)
+            continue
+        if not on:
+            continue
+        m = re.match(r"^- \*\*(.+?)\*\*\s*(?:[—–-]\s*(.*))?$", line)
+        if m:
+            out.append([m.group(1).strip(), (m.group(2) or "").strip(), []])
+        elif out and re.match(r"^\s+- ", line):
+            out[-1][2].append(line.strip()[2:])
+    return [tuple(x) for x in out]
+
+
+def _strip_symbols(s):
+    return "".join(ch for ch in s if not unicodedata.category(ch).startswith(("So", "Sk", "Cf", "Mn"))
+                   or ch.isalnum())
+
+
+def speakable(s):
+    """Spoken text: no emoji, code, parentheses, links, identifiers, amounts, times or dates."""
+    s = re.sub(r"`[^`]*`", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"https?://\S+|\S+@\S+|~?/\S+", " ", s)
+    s = re.sub(r"(?i)(?:€|\$|£|\bchf|\beur|\busd)\s?\d[\d'.,]*|\d[\d'.,]*\s?(?:€|\$|chf|eur|usd)\b", " ", s)
+    s = re.sub(r"\b[A-Z]{1,4}\s?\d[\w./-]*", " ", s)          # flight / ticket / model codes
+    s = re.sub(r"\b\w*\d\w*(?:[.:/-]\w+)*\b", " ", s)         # any token with a digit: ids, times, dates
+    s = re.sub(r"\b[a-z]{2,6}:(?=\s|$|,)", " ", s)             # callback prefixes like hwr:
+    s = _strip_symbols(s)
+    s = re.sub(r"[→←*_#|\[\]{}<>\"]", " ", s)
+    s = re.sub(r"\s+([,?.!:;])", r"\1", " ".join(s.split()))
+    return s.strip(" ,;:-—–")
+
+
+def spoken_title(title):
+    t = speakable(title)
+    if len(t.split()) < 2:
+        noun = next((n for e, n in EMOJI_NOUN.items() if e in title), None)
+        if noun:
+            t = (t + " " + noun).strip()
+    return t[:1].upper() + t[1:] if t else ""
+
+
+def slug(s):
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")[:32] or "item"
+
+
+def _options(question):
+    q = question.strip().rstrip("?").strip()
+    parts = [p.strip(" ,") for p in re.split(r"\s*/\s*|,\s*|\s+or\s+|\s+oder\s+", q) if p.strip(" ,")]
+    return parts if 2 <= len(parts) <= 4 else None
+
+
+def _join(opts):
+    return opts[0] if len(opts) == 1 else ", ".join(opts[:-1]) + ", or " + opts[-1]
+
+
+def classify(title, status):
+    """(kind, say, options) or ("skip", why, None)."""
+    both = "%s %s" % (title, status)
+    for pat, why in SKIP:
+        if re.search(pat, both, re.I):
+            return "skip", why, None
+    name = spoken_title(title)
+    if not name:
+        return "skip", "no speakable title", None
+    for seg in re.split(r";|\s[—–]\s", status):
+        if "?" in seg:
+            opts = _options(speakable(seg.split("?")[0]))
+            if opts:
+                return "choice", "%s: %s?" % (name, _join(opts)), opts
+    if POLL.search(both):
+        return "poll", "%s: answer it on Telegram, or drop it?" % name, ["answer on Telegram", "drop it"]
+    if ORDER.search(both):
+        return "order", "%s: order it now, or wait for more items?" % name, ["order now", "wait"]
+    if DONE.search(both):
+        return "done", "%s: already done, or still to do?" % name, ["done", "still to do"]
+    return "keep", "%s: still want it, or drop it?" % name, ["keep", "drop"]
+
+
+def build(text, max_items=8):
+    items, skipped, seen = [], [], set()
+    for title, status, _sub in parse_waiting(text):
+        kind, say, opts = classify(title, status)
+        if kind == "skip":
+            skipped.append({"title": title, "why": say})
+            continue
+        if len(say) > 160 or say.count(". ") or say.count("? ") or not say.endswith("?"):
+            skipped.append({"title": title, "why": "prompt would not fit one short sentence"})
+            continue
+        base = slug(spoken_title(title))
+        iid, n = base, 2
+        while iid in seen:
+            iid, n = "%s-%d" % (base, n), n + 1
+        seen.add(iid)
+        m = DEADLINE.search(status)
+        items.append({"id": iid, "title": title, "say": say, "options": opts, "kind": kind,
+                      "due": m.group(1) if m else None, "status": status})
+    items.sort(key=lambda it: (it["due"] is None, KIND_ORDER[it["kind"]]))   # deadlines first, then choices
+    over = items[max_items:]
+    for it in over:
+        skipped.append({"title": it["title"], "why": "over the deck limit (%d)" % max_items})
+    return {"generated": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "items": items[:max_items], "skipped": skipped}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="decision-deck", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--json", action="store_true", help="the deck as JSON (default)")
+    ap.add_argument("--list", action="store_true", help="human-readable list for the session")
+    ap.add_argument("--todo", default=os.environ.get("DECISION_DECK_TODO") or DEFAULT_TODO)
+    ap.add_argument("--max", type=int, default=8)
+    a = ap.parse_args(argv)
+    try:
+        with open(a.todo, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as e:
+        print("decision-deck: cannot read %s (%s)" % (a.todo, type(e).__name__), file=sys.stderr)
+        return 2
+    deck = build(text, max(1, a.max))
+    deck["source"] = a.todo
+    if a.list:
+        if not deck["items"]:
+            print("No either/or decisions in Waiting on you.")
+        for i, it in enumerate(deck["items"], 1):
+            print("%d. [%s] %s%s\n   says: %s\n   options: %s" % (
+                i, it["id"], it["title"], "  (due %s)" % it["due"] if it["due"] else "", it["say"],
+                " | ".join(it["options"])))
+        for s in deck["skipped"]:
+            print("skipped: %s (%s)" % (s["title"], s["why"]))
+        return 0
+    json.dump(deck, sys.stdout, ensure_ascii=False, indent=1)
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

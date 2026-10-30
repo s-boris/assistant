@@ -1,0 +1,17 @@
+{"region": "CH / test canton", "updated": "2026-10-01",
+ "deadlines": [
+  {"id": "pillar3a", "title": "3a {year}", "date": "12-31", "workday": "before", "amounts": {"2026": "CHF 7,258"},
+   "sources": [{"title": "BSV: Beiträge Säule 3a", "url": "https://www.bsv.admin.ch/de/beitrag-3-sauele"}]},
+  {"id": "tax-return", "title": "Tax return {prev} due", "date": "03-31", "workday": "after", "verified": "partly",
+   "remind_text": "File it, or extend online before the deadline."}
+ ],
+ "checklists": {"tax": {"title": "Tax return {prev}", "exclude_types": ["Lohnausweis", "Lohnabrechnung"], "items": [
+  {"id": "lohnausweis", "title": "Lohnausweis {prev} (every employer)", "paperless": {"queries": ["Lohnausweis"], "exclude_types": [], "confirm": "Lohnausweis"}},
+  {"id": "pillar3a-cert", "title": "3a certificate {prev}", "paperless": {"queries": ["Säule 3a"], "confirm": "3a|Vorsorgekonto"}},
+  {"id": "bank-statements", "title": "Bank statements {prev}", "paperless": {"queries": ["Steuerauszug"], "confirm": "Steuerauszug"}},
+  {"id": "pk-buyin", "title": "PK buy-in {prev}", "if": "pk_buyin", "paperless": {"queries": ["Einkauf"], "confirm": "Einkauf"}},
+  {"id": "crypto", "title": "Crypto {prev}", "if": "crypto", "paperless": {"queries": ["Bitcoin"], "confirm": "Bitcoin"}},
+  {"id": "kk-premiums", "title": "KK premiums {prev}", "optional": true, "paperless": {"queries": ["Krankenkasse"], "confirm": "Prämie"}},
+  {"id": "donations", "title": "Donations {prev}", "optional": true, "paperless": {"queries": ["Spende"], "confirm": "Spende"}},
+  {"id": "tax-form", "title": "Tax form {prev}", "paperless": null}
+ ]}}}

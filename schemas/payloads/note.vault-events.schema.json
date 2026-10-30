@@ -1,0 +1,94 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.vault-events.schema.json",
+ "title": "vault-events: one note per batch of triaged messages; counts, labels, chat keys and mail refs as the note shows them (no text, no names)",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "messages",
+  "sources",
+  "labels",
+  "chats",
+  "mails",
+  "cursor"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.vault-events"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "messages": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "sources": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "integer",
+    "minimum": 0
+   }
+  },
+  "labels": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "integer",
+    "minimum": 0
+   }
+  },
+  "priority": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "chats": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  },
+  "mails": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   }
+  },
+  "bills": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "chatter": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "counted": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "plans": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "more": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "cursor": {
+   "type": "array",
+   "items": {
+    "type": "integer"
+   },
+   "minItems": 2,
+   "maxItems": 2
+  }
+ }
+}

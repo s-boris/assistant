@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Stub of `ha todo` for the shop tests: a JSON file (STUB_HA_DB) holds {"items": [...], "n": int}.
+STUB_HA_FAIL=1 -> exit 1 (HA unreachable); STUB_HA_NOCONFIRM=1 -> add exits 3; every call is appended to
+STUB_HA_LOG. Only `ha todo items|add|done|undo|rm --list L --json [--all] [--] [ITEM]` is understood."""
+import json
+import os
+import sys
+
+db_path, log = os.environ["STUB_HA_DB"], os.environ.get("STUB_HA_LOG")
+argv = sys.argv[1:]
+if log:
+    with open(log, "a") as fh:
+        fh.write(json.dumps(argv) + "\n")
+if os.environ.get("STUB_HA_FAIL") == "1":
+    print("ha: error: cannot reach Home Assistant (URLError)", file=sys.stderr)
+    sys.exit(1)
+assert argv[0] == "todo", argv
+verb, rest = argv[1], argv[2:]
+# the real ha's argparse wants the item words right after the verb, then the options (no "--")
+words = []
+while rest and not rest[0].startswith("-"):
+    words.append(rest.pop(0))
+assert "--" not in rest, argv
+assert rest[:2] == ["--list", "todo.shopping_list"] and rest[2] == "--json", argv
+lst, flags = rest[1], set(rest[2:])
+assert all(f.startswith("--") for f in flags), argv
+assert lst == "todo.shopping_list", lst
+assert "--json" in flags
+try:
+    db = json.load(open(db_path))
+except OSError:
+    db = {"items": [], "n": 0}
+items = db["items"]
+text = " ".join(words)
+
+
+def save():
+    json.dump(db, open(db_path, "w"))
+
+
+if verb == "items":
+    print(json.dumps([x for x in items if "--all" in flags or x["status"] == "needs_action"]))
+    sys.exit(0)
+if verb == "add":
+    if os.environ.get("STUB_HA_NOCONFIRM") == "1":
+        db["n"] += 1
+        items.append({"uid": f"h{db['n']}", "summary": text, "status": "needs_action"})
+        save()
+        print("ha: todo add: not confirmed after 8s", file=sys.stderr)
+        sys.exit(3)
+    db["n"] += 1
+    it = {"uid": f"h{db['n']}", "summary": text, "status": "needs_action"}
+    items.append(it)
+    save()
+    print(json.dumps(it))
+    sys.exit(0)
+hit = [x for x in items if x["uid"] == text]
+if not hit:
+    print(f"ha: refused: no item {text!r} on the list (ha todo items --all)", file=sys.stderr)
+    sys.exit(2)
+if verb == "rm":
+    items.remove(hit[0])
+    save()
+    print(json.dumps({"uid": text, "status": "removed"}))
+    sys.exit(0)
+hit[0]["status"] = "completed" if verb == "done" else "needs_action"
+save()
+print(json.dumps(hit[0]))

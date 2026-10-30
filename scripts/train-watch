@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""train-watch: silent live watch of the owner's planned train legs (transport.opendata.ch, read-only).
+
+  train-watch sync FILE|- [FILE ...]   import the 🚆 events from saved Google Calendar list_events JSON (the MCP
+                                       result; a page object with "events" or "items", a list of pages, or a list
+                                       of events); replaces every calendar leg, keeps legs added by hand, drops
+                                       past ones; prints counts only
+  train-watch sync --from-cache        the same from calcache's cache (~/.local/state/calcache/events.json, no MCP
+                                       needed); calendar legs past the cache window are kept
+              [--allow-empty]          a source with no calendar events at all (an empty cache or page) would
+                                       drop every calendar leg: refused (exit 2, legs unchanged) unless given
+  train-watch add FROM TO "YYYY-MM-DD HH:MM" [--arr HH:MM] [--line S5 ...] [--title TEXT]
+  train-watch list [--json]            legs ahead: id, departure, from → to, lines, source
+  train-watch rm ID
+  train-watch check [--cron] [--dry-run] [--now ISO]
+  train-watch status ID [--json] [--now ISO]  live verdict for one leg at any time; writes no note and no state
+                                       (--json: {id, from, to, dep, arr, lines, fine, live, problems, alt}; live/alt
+                                       = {dep, arr, delay, cancelled, lines, platform, changes, text[, link]} or null)
+
+Legs: ~/.local/state/trains/legs.json ({"legs": [{id, from, to, dep, arr, lines, title, source, event_id}]};
+stations are exact stop names, from the SBB link in a 🚆 event's description, else from its "A → B" title).
+Home is door to door: a leg's from/to may be the home address ("home", the home town or its stop on the home street
+mean the same; lib/home_place): the API gets its coordinates, the planned departure is the leave-home time, and every
+ride of the connection is watched, the first bus included. A 🚆 title "Home → B" / "A → Home" makes that end home
+even when the SBB link names a stop. Lists and notes show "home"; SBB links in notes run from/to the connection's
+first/last stop (the SBB app can't resolve a free-text address).
+check: every leg whose departure is 0–180 min away is looked up with /connections (from, to, date, time = the
+planned departure). The planned connection is the one with that scheduled departure (to the minute, preferring
+the planned first line, then the planned arrival and lines), else the one with the planned arrival leaving up to 30 min after the event start (an event
+that starts at the door, with the station a bus ride later). Problems:
+  cancelled   a ride flagged cancelled, or the connection is gone from the live timetable (two runs in a row;
+              one run when the departure is under 25 min away)
+  delay       departure or arrival 5 min or more late (buckets 5/15/30/60: a worse bucket notes again)
+  platform    a ride leaves from another platform than planned
+  bus         a replacement bus (category EV / "Ersatz"), or a bus where the plan had trains only
+  timetable   the scheduled arrival is 5 min or more later than the planned one
+  transfer    a change shrinks below 2 min
+A new problem writes ONE ~/inbox/train-watch-<id>-<epoch>.md: the leg, what changed, and a suggested alternative
+(the earliest-arriving connection without problems that still leaves 3 min from now or later, from 40 min before
+the planned departure) with its SBB Mobile link. Each problem notes once per leg (state.json next to legs.json).
+Silent when the train is fine; `check --cron` exits at once when no leg is in its window.
+Exit: 0 ok, 1 transport API error for every leg checked, 2 usage error or bad input (sync: not a list_events
+result, or an empty source over calendar legs; the legs stay as they were).
+Phone app: a Live Update chip (lib/livecount.py) per leg from 30 min before departure ("Train HH:MM +N min", door legs
+"Leave HH:MM"), updated on delay, held until a late train leaves, ended when cancelled; silent without a paired phone
+(tests: LIVECOUNT_PHONE = a stub phone; test state makes no chips without it).
+Env (tests): TRAIN_WATCH_API (else ROUTE_API, else transport.opendata.ch), TRAIN_WATCH_DIR, TRAIN_WATCH_INBOX,
+TRAIN_WATCH_NOW (ISO), TRAIN_WATCH_WINDOW (minutes, default 180), CALCACHE_DIR (calcache's cache dir).
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pwd
+import re
+import sys
+import urllib.error
+import urllib.parse
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import http as web, jsonstate, locks  # noqa: E402
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+import assistant_profile as profile  # noqa: E402
+from sbb import sbb_link  # noqa: E402
+import home_place  # noqa: E402
+import livecount  # noqa: E402
+
+HOME_DIR = os.path.expanduser('~')
+API = os.environ.get('TRAIN_WATCH_API') or os.environ.get('ROUTE_API') or 'https://transport.opendata.ch/v1'
+DIR = os.environ.get('TRAIN_WATCH_DIR') or f'{HOME_DIR}/.local/state/trains'
+INBOX = os.environ.get('TRAIN_WATCH_INBOX') or f'{HOME_DIR}/inbox'
+LEGS_F, STATE_F, LOCK_F = (os.path.join(DIR, n) for n in ('legs.json', 'state.json', '.lock'))
+CALCACHE_F = os.path.join(os.environ.get('CALCACHE_DIR') or f'{HOME_DIR}/.local/state/calcache', 'events.json')
+WINDOW = dt.timedelta(minutes=int(os.environ.get('TRAIN_WATCH_WINDOW') or 180))
+UA = 'train-watch/1.0 (personal trip watcher)'
+MIN = dt.timedelta(minutes=1)
+DELAY_BUCKETS = (60, 30, 15, 5)
+MISS_FAST = dt.timedelta(minutes=25)        # closer than this: one miss is enough
+ALT_BEFORE = dt.timedelta(minutes=40)       # alternatives may leave this much before the planned departure
+LATER_STOP = dt.timedelta(minutes=30)      # match by arrival: the stop may be this far after the event start
+REACH = dt.timedelta(minutes=3)             # an alternative must leave at least this far from now
+TRAIN_ICON = '\U0001F686'
+BUS_CATS = {'B', 'BN', 'BUS', 'NFB', 'KB', 'EXB', 'BP', 'EV'}
+TRAM_CATS = {'T', 'TN', 'TRAM'}
+LINE_RE = re.compile(r'(?i:\b(?:bus|tram)\s+[A-Z]?\d+[A-Z]?\b)|\b(?:SN|S|ICN|ICE|IC|IR|RE|R|EC|EN|NJ|TGV|RJX|RJ|PE)\d{1,4}\b')
+LINK_RE = re.compile(r'https://app\.sbbmobile\.ch/timetable\?[^\s)>\]]+')
+
+
+class Fail(Exception):
+    pass
+
+
+def die(msg, code=2):
+    print(f'train-watch: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------------------------ time
+def tz():
+    return profile.tz()
+
+
+def fixed(t):
+    """Owner wall time with a fixed UTC offset. Two times in one ZoneInfo subtract and compare as wall clocks (the
+    fold is ignored), so in the repeated autumn hour a 02:20 CET leg looked gone at 02:30 CEST; with fixed offsets all
+    arithmetic is real elapsed time. Display goes through hm()/day_label() (back to his zone)."""
+    t = t.astimezone(tz())
+    return t.replace(tzinfo=dt.timezone(t.utcoffset()))
+
+
+def now_arg(s=None):
+    s = s or os.environ.get('TRAIN_WATCH_NOW')
+    if not s:
+        return fixed(dt.datetime.now(tz())).replace(microsecond=0)
+    t = iso(s)
+    if not t:
+        die(f'bad --now {s!r} (ISO, e.g. 2026-11-14T16:00:00+01:00)')
+    return t
+
+
+def iso(s):
+    """ISO string (with or without offset; API style +0100 too) -> aware datetime in the owner zone, or None."""
+    if not s:
+        return None
+    s = str(s).strip()
+    m = re.fullmatch(r'(.*[T ]\d{2}:\d{2}(?::\d{2})?)([+-]\d{2})(\d{2})', s)
+    if m:
+        s = f'{m.group(1)}{m.group(2)}:{m.group(3)}'
+    try:
+        t = dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return fixed(t.replace(tzinfo=tz()) if t.tzinfo is None else t)
+
+
+def hm(t):
+    return t.astimezone(tz()).strftime('%H:%M')
+
+
+def day_label(t):
+    t = t.astimezone(tz())
+    return f"{t.strftime('%a')} {t.day:02d}.{t.month:02d}"
+
+
+def mins(td):
+    return int(round(td.total_seconds() / 60))
+
+
+# ------------------------------------------------------------------------------------------------ files
+def read_json(path, default):
+    """core.jsonstate.load; missing -> default, unreadable -> exit 1 with the reason."""
+    try:
+        return jsonstate.load(path, default, strict=True)
+    except (OSError, ValueError) as e:
+        die(f'cannot read {path}: {e}', 1)
+
+
+def write_json(path, data):
+    """Private state (0600 in a 0700 dir), atomic (core.jsonstate)."""
+    jsonstate.save(path, data, newline=True, mode=0o600, dir_mode=0o700, ensure_ascii=False, indent=1)
+
+
+def lock(blocking=True):
+    """The state lock (core.locks): the fd to close when done, or None when another run holds it (blocking=False)."""
+    return locks.acquire(LOCK_F, wait=None if blocking else 0, dir_mode=0o700)
+
+
+def legs_load():
+    d = read_json(LEGS_F, {'legs': []})
+    legs = d.get('legs') if isinstance(d, dict) else d
+    return [g for g in (legs or []) if isinstance(g, dict) and g.get('id') and iso(g.get('dep'))]
+
+
+def legs_save(legs, now):
+    keep = [g for g in legs if iso(g['dep']) > now - dt.timedelta(days=1)]
+    keep.sort(key=lambda g: iso(g['dep']))
+    write_json(LEGS_F, {'updated': now.isoformat(), 'legs': keep})
+    st = read_json(STATE_F, {'legs': {}})
+    ids = {g['id'] for g in keep}
+    st['legs'] = {k: v for k, v in (st.get('legs') or {}).items() if k in ids}
+    write_json(STATE_F, st)
+    return keep
+
+
+def leg_id(prefix, *parts):
+    return prefix + hashlib.sha1('|'.join(map(str, parts)).encode()).hexdigest()[:7]
+
+
+def norm_line(s):
+    return re.sub(r'\s+', '', str(s or '')).lower()
+
+
+def is_busline(s):
+    return norm_line(s).startswith(('bus', 'ev'))
+
+
+# ------------------------------------------------------------------------------------------------ calendar import
+def parse_lines(text):
+    """Planned lines from a 🚆 description's first line ('16:58 Bus 21 › RE48 X › IC8 Y …'), one per part."""
+    first = (str(text or '').strip().splitlines() or [''])[0]
+    out = []
+    for part in first.split('›'):
+        m = LINE_RE.search(part)
+        if m:
+            w = m.group(0).split()
+            out.append(f'{w[0].capitalize()} {w[1]}' if len(w) == 2 else w[0])
+    return out
+
+
+def from_event(e):
+    """Calendar event -> leg dict, or None when it is not a timed 🚆 leg with two stations."""
+    summary = ' '.join(str(e.get('summary') or '').split())
+    if TRAIN_ICON not in summary or e.get('status') == 'cancelled':
+        return None
+    dep = iso((e.get('start') or {}).get('dateTime'))
+    arr = iso((e.get('end') or {}).get('dateTime'))
+    if not dep:
+        return None
+    desc = str(e.get('description') or '')
+    src = dst = None
+    m = LINK_RE.search(desc)
+    if m:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(m.group(0)).query)
+        src, dst = (q.get('from') or [None])[0], (q.get('to') or [None])[0]
+    title_lines = []
+    if not (src and dst):
+        body = re.sub(r'\s*\([^)]*\)\s*$', '', summary.replace(TRAIN_ICON, '')).strip()
+        if '→' not in body:
+            return None
+        a, b = (x.strip() for x in body.split('→', 1))
+        lm = re.match(r'^(\S+)\s+(.+)$', a)
+        if lm and LINE_RE.fullmatch(lm.group(1)):
+            title_lines, a = [lm.group(1)], lm.group(2)
+        src, dst = a, b
+    body = re.sub(r'\s*\([^)]*\)\s*$', '', summary.replace(TRAIN_ICON, '')).strip()
+    if '→' in body:                                       # "Home → B": door to door, whatever stop the link names
+        ta, tb = (x.strip() for x in body.split('→', 1))
+        src = 'home' if home_place.is_home(ta) else src
+        dst = 'home' if home_place.is_home(tb) else dst
+    if not (src and dst) or src == dst:
+        return None
+    lines = parse_lines(desc) or title_lines or parse_lines(summary)
+    eid = str(e.get('id') or f'{src}|{dst}|{dep.isoformat()}')
+    return {'id': leg_id('c', eid), 'from': src, 'to': dst, 'dep': dep.isoformat(),
+            'arr': arr.isoformat() if arr and arr > dep else None, 'lines': lines, 'title': summary,
+            'source': 'calendar', 'event_id': eid}
+
+
+PAGE_KEYS = ('events', 'items')                            # claude.ai tool result / Google API events.list
+
+
+def page_events(data, p):
+    """Raw events of a saved list_events result: page objects with a list under "events" or "items" (the page's own
+    "summary" is the calendar's name), a list of pages, or bare events (objects with a "start")."""
+    items = data if isinstance(data, list) else [data]
+    out, ok = [], not items
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        lists = [it[k] for k in PAGE_KEYS if isinstance(it.get(k), list)]
+        if lists:
+            out += [e for lst in lists for e in lst]
+            ok = True
+        elif it.get('start'):
+            out.append(it)
+            ok = True
+    if not ok:
+        die(f'{p}: no list_events result (expected an object with "events" or "items", or a list of events); '
+            'legs unchanged')
+    return out
+
+
+def cache_events():
+    """calcache's cache -> ([list_events-shaped events for its timed 🚆/🚌 legs], window end, events in the cache).
+    The cache keeps no descriptions: each event gets a stand-in one (planned lines, then the SBB link of its stops),
+    so from_event reads it exactly like the calendar's."""
+    data = read_json(CALCACHE_F, None)
+    if not isinstance(data, dict) or not isinstance(data.get('events'), list):
+        die(f'no calendar cache at {CALCACHE_F} (calcache import first)')
+    out = []
+    for e in data['events']:
+        t = e.get('train') if isinstance(e, dict) and not e.get('all_day') else None
+        if not isinstance(t, dict):
+            continue
+        desc = ' › '.join(t.get('lines') or []) or '-'
+        if t.get('from') and t.get('to'):
+            desc += '\nSBB: https://app.sbbmobile.ch/timetable?' + urllib.parse.urlencode({'from': t['from'],
+                                                                                         'to': t['to']})
+        out.append({'id': e.get('id'), 'summary': e.get('title'), 'start': {'dateTime': e.get('start')},
+                    'end': {'dateTime': e.get('end')}, 'description': desc})
+    return out, iso((data.get('window') or {}).get('end')), len(data['events'])
+
+
+def cmd_sync(a, now):
+    found = {}
+    if not a.files and not a.from_cache:
+        die('sync needs FILE|- or --from-cache')
+    batches, beyond, n_src = [], None, 0
+    if a.from_cache:
+        evs, beyond, n_src = cache_events()
+        batches.append(('cache', evs))
+    for p in a.files:
+        try:
+            data = json.load(sys.stdin) if p == '-' else read_json(p, None)
+        except ValueError as e:
+            die(f'{p}: not JSON ({e})')
+        if data is None:
+            die(f'{p}: no such file')
+        evs = page_events(data, p)
+        n_src += len(evs)
+        batches.append((p, evs))
+    for p, events in batches:
+        for e in events:
+            g = from_event(e) if isinstance(e, dict) else None
+            if g and iso(g['dep']) > now:
+                found[g['id']] = g
+    fd = lock()
+    old = legs_load()
+    manual = [g for g in old if g.get('source') != 'calendar']
+    far = [g for g in old if g.get('source') == 'calendar' and beyond and iso(g['dep']) >= beyond
+           and g['id'] not in found]
+    gone = len({g['id'] for g in old if g.get('source') == 'calendar'} - set(found) - {g['id'] for g in far})
+    keep = set(found) | {g['id'] for g in far}
+    lost = sum(1 for g in old if g.get('source') == 'calendar' and g['id'] not in keep and iso(g['dep']) > now)
+    if lost and not n_src and not a.allow_empty:      # a bad import, not a calendar without trains: keep the legs
+        os.close(fd)
+        die(f'{"the calendar cache" if a.from_cache else "the input"} holds no events at all; keeping the {lost} '
+            'upcoming calendar legs (a bad calendar import? re-import it; really empty: --allow-empty)')
+    legs_save(manual + far + list(found.values()), now)
+    os.close(fd)
+    print(f'synced {len(found)} calendar legs ({gone} removed)'
+          + (f', kept {len(far)} past the cache window' if a.from_cache else '')
+          + f', kept {len(manual)} added by hand -> {LEGS_F}')
+
+
+def cmd_add(a, now):
+    dep = iso(a.when.replace(' ', 'T'))
+    if not dep or not re.fullmatch(r'\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}', a.when.strip()):
+        die(f'bad departure {a.when!r} (YYYY-MM-DD HH:MM, local time)')
+    arr = None
+    if a.arr:
+        if not re.fullmatch(r'\d{1,2}:\d{2}', a.arr):
+            die(f'bad --arr {a.arr!r} (HH:MM)')
+        h, m = map(int, a.arr.split(':'))
+        if h > 23 or m > 59:
+            die(f'bad --arr {a.arr!r} (HH:MM)')
+        w = dep.astimezone(tz()).replace(hour=h, minute=m)  # on his wall clock, then a real instant
+        arr = fixed(w) if fixed(w) > dep else fixed(w + dt.timedelta(days=1))
+    src, dst = a.src.strip(), a.dst.strip()
+    if not src or not dst or src == dst:
+        die('FROM and TO must be two different stops')
+    if dep <= now:
+        die('that departure is in the past')
+    g = {'id': leg_id('m', src, dst, dep.isoformat()), 'from': src, 'to': dst, 'dep': dep.isoformat(),
+         'arr': arr.isoformat() if arr else None, 'lines': a.line or [],
+         'title': a.title or f'{TRAIN_ICON} {src} → {dst}', 'source': 'manual', 'event_id': None}
+    fd = lock()
+    legs = [x for x in legs_load() if x['id'] != g['id']] + [g]
+    legs_save(legs, now)
+    os.close(fd)
+    print(f"added {g['id']}: {day_label(dep)} {hm(dep)} {src} → {dst}")
+
+
+def cmd_rm(a, now):
+    fd = lock()
+    legs = legs_load()
+    rest = [g for g in legs if g['id'] != a.id]
+    if len(rest) == len(legs):
+        os.close(fd)
+        die(f'no leg {a.id} (train-watch list)')
+    legs_save(rest, now)
+    os.close(fd)
+    print(f'removed {a.id}')
+
+
+def window_text(g, now):
+    dep = iso(g['dep'])
+    if dep < now:
+        return 'departed'
+    if dep - WINDOW <= now:
+        return 'watching now'
+    return f'watch from {day_label(dep - WINDOW)} {hm(dep - WINDOW)}'
+
+
+def cmd_list(a, now):
+    legs = [g for g in legs_load() if iso(g['dep']) >= now - dt.timedelta(hours=1)]
+    legs.sort(key=lambda g: iso(g['dep']))
+    if a.json:
+        print(json.dumps(legs, ensure_ascii=False, indent=1))
+        return
+    if not legs:
+        print('no legs ahead (train-watch sync / add)')
+        return
+    for g in legs:
+        dep, arr = iso(g['dep']), iso(g.get('arr'))
+        lines = ' › '.join(g.get('lines') or []) or '-'
+        print(f"{g['id']}  {day_label(dep)} {hm(dep)}{' → ' + hm(arr) if arr else ''}  {place(g['from'])} → {place(g['to'])}"
+              f"  [{lines}]  {g.get('source')}  ({window_text(g, now)})")
+
+
+# ------------------------------------------------------------------------------------------------ transport API
+def api(path, params):
+    url = f'{API}/{path}?{urllib.parse.urlencode(params)}'
+    try:
+        with web.open(url, headers={'User-Agent': UA}, timeout=25) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            why = json.load(e)['errors'][0]['message']
+        except Exception:
+            why = f'HTTP {e.code}'
+        raise Fail(f'transport API error: {why}')
+    except (OSError, ValueError) as e:
+        raise Fail(f'transport API unreachable or broken: {getattr(e, "reason", e)}')
+
+
+def line_name(j):
+    cat, num = (j.get('category') or '').strip(), (j.get('number') or '').strip()
+    if cat.upper() in BUS_CATS:
+        return f"{'EV' if cat.upper() == 'EV' else 'Bus'} {num}".strip()
+    if cat.upper() in TRAM_CATS:
+        return f'Tram {num}'.strip()
+    if not num or (num.isdigit() and len(num) >= 4) or num == cat:
+        return cat or '?'
+    return f'{cat}{num}' if num.isdigit() else f'{cat} {num}'
+
+
+def flagged_cancel(*ds):
+    return any(isinstance(d, dict) and (d.get('cancelled') or d.get('canceled') or d.get('isCancelled'))
+               for d in ds)
+
+
+def stname(x):
+    x = x or {}
+    return (x.get('station') or {}).get('name') or (x.get('location') or {}).get('name') or ''
+
+
+def late(sched, prog, delay):
+    if isinstance(delay, (int, float)) and not isinstance(delay, bool):
+        return int(delay)
+    return mins(prog - sched) if sched and prog else 0
+
+
+def ride(s):
+    j, d, a = s.get('journey') or {}, s.get('departure') or {}, s.get('arrival') or {}
+    sd, sa = iso(d.get('departure')), iso(a.get('arrival'))
+    if not sd or not sa:
+        return None
+    pd, pa = iso((d.get('prognosis') or {}).get('departure')), iso((a.get('prognosis') or {}).get('arrival'))
+    dd, ad = late(sd, pd, d.get('delay')), late(sa, pa, a.get('delay'))
+    pl = str(d.get('platform') or '').strip()
+    new_pl = str((d.get('prognosis') or {}).get('platform') or '').strip()
+    if pl.endswith('!'):                                  # some feeds mark a changed platform with "!"
+        pl, new_pl = '', new_pl or pl.rstrip('!')
+    cat = (j.get('category') or '').strip().upper()
+    text = ' '.join(str(j.get(k) or '') for k in ('name', 'category', 'to', 'operator')).lower()
+    return {'line': line_name(j), 'from': stname(d), 'at': stname(a), 'sdep': sd, 'sarr': sa,
+            'dep': sd + dd * MIN, 'arr': sa + ad * MIN, 'ddelay': dd, 'adelay': ad,
+            'platform': pl, 'new_platform': new_pl if new_pl and new_pl != pl else '',
+            'bus': cat in BUS_CATS, 'ev': cat == 'EV' or 'ersatz' in text,
+            'cancelled': flagged_cancel(s, j, d, a)}
+
+
+def connection(c):
+    rides = [r for r in (ride(s) for s in (c.get('sections') or []) if s.get('journey')) if r]
+    sdep = iso((c.get('from') or {}).get('departure')) or (rides[0]['sdep'] if rides else None)
+    sarr = iso((c.get('to') or {}).get('arrival')) or (rides[-1]['sarr'] if rides else None)
+    if not sdep or not sarr or not rides:
+        return None
+    dd = max(rides[0]['ddelay'], late(sdep, iso(((c.get('from') or {}).get('prognosis') or {}).get('departure')),
+                                       (c.get('from') or {}).get('delay')))
+    ad = max(rides[-1]['adelay'], late(sarr, iso(((c.get('to') or {}).get('prognosis') or {}).get('arrival')),
+                                        (c.get('to') or {}).get('delay')))
+    return {'sdep': sdep, 'sarr': sarr, 'dep': sdep + dd * MIN, 'arr': sarr + ad * MIN, 'ddelay': dd, 'adelay': ad,
+            'rides': rides, 'lines': [r['line'] for r in rides],
+            'cancelled': flagged_cancel(c, c.get('from'), c.get('to')) or any(r['cancelled'] for r in rides)}
+
+
+def connections(g, when, limit):
+    when = when.astimezone(tz())
+    p = {'from': home_place.query(g['from']), 'to': home_place.query(g['to']), 'date': when.date().isoformat(),
+         'time': hm(when), 'limit': limit}
+    data = api('connections', p)
+    return [x for x in map(connection, data.get('connections') or []) if x]
+
+
+def match(g, conns):
+    dep = iso(g['dep'])
+    want = {norm_line(x) for x in (g.get('lines') or [])[:1]}
+    near = [c for c in conns if abs(c['sdep'] - dep) <= MIN]
+    arr = iso(g.get('arr'))
+    if not near and arr:                                  # the event starts at the door, the stop is a bit later
+        near = [c for c in conns if abs(c['sarr'] - arr) <= MIN and dep - 5 * MIN <= c['sdep'] <= dep + LATER_STOP]
+    planned = {norm_line(x) for x in (g.get('lines') or [])}
+    # same departure and first line (e.g. one tram, two ways on): the planned arrival, then the planned lines decide
+    near.sort(key=lambda c: (norm_line(c['lines'][0]) not in want, abs(c['sarr'] - arr) if arr else dt.timedelta(0),
+                             -len(planned & {norm_line(x) for x in c['lines']}), abs(c['sdep'] - dep)))
+    return near[0] if near else None
+
+
+def plain(c):
+    return not c['cancelled'] and max(c['ddelay'], c['adelay']) < 5 and not any(r['ev'] for r in c['rides'])
+
+
+def conn_text(c):
+    pl = c['rides'][0]['new_platform'] or c['rides'][0]['platform']
+    ch = len(c['rides']) - 1
+    late_txt = f" (+{max(c['ddelay'], c['adelay'])} min)" if max(c['ddelay'], c['adelay']) else ''
+    return (f"{hm(c['dep'])} {' › '.join(c['lines'])} → {hm(c['arr'])}{late_txt}"
+            f"{', pl ' + pl if pl else ''}, {'direct' if not ch else f'{ch} change' + ('s' if ch > 1 else '')}")
+
+
+# ------------------------------------------------------------------------------------------------ problems
+def problems(g, c, st):
+    """Matched connection -> [(key, text)] for everything wrong with it."""
+    out = []
+    planned = [norm_line(x) for x in (g.get('lines') or [])] or st.get('baseline') or []
+    if c['cancelled']:
+        r = next((r for r in c['rides'] if r['cancelled']), c['rides'][0])
+        out.append(('cancelled', f"cancelled: {r['line']} {hm(r['sdep'])} from {r['from']}"))
+    d = max(c['ddelay'], c['adelay'])
+    if d >= 5:
+        b = next(x for x in DELAY_BUCKETS if d >= x)
+        plus = lambda m: f' (+{m} min)' if m else ''  # noqa: E731
+        out.append((f'delay{b}', f"delayed: leaves {hm(c['dep'])}{plus(c['ddelay'])}, "
+                                 f"arrives {hm(c['arr'])}{plus(c['adelay'])}"))
+    for r in c['rides']:
+        if r['new_platform']:
+            was = f" (was {r['platform']})" if r['platform'] else ''
+            out.append((f"platform:{r['from']}:{r['new_platform']}",
+                        f"platform change at {r['from']}: {r['line']} now leaves from pl {r['new_platform']}{was}"))
+    known = set(planned) | set(st.get('baseline') or [])
+    trains_only = bool(g.get('lines')) and not any(is_busline(x) for x in g['lines'])
+    for r in c['rides']:
+        ln = norm_line(r['line'])
+        if r['ev'] or (r['bus'] and (ln not in known or (trains_only and ln not in planned))):
+            out.append((f"bus:{r['from']}", f"replacement bus: {r['line']} {r['from']} {hm(r['sdep'])} → "
+                                             f"{r['at']} {hm(r['sarr'])} instead of the train"))
+    arr = iso(g.get('arr'))
+    if arr and c['sarr'] - arr >= 5 * MIN:
+        out.append((f"timetable:{hm(c['sarr'])}", f"timetable change: now scheduled to arrive {hm(c['sarr'])} "
+                                                   f"instead of {hm(arr)}"))
+    for a, b in zip(c['rides'], c['rides'][1:]):
+        gap, planned_gap = b['dep'] - a['arr'], b['sdep'] - a['sarr']
+        if gap < 2 * MIN and gap < planned_gap:
+            out.append((f"transfer:{b['from']}", f"change at {b['from']} at risk: {a['line']} arrives "
+                                                 f"{hm(a['arr'])}, {b['line']} leaves {hm(b['dep'])}"))
+    return out
+
+
+def same(a, b):
+    return a['sdep'] == b['sdep'] and a['lines'] == b['lines']
+
+
+def alternative(g, planned, now):
+    dep = iso(g['dep'])
+    t = max(now + REACH, dep - ALT_BEFORE)
+    cands = [c for c in connections(g, t, 6) if not (planned and same(c, planned))]
+    ok = [c for c in cands if plain(c) and c['dep'] >= now + REACH]
+    return min(ok, key=lambda c: (c['arr'], -c['dep'].timestamp()), default=None)
+
+
+def assess(g, now, st, live=True):
+    """-> (problems [(key, text)], matched connection or None, missing: bool). Raises Fail."""
+    dep = iso(g['dep'])
+    c = match(g, connections(g, dep, 4))
+    if c is None:
+        st['miss'] = st.get('miss', 0) + 1
+        if st['miss'] >= 2 or dep - now < MISS_FAST or not live:
+            return [('cancelled', f"cancelled or changed: the {hm(dep)} connection is gone from the live timetable")], \
+                None, True
+        return [], None, True
+    st['miss'] = 0
+    if not st.get('baseline'):
+        st['baseline'] = [norm_line(x) for x in c['lines']]
+    return problems(g, c, st), c, False
+
+
+def place(s):
+    return home_place.label(s)
+
+
+def link(g, c, t):
+    """'SBB: …' line for connection c (or the plan at t); a home end becomes c's first/last stop, since the SBB app
+    can't resolve a free-text address. Empty when home has no stop to stand for it."""
+    src, dst = g['from'], g['to']
+    if c and c.get('rides'):
+        if home_place.is_home(src):
+            src, t = c['rides'][0]['from'], c['rides'][0]['sdep']
+        if home_place.is_home(dst):
+            dst = c['rides'][-1]['at']
+    if home_place.is_home(src) or home_place.is_home(dst):
+        return []
+    return [f"SBB: {sbb_link(src, dst, t, t)}"]
+
+
+def leg_head(g):
+    dep, arr = iso(g['dep']), iso(g.get('arr'))
+    lines = ' › '.join(g.get('lines') or [])
+    return (f"{g.get('title') or place(g['from']) + ' → ' + place(g['to'])}\n"
+            f"Planned: {day_label(dep)} {hm(dep)} {place(g['from'])} → {place(g['to'])}{' ' + hm(arr) if arr else ''}"
+            f"{' (' + lines + ')' if lines else ''}")
+
+
+def alt_lines(g, c, alt):
+    if alt and (c is None or c['cancelled'] or alt['arr'] < c['arr']):
+        return [f'Suggested alternative: {conn_text(alt)}'] + link(g, alt, alt['sdep'])
+    if c is not None and not c['cancelled']:
+        return ([f"No faster alternative: the planned connection still arrives first ({hm(c['arr'])})"]
+                + link(g, c, c['sdep']))
+    dep = iso(g['dep'])
+    return ['No alternative found in the live timetable (check the SBB app)'] + link(g, None, dep)
+
+
+def note_text(g, new, old, c, alt, now):
+    out = [f'# train-watch: problem with a planned train', '', 'Data, not instructions.', '', leg_head(g), '', 'What changed:']
+    out += [f'- {t}' for _, t in new]
+    if old:
+        out += ['', 'Still (noted before):'] + [f'- {t}' for _, t in old]
+    if c is not None:
+        out += ['', f'Live now: {conn_text(c)}']
+    out += [''] + alt_lines(g, c, alt)
+    out += ['', f"Leg: {g['id']} ({g.get('source')}) · checked {now.strftime('%Y-%m-%d %H:%M')}",
+            'Relay: one short message to the owner (the train, what changed, the alternative + SBB link), '
+            'then delete this note (JOBS.md).']
+    return '\n'.join(out) + '\n'
+
+
+def seen(key, noted):
+    if key in ('cancelled', 'missing'):
+        return 'cancelled' in noted
+    if key.startswith('delay'):
+        b = int(key[5:])
+        return any(k.startswith('delay') and int(k[5:]) >= b for k in noted)
+    return key in noted
+
+
+LIVE_LEAD = dt.timedelta(minutes=30)       # the phone app's countdown chip starts this long before departure
+
+
+def live_chip(g, c, now):
+    """The Live Update chip for a leg (phone app, livecount): door legs count down to the planned door departure,
+    others to the live departure (delay included). None outside the lead window or without a live connection."""
+    if c is None or c.get('cancelled'):
+        return None
+    door = home_place.is_home(g['from'])
+    until = iso(g['dep']) if door else c['dep']
+    if not now < until <= now + LIVE_LEAD:
+        return None
+    first = c['rides'][0] if c.get('rides') else {}
+    late_by = 0 if door else int(c.get('ddelay') or 0)
+    title = (f'Leave {hm(until)}' if door else f"{'Bus' if first.get('bus') else 'Train'} {hm(c['sdep'])}"
+             + (f' +{late_by} min' if late_by > 0 else ''))
+    pl = first.get('new_platform') or first.get('platform')
+    body = ' → '.join((c.get('lines') or [])[:2]) + (f' · platform {pl}' if pl and not door else '')
+    return {'key': g['id'], 'until': until, 'title': title, 'body': body}
+
+
+def live_sync(a, chips, ended, now):
+    """After the main work: start, update or end the chips (silent no-op without a paired phone; <= 5 s). Held: a chip
+    stays until its departure even once the leg has left the check window (a late train)."""
+    test = bool(os.environ.get('TRAIN_WATCH_DIR') or os.environ.get('TRAIN_WATCH_NOW') or getattr(a, 'now', None))
+    for line in livecount.sync('train', chips, now=now, hold=True, ended=ended, test=test, dry=a.dry_run):
+        if a.dry_run:
+            print(line)
+
+
+def cmd_check(a, now):
+    legs = [g for g in legs_load() if iso(g['dep']) - WINDOW <= now <= iso(g['dep'])]
+    if not legs:
+        live_sync(a, [], [], now)                         # ends chips whose train has left (no live state: no-op)
+        return 0                                          # the cron fast path: nothing in its window
+    fd = lock(blocking=False)
+    if fd is None:
+        return 0                                          # another run is still busy
+    state = read_json(STATE_F, {'legs': {}})
+    state.setdefault('legs', {})
+    errors = 0
+    chips, ended = [], []
+    for g in legs:
+        st = state['legs'].setdefault(g['id'], {'noted': []})
+        try:
+            found, c, _missing = assess(g, now, st)
+            chip = live_chip(g, c, now)
+            if chip:
+                chips.append(chip)
+            elif any(k == 'cancelled' for k, _ in found) or (c or {}).get('cancelled'):
+                ended.append(g['id'])
+            new = [(k, t) for k, t in found if not seen(k, st['noted'])]
+            if new:
+                alt = alternative(g, c, now)
+                text = note_text(g, new, [(k, t) for k, t in found if seen(k, st['noted'])], c, alt, now)
+                if a.dry_run:
+                    print(text)
+                else:
+                    path = notes.write(INBOX, f"train-watch-{g['id']}-{int(now.timestamp())}.md", text)
+                    if not a.cron:
+                        print(f'note: {path}')
+                st['noted'] = sorted(set(st['noted']) | {k for k, _ in new})
+            elif not a.cron:
+                print(f"{g['id']}: {'ok' if not found else 'known: ' + ', '.join(k for k, _ in found)}")
+            st['last'] = now.isoformat()
+        except Fail as e:
+            errors += 1
+            print(f"train-watch: {g['id']}: {e}", file=sys.stderr)
+    if not a.dry_run:
+        write_json(STATE_F, state)
+    os.close(fd)
+    live_sync(a, chips, ended, now)
+    return 1 if errors == len(legs) else 0
+
+
+def conn_json(c):
+    if c is None:
+        return None
+    r0 = c['rides'][0]
+    return {'dep': hm(c['dep']), 'arr': hm(c['arr']), 'delay': max(c['ddelay'], c['adelay']),
+            'cancelled': bool(c['cancelled']), 'lines': c['lines'],
+            'platform': r0['new_platform'] or r0['platform'] or None, 'changes': len(c['rides']) - 1,
+            'text': conn_text(c)}
+
+
+def status_json(g, found, c, now):
+    """status --json: the same verdict as the text; alt only with a problem and when alt_lines would suggest it."""
+    alt = None
+    if found:
+        x = alternative(g, c, now)
+        if x and (c is None or c['cancelled'] or x['arr'] < c['arr']):
+            alt = dict(conn_json(x), link=next((l[5:] for l in link(g, x, x['sdep'])), None))
+    return {'id': g['id'], 'from': place(g['from']), 'to': place(g['to']), 'dep': g['dep'], 'arr': g.get('arr'),
+            'lines': g.get('lines') or [], 'fine': not found, 'live': conn_json(c),
+            'problems': [{'key': k, 'text': t} for k, t in found], 'alt': alt}
+
+
+def cmd_status(a, now):
+    g = next((x for x in legs_load() if x['id'] == a.id), None)
+    if not g:
+        die(f'no leg {a.id} (train-watch list)')
+    st = dict(read_json(STATE_F, {'legs': {}}).get('legs', {}).get(g['id']) or {})
+    try:
+        found, c, _missing = assess(g, now, st, live=False)
+        if a.json:
+            print(json.dumps(status_json(g, found, c, now), ensure_ascii=False))
+            return 0
+        print(leg_head(g))
+        if c is not None:
+            print(f'Live: {conn_text(c)}')
+        if not found:
+            print('Status: fine')
+            return 0
+        print('Problems:')
+        for _, t in found:
+            print(f'- {t}')
+        for line in alt_lines(g, c, alternative(g, c, now)):
+            print(line)
+    except Fail as e:
+        print(f'train-watch: {e}', file=sys.stderr)
+        return 1
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='train-watch', description=__doc__.split('\n')[0],
+                                 epilog='Details: the module docstring (sed -n 2,30p ~/bin/train-watch).')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('sync', help='import 🚆 events from saved list_events JSON or the calcache cache')
+    s.add_argument('files', nargs='*')
+    s.add_argument('--from-cache', action='store_true')
+    s.add_argument('--allow-empty', action='store_true', help='let an empty source drop every calendar leg')
+    s = sub.add_parser('add', help='add a leg by hand')
+    s.add_argument('src'); s.add_argument('dst'); s.add_argument('when')
+    s.add_argument('--arr'); s.add_argument('--line', action='append'); s.add_argument('--title')
+    s = sub.add_parser('list', help='legs ahead')
+    s.add_argument('--json', action='store_true')
+    s = sub.add_parser('rm', help='remove a leg')
+    s.add_argument('id')
+    s = sub.add_parser('check', help='check the legs in their window; note on a new problem')
+    s.add_argument('--cron', action='store_true'); s.add_argument('--dry-run', action='store_true')
+    s = sub.add_parser('status', help='live verdict for one leg (no note, no state)')
+    s.add_argument('id'); s.add_argument('--json', action='store_true')
+    for p in sub.choices.values():
+        p.add_argument('--now')
+    a = ap.parse_args()
+    now = now_arg(a.now)
+    fn = {'sync': cmd_sync, 'add': cmd_add, 'list': cmd_list, 'rm': cmd_rm, 'check': cmd_check,
+          'status': cmd_status}[a.cmd]
+    sys.exit(fn(a, now) or 0)
+
+
+if __name__ == '__main__':
+    main()

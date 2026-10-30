@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""lights-preset: the /lights remote's presets with a safety net, so a preset never leaves the room dark.
+
+Usage:
+  lights-preset NAME [-n]     run one preset (e.g. warm, dim, full, amb, movie, off; "lt:movie" works too)
+  lights-preset --list        the presets in the config and what each one runs
+
+Everything goes through `ha` (allowlisted, logged, read-back); this script never talks to HA itself.
+
+Config (private, household ids): LIGHTS_PRESETS, default ~/.config/assistant/lights-presets.json (0600):
+  {"presets": {"NAME": {
+      "run":      ["scene", "scene.x"] | ["script", "script_id"],
+      "when":     "before" | "after",      (optional; only with "fallback")
+      "fallback": [["set", "light.a", "--brightness", "30"], ["call", "light.turn_on", "light.b", "{...}"]],
+      "watch":    ["light.a", ...]         (optional)
+  }}}
+  before: if no watched light is on, run the fallback first, then the preset (default watch: every light).
+          For scripts that only change lights that are already on.
+  after:  run the preset, then the fallback if every watched light is dark
+          (default watch: the scene's own entity_id list). For scenes that may switch everything off.
+  "Dark" = no watched light is "on" (off, unavailable and unknown all count as dark). After a run the check
+  polls `ha list light --json` for up to LIGHTS_PRESET_SETTLE seconds (default 5), so lights the scene
+  switched off have time to report it; it falls back as soon as they read dark.
+  Fallback steps are ha argv lists; their verb must be one of set, on, off, call.
+
+-n  dry run: every ha call gets -n and sends nothing; the fallback is shown with -n as well.
+Exit: 0 ok (with or without fallback); 1 an ha call failed (its output is printed); 2 usage or config.
+Env for tests: LIGHTS_HA_BIN (default: ha on PATH), LIGHTS_PRESETS, LIGHTS_PRESET_SETTLE.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+HA = os.environ.get('LIGHTS_HA_BIN') or 'ha'
+CONFIG = os.path.expanduser(os.environ.get('LIGHTS_PRESETS', '~/.config/assistant/lights-presets.json'))
+FALLBACK_VERBS = ('set', 'on', 'off', 'call')
+
+
+def die(msg, rc=2):
+    print(f'lights-preset: {msg}', file=sys.stderr)
+    sys.exit(rc)
+
+
+def load():
+    try:
+        with open(CONFIG) as f:
+            presets = json.load(f).get('presets')
+    except (OSError, ValueError) as ex:
+        die(f'config {CONFIG}: {ex}')
+    if not isinstance(presets, dict) or not presets:
+        die(f'config {CONFIG}: no "presets"')
+    for name, p in presets.items():
+        run = p.get('run')
+        if not (isinstance(run, list) and len(run) == 2 and run[0] in ('scene', 'script')):
+            die(f'preset {name}: "run" must be ["scene", id] or ["script", id]')
+        fb = p.get('fallback') or []
+        if fb and p.get('when') not in ('before', 'after'):
+            die(f'preset {name}: "when" must be "before" or "after"')
+        for step in fb:
+            if not (isinstance(step, list) and step and all(isinstance(x, str) for x in step)
+                    and step[0] in FALLBACK_VERBS):
+                die(f'preset {name}: fallback step {step!r} must be an ha argv list ({", ".join(FALLBACK_VERBS)})')
+    return presets
+
+
+def ha(*argv, dry=False, show=True):
+    cmd = [HA, *argv] + (['-n'] if dry else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        print(f'ha {" ".join(argv)}: {ex}')
+        return 1, ''
+    out = (r.stdout + r.stderr).strip()
+    if show and out:
+        print(out)
+    return r.returncode, r.stdout
+
+
+def light_states():
+    rc, out = ha('list', 'light', '--json', show=False)
+    try:
+        rows = json.loads(out) if rc == 0 else None
+    except ValueError:
+        rows = None
+    if not isinstance(rows, list):
+        return None
+    return {r.get('entity_id'): r.get('state') for r in rows if isinstance(r, dict)}
+
+
+def lit(states, watch):
+    return [e for e, s in states.items() if s == 'on' and (watch is None or e in watch)]
+
+
+def scene_members(scene):
+    rc, out = ha('state', scene, '--json', show=False)
+    try:
+        ents = json.loads(out).get('attributes', {}).get('entity_id') if rc == 0 else None
+    except (ValueError, AttributeError):
+        ents = None
+    return [e for e in ents if isinstance(e, str) and e.startswith('light.')] if isinstance(ents, list) else None
+
+
+def run_steps(steps, dry):
+    rc = 0
+    for step in steps:
+        r, _ = ha(*step, dry=dry)
+        rc = max(rc, 1 if r not in (0, 3) else 0)
+    return rc
+
+
+def run_preset(name, p, dry):
+    kind, target = p['run']
+    fb, when = p.get('fallback') or [], p.get('when')
+    watch = p.get('watch')
+    run_argv = ('scene', 'run', target) if kind == 'scene' else ('script', 'run', target)
+    rc = 0
+
+    if fb and when == 'before':
+        states = light_states()
+        if states is None:
+            print('lights-preset: could not read the lights; running the preset without the check')
+        elif not lit(states, watch):
+            print(f'fallback first: no {"watched " if watch else ""}light is on')
+            rc = max(rc, run_steps(fb, dry))
+        elif dry:
+            on = lit(states, watch)
+            print(f'(no fallback: {len(on)} on now, e.g. {", ".join(on[:3])})')
+
+    r, _ = ha(*run_argv, dry=dry)
+    if r not in (0, 3):
+        return 1
+    if not fb or when != 'after':
+        return rc
+
+    if kind == 'scene' and watch is None:
+        watch = scene_members(target)
+        if not watch:
+            print(f'lights-preset: {target} lists no lights; checking every light')
+            watch = None
+    if dry:
+        print(f'then, if {", ".join(watch) if watch else "every light"} read dark afterwards, the fallback:')
+        return max(rc, run_steps(fb, dry))
+
+    settle = float(os.environ.get('LIGHTS_PRESET_SETTLE', '5'))
+    deadline = time.monotonic() + settle
+    while True:
+        states = light_states()
+        on = lit(states, watch) if states is not None else None
+        if on == []:
+            print(f'fallback: {target} left {", ".join(watch) if watch else "every light"} dark')
+            return max(rc, run_steps(fb, dry))
+        if time.monotonic() >= deadline:
+            if on is None:
+                print('lights-preset: could not read the lights after the run; no fallback')
+            return rc
+        time.sleep(min(0.7, max(0.0, deadline - time.monotonic())))
+
+
+def main(argv):
+    if not argv or argv[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    dry = '-n' in argv or '--dry-run' in argv
+    args = [a for a in argv if a not in ('-n', '--dry-run')]
+    presets = load()
+    if args == ['--list']:
+        for name, p in presets.items():
+            extra = f' + fallback {p["when"]} ({len(p["fallback"])} steps)' if p.get('fallback') else ''
+            print(f'{name:8} {p["run"][0]} {p["run"][1]}{extra}')
+        return 0
+    if len(args) != 1:
+        die('give one preset name (lights-preset --list)')
+    name = args[0].split(':', 1)[1] if args[0].startswith('lt:') else args[0]
+    if name not in presets:
+        die(f'unknown preset {name!r}; known: {", ".join(presets)}')
+    return run_preset(name, presets[name], dry)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

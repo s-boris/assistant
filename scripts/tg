@@ -1,0 +1,194 @@
+#!/bin/sh
+# Text the owner on Telegram from scripts and cron jobs:  tg [--soft|--urgent] "backup failed"
+# Plain `tg` is the alert class (server, HA, travel, his own reminders, calls): it goes out at once. --soft (or
+# TG_SOFT=1) marks a non-urgent message (reports, nudges, news, deal and ready pings): on a sleep-in morning
+# (`sleepin active`) it waits in sleepin's queue and goes out as plain tg when the guard ends (`sleepin gate`, then
+# `sleepin flush`); while the live outbox sends, it also waits in quiet hours there.
+# With buttons:  tg [--soft] --buttons ROWS_JSON "text"
+#   ROWS_JSON = rows of {text, data} as for the reply tool (callback_data is an alias of data; data <= 64 bytes), or
+#   {text, url} for a one-tap link button (https:// only, <= 2048 chars; Telegram opens it, no button event). A press
+#   reaches the session as a button event with that callback_data. Bad rows: exit 2, nothing sent.
+# A voice note:  tg --voice FILE.ogg [--silent] [--reply-to MESSAGE_ID] ["caption"]
+#   FILE = OGG/Opus (what `tts` writes), shown as a playable voice message (the reply tool sends .ogg files as
+#   documents). The caption is plain text, cut to 1000 characters. Prints the new message_id. If his privacy settings
+#   refuse voice messages, it is re-sent once as an audio file (a note on stderr). Not OGG/Opus or no such file: exit 2.
+# One sender: while the hub's tg-adapter drains the hub outbox (the hub answers), the message goes into that outbox
+# through `tg-outbox send tg|tg-buttons|tg-voice` (text, buttons, voice note; its gate decides, `tg-outbox gate tg`
+# shows how) and the adapter sends it: a repeat of the same text within its dedupe window is skipped, and a --soft one waits in quiet hours and
+# sleep-in. Otherwise, or when the outbox can't take it (exit 75: gate closed, or a row no adapter claimed, withdrawn
+# first), it goes directly: a text through the image's /usr/local/bin/tg, buttons and voice notes through the Bot API
+# here (the token never reaches argv or output). Switches: ~/.config/tg-adapter/direct-tg, direct-tg-buttons,
+# direct-tg-voice (or direct-all) = always direct.
+# Counts each send for the usage analytics: caller name, outcome, path (outbox|direct) and kind (buttons|voice; none =
+# a text) only, never the text.
+# Exit: 0 sent (or queued / skipped as a repeat), 2 usage error (not sent), else not sent (Telegram's reason on stderr).
+# Test seams: TG_SEND_BIN (the direct text sender), TG_ENV (bot token file), TG_ACCESS (access.json), TG_API (Bot API
+# base URL; with any of these three set, buttons and voice notes never use the outbox), TG_SLEEPIN_BIN (the sleep-in
+# gate), TG_ADAPTER_BIN, TG_OUTBOX_BIN, TG_ADAPTER_STATE_DIR.
+# Options anywhere: -h/--help prints this header and exits 0; no text (or only blanks; a voice note needs none) prints
+# it to stderr and exits 2; any other argument starting with -- is refused with exit 2. Nothing is sent in these cases.
+print_usage() { awk 'NR == 1 || /^# managed: / { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
+refuse() { echo "tg: $1, nothing sent (tg --help)" >&2; exit 2; }
+soft=${TG_SOFT:-}
+kind=text
+buttons= voice= silent= reply_to= has_b= has_v=
+n=$#
+while [ "$n" -gt 0 ]; do
+  a=$1
+  shift
+  n=$((n - 1))
+  case $a in
+    -h | --help) print_usage; exit 0 ;;
+    --soft) soft=1 ;;
+    --urgent) soft= ;;
+    --buttons | --voice | --reply-to)
+      [ "$n" -gt 0 ] || refuse "$a needs a value"
+      v=$1
+      shift
+      n=$((n - 1))
+      case $a in
+        --buttons) buttons=$v has_b=1 kind=buttons ;;
+        --voice) voice=$v has_v=1 kind=voice ;;
+        *) reply_to=$v ;;
+      esac ;;
+    --silent) silent=1 ;;
+    --*) refuse "unknown option '$a'" ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+[ -z "$has_b" ] || [ -z "$has_v" ] || refuse "--buttons and --voice don't go together"
+[ -n "$has_v" ] || [ -z "$silent$reply_to" ] || refuse "--silent and --reply-to go with --voice"
+if [ "$kind" != voice ] && [ -z "$(printf '%s' "$*" | tr -d '[:space:]')" ]; then
+  echo "tg: no text, nothing sent" >&2
+  print_usage >&2
+  exit 2
+fi
+markup= caption= duration=
+if [ "$kind" = buttons ]; then
+  markup=$(printf '%s' "$buttons" | jq -ce '
+    {inline_keyboard: [.[] | [.[] | if .url != null then {text: .text, url: .url}
+                                    else {text: .text, callback_data: (.data // .callback_data // .text)} end]]}
+    | select(all(.inline_keyboard[][]; (.text | type) == "string" and (.text | length) > 0
+                                      and (if has("url")
+                                           then (.url | type) == "string" and (.url | test("^https://[^\\s]+$"))
+                                                and (.url | length) <= 2048
+                                           else (.callback_data | type) == "string"
+                                                and (.callback_data | utf8bytelength) <= 64 end)))' 2>/dev/null) &&
+    [ -n "$markup" ] || refuse "bad ROWS_JSON (rows of {text, data} with data at most 64 bytes, or {text, url} with an https url)"
+elif [ "$kind" = voice ]; then
+  [ -f "$voice" ] && [ -r "$voice" ] && [ -s "$voice" ] || refuse "no such file: $voice"
+  case $voice in *\;* | *\"* | *,*) refuse 'the file name must not contain ; " or ,' ;; esac
+  case $reply_to in '' | *[!0-9]*) [ -z "$reply_to" ] || refuse "--reply-to takes a message id" ;; esac
+  if command -v ffprobe >/dev/null 2>&1; then
+    codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$voice" 2>/dev/null)
+    fmt=$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$voice" 2>/dev/null)
+    [ "$codec" = opus ] && [ "$fmt" = ogg ] ||
+      refuse "$voice is not OGG/Opus (codec ${codec:-?}, container ${fmt:-?}); make it with tts"
+    duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$voice" 2>/dev/null |
+      awk '{printf "%d", $1 + 0.5}')
+    [ "$duration" != 0 ] || duration=
+  fi
+  [ -z "$*" ] || caption=$(printf '%s' "$*" | jq -Rrs 'if length > 1000 then .[:999] + "…" else . end')
+fi
+
+# Non-urgent: the sleep-in gate first (`sleepin gate` runs this again now, or queues the plain call for the guard's end).
+if [ -n "$soft" ] && [ -z "${TG_SOFT_GATED:-}" ]; then
+  sl=${TG_SLEEPIN_BIN:-$(dirname "$0")/sleepin}
+  if [ -x "$sl" ]; then
+    TG_SOFT=1 TG_SOFT_GATED=1
+    export TG_SOFT TG_SOFT_GATED
+    [ -z "$reply_to" ] || set -- --reply-to "$reply_to" "$@"
+    [ -z "$silent" ] || set -- --silent "$@"
+    [ -z "$has_v" ] || set -- --voice "$voice" "$@"
+    [ -z "$has_b" ] || set -- --buttons "$buttons" "$@"
+    exec "$sl" gate -- "$0" "$@"
+  fi
+fi
+
+redact() { sed -E 's/bot[0-9]+:[A-Za-z0-9_-]+/bot<token>/g'; }
+# bot_env: the owner's chat id and the bot token, inside the calling subshell only.
+bot_env() {
+  api=${TG_API:-https://api.telegram.org}
+  envf=${TG_ENV:-$HOME/.claude/channels/telegram/.env}
+  acc=${TG_ACCESS:-$HOME/.claude/channels/telegram/access.json}
+  [ -r "$envf" ] && . "$envf"
+  [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || { echo 'tg: no bot token in the token file, not sent' >&2; return 1; }
+  owner=$(jq -r '.allowFrom[0] // empty' "$acc" 2>/dev/null)
+  [ -n "$owner" ] || { echo 'tg: no owner chat id in access.json, not sent' >&2; return 1; }
+}
+send_buttons() (
+  bot_env || exit 1
+  printf 'url = "%s/bot%s/sendMessage"\n' "$api" "$TELEGRAM_BOT_TOKEN" |
+    curl -fsS -m 25 -o /dev/null -K - -d chat_id="$owner" --data-urlencode text="$1" \
+      --data-urlencode reply_markup="$markup"
+)
+# voice_call METHOD FIELD: prints the response body, then the HTTP code on its own last line (000 = no response).
+voice_call() {
+  set -- "$1" "$2" --form-string "chat_id=$owner" -F "$2=@\"$voice\";type=audio/ogg"
+  [ -z "$caption" ] || set -- "$@" --form-string "caption=$caption"
+  [ -z "$duration" ] || set -- "$@" --form-string "duration=$duration"
+  [ -z "$silent" ] || set -- "$@" --form-string "disable_notification=true"
+  [ -z "$reply_to" ] ||
+    set -- "$@" --form-string "reply_parameters={\"message_id\":$reply_to,\"allow_sending_without_reply\":true}"
+  method=$1
+  shift 2
+  printf 'url = "%s/bot%s/%s"\n' "$api" "$TELEGRAM_BOT_TOKEN" "$method" |
+    curl -sS -m 60 -K - --stderr - -w '\n%{http_code}' "$@" || true
+}
+send_voice() (
+  bot_env || exit 1
+  out=$(voice_call sendVoice voice)
+  code=$(printf '%s\n' "$out" | tail -n 1)
+  body=$(printf '%s\n' "$out" | sed '$d')
+  if [ "$code" != 200 ] && printf '%s' "$body" | grep -q 'VOICE_MESSAGES_FORBIDDEN'; then
+    echo 'tg: his privacy settings refuse voice messages; sent as an audio file instead' >&2
+    out=$(voice_call sendAudio audio)
+    code=$(printf '%s\n' "$out" | tail -n 1)
+    body=$(printf '%s\n' "$out" | sed '$d')
+  fi
+  if [ "$code" = 200 ] && id=$(printf '%s' "$body" | jq -er 'select(.ok == true) | .result.message_id' 2>/dev/null)
+  then
+    printf '%s\n' "$id"
+    exit 0
+  fi
+  if [ "$code" = 000 ]; then
+    echo "tg: not sent (no response): $(printf '%s' "$body" | tail -n 1 | redact)" >&2
+  else
+    why=$(printf '%s' "$body" | jq -r '.description // empty' 2>/dev/null)
+    echo "tg: not sent (HTTP $code): $(printf '%s' "${why:-unexpected response}" | redact)" >&2
+  fi
+  exit 1
+)
+
+path=direct
+rc=75
+ob=${TG_OUTBOX_BIN:-$(dirname "$0")/tg-outbox}
+seamed=${TG_ENV:-}${TG_ACCESS:-}${TG_API:-}
+# The gate runs where an outbox can exist: the live adapter's PID file, or a hub (HUB_URL or the hub token file).
+if [ -x "$ob" ] && { [ "$kind" = text ] || [ -z "$seamed" ]; } &&
+   { [ -s "${TG_ADAPTER_STATE_DIR:-$HOME/.local/state/tg-adapter}/live/adapter.pid" ] || [ -n "${HUB_URL:-}" ] ||
+     [ -e "${HUB_TOKEN_FILE:-$HOME/.secrets/hub-token}" ]; }; then
+  case $kind in
+    text) printf '%s' "$*" | "$ob" send tg ${soft:+--soft} >/dev/null ;;
+    buttons) printf '%s' "$*" | "$ob" send tg-buttons ${soft:+--soft} --buttons "$buttons" >/dev/null ;;
+    voice) "$ob" send tg-voice ${soft:+--soft} --file "$voice" ${caption:+--caption} ${caption:+"$caption"} \
+      ${duration:+--duration} ${duration:+"$duration"} ${silent:+--silent} ${reply_to:+--reply-to} \
+      ${reply_to:+"$reply_to"} </dev/null ;;
+  esac
+  rc=$?
+  [ "$rc" -eq 75 ] || path=outbox
+fi
+if [ "$path" = direct ]; then
+  case $kind in
+    text) "${TG_SEND_BIN:-/usr/local/bin/tg}" "$@" ;;
+    buttons) send_buttons "$*" ;;
+    voice) send_voice ;;
+  esac
+  rc=$?
+fi
+caller=$(ps -o comm= -p "$PPID" 2>/dev/null | tr -cd 'A-Za-z0-9._-')
+[ "$rc" -eq 0 ] && out=ok || out=fail
+[ "$kind" = text ] && k= || k="kind=$kind"
+command -v usage >/dev/null 2>&1 && \
+  ( usage log "tg.send" notify_sent --channel cron --actor "${USAGE_ACTOR:-cron}" --outcome "$out" --attr "caller=${caller:-unknown}" --attr "path=$path" ${k:+--attr} ${k:+"$k"} >/dev/null 2>&1 & )
+exit "$rc"

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fake phone / tg / sleepin: name from $0; exit code from $VC_FAKE/<name>.rc; argv logged to <name>.log.
+n=$(basename "$0")
+printf '%s\n' "$*" >> "$VC_FAKE/$n.log"
+[ "$n" = phone ] && echo "phonegw/0.1.0 fake"
+exit "$(cat "$VC_FAKE/$n.rc" 2>/dev/null || echo 0)"

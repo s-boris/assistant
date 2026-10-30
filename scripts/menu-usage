@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""menu-usage: how often the owner uses each Telegram slash command and button prefix (counts only, no tokens).
+
+  menu-usage [--days 30] [--json] [--brief]   report (runs a collect first): per "/" menu command the uses in
+                        the window, top commands, never-used menu commands, used commands not in the menu, and
+                        button presses per callback prefix. --brief = one line (weekly self-cleanup report).
+  menu-usage collect    fold new events into the counts store (cron */15; silent; exit 0 unless the store breaks)
+
+Sources (read-only):
+  - from marks.events_from on (set by the first collect that reads it): the events ledger
+    (~/.local/state/assistant/events.db, rows tg-adapter wrote; only allowlisted senders get rows):
+      tg.message "/cmd …" received by a binding (ack_by binding)  -> instant command
+      tg.message "/cmd …" otherwise                               -> session command
+      tg.button meta callback_data                                -> button prefix
+      tg.reaction                                                 -> reaction count
+  - while the Telegram transport runs on the hub: the hub's rows through core.hub.tg_journal
+    (tg.message, tg.button, tg.reaction as journal entries, read like the journal below; seen by hub row id), only
+    rows newer than the local events ledger's last tg-adapter row (the hub holds copies of the older ones)
+  - before marks.events_from: the telegram-plus inbound journal (owner entries only; it keeps the last 100 events):
+      kind instant  "/cmd (answered instantly …)"  -> instant command
+      kind message  "/cmd …"                        -> session command (handled by the session)
+      kind button   meta.callback_data             -> button prefix ("mt:play:123" -> "mt:play", "rm:s1h:ID" -> "rm")
+      kind reaction                                 -> reaction count
+  - talk-button's tap log (📞 Talk taps the plugin ran itself may miss the journal)  -> button "call:talk"; a tap
+    with a journal call:talk event up to 180 s before or 60 s after it is the same tap; taps count after 5 min
+  - once, on the first collect: slash commands from the plugin's MCP logs older than the journal (history before
+    the collector existed; those logs carry no owner flag, the bot only accepts the owner)
+Only names, prefixes, dates and counts are stored, never message text. Dedupe: journal entry ids (kept 14 days)
+and a timestamp watermark per source.
+
+Menu = the bindings table's active command rows (instant; tg-bind) + the brain's own set_commands list (session; the
+ledger's meta commands:<bot>, else commands.json); without command rows, instant.json. Paths overridable for tests:
+MENU_USAGE_STATE (dir), MENU_USAGE_EVENTS_DB (else $ASSISTANT_EVENTS_DB), MENU_USAGE_JOURNAL, MENU_USAGE_INSTANT,
+MENU_USAGE_COMMANDS, MENU_USAGE_TALKLOG, MENU_USAGE_MCP_DIR, MENU_USAGE_NOW (ISO time), MENU_USAGE_TZ (default
+the owner's zone, profile locale.tz), MENU_USAGE_HUB (on | off; default: the hub in hub mode, unless MENU_USAGE_JOURNAL or
+MENU_USAGE_EVENTS_DB is set).
+"""
+import argparse
+import datetime as dt
+import fcntl
+import glob
+import json
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser("~")
+TG = os.path.join(HOME, ".claude/channels/telegram")
+STATE_DIR = os.environ.get("MENU_USAGE_STATE", os.path.join(HOME, ".local/state/menu-usage"))
+JOURNAL = os.environ.get("MENU_USAGE_JOURNAL", os.path.join(TG, "inbound-journal.jsonl"))
+EVENTS_DB = (os.environ.get("MENU_USAGE_EVENTS_DB") or os.environ.get("ASSISTANT_EVENTS_DB")
+             or os.path.join(HOME, ".local/state/assistant/events.db"))
+INSTANT = os.environ.get("MENU_USAGE_INSTANT", os.path.join(TG, "instant.json"))
+COMMANDS = os.environ.get("MENU_USAGE_COMMANDS", os.path.join(TG, "commands.json"))
+TALKLOG = os.environ.get("MENU_USAGE_TALKLOG", os.path.join(HOME, ".local/state/talk-button/log"))
+MCP_DIR = os.environ.get("MENU_USAGE_MCP_DIR",
+                         os.path.join(HOME, ".cache/claude-cli-nodejs/-home-node-workspace/"
+                                            "mcp-logs-plugin-telegram-plus-telegram"))
+
+
+def _owner_tz():
+    """MENU_USAGE_TZ (tests), else the profile's locale.tz (assistant_profile, next to this script or in ~/bin/lib)."""
+    if os.environ.get("MENU_USAGE_TZ"):
+        return ZoneInfo(os.environ["MENU_USAGE_TZ"])
+    for lib in (os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"), os.path.join(HOME, "bin", "lib")):
+        if os.path.isfile(os.path.join(lib, "assistant_profile.py")) and lib not in sys.path:
+            sys.path.insert(0, lib)
+    import assistant_profile
+    return assistant_profile.tz()
+
+
+TZ = _owner_tz()
+COUNTS = os.path.join(STATE_DIR, "counts.json")
+SEEN_DAYS = 14
+HUB = os.environ.get("MENU_USAGE_HUB", "")
+HUB_KINDS = ("tg.message", "tg.button", "tg.reaction")
+HUB_OVERLAP_S = 900   # each hub read looks this far behind the last one (ids dedupe)
+CMD_RE = re.compile(r"^/([A-Za-z0-9_]{1,32})(?:@\w+)?(?:\s|$)")
+
+
+def now():
+    v = os.environ.get("MENU_USAGE_NOW")
+    return parse_ts(v) if v else dt.datetime.now(dt.timezone.utc)
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=TZ)
+
+
+def day_of(t):
+    return t.astimezone(TZ).strftime("%Y-%m-%d")
+
+
+def command_of(text):
+    m = CMD_RE.match(text or "")
+    return m.group(1).lower() if m else None
+
+
+def button_prefix(data):
+    parts = (data or "").split(":")
+    if not parts[0]:
+        return None
+    p = parts[0][:24]
+    if len(parts) > 1 and re.fullmatch(r"[a-z_]{1,12}", parts[1]):
+        p += ":" + parts[1]
+    return p
+
+
+def load_store():
+    try:
+        with open(COUNTS) as f:
+            s = json.load(f)
+    except FileNotFoundError:
+        s = {}
+    s.setdefault("version", 1)
+    s.setdefault("days", {})
+    s.setdefault("seen", {})
+    s.setdefault("marks", {})
+    return s
+
+
+def save_store(s):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".counts.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(s, f, indent=1, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, COUNTS)
+
+
+def bump(s, t, group, key, sub=None, n=1):
+    d = s["days"].setdefault(day_of(t), {})
+    if group == "react":
+        d["react"] = d.get("react", 0) + n
+        return
+    g = d.setdefault(group, {})
+    if sub is None:
+        g[key] = g.get(key, 0) + n
+    else:
+        e = g.setdefault(key, {})
+        e[sub] = e.get(sub, 0) + n
+    s.setdefault("since", day_of(t))
+    if day_of(t) < s["since"]:
+        s["since"] = day_of(t)
+
+
+def classify(e):
+    """Journal entry -> (group, key, sub) or None. Owner entries only; nothing but names leaves here."""
+    if not e.get("owner"):
+        return None
+    kind = e.get("kind")
+    meta = e.get("meta") or {}
+    content = e.get("content") or ""
+    if kind == "instant":
+        c = command_of(content) or (meta.get("handled") if re.fullmatch(r"[a-z0-9_]{1,32}", str(meta.get("handled") or "")) else None)
+        return ("cmd", c, "instant") if c else None
+    if kind == "message":
+        c = command_of(content)
+        return ("cmd", c, "session") if c else None
+    if kind == "button":
+        p = button_prefix(meta.get("callback_data"))
+        return ("btn", p, None) if p else None
+    if kind == "reaction":
+        return ("react", None, None)
+    return None
+
+
+def events_db():
+    """The events ledger, read-only (None when it is not there)."""
+    if not os.path.exists(EVENTS_DB):
+        return None
+    con = sqlite3.connect(f"file:{EVENTS_DB}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def collect_events(s):
+    """tg-adapter's rows since marks.events_from past the id watermark (marks.events_id)."""
+    added = 0
+    oldest = None
+    after = parse_ts(s["marks"].get("events_from"))
+    last = int(s["marks"].get("events_id") or 0)
+    try:
+        con = events_db()
+    except sqlite3.Error:
+        return 0, None
+    if con is None:
+        return 0, None
+    try:
+        rows = con.execute(
+            "SELECT id, ts, kind, payload, ack_by FROM events WHERE id > ? AND source = 'tg-adapter'"
+            " AND kind IN ('tg.message', 'tg.button', 'tg.reaction') ORDER BY id", (last,)).fetchall()
+    except sqlite3.Error:
+        rows = []
+    finally:
+        con.close()
+    for r in rows:
+        last = max(last, r["id"])
+        t = dt.datetime.fromtimestamp(r["ts"], dt.timezone.utc)
+        if after and t < after:
+            continue   # the journal had it (before marks.events_from)
+        try:
+            p = json.loads(r["payload"] or "{}")
+        except ValueError:
+            continue
+        if r["kind"] == "tg.message":
+            c = command_of(p.get("text"))
+            hit = ("cmd", c, "instant" if r["ack_by"] == "binding" else "session") if c else None
+        elif r["kind"] == "tg.button":
+            b = button_prefix(p.get("callback_data"))
+            hit = ("btn", b, None) if b else None
+        else:
+            hit = ("react", None, None)
+        if hit:
+            bump(s, t, *hit)
+            added += 1
+            oldest = t if oldest is None or t < oldest else oldest
+            if hit[1] == "call:talk":   # the same tap may also sit in talk-button's log
+                s["marks"].setdefault("talk_journal", []).append(t.isoformat())
+    s["marks"]["events_id"] = last
+    return added, oldest
+
+
+def hub_mod():
+    """core.hub when the hub's Telegram rows are to be read (hub mode; MENU_USAGE_HUB=on|off overrides), else None."""
+    overridden = os.environ.get("MENU_USAGE_JOURNAL") or os.environ.get("MENU_USAGE_EVENTS_DB")   # a test's files
+    if HUB == "off" or (HUB != "on" and overridden):
+        return None
+    try:
+        lib = os.path.join(HOME, "bin", "lib")
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        from core import hub
+        return hub if HUB == "on" or hub.tg_hub() else None
+    except Exception:
+        return None
+
+
+def local_last_ts():
+    """ts of the local events ledger's newest tg-adapter row (0 = none): hub rows up to it were counted from there."""
+    try:
+        con = events_db()
+    except sqlite3.Error:
+        return 0.0
+    if con is None:
+        return 0.0
+    try:
+        r = con.execute("SELECT max(ts) FROM events WHERE source = 'tg-adapter'"
+                        " AND kind IN ('tg.message', 'tg.button', 'tg.reaction')").fetchone()
+    except sqlite3.Error:
+        r = None
+    finally:
+        con.close()
+    return float(r[0] or 0) if r else 0.0
+
+
+def collect_hub(s):
+    """Hub mode: the hub's rows since the last read (HUB_OVERLAP_S behind it, at most SEEN_DAYS), as journal
+    entries; each counted once (seen "hub:<id>") and only when newer than the local ledger's last row (marks.hub_floor
+    keeps it once the ledger prunes its rows)."""
+    hub = hub_mod()
+    if hub is None:
+        return 0, None
+    t_now = now()
+    local = max(float(s["marks"].get("hub_floor") or 0), local_last_ts())   # kept: the ledger's rows get pruned
+    s["marks"]["hub_floor"] = local
+    floor = max(local, (t_now - dt.timedelta(days=SEEN_DAYS)).timestamp())
+    since = max(floor, float(s["marks"].get("hub_ts") or 0) - HUB_OVERLAP_S)
+    try:
+        entries = hub.tg_journal(since, t_now.timestamp() + 60, kinds=HUB_KINDS, timeout=10.0)
+    except Exception:
+        return 0, None   # hub down or slow: the next collect reads the same window
+    added, oldest = 0, None
+    for e in entries:
+        t = parse_ts(e.get("ts") or e.get("at"))
+        jid = e.get("id")
+        if t is None or not jid or t.timestamp() <= floor or jid in s["seen"]:
+            continue
+        s["seen"][jid] = t.isoformat()
+        c = classify(e)
+        if c:
+            bump(s, t, *c)
+            added += 1
+            oldest = t if oldest is None or t < oldest else oldest
+            if c[1] == "call:talk":   # the same tap may also sit in talk-button's log
+                s["marks"].setdefault("talk_journal", []).append(t.isoformat())
+    s["marks"]["hub_ts"] = t_now.timestamp()
+    return added, oldest
+
+
+def collect_journal(s, before=None):
+    """The 0.1.22 journal, entries before marks.events_from only (the events ledger has the rest)."""
+    added = 0
+    oldest = None
+    first_run = not s["marks"].get("mcp_backfill")
+    cutoff = (now() - dt.timedelta(days=SEEN_DAYS)).isoformat()   # older ids are pruned: never count them again
+    try:
+        f = open(JOURNAL)
+    except FileNotFoundError:
+        return 0, None
+    with f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            t = parse_ts(e.get("ts") or e.get("at"))
+            if t is None:
+                continue
+            at = parse_ts(e.get("at")) or t
+            oldest = at if oldest is None or at < oldest else oldest
+            jid = e.get("id") or f"{e.get('kind')}|{e.get('ts')}|{e.get('message_id')}"
+            if jid in s["seen"] or (not first_run and t.isoformat() < cutoff) or (before and t >= before):
+                continue
+            s["seen"][jid] = t.isoformat()
+            c = classify(e)
+            if c:
+                bump(s, t, *c)
+                added += 1
+                if c[1] == "call:talk":   # the same tap may also sit in talk-button's log
+                    s["marks"].setdefault("talk_journal", []).append(t.isoformat())
+    return added, oldest
+
+
+def collect_talklog(s):
+    mark = s["marks"].get("talk")
+    last = mark
+    added = 0
+    settle = now() - dt.timedelta(minutes=5)   # let the journal catch up before a tap counts on its own
+    seen = [parse_ts(x) for x in s["marks"].get("talk_journal", [])]
+    try:
+        f = open(TALKLOG)
+    except FileNotFoundError:
+        return 0
+    with f:
+        for line in f:
+            m = re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) tap\b", line)
+            if not m:
+                continue
+            stamp = m.group(1)
+            if mark and stamp <= mark:
+                continue
+            t = dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+            if t > settle:
+                break
+            last = max(last or stamp, stamp)
+            if any(j and -180 <= (j - t).total_seconds() <= 60 for j in seen):
+                continue   # already counted from the journal
+            bump(s, t, "btn", "call:talk")
+            added += 1
+    if last:
+        s["marks"]["talk"] = last
+    return added
+
+
+def backfill_mcp(s, before):
+    """One-time: slash commands from the plugin MCP logs older than the journal's oldest entry."""
+    if s["marks"].get("mcp_backfill"):
+        return 0
+    added = 0
+    cut = before - dt.timedelta(seconds=5) if before else None
+    for path in sorted(glob.glob(os.path.join(MCP_DIR, "*.jsonl"))):
+        try:
+            f = open(path)
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                if "notifications/claude/channel: /" not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                msg = str(d.get("debug", "")).split("notifications/claude/channel: ", 1)[-1]
+                c = command_of(msg)
+                t = parse_ts(d.get("timestamp"))
+                if not c or t is None or (cut and t >= cut):
+                    continue
+                bump(s, t, "cmd", c, "instant" if "answered instantly" in msg else "session")
+                added += 1
+    s["marks"]["mcp_backfill"] = (before or now()).isoformat()
+    return added
+
+
+def collect():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        s = load_store()
+        s["marks"].setdefault("events_from", now().isoformat())   # events ledger from here on
+        cut = parse_ts(s["marks"]["events_from"])
+        a, oldest = collect_journal(s, before=cut)
+        e, e_oldest = collect_events(s)
+        h, h_oldest = collect_hub(s)
+        oldest = min([x for x in (oldest, e_oldest, h_oldest) if x], default=None)
+        a += e + h
+        b = backfill_mcp(s, oldest)
+        c = collect_talklog(s)
+        cutoff = (now() - dt.timedelta(days=SEEN_DAYS)).isoformat()
+        s["seen"] = {k: v for k, v in s["seen"].items() if v >= cutoff}
+        s["marks"]["talk_journal"] = [x for x in s["marks"].get("talk_journal", []) if x >= cutoff]
+        s["updated"] = now().isoformat()
+        save_store(s)
+    return a + b + c
+
+
+def read_menu():
+    """{command: instant|session}: the active tg-bind command rows, then the brain's set_commands list (the ledger's
+    meta commands:<bot>, else commands.json); instant.json only while the ledger has no command rows."""
+    menu, custom = {}, None
+    try:
+        con = events_db()
+    except sqlite3.Error:
+        con = None
+    if con is not None:
+        try:
+            t = dt.datetime.now(dt.timezone.utc).timestamp()
+            for r in con.execute("SELECT key FROM bindings WHERE kind = 'command' AND active = 1"
+                                 " AND (expires IS NULL OR expires > ?) ORDER BY id", (t,)):
+                menu[r["key"].lower()] = "instant"
+            m = con.execute("SELECT v FROM meta WHERE k LIKE 'commands:%' ORDER BY k LIMIT 1").fetchone()
+            custom = json.loads(m["v"]) if m else None
+        except (sqlite3.Error, ValueError):
+            pass
+        finally:
+            con.close()
+    sources = ([] if menu else [(INSTANT, "instant")]) + ([] if isinstance(custom, list) else [(COMMANDS, "session")])
+    for path, how in sources:
+        try:
+            for c in json.load(open(path)):
+                if c.get("command"):
+                    menu.setdefault(c["command"].lower(), how)
+        except (OSError, ValueError):
+            pass
+    for c in custom if isinstance(custom, list) else []:
+        if isinstance(c, dict) and c.get("command"):
+            menu.setdefault(str(c["command"]).lower(), "session")
+    return menu
+
+
+def report(days):
+    s = load_store()
+    first = (now().astimezone(TZ) - dt.timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    cmds, btns, react = {}, {}, 0
+    for day, d in s["days"].items():
+        if day < first:
+            continue
+        for c, by in d.get("cmd", {}).items():
+            e = cmds.setdefault(c, {"instant": 0, "session": 0})
+            for k, n in by.items():
+                e[k] = e.get(k, 0) + n
+        for p, n in d.get("btn", {}).items():
+            btns[p] = btns.get(p, 0) + n
+        react += d.get("react", 0)
+    menu = read_menu()
+    total = lambda c: sum(cmds.get(c, {}).values())
+    used = sorted((c for c in cmds if total(c)), key=lambda c: (-total(c), c))
+    groups = {}
+    for p, n in btns.items():
+        top = p.split(":")[0]
+        g = groups.setdefault(top, {"total": 0, "sub": {}})
+        g["total"] += n
+        if ":" in p:
+            g["sub"][p.split(":", 1)[1]] = n
+    since = max(s.get("since") or first, first)
+    return {
+        "days": days,
+        "from": since,
+        "counted_since": s.get("since"),
+        "commands": [{"command": c, "uses": total(c), "instant": cmds[c].get("instant", 0),
+                      "session": cmds[c].get("session", 0), "in_menu": c in menu} for c in used],
+        "never_used": sorted(c for c in menu if not total(c)),
+        "off_menu": [c for c in used if c not in menu],
+        "menu_size": len(menu),
+        "buttons": [{"prefix": k, "presses": v["total"], "sub": dict(sorted(v["sub"].items(), key=lambda x: -x[1]))}
+                    for k, v in sorted(groups.items(), key=lambda x: (-x[1]["total"], x[0]))],
+        "reactions": react,
+    }
+
+
+def fmt_day(d):
+    return f"{d[8:10]}.{d[5:7]}"
+
+
+def text(r, brief=False):
+    used_menu = [c for c in r["commands"] if c["in_menu"]]
+    top = " · ".join(f"/{c['command']} {c['uses']}" for c in r["commands"][:5]) or "none"
+    never = " ".join("/" + c for c in r["never_used"]) or "none"
+    if brief:
+        return (f"Menu usage {r['days']} d (since {fmt_day(r['from'])}): {len(used_menu)}/{r['menu_size']} menu commands "
+                f"used; top {top}; never: {never}")
+    out = [f"Menu usage, last {r['days']} days (counted since {fmt_day(r['from'])})",
+           f"{len(used_menu)} of {r['menu_size']} menu commands used, {sum(c['uses'] for c in r['commands'])} command uses"]
+    for c in r["commands"]:
+        how = "/".join(k for k in ("instant", "session") if c[k])
+        out.append(f"  /{c['command']:<12} {c['uses']:>3}  {how}{'' if c['in_menu'] else '  (not in menu)'}")
+    out.append(f"Never used: {never}")
+    if r["buttons"]:
+        out.append("Buttons:")
+        for b in r["buttons"]:
+            sub = ", ".join(f"{k} {v}" for k, v in list(b["sub"].items())[:4])
+            out.append(f"  {b['prefix']:<12} {b['presses']:>3}" + (f"  ({sub})" if sub else ""))
+    out.append(f"Reactions: {r['reactions']}")
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="menu-usage", description=__doc__.split("\n\n")[0])
+    ap.add_argument("action", nargs="?", choices=["report", "collect"], default="report")
+    ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--brief", action="store_true")
+    ap.add_argument("--no-collect", action="store_true", help="report from the store as is")
+    a = ap.parse_args()
+    if a.action == "collect":
+        collect()
+        return 0
+    if a.days < 1:
+        ap.error("--days must be >= 1")
+    if not a.no_collect:
+        try:
+            collect()
+        except OSError as e:
+            print(f"menu-usage: collect failed ({e}); reporting stored counts", file=sys.stderr)
+    r = report(a.days)
+    print(json.dumps(r, indent=1) if a.json else text(r, a.brief))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

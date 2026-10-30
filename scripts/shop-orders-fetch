@@ -1,0 +1,114 @@
+#!/usr/bin/env node
+// shop-orders-fetch URL [--timeout S] [--settle MS]
+// Read ONE of his own shop order-history pages in the headed browser (~/bin/browser, CDP on 127.0.0.1:$BROWSER_CDP_PORT,
+// default 9222), logged in already, and print one JSON line: {ok, status, url, title, text, login, challenge}.
+// It opens its own background tab, never touches the MCP's tabs, and always closes its tab (also on timeout).
+// Scope: `parcels refresh` only. Allowed: Amazon.de "Your Orders" (/gp/css/order-history, /your-orders/orders),
+// Galaxus/Digitec order lists (/<lang>/Order, /<lang>/order), Brack (/mein-konto/auftraege, /mein-konto/bestellhistorie).
+// No interaction with the page: no clicks, no typing, never logs in or out; `login` = the shop shows a sign-in page
+// (the caller stops then and reports "sign-in needed"). `text` = the page's visible text (innerText, ≤ 60 KB);
+// `cards` = Amazon order cards [{text (visible text incl. the dispatch popover), titles (product links)}].
+// Exit: 0 page read (check `login`/`challenge`), 2 usage/refused URL, 3 timeout, 4 browser (CDP) unreachable, 5 other error.
+const args = process.argv.slice(2);
+let url = null, timeout = 45, settle = 2500;
+// CDP: the browser service in claude-hub-browser (browsersvc HUB_CDP, as browsersvc.route() names it for every
+// client); BROWSER_HUB_CDP overrides it, BROWSER_CDP_PORT (tests) points at a CDP on this host's loopback.
+const cdpBase = process.env.BROWSER_CDP_PORT
+  ? `http://127.0.0.1:${Number(process.env.BROWSER_CDP_PORT)}`
+  : (process.env.BROWSER_HUB_CDP || 'http://claude-hub-browser:9223').replace(/\/+$/, '');
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if (a === '--timeout') timeout = Number(args[++i]);
+  else if (a === '--settle') settle = Number(args[++i]);
+  else if (a === '-h' || a === '--help') { console.log('usage: shop-orders-fetch URL [--timeout S] [--settle MS]'); process.exit(0); }
+  else if (!url) url = a;
+  else { console.error('shop-orders-fetch: unexpected argument ' + a); process.exit(2); }
+}
+let u = null;
+try { u = new URL(url); } catch { /* handled below */ }
+const ALLOWED = [
+  ['www.amazon.de', /^\/(gp\/css\/order-history|gp\/your-account\/order-history|your-orders\/orders)\/?$/],
+  ['www.galaxus.ch', /^\/(de|en|fr|it)\/(order|Order|orders|user\/orders)\/?$/],
+  ['www.digitec.ch', /^\/(de|en|fr|it)\/(order|Order|orders|user\/orders)\/?$/],
+  ['www.brack.ch', /^\/((de|fr)\/)?mein-konto\/(auftraege|bestellhistorie)\/?$/],
+];
+if (!u || u.protocol !== 'https:' || !ALLOWED.some(([h, p]) => u.hostname === h && p.test(u.pathname))) {
+  console.error('shop-orders-fetch: only his shop order-history pages are allowed (see header)');
+  process.exit(2);
+}
+if (!(timeout > 0 && timeout <= 120) || !(settle >= 0 && settle <= 15000)) { console.error('shop-orders-fetch: bad --timeout/--settle'); process.exit(2); }
+
+let ws = null, targetId = null, done = false;
+let nextId = 1;
+const pending = new Map(), listeners = [];
+const send = (method, params = {}, sessionId) => new Promise((res, rej) => {
+  const id = nextId++;
+  pending.set(id, { res, rej });
+  ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+});
+async function finish(obj, code) {
+  if (done) return;
+  done = true;
+  if (targetId && ws && ws.readyState === 1) {
+    try { await Promise.race([send('Target.closeTarget', { targetId }), new Promise((r) => setTimeout(r, 3000))]); } catch { /* gone */ }
+  }
+  try { if (ws) ws.close(); } catch { /* ignore */ }
+  // exit only after the write has flushed: stdout to a pipe is async, and process.exit() would cut a big page short
+  process.stdout.write(JSON.stringify(obj) + '\n', () => process.exit(code));
+  setTimeout(() => process.exit(code), 10000).unref();
+}
+setTimeout(() => finish({ ok: false, error: `timeout after ${timeout}s` }, 3), timeout * 1000);
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => finish({ ok: false, error: 'killed (' + sig + ')' }, 3));
+
+const CHALLENGE = /just a moment|einen moment|attention required|verify you are human|sicherheitsüberprüfung|access denied|robot check|captcha/i;
+const PROBE = `JSON.stringify((() => {
+  const body = document.body ? document.body.innerText : '';
+  const html = document.documentElement ? document.documentElement.outerHTML.slice(0, 200000) : '';
+  const login = /\\/ap\\/signin|\\/login|\\/anmelden|\\/signin/i.test(location.pathname) || !!document.querySelector('input[type=password]');
+  const chal = /cf[-_]chl|challenges\\.cloudflare\\.com|cf-turnstile|id="captchacharacters"/i.test(html) || ${CHALLENGE}.test(document.title);
+  const vis = (e) => { const w = document.createTreeWalker(e, NodeFilter.SHOW_TEXT, { acceptNode: (n) => /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.parentNode.nodeName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT }); let o = ''; while (w.nextNode()) o += w.currentNode.nodeValue + ' '; return o.replace(/\\s+/g, ' ').trim(); };
+  const cards = Array.from(document.querySelectorAll('.order-card, .js-order-card')).filter((e) => !e.parentElement.closest('.order-card, .js-order-card')).slice(0, 30).map((e) => ({ text: vis(e).slice(0, 12000), titles: Array.from(new Set(Array.from(e.querySelectorAll('a[href*="/dp/"], a[href*="/gp/product/"], .yohtmlc-product-title')).map((a) => (a.innerText || '').trim()).filter((t) => t.length > 3))).slice(0, 12) }));
+  return {url: location.href, title: document.title, text: body.slice(0, 60000), cards, login, challenge: chal};
+})())`;
+
+(async () => {
+  let ver;
+  try {
+    const r = await fetch(`${cdpBase}/json/version`, { signal: AbortSignal.timeout(3000) });
+    ver = await r.json();
+  } catch (e) { return finish({ ok: false, error: 'browser not reachable over CDP: ' + (e.cause?.code || e.message) }, 4); }
+  ws = new WebSocket(ver.webSocketDebuggerUrl);
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.id && pending.has(m.id)) {
+      const { res, rej } = pending.get(m.id); pending.delete(m.id);
+      if (m.error) rej(new Error(m.error.message)); else res(m.result);
+    } else for (const l of listeners) l(m);
+  };
+  try {
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('websocket error')); });
+  } catch (e) { return finish({ ok: false, error: 'browser not reachable over CDP: ' + e.message }, 4); }
+  try {
+    ({ targetId } = await send('Target.createTarget', { url: 'about:blank', background: true }));
+    const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+    let status = null;
+    listeners.push((m) => {
+      if (m.sessionId === sessionId && m.method === 'Network.responseReceived' && m.params.type === 'Document'
+          && m.params.frameId === targetId) status = m.params.response.status;
+    });
+    await send('Network.enable', {}, sessionId);
+    await send('Page.enable', {}, sessionId);
+    const loaded = new Promise((res) => listeners.push((m) => {
+      if (m.sessionId === sessionId && m.method === 'Page.loadEventFired') res();
+    }));
+    const nav = await send('Page.navigate', { url }, sessionId);
+    if (nav.errorText) throw new Error('navigation failed: ' + nav.errorText);
+    await loaded;
+    await new Promise((r) => setTimeout(r, settle));
+    const r = await send('Runtime.evaluate', { expression: PROBE, returnByValue: true }, sessionId);
+    const page = JSON.parse(r.result.value);
+    return finish({ ok: true, status, ...page }, 0);
+  } catch (e) {
+    return finish({ ok: false, error: String(e.message || e) }, 5);
+  }
+})();

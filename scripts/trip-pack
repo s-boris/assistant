@@ -1,0 +1,779 @@
+#!/usr/bin/env python3
+"""trip-pack: one self-contained offline HTML pack for a trip in tg-cmd's trips.json.
+
+usage:
+  trip-pack TRIP [--out FILE|-] [--json] [--no-fetch]
+  trip-pack --list
+
+TRIP     a trip's name or one of its "match" words (case-insensitive substring), e.g. "belgium"
+--out    where the HTML goes: FILE, or - for stdout (default: the trip's "pack" path,
+         else ~/reports/trips/<name>-pack.html)
+--json   print the pack's data (places, legs, weather, money, packing, out) instead of the summary line
+--no-fetch  no network: no geocoding, forecast or exchange rate (the page says so)
+--list   trips with dates and their pack path
+
+The pack (phone-sized, works offline, light + dark): towns and dates, the legs from calcache once they are in
+the calendar (else "legs not booked yet" + the trip's planned legs), local transport links per country and city
+(rail, airport transfers), an open-meteo forecast per place when the day is <= 14 days away (else "forecast
+from DD.MM"), currency (+ the central-bank reference rate from the home currency; Frankfurter v2, keyless), plugs, emergency numbers, a roaming reminder
+for a home plan outside the EU, and the trip type's packing list from tg-cmd's pack-templates.json as a
+checklist (ticks stay in that browser).
+
+Trip entry (trips.json "trips"): name, emoji, from, to (YYYY-MM-DD), legs [text], match [words], type
+(pack template: business, beach, ...; default business when abroad), places [{town, country (ISO-2),
+from, to, what, lat, lon}] (lat/lon optional: geocoded by open-meteo, cached), pack (output path), extras (JSON
+file with the trip's own pages; default TRIP_PACK_EXTRAS_DIR/<slug>.json when it exists).
+Extras file: {"days": [{date YYYY-MM-DD, where, title, items [text], tag}] -> "Day by day" (today is marked on
+the phone), "days_title", "sections": [{id, title, intro, note, rows [[left, right]], table {head, rows},
+items [text], links [[label, url]], groups [same fields + title]} or {"include": "other.json"} (a section file,
+path relative to the extras file)] -> one page section each after Legs, "emergency": [{where, text}] -> first
+lines of Emergency}. Links: http(s), tel: and mailto: only. A broken extras file = exit 2, the rest still built.
+Home town and country come from the assistant profile (home.town, locale.country), never from here.
+
+exit: 0 written, 1 trip not found / no dates / bad arguments, 2 written but a source failed (named in
+the page and on stderr).
+env: TRIP_PACK_TRIPS (else TG_CMD_TRIPS, else ~/.config/tg-cmd/trips.json), TRIP_PACK_TEMPLATES (else
+TG_CMD_PACK_TEMPLATES), TRIP_PACK_BIN (dir with calcache), TRIP_PACK_NOW ("YYYY-MM-DD HH:MM"),
+TRIP_PACK_CACHE (geocode cache dir), TRIP_PACK_OUTDIR, TRIP_PACK_CITIES (extra city table, JSON; default
+~/.config/trip-pack/cities.json), TRIP_PACK_COUNTRIES (extra country table, JSON {"XX": {name, cur, plug, rail
+[[label, url]], extra, tips, europe, fx}}: fx false = no reference rate for that currency, europe false = the 112 line and
+the roaming note for a trip outside Europe; default ~/.config/trip-pack/countries.json), TRIP_PACK_FIXTURES (tests: dir with geocode.json / forecast.json / fx.json instead of the network),
+TRIP_PACK_EXTRAS_DIR (default ~/.config/trip-pack/extras). Each build logs one usage event (bin.trip-pack; USAGE=off).
+"""
+import html, json, os, pwd, re, subprocess, sys, urllib.parse, urllib.request
+from datetime import date, datetime, timedelta
+
+sys.dont_write_bytecode = True
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "bin", "lib"), os.path.expanduser("~/bin/lib"),
+             os.path.join(_here, "lib")):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, "lib", "core")) and os.path.isdir(os.path.join(_here, "..", "core")):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+import assistant_profile  # noqa: E402
+from core import http as web, jsonstate  # noqa: E402
+
+TZ = assistant_profile.tz()
+E = os.environ.get
+CONF = os.path.expanduser("~/.config")
+TRIPS = os.path.expanduser(E("TRIP_PACK_TRIPS") or E("TG_CMD_TRIPS") or f"{CONF}/tg-cmd/trips.json")
+TEMPLATES = os.path.expanduser(E("TRIP_PACK_TEMPLATES") or E("TG_CMD_PACK_TEMPLATES") or f"{CONF}/tg-cmd/pack-templates.json")
+BIN = os.path.expanduser(E("TRIP_PACK_BIN") or "~/bin")
+CACHE = os.path.expanduser(E("TRIP_PACK_CACHE") or "~/.cache/trip-pack")
+OUTDIR = os.path.expanduser(E("TRIP_PACK_OUTDIR") or "~/reports/trips")
+CITIES_FILE = os.path.expanduser(E("TRIP_PACK_CITIES") or f"{CONF}/trip-pack/cities.json")
+COUNTRIES_FILE = os.path.expanduser(E("TRIP_PACK_COUNTRIES") or f"{CONF}/trip-pack/countries.json")
+FIXTURES = E("TRIP_PACK_FIXTURES")
+EXTRAS_DIR = os.path.expanduser(E("TRIP_PACK_EXTRAS_DIR") or f"{CONF}/trip-pack/extras")
+BUILTIN_IDS = {"where", "legs", "days", "transport", "weather", "money", "sos", "pack", "issues"}
+FORECAST_DAYS = 14
+UA = "trip-pack/1 (personal offline travel sheet)"
+
+# Public, slow-changing facts per country (ISO-2). rail: the national planner; extra: emergency numbers besides 112.
+COUNTRIES = {
+    "BE": {"name": "Belgium", "cur": "EUR", "plug": "E", "eu": True,
+           "rail": [("SNCB/NMBS trains", "https://www.belgiantrain.be"), ("De Lijn buses (Flanders)", "https://www.delijn.be"),
+                    ("TEC buses (Wallonia)", "https://www.letec.be")],
+           "extra": "101 police · 112 ambulance/fire",
+           "tips": ["Station tickets: SNCB app or machines; a Brussels Airport station fee is added to airport fares."]},
+    "IT": {"name": "Italy", "cur": "EUR", "plug": "L / F", "eu": True,
+           "rail": [("Trenitalia", "https://www.trenitalia.com"), ("Italo", "https://www.italotreno.com")],
+           "extra": "112 is the single number in most regions",
+           "tips": ["Paper regional train tickets: validate before boarding.",
+                    "EuroCity Milano Centrale ↔ Zürich HB takes ~3 h 20 (SBB or Trenitalia)."]},
+    "DE": {"name": "Germany", "cur": "EUR", "plug": "F", "eu": True, "rail": [("Deutsche Bahn", "https://www.bahn.de")],
+           "extra": "110 police", "tips": []},
+    "FR": {"name": "France", "cur": "EUR", "plug": "E", "eu": True, "rail": [("SNCF Connect", "https://www.sncf-connect.com")],
+           "extra": "15 medical · 17 police · 18 fire", "tips": []},
+    "AT": {"name": "Austria", "cur": "EUR", "plug": "F", "eu": True, "rail": [("ÖBB", "https://www.oebb.at")],
+           "extra": "144 ambulance · 133 police · 122 fire", "tips": []},
+    "NL": {"name": "Netherlands", "cur": "EUR", "plug": "F", "eu": True, "rail": [("NS", "https://www.ns.nl")],
+           "extra": "", "tips": ["Trains and buses: tap in and out with a contactless card (OVpay)."]},
+    "ES": {"name": "Spain", "cur": "EUR", "plug": "F", "eu": True, "rail": [("Renfe", "https://www.renfe.com")],
+           "extra": "", "tips": []},
+    "PT": {"name": "Portugal", "cur": "EUR", "plug": "F", "eu": True, "rail": [("CP", "https://www.cp.pt")],
+           "extra": "", "tips": []},
+    "CH": {"name": "Switzerland", "adj": "Swiss", "cur": "CHF", "plug": "J", "eu": False,
+           "rail": [("SBB", "https://www.sbb.ch")], "extra": "117 police · 144 ambulance · 118 fire", "tips": []},
+}
+for _c in COUNTRIES.values():
+    _c.setdefault("europe", True)
+# Cities: transfers and city transport (public facts). Keys and aliases lowercase.
+CITIES = {
+    "brussels": {"aliases": ["bruxelles", "brussel", "zaventem", "brussels airport"], "links": [
+        ("Brussels Airport → city: train from the station under the terminal, ~20 min to Brussels-Central",
+         "https://www.brusselsairport.be"),
+        ("STIB/MIVB metro, tram, bus (tap a contactless card)", "https://www.stib-mivb.be")]},
+    "milan": {"aliases": ["milano", "linate", "milan linate", "malpensa"], "links": [
+        ("Linate → city: metro M4 (blue) to San Babila ~12 min, tap a contactless card at the gate; bus 73 as backup",
+         "https://www.atm.it"),
+        ("Malpensa → city: Malpensa Express to Cadorna / Centrale ~50 min", "https://www.malpensaexpress.it"),
+        ("Linate airport info", "https://www.milanolinate-airport.com")]},
+}
+WMO = [((0,), "☀️", "clear"), ((1, 2), "🌤", "partly cloudy"), ((3,), "☁️", "overcast"), ((45, 48), "🌫", "fog"),
+       ((51, 53, 55, 56, 57), "🌦", "drizzle"), ((61, 63, 65, 66, 67), "🌧", "rain"), ((71, 73, 75, 77), "🌨", "snow"),
+       ((80, 81, 82), "🌦", "showers"), ((85, 86), "🌨", "snow showers"), ((95, 96, 99), "⛈", "thunderstorm")]
+EXTRAS = (  # (reason, item, skipped when an item already matches) -- the same idea as tg-cmd's /pack extras
+    ("abroad", "🛂 Passport or ID card", r"passport|\bID\b"),
+    ("cash", "💶 Some {cur} cash", r"\b{cur}\b|€|\beuro|cash"),
+    ("adapter", "🔌 Plug adapter ({plugs})", r"adapter"),
+    ("overnight", "🪥 Toothbrush", r"toothbrush|wash ?bag|toiletr"),
+    ("overnight", "🔋 Phone charger", r"charger"),
+)
+
+
+class Fail(Exception):
+    pass
+
+
+def load_countries():
+    """Merge the private country table (places the public script must not name) into COUNTRIES."""
+    x = jsonstate.load(COUNTRIES_FILE, {})
+    for k, v in (x.get("countries", x) if isinstance(x, dict) else {}).items():
+        if not (isinstance(v, dict) and re.fullmatch(r"[A-Za-z]{2}", str(k)) and v.get("name") and v.get("cur") and v.get("plug")):
+            continue
+        COUNTRIES[k.upper()] = {"eu": False, "europe": False, "extra": "", **v,
+                                "tips": [t for t in v.get("tips") or [] if isinstance(t, str)],
+                                "rail": [tuple(r) for r in v.get("rail") or [] if isinstance(r, (list, tuple)) and len(r) == 2]}
+
+
+def now():
+    n = E("TRIP_PACK_NOW")
+    return datetime.strptime(n, "%Y-%m-%d %H:%M") if n else datetime.now(TZ).replace(tzinfo=None)
+
+
+def span(a, b):
+    if a == b:
+        return f"{a:%a} {a.day}.{a.month}."
+    if a.year != b.year:
+        return f"{a.day}.{a.month}.{a.year}–{b.day}.{b.month}.{b.year}"
+    return f"{a:%a} {a.day}.–{b:%a} {b.day}.{b.month}." if a.month == b.month else f"{a:%a} {a.day}.{a.month}.–{b:%a} {b.day}.{b.month}."
+
+
+def ddmm(d):
+    return f"{d.day:02d}.{d.month:02d}"
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-") or "trip"
+
+
+def trips():
+    x = jsonstate.load(TRIPS, {})
+    out = []
+    for t in (x.get("trips") if isinstance(x, dict) else x) or []:
+        if not isinstance(t, dict) or not t.get("name"):
+            continue
+        try:
+            t = dict(t, _from=date.fromisoformat(str(t["from"])), _to=date.fromisoformat(str(t.get("to") or t["from"])))
+        except (KeyError, ValueError):
+            t = dict(t, _from=None, _to=None)
+        out.append(t)
+    return out
+
+
+def find_trip(q):
+    q = q.strip().lower()
+    ts = trips()
+    for pred in (lambda t: t["name"].lower() == q, lambda t: q in t["name"].lower(),
+                 lambda t: any(q in str(m).lower() or str(m).lower() in q for m in t.get("match") or [] if m)):
+        hit = [t for t in ts if pred(t)]
+        if hit:
+            dated = [t for t in hit if t["_from"]]
+            return (dated or hit)[0]
+    return None
+
+
+# ---------------------------------------------------------------- fetch (network seam)
+def fetch(kind, url):
+    if FIXTURES:
+        p = os.path.join(FIXTURES, f"{kind}.json")
+        if not os.path.exists(p):
+            raise Fail(f"{kind}: no fixture")
+        return jsonstate.load(p, None)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with web.open(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:  # network, HTTP or JSON: the pack still gets written
+        raise Fail(f"{kind}: {type(e).__name__}")
+
+
+def geocode(p, problems, offline):
+    if isinstance(p.get("lat"), (int, float)) and isinstance(p.get("lon"), (int, float)):
+        return p["lat"], p["lon"]
+    key = f"{p['town'].lower()}|{(p.get('country') or '').upper()}"
+    cache = jsonstate.load(os.path.join(CACHE, "geo.json"), {}) if not FIXTURES else {}
+    if key in cache:
+        return tuple(cache[key])
+    if offline:
+        return None
+    q = {"name": p["town"], "count": 5, "language": "en", "format": "json"}
+    if p.get("country"):
+        q["countryCode"] = p["country"].upper()
+    try:
+        d = fetch("geocode", "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode(q))
+        res = [r for r in (d or {}).get("results") or [] if not p.get("country") or r.get("country_code", "").upper() == p["country"].upper()]
+        if not res:
+            raise Fail(f"geocode: {p['town']} not found")
+        ll = (round(res[0]["latitude"], 4), round(res[0]["longitude"], 4))
+    except (Fail, KeyError, TypeError) as e:
+        problems.append(str(e) if isinstance(e, Fail) else f"geocode: {type(e).__name__}")
+        return None
+    if not FIXTURES:
+        cache[key] = ll
+        try:
+            os.makedirs(CACHE, exist_ok=True)
+            with open(os.path.join(CACHE, "geo.json"), "w") as f:
+                json.dump(cache, f)
+        except OSError:
+            pass
+    return ll
+
+
+def weather(places, today, problems, offline):
+    out = []
+    for p in places:
+        days = [p["_from"] + timedelta(days=i) for i in range((p["_to"] - p["_from"]).days + 1)]
+        days = [d for d in days if d >= today]
+        if not days:
+            continue
+        w = {"town": p["town"], "days": [], "note": None}
+        near = [d for d in days if (d - today).days <= FORECAST_DAYS]
+        far = [d for d in days if d not in near]
+        if far:
+            w["note"] = f"Forecast from {ddmm(far[0] - timedelta(days=FORECAST_DAYS))}" + (
+                f" (for {ddmm(far[0])})" if near else "")
+        if near and offline:
+            w["note"] = "No forecast (built offline)"
+        elif near:
+            ll = geocode(p, problems, offline)
+            if not ll:
+                w["note"] = "No forecast (place not found)"
+            else:
+                q = {"latitude": ll[0], "longitude": ll[1], "timezone": "auto", "start_date": near[0].isoformat(),
+                     "end_date": near[-1].isoformat(), "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                     "precipitation_probability_max,precipitation_sum,wind_speed_10m_max"}
+                try:
+                    d = (fetch("forecast", "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode(q)) or {})["daily"]
+                    for i, ds in enumerate(d["time"]):
+                        code = d["weather_code"][i]
+                        icon, txt = next(((ic, t) for codes, ic, t in WMO if code in codes), ("·", "–"))
+                        w["days"].append({"date": ds, "icon": icon, "text": txt, "tmax": d["temperature_2m_max"][i],
+                                          "tmin": d["temperature_2m_min"][i],
+                                          "rain_pct": d["precipitation_probability_max"][i],
+                                          "rain_mm": d["precipitation_sum"][i], "wind": d["wind_speed_10m_max"][i]})
+                except Fail as e:
+                    problems.append(str(e))
+                    w["note"] = "Forecast unavailable when built"
+                except (KeyError, TypeError, IndexError):
+                    problems.append("forecast: unexpected answer")
+                    w["note"] = "Forecast unavailable when built"
+        out.append(w)
+    return out
+
+
+# ---------------------------------------------------------------- calendar legs (calcache)
+def local_dt(s):
+    d = datetime.fromisoformat(s)
+    return d.astimezone(TZ).replace(tzinfo=None) if d.tzinfo else d
+
+
+def calendar(t, problems):
+    """(legs, events, note): calcache travel legs and the trip's own calendar events; note when not cached."""
+    try:
+        r = subprocess.run([os.path.join(BIN, "calcache"), "age", "--json"], capture_output=True, text=True, timeout=10)
+        age = json.loads(r.stdout or "{}") if r.returncode in (0, 1) else {}
+        r = subprocess.run([os.path.join(BIN, "calcache"), "show", "--days", "21", "--json"], capture_output=True,
+                           text=True, timeout=10)
+        if r.returncode == 3:
+            return [], [], "Calendar not cached"
+        if r.returncode != 0:
+            raise Fail("calendar: calcache failed")
+        evs = json.loads(r.stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired, Fail) as e:
+        problems.append(str(e) if isinstance(e, Fail) else "calendar: calcache failed")
+        return [], [], "Calendar unavailable when built"
+    win = (age or {}).get("window") or []
+    note = None
+    if len(win) == 2 and win[1] < t["_to"].isoformat():
+        note = f"Calendar cached only up to {ddmm(date.fromisoformat(win[1]))}"
+    words = [str(m).lower() for m in t.get("match") or [] if m] + [t["name"].lower()] + \
+            [p["town"].lower() for p in t["places"]]
+    legs, own = [], []
+    for e in evs if isinstance(evs, list) else []:
+        try:
+            if e.get("all_day"):
+                s, en = datetime.fromisoformat(e["start"][:10]), datetime.fromisoformat(e["end"][:10])
+            else:
+                s, en = local_dt(e["start"]), local_dt(e["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        f, title = e.get("flags") or {}, str(e.get("title") or "")
+        hit = any(w and w in (title + " " + str(e.get("town") or "")).lower() for w in words)
+        if f.get("travel"):
+            d = s.date()
+            inside = t["_from"] <= d <= t["_to"]
+            edge = t["_from"] - timedelta(days=1) <= d <= t["_to"] + timedelta(days=1)
+            if inside or (edge and (hit or f.get("travel") == "flight" or f.get("abroad"))):
+                legs.append({"start": s.isoformat(timespec="minutes"), "end": en.isoformat(timespec="minutes"),
+                             "title": title, "kind": f.get("travel"), "_s": s, "_e": en})
+        elif hit and s.date() <= t["_to"] and (en - timedelta(seconds=1)).date() >= t["_from"]:
+            own.append({"title": title, "start": s.date().isoformat() if e.get("all_day") else s.isoformat(timespec="minutes"),
+                        "all_day": bool(e.get("all_day")), "_s": s, "_e": en})
+    return sorted(legs, key=lambda g: g["_s"]), own, note
+
+
+# ---------------------------------------------------------------- packing
+def packing(t, countries, home_c, problems):
+    d = jsonstate.load(TEMPLATES, None)
+    types = {str(k).lower(): v for k, v in ((d or {}).get("types") or {}).items() if isinstance(v, dict)}
+    kind = str(t.get("type") or ("business" if t.get("abroad") or any(c != home_c for c in countries) else "")).lower()
+    tpl = types.get(kind) or {}
+    if kind and not tpl:
+        problems.append(f"packing: no {kind} template")
+    items = [x.strip() for x in tpl.get("items") or [] if isinstance(x, str) and x.strip()]
+    hc = COUNTRIES.get(home_c, {})
+    curs = sorted({COUNTRIES[c]["cur"] for c in countries if c in COUNTRIES and COUNTRIES[c]["cur"] != hc.get("cur")})
+    plugs = sorted({COUNTRIES[c]["plug"] for c in countries if c in COUNTRIES and COUNTRIES[c]["plug"] != hc.get("plug")})
+    reasons = {"abroad": any(c != home_c for c in countries), "cash": bool(curs), "adapter": bool(plugs and hc),
+               "overnight": t["_to"] > t["_from"]}
+    extra = []
+    for reason, item, pat in EXTRAS:
+        item = item.format(cur="/".join(curs), plugs="type " + " / ".join(plugs))
+        pat = pat.format(cur="|".join(map(re.escape, curs)) or "x^")
+        if reasons[reason] and not any(re.search(pat, x, re.I) for x in extra + items):
+            extra.append(item)
+    return {"type": kind or None, "label": tpl.get("label") or kind or None, "emoji": tpl.get("emoji"),
+            "items": extra + items}
+
+
+# ---------------------------------------------------------------- model
+def _txt(x, n=600):
+    return str(x).strip()[:n] if isinstance(x, (str, int, float)) and str(x).strip() else ""
+
+
+def _link_ok(u):
+    return bool(re.match(r"^(https?://|tel:|mailto:)\S+$", u))
+
+
+def clean_block(b):
+    """One extras block -> {title, intro, note, rows, table, items, links} with only well-formed parts, or None."""
+    if not isinstance(b, dict):
+        return None
+    out = {"title": _txt(b.get("title"), 120), "intro": _txt(b.get("intro"), 1200), "note": _txt(b.get("note"), 1200),
+           "rows": [], "table": None, "items": [], "links": []}
+    for r in b.get("rows") or []:
+        if isinstance(r, (list, tuple)) and len(r) >= 2 and _txt(r[1]):
+            out["rows"].append([_txt(r[0], 60), _txt(r[1], 1200)])
+    tb = b.get("table")
+    if isinstance(tb, dict) and isinstance(tb.get("rows"), list):
+        head = [_txt(h, 60) for h in tb.get("head") or []]
+        rows = [[_txt(c, 400) for c in r] for r in tb["rows"] if isinstance(r, (list, tuple)) and r]
+        if rows:
+            out["table"] = {"head": head, "rows": rows}
+    out["items"] = [_txt(i, 1200) for i in b.get("items") or [] if _txt(i)]
+    for lk in b.get("links") or []:
+        if isinstance(lk, (list, tuple)) and len(lk) == 2 and _link_ok(str(lk[1])):
+            out["links"].append([_txt(lk[0], 120) or str(lk[1]), str(lk[1])])
+    if not any((out["intro"], out["note"], out["rows"], out["table"], out["items"], out["links"])) and not b.get("groups"):
+        return None
+    return out
+
+
+def load_extras(t, problems):
+    """The trip's own pages from its extras file: day by day, sections, emergency lines. Never raises."""
+    empty = {"days": [], "days_title": "Day by day", "sections": [], "emergency": []}
+    given = t.get("extras")
+    path = os.path.expanduser(str(given)) if given else os.path.join(EXTRAS_DIR, slug(t["name"]) + ".json")
+    if not given and not os.path.exists(path):
+        return empty
+    try:
+        with open(path) as f:
+            x = json.load(f)
+        if not isinstance(x, dict):
+            raise ValueError("not an object")
+    except (OSError, ValueError):
+        problems.append(f"extras: {os.path.basename(path)} unreadable")
+        return empty
+    base = os.path.dirname(os.path.abspath(path))
+    days = []
+    for d in x.get("days") or []:
+        if not isinstance(d, dict):
+            continue
+        try:
+            day = date.fromisoformat(str(d.get("date")))
+        except ValueError:
+            continue
+        days.append({"date": day.isoformat(), "label": f"{day:%a} {ddmm(day)}", "where": _txt(d.get("where"), 60),
+                     "title": _txt(d.get("title"), 200), "tag": _txt(d.get("tag"), 30),
+                     "items": [_txt(i, 600) for i in d.get("items") or [] if _txt(i)]})
+    days.sort(key=lambda d: d["date"])
+    sections, ids = [], set()
+    for s in x.get("sections") or []:
+        if isinstance(s, dict) and s.get("include"):
+            ip = os.path.expanduser(str(s["include"]))
+            ip = ip if os.path.isabs(ip) else os.path.join(base, ip)
+            try:
+                with open(ip) as f:
+                    inc = json.load(f)
+                if not isinstance(inc, dict):
+                    raise ValueError("not an object")
+            except (OSError, ValueError):
+                problems.append(f"extras: {os.path.basename(ip)} unreadable")
+                continue
+            s = dict(inc, **{k: v for k, v in s.items() if k != "include"})
+        sec = clean_block(s)
+        if not sec or not sec["title"]:
+            continue
+        sid = slug(str(s.get("id") or sec["title"]))[:24] or "extra"
+        sid = "x-" + sid if sid in BUILTIN_IDS else sid
+        while sid in ids:
+            sid += "-2"
+        ids.add(sid)
+        groups = [g for g in (clean_block(g) for g in s.get("groups") or []) if g]
+        sections.append(dict(sec, id=sid, groups=groups))
+    emergency = [{"where": _txt(e.get("where"), 60), "text": _txt(e.get("text"), 600)}
+                 for e in x.get("emergency") or [] if isinstance(e, dict) and _txt(e.get("text"))]
+    return {"days": days, "days_title": _txt(x.get("days_title"), 60) or "Day by day", "sections": sections,
+            "emergency": emergency}
+
+
+def build(t, offline):
+    load_countries()
+    today, problems = now().date(), []
+    places = []
+    for p in t.get("places") or []:
+        if not isinstance(p, dict) or not p.get("town"):
+            continue
+        try:
+            pf = date.fromisoformat(str(p.get("from") or t["_from"]))
+            pt = date.fromisoformat(str(p.get("to") or p.get("from") or t["_to"]))
+        except ValueError:
+            pf, pt = t["_from"], t["_to"]
+        places.append(dict(p, country=str(p.get("country") or "").upper(), _from=pf, _to=pt))
+    t = dict(t, places=places)
+    home_c = str(assistant_profile.get("locale.country", "") or "").upper()
+    home_town = assistant_profile.get("home.town", "") or ""
+    countries = list(dict.fromkeys(p["country"] for p in places if p["country"]))
+    legs, own, cal_note = calendar(t, problems)
+    if not places:   # no places listed: the towns of the trip's own calendar events
+        towns = list(dict.fromkeys(re.sub(r".*\(([^)]+)\)\s*$", r"\1", e["title"]) for e in own if "(" in e["title"]))
+        places = [{"town": x, "country": "", "_from": t["_from"], "_to": t["_to"]} for x in towns]
+    transport, tips = [], []
+    for c in countries:
+        info = COUNTRIES.get(c)
+        if info:
+            transport += [{"label": l, "url": u, "where": info["name"]} for l, u in info["rail"]]
+            tips += [{"where": info["name"], "text": x} for x in info["tips"]]
+    cities = dict(CITIES)
+    extra = jsonstate.load(CITIES_FILE, {})
+    for k, v in (extra if isinstance(extra, dict) else {}).items():
+        if isinstance(v, dict):
+            cities[k.lower()] = {"aliases": v.get("aliases") or [], "links": [tuple(x) for x in v.get("links") or []]}
+    seen = set()
+    for p in places:
+        name = p["town"].lower()
+        for k, v in cities.items():
+            if k not in seen and (name == k or name in v["aliases"]):
+                seen.add(k)
+                transport += [{"label": l, "url": u, "where": p["town"]} for l, u in v["links"]]
+    for x in t.get("links") or []:
+        if isinstance(x, dict) and x.get("url"):
+            transport.append({"label": x.get("label") or x["url"], "url": x["url"], "where": x.get("where") or ""})
+    hc = COUNTRIES.get(home_c, {})
+    money = []
+    nofx = {COUNTRIES[c]["cur"] for c in countries if c in COUNTRIES and COUNTRIES[c].get("fx") is False}
+    for cur in sorted({COUNTRIES[c]["cur"] for c in countries if c in COUNTRIES}):
+        m = {"currency": cur, "rate": None, "rate_date": None}
+        if cur in nofx:
+            m["note"] = "no reference rate"
+        elif hc and cur != hc["cur"] and not offline:
+            try:
+                fx = fetch("fx", f"https://api.frankfurter.dev/v2/rate/{hc['cur']}/{cur}") or {}
+                if fx.get("quote") != cur:
+                    raise Fail(f"fx: no rate for {cur}")
+                m.update(rate=round(float(fx["rate"]), 4), rate_date=fx.get("date"), base=hc["cur"])
+            except (Fail, AttributeError, KeyError, TypeError, ValueError) as e:
+                problems.append(str(e) if isinstance(e, Fail) else "fx: unexpected answer")
+        money.append(m)
+    abroad = [c for c in countries if c != home_c]
+    roaming = None
+    if hc and not hc.get("eu") and any(COUNTRIES.get(c, {}).get("eu") for c in abroad):
+        roaming = (f"{hc.get('adj', hc['name'])} plans don't fall under the EU's roam-like-at-home rules. Check your plan "
+                   "before you leave: EU data included? Otherwise add a roaming pack or an eSIM, and keep data roaming "
+                   "off until then.")
+    far = [c for c in abroad if c in COUNTRIES and not COUNTRIES[c].get("europe")]
+    if hc and far and not roaming:
+        roaming = (f"{hc.get('adj', hc['name'])} plans charge a lot for roaming outside Europe. Check your plan before you "
+                   "leave: add a roaming pack or a local/eSIM data plan, and keep data roaming off until then.")
+    if not countries or any(COUNTRIES.get(c, {"europe": True}).get("europe") for c in countries):
+        emergency = [{"where": "Europe", "text": "112: emergency, free from any phone"}]
+    else:
+        emergency = [{"where": "Mobile", "text": "112 often reaches the local emergency line from a mobile; the local "
+                                                 "numbers below come first"}]
+    emergency += [{"where": COUNTRIES[c]["name"], "text": COUNTRIES[c]["extra"]} for c in countries
+                  if c in COUNTRIES and COUNTRIES[c]["extra"]]
+    plugs = [{"where": COUNTRIES[c]["name"], "type": COUNTRIES[c]["plug"]} for c in countries if c in COUNTRIES]
+    w = weather(places, today, problems, offline)
+    ex = load_extras(t, problems)
+    emergency = ex["emergency"] + emergency
+    planned = [x for x in t.get("legs") or [] if isinstance(x, str) and x]
+    return {
+        "trip": t["name"], "emoji": t.get("emoji") or "🧳", "from": t["_from"].isoformat(), "to": t["_to"].isoformat(),
+        "dates": span(t["_from"], t["_to"]), "days_until": (t["_from"] - today).days, "home_town": home_town,
+        "places": [{k: v for k, v in p.items() if not k.startswith("_")} | {"dates": span(p["_from"], p["_to"])}
+                   for p in places],
+        "calendar": [{k: v for k, v in e.items() if not k.startswith("_")} for e in own],
+        "legs": [{k: v for k, v in g.items() if not k.startswith("_")} | {"when": f"{g['_s']:%a} {ddmm(g['_s'])} {g['_s']:%H:%M}–{g['_e']:%H:%M}"}
+                 for g in legs],
+        "legs_note": None if legs else "Legs not booked yet", "calendar_note": cal_note, "planned": planned,
+        "transport": transport, "tips": tips, "weather": w, "money": money, "plugs": plugs,
+        "emergency": emergency, "roaming": roaming, "packing": packing(t, countries, home_c, problems),
+        "built": now().strftime("%Y-%m-%d %H:%M"), "problems": problems,
+        "days": ex["days"], "days_title": ex["days_title"], "extras": ex["sections"],
+    }
+
+
+# ---------------------------------------------------------------- HTML
+CSS = """
+:root{--ground:#f3f1ec;--paper:#fffdf9;--ink:#1d2430;--ink-2:#5b6472;--line:#ded9cf;--accent:#1f5f8b;--accent-tint:#e1ecf4;
+--warm:#a5521b;--warm-tint:#f7e6d9;--ok:#2f7a3d;--shade:rgba(29,36,48,.06);--radius:14px;
+--f-body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--f-mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--ground:#11151b;--paper:#181e26;--ink:#e6e9ee;--ink-2:#9aa4b2;
+--line:#2a323d;--accent:#7cb6e0;--accent-tint:#1b2c3a;--warm:#f0a46c;--warm-tint:#3a2618;--ok:#7ccf8a;--shade:rgba(0,0,0,.35);color-scheme:dark}}
+:root[data-theme="dark"]{--ground:#11151b;--paper:#181e26;--ink:#e6e9ee;--ink-2:#9aa4b2;--line:#2a323d;--accent:#7cb6e0;
+--accent-tint:#1b2c3a;--warm:#f0a46c;--warm-tint:#3a2618;--ok:#7ccf8a;--shade:rgba(0,0,0,.35);color-scheme:dark}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--f-body);font-size:1rem;line-height:1.5;-webkit-text-size-adjust:100%}
+a{color:var(--accent);text-underline-offset:3px;overflow-wrap:anywhere}
+.wrap{max-width:760px;margin:0 auto;padding:0 max(16px,env(safe-area-inset-left,0px))}
+header{padding:28px 0 12px}
+.eyebrow{font-family:var(--f-mono);font-size:.78rem;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2)}
+h1{font-size:clamp(2rem,8vw,3rem);line-height:1.1;margin:.2em 0 .15em;letter-spacing:-.01em}
+.sub{color:var(--ink-2)}
+nav{position:sticky;top:0;z-index:5;background:var(--ground);border-bottom:1px solid var(--line);padding:8px 0;
+overflow-x:auto;white-space:nowrap;scrollbar-width:none}
+nav a{display:inline-block;margin-right:6px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;
+font-size:.85rem;text-decoration:none;color:var(--ink);background:var(--paper)}
+section{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin:14px 0;
+box-shadow:0 1px 2px var(--shade);scroll-margin-top:56px}
+h2{font-size:1.15rem;margin:0 0 10px}
+ul{margin:0;padding-left:1.1em}li{margin:.25em 0}
+.rows{list-style:none;padding:0}.rows li{display:flex;gap:10px;padding:6px 0;border-top:1px solid var(--line)}
+.rows li:first-child{border-top:0}.when{font-family:var(--f-mono);font-size:.85rem;color:var(--ink-2);min-width:7.5em;
+font-variant-numeric:tabular-nums}
+.note{background:var(--warm-tint);color:var(--warm);border-radius:10px;padding:8px 12px;margin:8px 0;font-size:.95rem}
+.muted{color:var(--ink-2);font-size:.9rem}
+.big{font-size:1.6rem;font-weight:700;font-family:var(--f-mono)}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+td,th{text-align:left;padding:6px 4px;border-top:1px solid var(--line);font-size:.95rem;vertical-align:top}
+th{color:var(--ink-2);font-weight:600;border-top:0;font-size:.8rem}
+.check{list-style:none;padding:0}.check label{display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--line)}
+.check li:first-child label{border-top:0}.check input{width:20px;height:20px;margin:2px 0 0;accent-color:var(--accent)}
+.check input:checked+span{text-decoration:line-through;color:var(--ink-2)}
+footer{color:var(--ink-2);font-size:.8rem;padding:8px 0 40px}
+h3{font-size:1rem;margin:14px 0 4px}.tw{overflow-x:auto;margin:6px 0}.tw table{min-width:520px}
+.day{border-top:1px solid var(--line);padding:8px 6px;scroll-margin-top:60px}.day:first-of-type{border-top:0}
+.day.today{background:var(--accent-tint);border-radius:10px;border-top-color:transparent}
+.day ul{margin:4px 0 0}.dh{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline}
+.tag{font-size:.75rem;border:1px solid var(--line);border-radius:999px;padding:0 8px;color:var(--ink-2)}
+.past{opacity:.6}#todaylink{display:none;margin:0 0 8px}
+@media print{nav{display:none}section{break-inside:avoid;box-shadow:none}}
+"""
+
+
+def esc(s):
+    return html.escape(str(s if s is not None else ""))
+
+
+def block(b, sub=False):
+    out = f'<h3>{esc(b["title"])}</h3>' if sub and b["title"] else ""
+    if b["intro"]:
+        out += f"<p>{esc(b['intro'])}</p>"
+    if b["note"]:
+        out += f'<p class="note">{esc(b["note"])}</p>'
+    if b["rows"]:
+        out += '<ul class="rows">' + "".join(f'<li><span class="when">{esc(a)}</span><span>{esc(c)}</span></li>'
+                                            for a, c in b["rows"]) + "</ul>"
+    if b["table"]:
+        tb = b["table"]
+        head = "<tr>" + "".join(f"<th>{esc(h)}</th>" for h in tb["head"]) + "</tr>" if tb["head"] else ""
+        out += f'<div class="tw"><table>{head}' + "".join(
+            "<tr>" + "".join(f"<td>{esc(c)}</td>" for c in r) + "</tr>" for r in tb["rows"]) + "</table></div>"
+    if b["items"]:
+        out += "<ul>" + "".join(f"<li>{esc(i)}</li>" for i in b["items"]) + "</ul>"
+    if b["links"]:
+        out += '<p class="muted">' + " · ".join(f'<a href="{esc(u)}">{esc(lb)}</a>' for lb, u in b["links"]) + "</p>"
+    return out
+
+
+def render(m):
+    secs = []
+
+    def sec(sid, title, body):
+        secs.append((sid, title, f'<section id="{sid}"><h2>{esc(title)}</h2>{body}</section>'))
+
+    rows = "".join(f'<li><span class="when">{esc(p["dates"])}</span><span><b>{esc(p["town"])}</b>'
+                   f'{", " + esc(COUNTRIES.get(p["country"], {}).get("name", p["country"])) if p["country"] else ""}'
+                   f'{" · " + esc(p["what"]) if p.get("what") else ""}</span></li>' for p in m["places"])
+    cal = "".join(f'<li><span class="when">{"all day" if e["all_day"] else esc(e["start"][11:16])}</span>'
+                  f'<span>📅 {esc(e["title"])}</span></li>' for e in m["calendar"])
+    sec("where", "Where & when", f'<ul class="rows">{rows}{cal}</ul>' if rows or cal else '<p class="muted">No places listed.</p>')
+    body = ""
+    if m["legs"]:
+        body = '<ul class="rows">' + "".join(f'<li><span class="when">{esc(g["when"])}</span><span>{esc(g["title"])}</span></li>'
+                                            for g in m["legs"]) + "</ul>"
+    else:
+        body = f'<p class="note">{esc(m["legs_note"])}</p>'
+        if m["planned"]:
+            body += '<p class="muted">Planned:</p><ul>' + "".join(f"<li>{esc(x)}</li>" for x in m["planned"]) + "</ul>"
+    if m["calendar_note"]:
+        body += f'<p class="muted">{esc(m["calendar_note"])}.</p>'
+    if m["home_town"]:
+        body += f'<p class="muted">Door to door from and back to {esc(m["home_town"])}.</p>'
+    sec("legs", "Legs", body)
+    if m.get("days"):
+        body = '<p id="todaylink"><a href="#">Jump to today</a></p>' + "".join(
+            f'<div class="day" data-date="{esc(d["date"])}" id="d{esc(d["date"])}"><div class="dh"><span class="when">'
+            f'{esc(d["label"])}</span><b>{esc(d["where"])}</b><span>{esc(d["title"])}</span>'
+            f'{f"<span class=tag>{esc(d[chr(116)+chr(97)+chr(103)])}</span>" if d["tag"] else ""}</div>'
+            + ("<ul>" + "".join(f"<li>{esc(i)}</li>" for i in d["items"]) + "</ul>" if d["items"] else "") + "</div>"
+            for d in m["days"])
+        sec("days", m.get("days_title") or "Day by day", body)
+    for x in m.get("extras") or []:
+        body = block(x) + "".join(block(g, sub=True) for g in x["groups"])
+        sec(x["id"], x["title"], body)
+    if m["transport"] or m["tips"]:
+        body = '<ul class="rows">' + "".join(
+            f'<li><span class="when">{esc(x["where"])}</span><span><a href="{esc(x["url"])}">{esc(x["label"])}</a></span></li>'
+            for x in m["transport"]) + "</ul>"
+        if m["tips"]:
+            body += "<ul>" + "".join(f'<li>{esc(x["text"])}</li>' for x in m["tips"]) + "</ul>"
+        sec("transport", "Getting around", body)
+    body = ""
+    for w in m["weather"]:
+        body += f"<h3 style='font-size:1rem;margin:10px 0 4px'>{esc(w['town'])}</h3>"
+        if w["days"]:
+            body += "<table><tr><th>Day</th><th></th><th>°C</th><th>Rain</th><th>Wind</th></tr>" + "".join(
+                f"<tr><td>{esc(datetime.fromisoformat(d['date']).strftime('%a %d.%m'))}</td><td>{d['icon']} {esc(d['text'])}</td>"
+                f"<td>{round(d['tmin'])}–{round(d['tmax'])}</td><td>{esc(d['rain_pct'])} % · {esc(d['rain_mm'])} mm</td>"
+                f"<td>{round(d['wind'])} km/h</td></tr>" for d in w["days"]) + "</table>"
+        if w["note"]:
+            body += f'<p class="note">{esc(w["note"])}</p>'
+    sec("weather", "Weather", (body or '<p class="muted">Trip is over.</p>') +
+        '<p class="muted">open-meteo, as of the build time below. Rebuild for a fresh one.</p>')
+    body = ""
+    for x in m["money"]:
+        rate = (f' · 1 {esc(x["base"])} ≈ {x["rate"]} {esc(x["currency"])} <span class="muted">(reference rate {esc(x["rate_date"])})</span>'
+                if x.get("rate") else (f' <span class="muted">· {esc(x["note"])}</span>' if x.get("note") else ""))
+        body += f'<p><span class="big">{esc(x["currency"])}</span>{rate}</p>'
+    if m["plugs"]:
+        body += "<p>Plugs: " + " · ".join(f'{esc(p["where"])} type {esc(p["type"])}' for p in m["plugs"]) + "</p>"
+    if m["roaming"]:
+        body += f'<p class="note">📶 {esc(m["roaming"])}</p>'
+    sec("money", "Money, plugs & phone", body or '<p class="muted">Nothing special.</p>')
+    sec("sos", "Emergency", '<ul class="rows">' + "".join(
+        f'<li><span class="when">{esc(x["where"])}</span><span>{esc(x["text"])}</span></li>' for x in m["emergency"]) + "</ul>")
+    pk = m["packing"]
+    if pk["items"]:
+        key = "trip-pack:" + slug(m["trip"])
+        lis = "".join(f'<li><label><input type="checkbox" data-i="{i}"><span>{esc(x)}</span></label></li>'
+                      for i, x in enumerate(pk["items"]))
+        head = f'<p class="muted">{esc(pk.get("emoji") or "🎒")} {esc(pk["label"])} list · ticks stay in this browser</p>' if pk["label"] else ""
+        sec("pack", "Packing", f'{head}<ul class="check" id="check" data-key="{esc(key)}">{lis}</ul>')
+    if m["problems"]:
+        sec("issues", "Not checked", "<ul>" + "".join(f"<li>{esc(p)}</li>" for p in m["problems"]) + "</ul>")
+    towns = " · ".join(dict.fromkeys(p["town"] for p in m["places"]))
+    n = m["days_until"]
+    rel = "today" if n == 0 else "tomorrow" if n == 1 else f"in {n} days" if n > 1 else "under way" if n < 0 else ""
+    nav = "".join(f'<a href="#{sid}">{esc(title.split(",")[0].split(" &")[0].split(" (")[0])}</a>' for sid, title, _ in secs)
+    js = """<script>(function(){var ul=document.getElementById('check');if(!ul)return;var k=ul.dataset.key,s={};
+try{s=JSON.parse(localStorage.getItem(k)||'{}')}catch(e){}
+ul.querySelectorAll('input').forEach(function(b){b.checked=!!s[b.dataset.i];b.addEventListener('change',function(){
+s[b.dataset.i]=b.checked;try{localStorage.setItem(k,JSON.stringify(s))}catch(e){}})})})();
+(function(){var d=new Date(),p=function(n){return(n<10?'0':'')+n},t=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+var el=null;document.querySelectorAll('.day').forEach(function(x){if(x.dataset.date<t)x.classList.add('past');
+if(x.dataset.date===t){x.classList.add('today');el=x}});var l=document.getElementById('todaylink');
+if(el&&l){l.style.display='block';l.firstChild.setAttribute('href','#'+el.id)}})();</script>"""
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">'
+            f'<meta name="color-scheme" content="light dark"><title>{esc(m["trip"])} pack</title><style>{CSS}</style></head>'
+            f'<body><header class="wrap"><div class="eyebrow">Offline trip pack · {esc(rel)}</div>'
+            f'<h1>{esc(m["emoji"])} {esc(m["trip"])}</h1><p class="sub">{esc(m["dates"])}{" · " + esc(towns) if towns else ""}</p>'
+            f'</header><nav><div class="wrap">{nav}</div></nav><main class="wrap">'
+            + "".join(s for _, _, s in secs) +
+            f'</main><footer class="wrap">Built {esc(m["built"])} by trip-pack from the trip file and the calendar cache. '
+            f'Links need a connection; everything else works offline.</footer>{js}</body></html>\n')
+
+
+def main(argv):
+    a = argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if a else 1
+    if a[0] == "--list":
+        for t in trips():
+            if t["_from"]:
+                print(f"{t.get('emoji') or '🧳'} {t['name']} · {span(t['_from'], t['_to'])}"
+                      + (f" · {t['pack']}" if t.get("pack") else ""))
+        return 0
+    out, as_json, offline, q = None, False, False, []
+    i = 0
+    while i < len(a):
+        if a[i] == "--out" and i + 1 < len(a):
+            out, i = a[i + 1], i + 2
+            continue
+        if a[i] == "--json":
+            as_json = True
+        elif a[i] == "--no-fetch":
+            offline = True
+        elif a[i].startswith("-") and a[i] != "-":
+            print(f"trip-pack: unknown option {a[i]}", file=sys.stderr)
+            return 1
+        else:
+            q.append(a[i])
+        i += 1
+    if not q:
+        print("trip-pack: which trip? (trip-pack --list)", file=sys.stderr)
+        return 1
+    t = find_trip(" ".join(q))
+    if not t:
+        print(f"trip-pack: no trip matches {' '.join(q)!r} (trip-pack --list)", file=sys.stderr)
+        return 1
+    if not t["_from"]:
+        print(f"trip-pack: {t['name']} has no dates in {TRIPS}", file=sys.stderr)
+        return 1
+    m = build(t, offline)
+    page = render(m)
+    out = out or os.path.expanduser(t.get("pack") or os.path.join(OUTDIR, f"{slug(t['name'])}-pack.html"))
+    if out == "-":
+        sys.stdout.write(page)
+    else:
+        out = os.path.expanduser(out)
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        tmp = out + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(page)
+        os.replace(tmp, out)
+    m["out"] = out
+    try:
+        import usage
+        usage.log("bin.trip-pack", "exec", outcome="partial" if m["problems"] else "ok",
+                  attrs={"days": len(m["days"]), "extras": len(m["extras"])})
+    except Exception:
+        pass
+    if as_json:
+        print(json.dumps(m, ensure_ascii=False, indent=1))
+    elif out != "-":
+        legs = f"{len(m['legs'])} legs" if m["legs"] else "legs not booked yet"
+        fc = sum(len(w["days"]) for w in m["weather"])
+        print(f"{m['emoji']} {m['trip']} · {m['dates']} · {legs} · forecast {fc} days · "
+              f"{len(m['packing']['items'])} to pack -> {out} ({os.path.getsize(out) // 1024} KB)")
+    for p in m["problems"]:
+        print(f"trip-pack: {p}", file=sys.stderr)
+    return 2 if m["problems"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

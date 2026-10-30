@@ -1,0 +1,1238 @@
+#!/usr/local/bin/python3.13 -I
+"""contracts: contract radar: the owner's running contracts and recurring costs, from paperless cards only.
+
+  contracts scan [--refresh] [--budget SECONDS] [--workers N] [--json]
+        paperless metadata (`recent --json`) + one card per relevant document (`get ID --json`: date,
+        correspondent, type, title, amount, currency, due date; cached 30 days) → contracts grouped by
+        correspondent (else a known provider in the title, else the title's first word) and document type
+        family; cadence guessed from the document dates (monthly / quarterly / half-yearly / yearly), last
+        amount, yearly cost estimate, next expected bill. Read-only on paperless.
+  contracts show [--all] [--json]   phone-sized card: top costs, total per year, "no bill for >1.5 cycles →
+                                    maybe ended?", cancelled ones; --all lists every contract with its key
+  contracts notice [--all] [--json] where a notice period matters: health insurance gets the KVG basic-insurance
+                                    deadline (must ARRIVE by 30.11., last working day; kk-compare's deadline());
+                                    everything else "notice period unknown — needs his ✅ per document", never
+                                    guessed, unless he gave it (`set --notice`)
+                                    Banks (accounts, status "account") and car hire (one-off) never get a notice entry.
+  contracts ebill [--json]          (also `contracts --ebill`) recurring billers seen in paperless (documents, cadence,
+                                    last bill) and whether each offers eBill / direct debit, from public payment-option
+                                    pages (EBILL below); health uses kk-compare's insurer. LSV+/BDD end 30.09.2028.
+  contracts warranty [WORD…] [--all] [--json] [--max N] [--budget S]   (also `contracts --warranty`)
+        shop invoices and receipts (type Rechnung/Quittung/receipt/…, or such a word in the title) from a retailer
+        or maker store (SHOPS below + his private "shop" entries) with "covered until" = invoice date + 24 months
+        (the Swiss legal default, OR 210; shop/maker terms may give more or less: unverified), newest first, the
+        title (without ids, dates, the shop's and his own name) as the item. Default: still covered; --all: all;
+        WORD filters titles and shops (word prefixes) and then lists expired matches too. Live metadata
+        (`recent --json`, falls back to the last scan's), amounts from cached cards; cards missing for these
+        documents are fetched for up to --budget seconds (default 20; 0 = none) unless a scan holds the lock.
+        Shop purchases are not contracts: scan/show skip them (a shop that is also a provider, e.g. Apple, stays).
+  contracts set KEY [--name N] [--kind K] [--cadence C] [--ignore|--unignore] [--ended|--active]
+                    [--notice TEXT] [--merge-into KEY2]
+        owner corrections (KEY: a contract key from `show --all`, or a unique part of its name)
+
+Privacy: cards only. Never `--content`, `--reason`, `fields`, `download` (those need the owner's ✅ in the vault
+bot); titles are shown without digits, ids or the owner's own name. State (private, 0700/0600):
+~/.local/state/contracts/ (cards.json: metadata + card cache; contracts.json: the last scan's result;
+overrides.json: his corrections). No personal values in this file: provider names are public company names.
+Env (tests): CONTRACTS_STATE_DIR, CONTRACTS_PAPERLESS (paperless command), CONTRACTS_NOW (YYYY-MM-DD),
+CONTRACTS_KK (kk-compare path), CONTRACTS_KK_PROFILE (kk-compare profile), CONTRACTS_PROVIDERS (private extra providers), ASSISTANT_PROFILE. Tests: ~/opt/contracts-tests (test_contracts.py).
+"""
+import argparse, fcntl, json, os, re, statistics, subprocess, sys, time, unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+try:
+    import assistant_profile  # noqa: E402
+except ImportError:  # pragma: no cover
+    assistant_profile = None
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+STATE = os.environ.get("CONTRACTS_STATE_DIR") or os.path.expanduser("~/.local/state/contracts")
+CARDS = os.path.join(STATE, "cards.json")
+RESULT = os.path.join(STATE, "contracts.json")
+OVERRIDES = os.path.join(STATE, "overrides.json")
+CARD_TTL_DAYS = 30
+EVENT_GAP_DAYS = 14          # documents this close together are one billing event (policy + cover letter)
+UNKNOWN_ENDED_DAYS = 548     # assumed-yearly contracts: maybe ended after 1.5 years without a document
+STALE_UNKNOWN_DAYS = 1096    # no cadence at all: maybe ended after 3 years without a document
+HEALTH_MONTHLY_MAX = 1500    # a KVG policy quotes the monthly premium: no adult basic premium is this low per year
+
+# ---------------------------------------------------------------- vocabulary (generic, public)
+
+EMPLOYMENT_TYPES = {"lohnabrechnung", "lohnausweis", "arbeitsvertrag", "arbeitszeugnis"}
+SKIP_TYPES = EMPLOYMENT_TYPES | {"kontoauszug", "quittung"}
+CONTRACT_TYPES = {"vertrag", "police", "rechnung", "mahnung", "kundigung", "abonnement", "abo"}
+CONTRACT_TAGS = {"krankenkasse", "wohnen", "versicherung", "abo", "abonnement", "telecom", "leasing", "vertrag"}
+CONTRACT_WORDS = re.compile(
+    r"versicherung|police|praemie|pramie|abonnement|\babo\b|subscription|mitgliedschaft|membership|"
+    r"mietvertrag|mietzins|\bmiete\b|nebenkosten|leasing|serafe|krankenkasse|grundversicherung|"
+    r"vertrag|rechnung|invoice|mahnung|kundigung")
+NOT_CONTRACT_WORDS = re.compile(
+    r"lohn|gehalt|salary|payslip|zeugnis|steuererklarung|veranlagung|steuerausweis|kontoauszug|"
+    r"depotauszug|zinsausweis|quittung|receipt|kassenbon|arbeitsvertrag|einsatzvertrag|personalreglement|"
+    r"spesenreglement|\bnda\b|non disclosure|geheimhaltung|refund policy|privacy policy|privacy notice|"
+    r"datenschutzerklarung|cookie policy")
+CANCEL_WORDS = re.compile(r"kundigung|cancell?ation|aufhebung|vertragsende|austritt|abmeldung")
+
+# provider tokens (folded) → display name and kind. Public company names only.
+PROVIDERS = {
+    "swisscom": ("Swisscom", "telecom"), "sunrise": ("Sunrise", "telecom"), "salt": ("Salt", "telecom"),
+    "wingo": ("Wingo", "telecom"), "yallo": ("Yallo", "telecom"), "upc": ("UPC", "telecom"),
+    "quickline": ("Quickline", "telecom"), "init7": ("Init7", "telecom"), "lebara": ("Lebara", "telecom"),
+    "digital republic": ("Digital Republic", "telecom"), "galaxus mobile": ("Galaxus Mobile", "telecom"),
+    "m budget mobile": ("M-Budget Mobile", "telecom"), "coop mobile": ("Coop Mobile", "telecom"),
+    "axa": ("AXA", "insurance"), "mobiliar": ("Mobiliar", "insurance"), "allianz": ("Allianz", "insurance"),
+    "generali": ("Generali", "insurance"), "helvetia": ("Helvetia", "insurance"), "baloise": ("Baloise", "insurance"),
+    "vaudoise": ("Vaudoise", "insurance"), "smile direct": ("Smile", "insurance"), "simpego": ("Simpego", "insurance"),
+    "zurich versicherung": ("Zurich Versicherung", "insurance"), "elvia": ("Elvia", "insurance"),
+    "tcs": ("TCS", "insurance"), "wefox": ("Wefox", "insurance"), "emmental versicherung": ("Emmental", "insurance"),
+    "serafe": ("Serafe", "fee"),
+    "netflix": ("Netflix", "subscription"), "spotify": ("Spotify", "subscription"),
+    "disney": ("Disney+", "subscription"), "youtube premium": ("YouTube Premium", "subscription"),
+    "amazon prime": ("Amazon Prime", "subscription"), "apple": ("Apple", "subscription"),
+    "icloud": ("iCloud", "subscription"), "google one": ("Google One", "subscription"),
+    "microsoft": ("Microsoft", "subscription"), "adobe": ("Adobe", "subscription"),
+    "dropbox": ("Dropbox", "subscription"), "openai": ("OpenAI", "subscription"),
+    "chatgpt": ("ChatGPT", "subscription"), "anthropic": ("Anthropic", "subscription"),
+    "github": ("GitHub", "subscription"), "playstation": ("PlayStation", "subscription"),
+    "xbox": ("Xbox", "subscription"), "nintendo": ("Nintendo", "subscription"),
+    "zattoo": ("Zattoo", "subscription"), "teleboy": ("Teleboy", "subscription"),
+    "patreon": ("Patreon", "subscription"), "halbtax": ("Halbtax", "subscription"),
+    "generalabonnement": ("Generalabonnement", "subscription"),
+    "update fitness": ("Update Fitness", "subscription"), "activ fitness": ("Activ Fitness", "subscription"),
+    "migros fitness": ("Migros Fitness", "subscription"), "basefit": ("Basefit", "subscription"),
+    "kieser": ("Kieser", "subscription"), "john reed": ("John Reed", "subscription"),
+    "cembra": ("Cembra", "leasing"), "multilease": ("Multilease", "leasing"),
+    "amag leasing": ("AMAG Leasing", "leasing"),
+    # banks: accounts, not contracts with running costs or a notice period
+    "postfinance": ("PostFinance", "bank"),
+    "raiffeisen": ("Raiffeisen", "bank"), "zurcher kantonalbank": ("ZKB", "bank"), "zkb": ("ZKB", "bank"),
+    "migros bank": ("Migros Bank", "bank"), "credit suisse": ("Credit Suisse", "bank"), "yuh": ("Yuh", "bank"),
+    "swissquote": ("Swissquote", "bank"), "wise payments": ("Wise", "bank"), "finpension": ("finpension", "bank"),
+    "true wealth": ("True Wealth", "bank"), "viac": ("VIAC", "bank"), "n26": ("N26", "bank"),
+    # car hire: one agreement per trip
+    "goldcar": ("Goldcar", "rental"), "alamo": ("Alamo", "rental"), "enterprise rent": ("Enterprise", "rental"),
+    "enterprise rental": ("Enterprise", "rental"), "hertz": ("Hertz", "rental"), "avis rental": ("Avis", "rental"),
+    "avis rent": ("Avis", "rental"), "europcar": ("Europcar", "rental"), "sixt": ("Sixt", "rental"),
+    "thrifty": ("Thrifty", "rental"),
+}
+FIXED_KINDS = {"bank", "rental"}   # a provider of these kinds decides the kind, whatever the title says
+
+
+def _private_file():
+    path = os.environ.get("CONTRACTS_PROVIDERS") or os.path.expanduser("~/.config/contracts/providers.json")
+    try:
+        with open(path) as f:
+            extra = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(extra, dict):
+        return {}
+    return {k: v for k, v in extra.items() if isinstance(v, (list, tuple)) and len(v) == 2}
+
+
+def _private_providers():
+    """More providers from a private file (his own banks etc. stay out of this public script):
+    {"token": ["Display", "kind"], …} in CONTRACTS_PROVIDERS or ~/.config/contracts/providers.json.
+    Kind "shop" entries are retailers for `warranty` (_private_shops), not providers."""
+    return {fold(k): (v[0], v[1]) for k, v in _private_file().items() if v[1] in KIND_LABEL}
+
+
+def _private_shops():
+    return {fold(k): str(v[0]) for k, v in _private_file().items() if v[1] == "shop" and fold(k)}
+KIND_WORDS = [  # (kind, folded regex) in priority order: the first hit wins for one document
+    ("insurance", r"haftpflicht|liability|hausrat|motorfahrzeug|fahrzeugversicherung|autoversicherung|"
+                  r"reiseversicherung|rechtsschutz|lebensversicherung|gebaudeversicherung|deposit insurance"),
+    ("health", r"krankenkasse|krankenversicherung|grundversicherung|zusatzversicherung|\bkvg\b|\bokp\b|"
+               r"health insurance"),
+    ("leasing", r"leasing"),
+    ("rent", r"mietvertrag|mietzins|\bmiete\b|nebenkosten|wohnung|parkplatz|motorradplatz|einstellplatz|"
+             r"garage|wohnraum|wohnraeume"),
+    ("fee", r"serafe|radio und fernseh"),
+    ("telecom", r"mobile|mobil abo|internet|glasfaser|festnetz|telefon"),
+    ("subscription", r"abonnement|\babo\b|subscription|mitgliedschaft|membership|fitness"),
+    ("insurance", r"versicherung|insurance|police|praemie|pramie"),
+]
+BILL_TYPES = {"police", "rechnung", "mahnung"}
+# tag → (kind, document types the tag is trusted on): a tag alone is weak, mis-tags happen
+KIND_TAGS = {"krankenkasse": ("health", BILL_TYPES), "wohnen": ("rent", BILL_TYPES | {"vertrag", "behorde"}),
+             "versicherung": ("insurance", BILL_TYPES | {"vertrag"}), "leasing": ("leasing", BILL_TYPES | {"vertrag"})}
+KIND_LABEL = {"health": "health ins.", "insurance": "insurance", "telecom": "telecom", "subscription": "subscr.",
+              "rent": "housing", "leasing": "leasing", "fee": "fee", "bank": "bank", "rental": "car hire",
+              "other": "other"}
+NOTICE_KINDS = {"health", "insurance", "telecom", "subscription", "rent", "leasing", "other"}  # not: fee
+
+GENERIC = set("""
+document dokument doc scan scanned pdf signed unterschrieben copy kopie page seite version final neu new
+the and und der die das den dem des von vom fur mit zu zum zur nr no de en la le du et of for to in an im am
+police policy vertrag contract rechnung invoice antrag begleitschreiben zusammenfassung schreiben brief letter
+formular form beilage anhang info information informationen bestatigung confirmation offerte offer angebot
+jan januar january feb februar february mar marz march apr april mai may jun juni june jul juli july aug august
+sep sept september okt oktober october nov november dez dezember december
+""".split())
+
+CADENCES = [  # name, per year, interval days, accepted median interval range
+    ("monthly", 12, 30.4, (20, 42)),
+    ("quarterly", 4, 91.3, (75, 110)),
+    ("half-yearly", 2, 182.6, (160, 205)),
+    ("yearly", 1, 365.2, (320, 410)),
+]
+CADENCE = {c[0]: c for c in CADENCES}
+
+
+def die(msg, code=1):
+    print(f"contracts: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def today():
+    n = os.environ.get("CONTRACTS_NOW")
+    if n:
+        return datetime.strptime(n[:10], "%Y-%m-%d").date()
+    try:
+        return datetime.now(assistant_profile.tz()).date()
+    except Exception:
+        return date.today()
+
+
+def fold(s):
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+PROVIDERS.update(_private_providers())
+
+
+def pday(s):
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def dmy(d, year=True):
+    return d.strftime("%d.%m.%Y" if year else "%d.%m.") if d else "?"
+
+
+def money(x, dec=None):
+    if x is None:
+        return "?"
+    if dec is None:
+        dec = 0 if abs(x) >= 1000 or float(x).is_integer() else 2
+    s = f"{x:,.{dec}f}".replace(",", "'")
+    return s
+
+
+# ---------------------------------------------------------------- state
+
+class Locked:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        mkstate()
+        self.fd = os.open(self.path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        os.close(self.fd)
+
+
+def mkstate():
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STATE, 0o700)
+    except OSError:
+        pass
+
+
+def jload(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as e:
+        die(f"{path} is corrupt ({e}); not touching it")
+
+
+def jsave(path, obj):
+    mkstate()
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- paperless (cards only)
+
+def paperless(*args, timeout=180):
+    exe = os.environ.get("CONTRACTS_PAPERLESS") or os.path.expanduser("~/bin/paperless")
+    if args[0] not in ("recent", "get") or {"--content", "--reason", "--text"} & set(args):
+        raise RuntimeError("contracts reads paperless cards only")
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"paperless {args[0]} timed out after {timeout}s")
+    if r.returncode != 0:
+        raise RuntimeError(f"paperless {args[0]} failed (exit {r.returncode}): {(r.stderr or r.stdout).strip()[:200]}")
+    return json.loads(r.stdout)
+
+
+def all_docs():
+    n = 1000
+    while True:
+        docs = paperless("recent", "-n", str(n), "--json")["results"]
+        if len(docs) < n or n >= 20000:
+            return docs
+        n *= 5
+
+
+def card(doc_id):
+    c = paperless("get", str(doc_id), "--json", timeout=120)
+    return {k: c.get(k) for k in ("amount", "currency", "due_date", "created", "title", "correspondent",
+                                  "document_type")}
+
+
+# ---------------------------------------------------------------- classification
+
+_owner_tokens = None
+
+
+def owner_tokens():
+    """Folded tokens of the owner's own name (from the profile): never part of a contract's display name."""
+    global _owner_tokens
+    if _owner_tokens is None:
+        toks = set()
+        for k in ("owner.first_name", "owner.last_name"):
+            try:
+                toks |= set(fold(assistant_profile.get(k, "")).split())
+            except Exception:
+                pass
+        _owner_tokens = {t for t in toks if len(t) > 1}
+    return _owner_tokens
+
+
+_kk = None
+
+
+def kk():
+    """kk-compare as a module (its INSURERS register and KVG deadline()); None if it can't be loaded."""
+    global _kk
+    if _kk is None:
+        path = os.environ.get("CONTRACTS_KK") or os.path.join(HERE, "kk-compare")
+        if not os.path.exists(path):
+            path = os.path.expanduser("~/bin/kk-compare")
+        try:
+            from importlib.machinery import SourceFileLoader
+            import importlib.util
+            loader = SourceFileLoader("kk_compare", path)
+            spec = importlib.util.spec_from_loader("kk_compare", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            _kk = mod
+        except Exception as e:  # noqa: BLE001
+            print(f"contracts: kk-compare not loadable ({type(e).__name__}); KVG deadline unknown", file=sys.stderr)
+            _kk = False
+    return _kk or None
+
+
+_kk_names = None
+# register short names that are also places, family names or common words: too ambiguous in a title
+KK_NAME_SKIP = {"amb", "avenir", "birchmeier", "einsiedler", "glarner", "luzerner hinterland", "steffisburg",
+                "sumiswalder", "vallee d entremont", "visperterminen", "wadenswil", "vivao sympany"}
+KK_ALIASES = {"sympany": "Sympany", "groupe mutuel": "Groupe Mutuel"}
+
+
+def kk_insurer_names():
+    """Folded short names of the approved KVG basic insurers (kk-compare's BAG register), ≥ 4 chars."""
+    global _kk_names
+    if _kk_names is None:
+        m = kk()
+        names = {}
+        for short, _legal, _addr in (getattr(m, "INSURERS", {}) or {}).values() if m else []:
+            f = fold(short)
+            if len(f) >= 3 and f not in PROVIDERS and f not in KK_NAME_SKIP:
+                names[f] = short
+        if names:
+            names.update(KK_ALIASES)
+        _kk_names = names
+    return _kk_names
+
+
+def phrase_in(phrase, text):
+    return re.search(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])", text) is not None
+
+
+def doc_text(d):
+    return fold(" ".join([d.get("title") or "", d.get("correspondent") or "", d.get("document_type") or ""]))
+
+
+def provider_of(d):
+    """(token, display, kind) of a known provider in the correspondent or title, else None."""
+    t = doc_text(d)
+    for tok in sorted(PROVIDERS, key=len, reverse=True):
+        if phrase_in(tok, t):
+            return (tok,) + PROVIDERS[tok]
+    for tok, short in sorted(kk_insurer_names().items(), key=lambda x: -len(x[0])):
+        if phrase_in(tok, t):
+            return (tok, short, "health")
+    return None
+
+
+def kind_of(d):
+    t = doc_text(d)
+    p = provider_of(d)
+    if p and p[2] in FIXED_KINDS:
+        return p[2]
+    for kind, rx in KIND_WORDS[:-1]:      # specific words first
+        if re.search(rx, t):
+            return kind
+    if p:
+        return p[2]
+    typ = fold(d.get("document_type"))
+    for tag in d.get("tags") or []:
+        kind, types = KIND_TAGS.get(fold(tag), (None, ()))
+        if kind and (typ in types or re.search(KIND_WORDS[-1][1], t)):
+            return kind
+    if re.search(KIND_WORDS[-1][1], t) or fold(d.get("document_type")) == "police":
+        return "insurance"
+    return "other"
+
+
+def is_relevant(d, employers):
+    typ = fold(d.get("document_type"))
+    if typ in SKIP_TYPES:
+        return False
+    if d.get("correspondent") and d["correspondent"] in employers:
+        return False
+    title = fold(d.get("title"))
+    if NOT_CONTRACT_WORDS.search(title):
+        return False
+    pu = purchase_of(d)
+    if pu and pu[0] not in PROVIDERS:   # a one-off shop purchase (warranty), not a contract
+        return False
+    tags = {fold(t) for t in d.get("tags") or []}
+    return bool(typ in CONTRACT_TYPES or tags & CONTRACT_TAGS or CONTRACT_WORDS.search(title)
+                or provider_of(d))
+
+
+def name_tokens(title):
+    """The title's words without digits, ids, dates, generic document words or the owner's own name."""
+    out = []
+    for raw in re.split(r"[\s_/|,;:()\[\]]+", title or ""):
+        raw = raw.strip(".-–—'\"")
+        f = fold(raw)
+        if not f or any(ch.isdigit() for ch in f) or len(f) < 2:
+            continue
+        if f in GENERIC or set(f.split()) & owner_tokens() or any(len(o) >= 4 and o in f for o in owner_tokens()):
+            continue
+        out.append(raw)
+    return out
+
+
+def group_key(d):
+    """(key, display name): a known provider (named by the correspondent, else in the title), else the
+    correspondent, else health-insurance bills (one Krankenkasse), else the title's first meaningful word."""
+    if d.get("correspondent"):
+        p = provider_of({"correspondent": d["correspondent"]})
+        if p:   # one key for a provider, whether or not paperless has its correspondent on every document
+            return "p:" + p[0], d["correspondent"]
+        return "c:" + fold(d["correspondent"]), d["correspondent"]
+    p = provider_of(d)
+    if p:
+        return "p:" + p[0], p[1]
+    if fold(d.get("document_type")) in BILL_TYPES and kind_of(d) == "health":
+        return "g:health", "Krankenkasse"   # basic insurance: one insurer at a time
+    toks = name_tokens(d.get("title"))
+    if toks:
+        return "t:" + fold(toks[0]), " ".join(toks[:3])
+    typ = d.get("document_type") or "Document"
+    return f"d:{d['id']}", f"{typ} #{d['id']}"
+
+
+def guess_cadence(days):
+    """Cadence from sorted event dates: (name or None, source). Needs ≥ 2 dates; ≥ 3 for 'dates', else 'dates?'."""
+    if len(days) < 2:
+        return None, "none"
+    gaps = [(b - a).days for a, b in zip(days, days[1:])]
+    med = statistics.median(gaps)
+    for name, _py, _iv, (lo, hi) in CADENCES:
+        if lo <= med <= hi:
+            return name, ("dates" if len(gaps) >= 2 else "dates?")
+    return None, "irregular"
+
+
+# ---------------------------------------------------------------- build contracts
+
+def build(state, overrides, now):
+    docs = state.get("docs") or {}
+    cards = state.get("cards") or {}
+    employers = {c for c, types in _corr_types(docs).items() if types & EMPLOYMENT_TYPES}
+
+    groups = {}
+    for sid, d in docs.items():
+        if not is_relevant(d, employers):
+            continue
+        c = cards.get(sid) or {}
+        dd = dict(d, amount=c.get("amount"), currency=c.get("currency"), due_date=c.get("due_date"),
+                  card=bool(c.get("fetched")))
+        key, name = group_key(dd)
+        ov = overrides.get(key) or {}
+        if ov.get("merge_into"):
+            key = ov["merge_into"]
+        g = groups.setdefault(key, {"key": key, "names": [], "docs": []})
+        g["names"].append(name)
+        g["docs"].append(dd)
+
+    out = []
+    for key, g in groups.items():
+        ov = overrides.get(key) or {}
+        out.append(contract(key, g, ov, now))
+    out.sort(key=lambda c: (-(c["yearly"] or 0), c["status"] != "active", c["name"].lower()))
+    return out, employers
+
+
+def contract(key, g, ov, now):
+    docs = sorted(g["docs"], key=lambda d: (d.get("created") or "", d["id"]))
+    latest = docs[-1]
+    names = [n for _d, n in sorted(zip(g["docs"], g["names"]), key=lambda x: (x[0].get("created") or "",
+                                                                                 x[0]["id"]))]
+    name = ov.get("name") or max(reversed(names), key=names.count)   # most common; ties: the latest
+    if not ov.get("name") and key.startswith("t:") and len(set(names)) > 1:
+        split = [n.split() for n in names]
+        common = []
+        for words in zip(*split):
+            if len({fold(w) for w in words}) != 1:
+                break
+            common.append(split[-1][len(common)])
+        name = " ".join(common) or name
+    kinds = [kind_of(d) for d in docs]
+    real = [k for k in kinds if k != "other"]
+    kind = ov.get("kind") or (max(set(real), key=lambda k: (real.count(k), -list(KIND_LABEL).index(k)))
+                              if real else "other")
+    # billing events: documents within EVENT_GAP_DAYS of each other are one event
+    events = []
+    for d in docs:
+        day = pday(d.get("created"))
+        if not day:
+            continue
+        if events and (day - events[-1]["day"]).days <= EVENT_GAP_DAYS:
+            ev = events[-1]
+        else:
+            ev = {"day": day, "docs": [], "amount": None, "currency": None}
+            events.append(ev)
+        ev["docs"].append(d["id"])
+        if d.get("amount") is not None:
+            try:
+                amt = float(d["amount"])
+            except (TypeError, ValueError):
+                amt = None
+            if amt is not None and (ev["amount"] is None or amt > ev["amount"]):
+                ev["amount"], ev["currency"] = amt, (d.get("currency") or "CHF")
+    days = [e["day"] for e in events]
+    cadence, csrc = guess_cadence(days)
+    if ov.get("cadence"):
+        cadence, csrc = (None if ov["cadence"] == "none" else ov["cadence"]), "override"
+    elif cadence is None and fold(latest.get("document_type")) == "police":
+        cadence, csrc = "yearly", "assumed"    # a policy without billing rhythm: renewed yearly
+    curs = {d.get("currency") for d in docs if d.get("currency")}
+    foreign_once = len(events) == 1 and bool(curs) and "CHF" not in curs   # a trip abroad, not a running contract
+    one_off = (not ov.get("kind") and not ov.get("cadence")
+               and ((kind == "other" and len(events) == 1) or kind == "rental" or foreign_once))
+    last_amt = next((e for e in reversed(events) if e["amount"] is not None), None)
+    per_year = CADENCE[cadence][1] if cadence else None
+    yearly = round(last_amt["amount"] * per_year, 2) if (last_amt and per_year) else None
+    premium = None
+    if (kind == "health" and csrc == "assumed" and last_amt and last_amt["currency"] == "CHF"
+            and last_amt["amount"] < HEALTH_MONTHLY_MAX):
+        premium, yearly = "monthly?", round(last_amt["amount"] * 12, 2)   # assumed: the policy's monthly premium
+    last_day = days[-1] if days else None
+
+    cancelled = None
+    for d in docs:
+        if fold(d.get("document_type")) == "kundigung" or CANCEL_WORDS.search(fold(d.get("title"))):
+            cancelled = pday(d.get("created"))
+    last_doc = max((pday(d.get("created")) for d in docs if pday(d.get("created"))), default=None)
+    status, since = "active", (now - last_day).days if last_day else None
+    if ov.get("ignore"):
+        status = "ignored"
+    elif ov.get("ended") is True:
+        status = "ended"
+    elif ov.get("ended") is False:
+        status = "active"
+    elif kind == "bank":
+        status = "account"
+    elif cancelled and last_doc and (last_doc - cancelled).days <= EVENT_GAP_DAYS:
+        status = "cancelled"
+    elif one_off:
+        status = "one-off"
+    elif cadence and since is not None and since > 1.5 * CADENCE[cadence][2]:
+        status = "maybe-ended"
+    elif not cadence and csrc == "irregular" and since is not None and since > UNKNOWN_ENDED_DAYS:
+        status = "maybe-ended"
+    elif not cadence and since is not None and since > STALE_UNKNOWN_DAYS:
+        status = "maybe-ended"
+    elif not cadence and csrc != "irregular":
+        status = "unknown"
+
+    nxt, nxt_kind = None, None
+    due = pday(latest.get("due_date"))
+    if due and due >= now:
+        nxt, nxt_kind = due, "due"
+    elif cadence and last_day and status not in ("ended", "cancelled", "ignored"):
+        nxt, nxt_kind = last_day + timedelta(days=round(CADENCE[cadence][2])), "expected"
+    return {
+        "key": key, "name": name, "kind": kind, "status": status, "cadence": cadence, "cadence_source": csrc,
+        "events": len(events), "docs": [d["id"] for d in docs], "latest_doc": latest["id"],
+        "first": days[0].isoformat() if days else None, "last": last_day.isoformat() if last_day else None,
+        "days_since_last": since,
+        "last_amount": last_amt["amount"] if last_amt else None,
+        "currency": (last_amt["currency"] if last_amt else None) or "CHF",
+        "yearly": yearly, "next": nxt.isoformat() if nxt else None, "next_kind": nxt_kind,
+        "cancelled": cancelled.isoformat() if cancelled else None,
+        "cards_missing": sum(1 for d in docs if not d.get("card")),
+        "notice": ov.get("notice"), "premium": premium,
+    }
+
+
+def load_built():
+    state = jload(CARDS, None)
+    if not state or not state.get("docs"):
+        die("no scan yet: run `contracts scan` first")
+    contracts, _ = build(state, jload(OVERRIDES, {}), today())
+    return state, contracts
+
+
+def totals(contracts):
+    t = {}
+    for c in contracts:
+        if c["status"] in ("active", "unknown") and c["yearly"]:
+            t[c["currency"]] = round(t.get(c["currency"], 0) + c["yearly"], 2)
+    return t
+
+
+# ---------------------------------------------------------------- scan
+
+def cmd_scan(a):
+    t0 = time.monotonic()
+    now = today()
+    with Locked(CARDS):
+        state = jload(CARDS, {"docs": {}, "cards": {}})
+        try:
+            docs = all_docs()
+        except (RuntimeError, ValueError, KeyError) as e:
+            die(f"paperless metadata unavailable: {e}", 3)
+        state["docs"] = {str(d["id"]): {k: d.get(k) for k in ("id", "created", "title", "correspondent",
+                                                              "document_type", "tags")} for d in docs}
+        cards = state.setdefault("cards", {})
+        for sid in list(cards):
+            if sid not in state["docs"]:
+                del cards[sid]
+        employers = {c for c, ts in _corr_types(state["docs"]).items() if ts & EMPLOYMENT_TYPES}
+        want = []
+        for sid, d in state["docs"].items():
+            if not is_relevant(d, employers):
+                continue
+            c = cards.get(sid) or {}
+            f = pday(c.get("fetched"))
+            changed = f and (c.get("correspondent"), c.get("document_type")) != (d.get("correspondent"),
+                                                                                   d.get("document_type"))
+            if a.refresh or not f or (now - f).days > CARD_TTL_DAYS or c.get("error") or changed:
+                want.append(sid)
+        fetched, failed, skipped = 0, [], 0
+        w = max(1, a.workers)
+        with ThreadPoolExecutor(max_workers=w) as ex:
+            for i in range(0, len(want), w * 2):
+                chunk = want[i:i + w * 2]
+                if a.budget and time.monotonic() - t0 > a.budget:
+                    skipped = len(want) - i
+                    break
+                futs = {ex.submit(card, sid): sid for sid in chunk}
+                for fu in as_completed(futs):
+                    sid = futs[fu]
+                    try:
+                        c = fu.result()
+                        c["fetched"] = now.isoformat()
+                        cards[sid] = c
+                        fetched += 1
+                    except Exception as e:  # noqa: BLE001
+                        failed.append(int(sid))
+                        cards[sid] = dict(cards.get(sid) or {}, error=str(e)[:120])
+                jsave(CARDS, state)
+        state["scanned_at"] = datetime.now().isoformat(timespec="seconds")
+        jsave(CARDS, state)
+    overrides = jload(OVERRIDES, {})
+    contracts, employers = build(state, overrides, now)
+    relevant = sum(len(c["docs"]) for c in contracts)
+    res = {"as_of": now.isoformat(), "scanned_at": state["scanned_at"], "docs_total": len(state["docs"]),
+           "docs_relevant": relevant, "employers_skipped": len(employers), "cards_fetched": fetched,
+           "cards_failed": failed, "cards_skipped_budget": skipped, "seconds": round(time.monotonic() - t0, 1),
+           "totals": totals(contracts), "contracts": contracts}
+    jsave(RESULT, res)
+    if a.json:
+        print(json.dumps(res, indent=1, ensure_ascii=False))
+        return 0
+    live = [c for c in contracts if c["status"] != "ignored"]
+    print(f"contracts: {len(live)} from {relevant} of {len(state['docs'])} documents "
+          f"({len(employers)} employer(s) skipped); cards fetched {fetched}, cached {relevant - len(want)}, "
+          f"failed {len(failed)}" + (f", {skipped} left for the next scan (budget)" if skipped else "")
+          + f"; {res['seconds']}s")
+    if failed:
+        print("failed cards: " + ", ".join(f"#{i}" for i in sorted(failed)[:10]), file=sys.stderr)
+    return 0
+
+
+def _corr_types(docs):
+    out = {}
+    for d in docs.values():
+        if d.get("correspondent"):
+            out.setdefault(d["correspondent"], set()).add(fold(d.get("document_type")))
+    return out
+
+
+# ---------------------------------------------------------------- show
+
+def cadence_txt(c):
+    if not c["cadence"]:
+        return "irregular" if c["cadence_source"] == "irregular" else "cadence ?"
+    return c["cadence"] + ("?" if c["cadence_source"] in ("dates?", "assumed") else "")
+
+
+def cost_txt(c):
+    cur = c["currency"]
+    if c["last_amount"] is None:
+        return "amount ?"
+    s = f"{cur} {money(c['last_amount'])}"
+    if c.get("premium") == "monthly?":
+        return s + f"/mo? · ≈{money(c['yearly'], 0)}/yr"
+    if c["yearly"] is not None and c["cadence"] != "yearly":
+        s += f" · ≈{money(c['yearly'], 0)}/yr"
+    elif c["cadence"] == "yearly":
+        s += "/yr"
+    return s
+
+
+def next_txt(c, now):
+    if not c["next"]:
+        return ""
+    d = pday(c["next"])
+    if c["next_kind"] == "due":
+        return f" · due {dmy(d, d.year != now.year)}"
+    if d < now:
+        return f" · overdue since {dmy(d, d.year != now.year)}"
+    return f" · next ~{dmy(d, d.year != now.year)}"
+
+
+def card_text(state, contracts, now, show_all=False):
+    live = [c for c in contracts if c["status"] != "ignored"]
+    running = [c for c in live if c["status"] in ("active", "unknown")]
+    lines = [f"📑 Contracts · {dmy(now)}"]
+    tot = totals(live)
+    priced = [c for c in running if c["yearly"]]
+    if tot:
+        lines.append(f"{len(running)} running · ≈ " + " + ".join(f"{k} {money(v, 0)}/yr" for k, v in sorted(tot.items()))
+                     + f" ({len(priced)} with amounts)")
+    else:
+        lines.append(f"{len(running)} running · no yearly total: no amounts on the cards")
+    if show_all:
+        lines.append("")
+        for c in live:
+            lines.append(f"• {c['name']} [{c['key']}] {KIND_LABEL[c['kind']]} · {c['status']} · {cadence_txt(c)} · "
+                         f"{cost_txt(c)} · last {dmy(pday(c['last']))} · {c['events']} ev/{len(c['docs'])} docs"
+                         + next_txt(c, now))
+        return "\n".join(lines)
+    if priced:
+        lines += ["", "💰 Top costs"]
+        for i, c in enumerate(sorted(priced, key=lambda c: -c["yearly"])[:5], 1):
+            lines.append(f"{i}. {c['name']} — {cost_txt(c)} · {cadence_txt(c)}{next_txt(c, now)}")
+    unpriced = [c for c in running if not c["yearly"]]
+    if unpriced:
+        names = [c["name"] for c in sorted(unpriced, key=lambda c: c["last"] or "", reverse=True)]
+        lines += ["", f"❓ No cost estimate ({len(names)}): " + ", ".join(names[:6])
+                  + (f" +{len(names) - 6}" if len(names) > 6 else "")]
+    maybe = [c for c in live if c["status"] == "maybe-ended"]
+    if maybe:
+        lines += ["", "⚠️ No bill for >1.5 cycles → maybe ended?"]
+        for c in sorted(maybe, key=lambda c: c["last"] or "", reverse=True)[:4]:
+            lines.append(f"• {c['name']} — {cadence_txt(c)}, last {dmy(pday(c['last']))}")
+        if len(maybe) > 4:
+            lines.append(f"  +{len(maybe) - 4} more (contracts show --all)")
+    gone = [c for c in live if c["status"] in ("cancelled", "ended")]
+    if gone:
+        lines += ["", "✖ Cancelled/ended: " + ", ".join(
+            f"{c['name']} ({dmy(pday(c['cancelled'] or c['last']), True)})" for c in gone[:4])
+            + (f" +{len(gone) - 4}" if len(gone) > 4 else "")]
+    if any(c["kind"] == "health" and c["status"] in ("active", "unknown", "maybe-ended") for c in live):
+        dl = kvg_deadline(now)
+        if dl:
+            lines += ["", f"⏰ KVG switch: notice must arrive by {dl.strftime('%a')} {dmy(dl, False)} "
+                          f"({(dl - now).days} d) → contracts notice"]
+    accts = [c for c in live if c["status"] == "account"]
+    if accts:
+        lines += ["", "🏦 Bank accounts (fee documents, not counted): " + ", ".join(c["name"] for c in accts[:4])
+                  + (f" +{len(accts) - 4}" if len(accts) > 4 else "")]
+    oneoff = sum(1 for c in live if c["status"] == "one-off")
+    miss = sum(c["cards_missing"] for c in live)
+    scanned = pday(state.get("scanned_at"))
+    lines += ["", f"scan {dmy(scanned, False) if scanned else '?'} · {sum(len(c['docs']) for c in live)} docs"
+                  + (f" · {miss} card{'s' if miss != 1 else ''} missing" if miss else "")
+                  + (f" · {oneoff} one-off hidden" if oneoff else "")]
+    return "\n".join(lines)
+
+
+def cmd_show(a):
+    state, contracts = load_built()
+    now = today()
+    if a.json:
+        live = [c for c in contracts if a.all or c["status"] != "ignored"]
+        print(json.dumps({"as_of": now.isoformat(), "scanned_at": state.get("scanned_at"),
+                          "totals": totals(live), "contracts": live}, indent=1, ensure_ascii=False))
+        return 0
+    print(card_text(state, contracts, now, a.all))
+    return 0
+
+
+# ---------------------------------------------------------------- eBill sweep
+
+LSV_END = "30.09.2028"
+# eBill / direct-debit facts per biller (provider token), from the biller's public payment-options page
+EBILL = {
+    "axa": ("yes", "LSV no longer offered",
+            "https://www.axa.ch/en/private-customers/contact-services/services/payment-options.html"),
+    "helsana": ("yes, standing approval possible", f"LSV ends {LSV_END}; eBill registration ends it",
+                "https://www.helsana.ch/content/helsana/en/individuals/services/finance/payment-methods/ebill.html"),
+    "yallo": ("yes", "no LSV on its list",
+              "https://support.yallo.ch/en/ZvatzREAACQAgSM6-options-for-paying-bills"),
+}
+EBILL_KIND = {  # no entry for the biller: what to do per kind
+    "rent": "ask the property manager (rent: usually a standing order)",
+    "leasing": f"ask the leasing company (often LSV, which ends {LSV_END})",
+    "health": "most Swiss health insurers offer eBill",
+}
+EBILL_NOTE = (f"LSV+/BDD direct debit ends {LSV_END}. eBill Direct Debit (SIX, live since 2025) works only "
+              "if his bank supports it; there is no public biller list.")
+
+
+def kk_current_insurer():
+    """His current basic insurer from kk-compare's profile (his own admin data), else None."""
+    path = os.environ.get("CONTRACTS_KK_PROFILE") or os.path.expanduser("~/.config/kk/profile.json")
+    cur = (jload(path, {}) or {}).get("current") or {}
+    return cur.get("insurer") if isinstance(cur, dict) else None
+
+
+def ebill_rows(contracts, now):
+    rows = []
+    for c in contracts:
+        if c["status"] not in ("active", "unknown", "maybe-ended") or c["kind"] in FIXED_KINDS:
+            continue
+        tok = c["key"][2:] if c["key"].startswith("p:") else None
+        name = c["name"]
+        if c["kind"] == "health" and not tok:
+            ins = kk_current_insurer()
+            if ins:
+                tok, name = fold(ins), f"{c['name']} ({ins})"
+        fact = EBILL.get(tok or "")
+        first, last = pday(c["first"]), pday(c["last"])
+        rows.append({"key": c["key"], "name": name, "kind": c["kind"], "status": c["status"], "docs": len(c["docs"]),
+                     "bills": c["events"], "cadence": c["cadence"], "first": c["first"], "last": c["last"],
+                     "span": f"{first.year}–{last.year}" if first and last and first.year != last.year
+                     else (str(last.year) if last else "?"),
+                     "ebill": fact[0] if fact else None, "direct_debit": fact[1] if fact else None,
+                     "source": fact[2] if fact else None,
+                     "hint": None if fact else EBILL_KIND.get(c["kind"], "unknown: check the biller's payment page")})
+    rows.sort(key=lambda r: (r["status"] != "active", r["ebill"] is None, r["name"].lower()))
+    return rows
+
+
+def cmd_ebill(a):
+    _state, contracts = load_built()
+    now = today()
+    rows = ebill_rows(contracts, now)
+    if a.json:
+        print(json.dumps({"as_of": now.isoformat(), "note": EBILL_NOTE, "billers": rows}, indent=1,
+                         ensure_ascii=False))
+        return 0
+    lines = [f"💳 eBill sweep · {dmy(now)}", EBILL_NOTE, ""]
+    for r in rows:
+        how = (f"eBill {r['ebill']} · {r['direct_debit']}" if r["ebill"] else r["hint"])
+        lines.append(f"• {r['name']} ({KIND_LABEL[r['kind']]}, {r['status']}) · {r['bills']} bill"
+                     f"{'s' if r['bills'] != 1 else ''} {r['span']}, {r['cadence'] or 'cadence ?'} → {how}")
+    if not rows:
+        lines.append("No recurring billers in paperless.")
+    print("\n".join(lines))
+    return 0
+
+
+# ---------------------------------------------------------------- warranty (shop purchases)
+
+WARRANTY_MONTHS = 24
+WARRANTY_NOTE = ("24 months from the invoice date = the Swiss legal default (OR 210); shop or maker terms may give "
+                 "more, or less (unverified).")
+WARRANTY_NOTE_SHORT = "24 mo = Swiss legal default (OR 210); shop/maker terms may differ."
+WARRANTY_SOON_DAYS = 90
+# retailers and maker stores: folded token → display name. Public company names only; his own extras go in the
+# private providers file as "token": ["Display", "shop"].
+SHOPS = {
+    "digitec galaxus": "Digitec Galaxus", "galaxus": "Galaxus", "digitec": "Digitec", "brack": "Brack",
+    "amazon": "Amazon", "ikea": "IKEA", "interdiscount": "Interdiscount", "mediamarkt": "MediaMarkt",
+    "media markt": "MediaMarkt", "apple": "Apple", "fust": "Fust", "microspot": "Microspot",
+    "melectronics": "melectronics", "conrad": "Conrad", "steg electronics": "STEG Electronics",
+    "alternate": "Alternate", "manor": "Manor", "jumbo": "Jumbo", "hornbach": "Hornbach", "bauhaus": "Bauhaus",
+    "obi": "OBI", "decathlon": "Decathlon", "ochsner sport": "Ochsner Sport", "sportxx": "SportXX",
+    "pfister": "Pfister", "xxxlutz": "XXXLutz", "conforama": "Conforama", "samsung": "Samsung", "sonos": "Sonos",
+    "dyson": "Dyson", "logitech": "Logitech", "lenovo": "Lenovo", "dell": "Dell", "bose": "Bose",
+}
+SHOPS_CORR_ONLY = {"alternate", "jumbo", "obi", "manor", "dell"}   # common words: only as the correspondent
+RECEIPT_TYPES = {"rechnung", "quittung", "kaufbeleg", "kaufquittung", "beleg", "receipt", "invoice", "kassenbon",
+                 "kassenzettel", "facture", "bestellbestatigung", "bestellung", "order"}
+RECEIPT_WORDS = re.compile(r"rechnung|quittung|kaufbeleg|receipt|invoice|kassenbon|kassenzettel|facture|"
+                           r"bestellbestatigung|order confirmation")
+NOT_PURCHASE_WORDS = re.compile(r"mahnung|zahlungserinnerung|gutschrift|credit note|storno|refund|ruckerstattung|"
+                                r"abonnement|\babo\b|subscription|mitgliedschaft|membership|\bprime\b|icloud|"
+                                r"apple one|apple music|apple tv|app store|itunes")
+ITEM_GENERIC = set("""
+rechnung quittung invoice receipt kaufbeleg kaufquittung beleg bestellung bestellbestatigung order confirmation
+kassenbon kassenzettel facture nr no nummer number auftrag lieferung lieferschein kauf purchase vom von from de
+ch com ag gmbh sa ltd inc und and fur for der die das your ihre ihr online shop store
+""".split())
+ID_LIKE = re.compile(r"^#|\d{5,}|^\d{1,4}[./-]\d{1,2}([./-]\d{2,4})?$|^\d{1,2}[./-]\d{4}$")
+
+SHOPS.update(_private_shops())
+
+
+def shop_of(d):
+    """(token, display) of a shop in the correspondent, else in the title (not SHOPS_CORR_ONLY), else None."""
+    for field, corr in (("correspondent", True), ("title", False)):
+        t = fold(d.get(field))
+        if not t:
+            continue
+        for tok in sorted(SHOPS, key=len, reverse=True):
+            if (corr or tok not in SHOPS_CORR_ONLY) and phrase_in(tok, t):
+                return tok, SHOPS[tok]
+    return None
+
+
+def purchase_of(d):
+    """(shop token, shop display) when d is a shop invoice or receipt, else None. Subscriptions, telecom and other
+    providers named more specifically than the shop (Galaxus Mobile, Amazon Prime), reminders and credit notes are
+    not purchases."""
+    s = shop_of(d)
+    if not s:
+        return None
+    typ, title = fold(d.get("document_type")), fold(d.get("title"))
+    if not (typ in RECEIPT_TYPES or (not typ or typ in ("dokument", "document", "other", "andere"))
+            and RECEIPT_WORDS.search(title)):
+        return None
+    if NOT_PURCHASE_WORDS.search(title) or typ in ("mahnung", "gutschrift"):
+        return None
+    p = provider_of(d)
+    if p and len(p[0]) > len(s[0]) and s[0] in p[0]:
+        return None
+    return s
+
+
+def item_name(d, shop_tok):
+    """The title as an item name: without ids, dates, generic invoice words, the shop's or the owner's name."""
+    drop = set(shop_tok.split()) | set(fold(SHOPS.get(shop_tok, "")).split())
+    out = []
+    for raw in re.split(r"[\s_|,;:()\[\]]+", d.get("title") or ""):
+        raw = raw.strip(".-–—'\"")
+        f = fold(raw)
+        if not f or ID_LIKE.search(raw) or f in ITEM_GENERIC or f in drop or set(f.split()) <= drop:
+            continue
+        if set(f.split()) & owner_tokens() or any(len(o) >= 4 and o in f.replace(" ", "") for o in owner_tokens()):
+            continue
+        out.append(raw)
+    name = " ".join(out)
+    return name if len(name) <= 48 else name[:47].rstrip() + "…"
+
+
+def add_months(d, n):
+    y, m = divmod(d.month - 1 + n, 12)
+    y, m = d.year + y, m + 1
+    for day in (d.day, 30, 29, 28):
+        try:
+            return date(y, m, min(d.day, day))
+        except ValueError:
+            continue
+
+
+def _warranty_cards(sids, budget):
+    """Cached cards for sids; missing ones fetched for up to budget seconds and cached, unless the lock is busy."""
+    cards = (jload(CARDS, {}) or {}).get("cards") or {}
+    want = [s for s in sids if not (cards.get(s) or {}).get("fetched")]
+    if not want or budget <= 0:
+        return cards, 0
+    mkstate()
+    fd = os.open(CARDS + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return cards, 0     # a scan is running: amounts next time
+        deadline = time.monotonic() + budget
+        got = {}
+
+        def one(sid):
+            left = deadline - time.monotonic()
+            if left < 1:
+                raise RuntimeError("budget")
+            c = paperless("get", sid, "--json", timeout=max(1, int(left)))
+            return {k: c.get(k) for k in ("amount", "currency", "due_date", "created", "title", "correspondent",
+                                          "document_type")}
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futs = {ex.submit(one, s): s for s in want}
+            for fu in as_completed(futs):
+                try:
+                    got[futs[fu]] = dict(fu.result(), fetched=today().isoformat())
+                except Exception:  # noqa: BLE001  (no amount; the item is still listed)
+                    pass
+        if got:
+            state = jload(CARDS, {"docs": {}, "cards": {}})
+            state.setdefault("cards", {}).update(got)
+            state.setdefault("docs", {})
+            jsave(CARDS, state)
+            cards = state["cards"]
+        return cards, len(got)
+    finally:
+        os.close(fd)
+
+
+def warranty_items(docs, cards, now):
+    out = []
+    for d in docs:
+        pu = purchase_of(d)
+        day = pday(d.get("created"))
+        if not pu or not day:
+            continue
+        until = add_months(day, WARRANTY_MONTHS)
+        c = cards.get(str(d["id"])) or {}
+        name = item_name(d, pu[0])
+        out.append({"id": d["id"], "date": day.isoformat(), "covered_until": until.isoformat(),
+                    "days_left": (until - now).days, "covered": until >= now,
+                    "item": name or f"{d.get('document_type') or 'Invoice'} {dmy(day)}", "item_from_title": bool(name),
+                    "title": d.get("title"), "shop": pu[1], "type": d.get("document_type"),
+                    "amount": c.get("amount"), "currency": c.get("currency")})
+    out.sort(key=lambda x: (x["date"], x["id"]), reverse=True)
+    return out
+
+
+def _query_match(item, words):
+    t = fold(" ".join([item["title"] or "", item["item"], item["shop"]]))
+    return all(re.search(r"(?<![a-z0-9])" + re.escape(w), t) for w in words)
+
+
+def cmd_warranty(a):
+    now = today()
+    words = fold(" ".join(a.query or [])).split()
+    source = "live"
+    try:
+        docs = all_docs()
+    except (RuntimeError, ValueError, KeyError, OSError) as e:
+        cached = (jload(CARDS, {}) or {})
+        docs = list((cached.get("docs") or {}).values())
+        if not docs:
+            die(f"paperless metadata unavailable: {e}", 3)
+        source = "cache " + (cached.get("scanned_at") or "?")[:10]
+    items = warranty_items(docs, {}, now)
+    cards, fetched = _warranty_cards([str(i["id"]) for i in items], a.budget)
+    items = warranty_items(docs, cards, now)
+    total, covered = len(items), sum(1 for i in items if i["covered"])
+    if words:
+        items = [i for i in items if _query_match(i, words)]
+    elif not a.all:
+        items = [i for i in items if i["covered"]]
+    if a.json:
+        print(json.dumps({"as_of": now.isoformat(), "source": source, "months": WARRANTY_MONTHS,
+                          "note": WARRANTY_NOTE, "query": " ".join(words) or None, "purchases": total,
+                          "covered": covered, "cards_fetched": fetched, "items": items}, indent=1,
+                         ensure_ascii=False))
+        return 0
+    q = " ".join(words)
+    if q:
+        head = f"🛡 Warranty · \"{q}\": {len(items)} match{'es' if len(items) != 1 else ''}"
+    elif a.all:
+        head = f"🛡 Warranty · {total} purchase{'s' if total != 1 else ''}, {covered} still covered"
+    else:
+        head = f"🛡 Warranty · {covered} still covered" + (f" (of {total})" if total != covered else "")
+    lines = [head + (f" · as of the last scan ({dmy(pday(source[6:]))})" if source != "live" else "")]
+    shown = items[:a.max] if a.max else items
+    for i in shown:
+        until = pday(i["covered_until"])
+        if not i["covered"]:
+            when = f"expired {dmy(until)}"
+        elif i["days_left"] <= WARRANTY_SOON_DAYS:
+            when = f"⚠️ until {dmy(until)} ({i['days_left']} d)"
+        else:
+            when = f"until {dmy(until)}"
+        amt = f" · {i['currency'] or 'CHF'} {money(i['amount'])}" if i.get("amount") is not None else ""
+        lines.append(f"• {i['item']} · {i['shop']}{amt} · {when}")
+    if len(items) > len(shown):
+        lines.append(f"… +{len(items) - len(shown)} more")
+    if not items:
+        if q:
+            lines.append("No shop invoice or receipt matches.")
+        elif total:
+            lines.append("Nothing still covered.")
+        else:
+            lines.append("No shop invoices or receipts in paperless yet (send them to the vault bot).")
+    lines.append(WARRANTY_NOTE_SHORT)
+    print("\n".join(lines))
+    return 0
+
+
+# ---------------------------------------------------------------- notice
+
+def kvg_deadline(now):
+    """KVG basic insurance: the cancellation must ARRIVE by 30.11. (last working day): kk-compare's deadline()."""
+    m = kk()
+    if not m or not hasattr(m, "deadline"):
+        return None
+    dl = m.deadline(now.year)
+    return dl if now <= dl else m.deadline(now.year + 1)
+
+
+def notices(contracts, now):
+    out = []
+    dl = kvg_deadline(now)
+    for c in contracts:
+        if c["status"] not in ("active", "unknown", "maybe-ended") or c["kind"] not in NOTICE_KINDS:
+            continue
+        item = {"key": c["key"], "name": c["name"], "kind": c["kind"], "status": c["status"],
+                "yearly": c["yearly"], "currency": c["currency"], "latest_doc": c["latest_doc"]}
+        if c["notice"]:
+            item.update(rule="owner", lines=[c["notice"]], deadline=None)
+        elif c["kind"] == "health":
+            item.update(rule="kvg", deadline=dl.isoformat() if dl else None, days_left=(dl - now).days if dl else None,
+                        lines=[(f"KVG basic: notice must ARRIVE by {dl.strftime('%a')} {dmy(dl)} ({(dl - now).days} d"
+                                f"; kk-compare --letter)" if dl else "KVG basic: by 30.11. (kk-compare unavailable)"),
+                               "supplementary (VVG): notice period unknown — needs his ✅ per document"],
+                        needs_ok=True)
+        else:
+            item.update(rule="unknown", deadline=None, needs_ok=True,
+                        lines=[f"notice period unknown — needs his ✅ per document (#{c['latest_doc']})"])
+        item["text"] = "; ".join(item["lines"])
+        out.append(item)
+    out.sort(key=lambda i: (i["rule"] != "kvg", i["rule"] != "owner", -(i["yearly"] or 0), i["name"].lower()))
+    return out
+
+
+def cmd_notice(a):
+    _state, contracts = load_built()
+    now = today()
+    items = notices(contracts, now)
+    if a.json:
+        print(json.dumps({"as_of": now.isoformat(), "items": items}, indent=1, ensure_ascii=False))
+        return 0
+    if not items:
+        print("No running contracts where a notice period matters.")
+        return 0
+    lines = [f"📆 Notice periods · {dmy(now)}"]
+    shown = items if a.all else items[:8]
+    for i in shown:
+        cost = f" · ≈{i['currency']} {money(i['yearly'], 0)}/yr" if i["yearly"] else ""
+        flag = " · maybe ended?" if i["status"] == "maybe-ended" else ""
+        lines.append(f"• {i['name']} ({KIND_LABEL[i['kind']]}{cost}{flag})")
+        lines += [f"  {x}" for x in i["lines"]]
+    if len(items) > len(shown):
+        lines.append(f"+{len(items) - len(shown)} more (contracts notice --all)")
+    print("\n".join(lines))
+    return 0
+
+
+# ---------------------------------------------------------------- set (owner corrections)
+
+def cmd_set(a):
+    state, contracts = load_built()
+    keys = {c["key"]: c for c in contracts}
+    key = a.key if a.key in keys else None
+    if not key:
+        hits = [c["key"] for c in contracts if fold(a.key) and fold(a.key) in fold(c["name"])]
+        if len(hits) != 1:
+            die(f"{'no' if not hits else 'ambiguous'} contract {a.key!r}" + (f": {', '.join(hits)}" if hits else
+                "; see contracts show --all"), 2)
+        key = hits[0]
+    with Locked(OVERRIDES):
+        ov = jload(OVERRIDES, {})
+        o = ov.setdefault(key, {})
+        if a.name:
+            o["name"] = a.name
+        if a.kind:
+            o["kind"] = a.kind
+        if a.cadence:
+            o["cadence"] = a.cadence
+        if a.ignore:
+            o["ignore"] = True
+        if a.unignore:
+            o.pop("ignore", None)
+        if a.ended:
+            o["ended"] = True
+        if a.active:
+            o["ended"] = False
+        if a.notice is not None:
+            if a.notice:
+                o["notice"] = a.notice
+            else:
+                o.pop("notice", None)
+        if a.merge_into:
+            if a.merge_into not in keys or a.merge_into == key:
+                die(f"unknown merge target {a.merge_into!r}", 2)
+            o["merge_into"] = a.merge_into
+        if not o:
+            ov.pop(key, None)
+        jsave(OVERRIDES, ov)
+    print(f"{key}: " + (json.dumps(ov.get(key), ensure_ascii=False) if ov.get(key) else "no overrides"))
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="contracts", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    sc = sp.add_parser("scan", help="paperless cards → contracts (read-only on paperless)")
+    sc.add_argument("--refresh", action="store_true", help="refetch every card, not only new/stale ones")
+    sc.add_argument("--budget", type=int, default=0, help="stop fetching cards after this many seconds")
+    sc.add_argument("--workers", type=int, default=3)
+    sc.add_argument("--json", action="store_true")
+    sh = sp.add_parser("show", help="the phone card")
+    sh.add_argument("--all", action="store_true"); sh.add_argument("--json", action="store_true")
+    no = sp.add_parser("notice", help="contracts where a notice period matters")
+    no.add_argument("--all", action="store_true"); no.add_argument("--json", action="store_true")
+    eb = sp.add_parser("ebill", help="recurring billers and their eBill / direct-debit options")
+    eb.add_argument("--json", action="store_true")
+    wa = sp.add_parser("warranty", help="shop invoices/receipts and their 2-year warranty")
+    wa.add_argument("query", nargs="*", help="words that filter item titles and shops (lists expired ones too)")
+    wa.add_argument("--all", action="store_true", help="expired ones too")
+    wa.add_argument("--json", action="store_true")
+    wa.add_argument("--max", type=int, default=0, help="list at most N items (text)")
+    wa.add_argument("--budget", type=int, default=20, help="seconds for fetching missing cards (amounts); 0 = none")
+    st = sp.add_parser("set", help="owner corrections")
+    st.add_argument("key")
+    st.add_argument("--name"); st.add_argument("--kind", choices=sorted(KIND_LABEL))
+    st.add_argument("--cadence", choices=[c[0] for c in CADENCES] + ["none"])
+    g = st.add_mutually_exclusive_group()
+    g.add_argument("--ignore", action="store_true"); g.add_argument("--unignore", action="store_true")
+    g2 = st.add_mutually_exclusive_group()
+    g2.add_argument("--ended", action="store_true"); g2.add_argument("--active", action="store_true")
+    st.add_argument("--notice", help="the notice period he gave (empty string clears it)")
+    st.add_argument("--merge-into", help="another contract key: count these documents there")
+    argv = sys.argv[1:]
+    if argv[:1] == ["--ebill"]:
+        argv = ["ebill"] + argv[1:]
+    if argv[:1] == ["--warranty"]:
+        argv = ["warranty"] + argv[1:]
+    a = p.parse_args(argv)
+    return {"scan": cmd_scan, "show": cmd_show, "notice": cmd_notice, "ebill": cmd_ebill, "set": cmd_set,
+            "warranty": cmd_warranty}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except BrokenPipeError:
+        pass

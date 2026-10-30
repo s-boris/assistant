@@ -1,0 +1,1002 @@
+#!/usr/bin/env -S python3 -I
+"""trackid: name the track playing in a clip (video, voice note, audio file) via Shazam's fingerprint lookup.
+
+usage:
+  trackid FILE [--json] [--windows N] [--no-deezer] [--source NAME] [--min-store LEVEL]
+                                                      identify; exit 0 match, 1 no match, 2 bad input, 3 lookup failed;
+                                                      --source tags the stored id (the voice relay: "call");
+                                                      --min-store high|medium stores only matches that sure
+  trackid list [N] [--json]                           the last N identified tracks (default 10)
+  trackid show ID [--json]                            one stored ID (tid-…)
+  trackid set FILE [--step 60] [--window 12] [--deep] [--info] [--json|--text]
+                                                      tracklist of a long recording (a DJ set, hours): one sample
+                                                      per step, consecutive hits merged into tracks with start
+                                                      times (Shazam's match offset, else the first hit), long
+                                                      unidentified stretches as "ID? (31 min)"; --deep re-samples
+                                                      ID? stretches of 6+ min every 20 s. Exit 0 tracks, 1 none,
+                                                      2 bad input, 3 every lookup failed, 4 incomplete (rerun)
+
+How: ffmpeg cuts 12 s windows (loudest part, middle, start; for a long clip with no match also 1/4 and 3/4,
+up to --windows, default 5) to 16 kHz mono WAV in a temp dir; ~/bin/lib/trackid_shazam.py (in
+~/opt/trackid-venv: shazamio_core, the Rust port of SongRec's algorithm) turns each window into a Shazam
+audio fingerprint LOCALLY and POSTs only that fingerprint (a base64 spectral-peak signature, sample length,
+timestamp, a generic time zone, random request UUIDs; no audio, no account, no location) to amp.shazam.com.
+A match then costs one Deezer API search by artist + title (public metadata, for the Deezer link and BPM;
+--no-deezer skips it). Nothing else leaves the box; the clip and the WAVs stay local (temp dir removed).
+
+Set mode: lookups are spaced --pause s apart (default 4, min 1) with back-off on errors and a stop after
+--max-errors failures in a row. Answers are cached per file (hash of size + first/middle/last 4 MiB) in
+~/.local/state/trackid/sets/HASH.json, so a rerun only looks up what is missing. A hit counts when a nearby
+hit of the same track implies the same track start; a lone hit gets one re-check window 6 s later (dropped as
+unconfirmed if it disagrees; --no-recheck skips that). --deep: after the first pass, every "ID?" stretch of
+6 min or more is sampled again every 20 s (same pause, cache, agreement rule), then the list is rebuilt.
+Progress goes to
+sets/HASH.log (or --log), never stdout. --text = 1001tracklists/Mixcloud paste ('NN. [mm:ss] Artist - Title
+[Label]', unknowns 'ID - ID', no length: the paste parsers have no comment syntax); --info adds BPM/key/Camelot via trackinfo; --store saves tid- ids (crate).
+
+Confidence: high = 2+ windows name the same track; medium = one window matched, the others found nothing;
+low = windows disagree (a DJ transition: all candidates are listed under "also").
+Artist check: Shazam's artist line and remix credits vs rave-radar's followed artists (names + aliases, from
+$RAVE_RADAR_CONFIG_DIR/artists.json, default ~/.config/rave-radar; read-only).
+State: ~/.local/state/trackid/ids.json (0600, last 200 matches; id tid-<8 hex>; `source` = who asked, e.g. call). rave-radar's
+`releases crate tid-…` reads it, so the card's "➕ Crate" button is the usual rr:crate:<id> callback.
+Env (tests): TRACKID_RECOGNIZER (command taking WAV paths, printing trackid_shazam.py's JSON lines),
+TRACKID_DEEZER_API (base URL or "off"), TRACKID_STATE_DIR, RAVE_RADAR_CONFIG_DIR, TRACKID_PY (venv python),
+TRACKID_TRACKINFO (set --info command).
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+import warnings
+
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+from core import http as web, locks  # noqa: E402
+
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+STATE_DIR = os.environ.get('TRACKID_STATE_DIR') or f'{HOME}/.local/state/trackid'
+IDS_F = os.path.join(STATE_DIR, 'ids.json')
+RR_CONFIG = os.environ.get('RAVE_RADAR_CONFIG_DIR') or f'{HOME}/.config/rave-radar'
+ARTISTS_F = os.path.join(RR_CONFIG, 'artists.json')
+VENV_PY = os.environ.get('TRACKID_PY') or f'{HOME}/opt/trackid-venv/bin/python'
+HELPER = os.environ.get('TRACKID_HELPER') or next(
+    (p for p in (os.path.join(HERE, 'lib', 'trackid_shazam.py'), f'{HOME}/bin/lib/trackid_shazam.py')
+     if os.path.exists(p)), f'{HOME}/bin/lib/trackid_shazam.py')
+DEEZER = (os.environ.get('TRACKID_DEEZER_API') or 'https://api.deezer.com').rstrip('/')
+WIN = 12.0            # seconds per window (Shazam's signature length)
+MIN_LEN = 4.0         # shorter clips can't be fingerprinted reliably
+KEEP = 200
+
+
+def die(msg, code=2):
+    print(f'trackid: {msg}', file=sys.stderr)
+    sys.exit(code)
+
+
+def norm(s):
+    """Same as rave-radar's norm: lower case, accents stripped, '&' -> 'and', punctuation -> spaces."""
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode().lower().replace('&', ' and ')
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', s).split())
+
+
+def mmss(sec):
+    sec = int(round(sec))
+    return f'{sec // 60}:{sec % 60:02d}'
+
+
+# ------------------------------------------------------------------------------------------------ audio
+def probe(path):
+    """(duration seconds, has_audio)."""
+    try:
+        p = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=codec_type',
+                            '-of', 'json', path], capture_output=True, text=True, timeout=60)
+        d = json.loads(p.stdout or '{}')
+    except (subprocess.SubprocessError, ValueError):
+        return 0.0, False
+    has_audio = any(s.get('codec_type') == 'audio' for s in d.get('streams', []))
+    try:
+        dur = float(d.get('format', {}).get('duration') or 0)
+    except ValueError:
+        dur = 0.0
+    return dur, has_audio
+
+
+def loudness_per_second(path):
+    """RMS per second of the mono 8 kHz decode (list of floats); [] on failure."""
+    try:
+        p = subprocess.run(['ffmpeg', '-v', 'error', '-i', path, '-vn', '-ac', '1', '-ar', '8000', '-f', 's16le', '-'],
+                           capture_output=True, timeout=180)
+    except subprocess.SubprocessError:
+        return []
+    raw, step = p.stdout, 16000          # 8000 samples x 2 bytes
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            import audioop                # C speed; Python 3.11 still has it
+        return [audioop.rms(raw[i:i + step], 2) for i in range(0, len(raw) - 1, step) if len(raw[i:i + step]) >= 2]
+    except ImportError:
+        import array
+        import math
+        out = []
+        for i in range(0, len(raw) - 1, step):
+            a = array.array('h', raw[i:i + step - (len(raw[i:i + step]) % 2)])
+            out.append(math.sqrt(sum(x * x for x in a) / len(a)) if a else 0.0)
+        return out
+
+
+def pick_windows(dur, rms, max_windows):
+    """[(label, start)] in try order: loudest, middle, start; extras quarter, three-quarter."""
+    if dur <= WIN + 2:
+        return [('whole clip', 0.0)], 1
+    last = max(0.0, dur - WIN)
+    cands = []
+    w = int(WIN)
+    if len(rms) > w:
+        sums = [sum(rms[i:i + w]) for i in range(0, len(rms) - w + 1)]
+        cands.append(('loudest', float(min(last, max(range(len(sums)), key=sums.__getitem__)))))
+    cands.append(('middle', max(0.0, dur / 2 - WIN / 2)))
+    cands.append(('start', min(1.0, last)))
+    extras = [('1/4', max(0.0, dur / 4 - WIN / 2)), ('3/4', min(last, 3 * dur / 4 - WIN / 2))]
+    chosen = []
+    for label, s in cands + extras:
+        if all(abs(s - c) >= WIN / 2 for _, c in chosen):
+            chosen.append((label, round(s, 1)))
+    base = [c for c in chosen if c[0] not in ('1/4', '3/4')]
+    extra = [c for c in chosen if c[0] in ('1/4', '3/4')]
+    return (base + extra)[:max(1, max_windows)], len(base)
+
+
+def cut(path, start, out, length=WIN):
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', f'{start:.2f}', '-t', f'{length:g}', '-i', path,
+                    '-vn', '-ac', '1', '-ar', '16000', '-sample_fmt', 's16', out],
+                   check=True, capture_output=True, timeout=120)
+
+
+# ------------------------------------------------------------------------------------------------ lookup
+def recognize(wavs):
+    """{wav: {'ok':…, 'response'|'error'}} via the helper (or TRACKID_RECOGNIZER)."""
+    cmd = shlex.split(os.environ['TRACKID_RECOGNIZER']) if os.environ.get('TRACKID_RECOGNIZER') \
+        else [VENV_PY, '-I', HELPER]
+    if not os.environ.get('TRACKID_RECOGNIZER') and not os.path.exists(VENV_PY):
+        die(f'recogniser missing: {VENV_PY} (pip install shazamio into ~/opt/trackid-venv)', 3)
+    try:
+        p = subprocess.run(cmd + wavs, capture_output=True, text=True, timeout=40 * len(wavs) + 20,
+                           stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return {w: {'ok': False, 'error': 'recogniser timed out'} for w in wavs}
+    res = {}
+    for line in p.stdout.splitlines():
+        try:
+            d = json.loads(line)
+            res[d['file']] = d
+        except (ValueError, KeyError, TypeError):
+            continue
+    for w in wavs:
+        res.setdefault(w, {'ok': False, 'error': (p.stderr.strip().splitlines() or ['no output'])[-1][:200]})
+    return res
+
+
+def parse_track(resp):
+    t = (resp or {}).get('track')
+    if not t or not (resp.get('matches') or []):
+        return None
+    meta = {}
+    for s in t.get('sections') or []:
+        for m in s.get('metadata') or []:
+            if m.get('title') and m.get('text'):
+                meta.setdefault(m['title'].lower(), m['text'])
+    return {'key': str(t.get('key') or norm(f"{t.get('subtitle')} {t.get('title')}")),
+            'title': (t.get('title') or '').strip(), 'artist': (t.get('subtitle') or '').strip(),
+            'album': meta.get('album'), 'label': meta.get('label'), 'released': meta.get('released'),
+            'genre': ((t.get('genres') or {}).get('primary')), 'isrc': t.get('isrc'),
+            'shazam_url': t.get('url'), 'matches': len(resp.get('matches') or []),
+            'offset': (resp['matches'][0].get('offset') if resp.get('matches') else None)}
+
+
+def deezer(track):
+    """Deezer link + BPM (best effort; None on any failure)."""
+    if DEEZER == 'off':
+        return None
+    def get(url):
+        req = urllib.request.Request(url, headers={'User-Agent': 'trackid/1.0'})
+        with web.open(req, timeout=8) as r:
+            return json.loads(r.read().decode())
+    try:
+        d = None
+        if track.get('isrc'):
+            d = get(f"{DEEZER}/track/isrc:{urllib.parse.quote(track['isrc'])}")
+            if not isinstance(d, dict) or d.get('error') or not d.get('id'):
+                d = None
+        if d is None:
+            q = f'artist:"{track["artist"]}" track:"{track["title"]}"'
+            hits = (get(f'{DEEZER}/search?limit=1&q={urllib.parse.quote(q)}') or {}).get('data') or []
+            if not hits:
+                hits = (get(f'{DEEZER}/search?limit=1&q={urllib.parse.quote(track["artist"] + " " + track["title"])}')
+                        or {}).get('data') or []
+            if not hits:
+                return None
+            d = hits[0]
+            if not d.get('bpm'):
+                d = {**d, **(get(f"{DEEZER}/track/{d['id']}") or {})}
+        return {'url': d.get('link'), 'bpm': round(d['bpm']) if d.get('bpm') else None,
+                'artist': (d.get('artist') or {}).get('name'), 'title': d.get('title')}
+    except Exception:  # noqa: BLE001 - optional enrichment
+        return None
+
+
+# ------------------------------------------------------------------------------------------------ artists
+def load_followed():
+    try:
+        with open(ARTISTS_F) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    out = []
+    for a in (d.get('artists') or []) if isinstance(d, dict) else []:
+        names = [a.get('name')] + list(a.get('aliases') or [])
+        out.append((a.get('name'), [n for n in (norm(x) for x in names) if len(n) >= 3]))
+    return out
+
+
+def artist_check(track, followed):
+    """[{'name', 'how'}]: 'artist' when he follows a credited artist, 'remix' for a remix/edit credit in the title."""
+    if not followed:
+        return []
+    who = f" {norm(track['artist'])} "
+    remix = ' '.join(norm(x) for x in re.findall(r'[(\[]([^)\]]*(?:remix|edit|rework|mix|bootleg|flip|version)[^)\]]*)[)\]]',
+                                                     track['title'], flags=re.I))
+    hits = []
+    for name, keys in followed:
+        if any(f' {k} ' in who for k in keys):
+            hits.append({'name': name, 'how': 'artist'})
+        elif remix and any(f' {k} ' in f' {remix} ' for k in keys):
+            hits.append({'name': name, 'how': 'remix'})
+    return hits
+
+
+def split_artists(s):
+    parts = re.split(r'\s*(?:,|&|\bfeat\.?|\bft\.?|\bx\b|\bvs\.?|\band\b|\bwith\b)\s*', s or '', flags=re.I)
+    return [p.strip() for p in parts if p.strip()]
+
+
+# ------------------------------------------------------------------------------------------------ state
+def load_ids():
+    try:
+        with open(IDS_F) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and isinstance(d.get('ids'), dict) else {'ids': {}}
+    except (OSError, ValueError):
+        return {'ids': {}}
+
+
+def save_ids(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    items = sorted(st['ids'].values(), key=lambda r: r.get('ts', ''), reverse=True)[:KEEP]
+    st = {'ids': {r['id']: r for r in items}}
+    tmp = f'{IDS_F}.tmp{os.getpid()}'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(st, f, indent=1, ensure_ascii=False)
+        f.write('\n')
+    os.replace(tmp, IDS_F)
+
+
+LEVELS = {'low': 0, 'medium': 1, 'high': 2}
+
+
+def store(track, extra, source=None):
+    tid = 'tid-' + hashlib.sha1(track['key'].encode()).hexdigest()[:8]
+    st = load_ids()
+    rec = {'id': tid, 'crate': f"{track['artist']} – {track['title']}", 'artist': track['artist'],
+           'title': track['title'], 'label': track.get('label'), 'album': track.get('album'),
+           'released': track.get('released'), 'shazam_url': track.get('shazam_url'),
+           'deezer_url': (extra.get('deezer') or {}).get('url'),
+           'ts': dt.datetime.now().astimezone().isoformat(timespec='seconds'),
+           'count': st['ids'].get(tid, {}).get('count', 0) + 1}
+    if source:
+        rec['source'] = source
+    st['ids'][tid] = rec
+    save_ids(st)
+    return rec
+
+
+# ------------------------------------------------------------------------------------------------ main flows
+def identify(a):
+    path = a.file
+    if not os.path.isfile(path):
+        die(f'no such file: {path}')
+    dur, has_audio = probe(path)
+    if not has_audio:
+        die('no audio track in this file', 2)
+    if dur and dur < MIN_LEN:
+        die(f'clip too short ({dur:.1f} s): send at least ~8 s of music', 2)
+    rms = loudness_per_second(path)
+    if not dur:
+        dur = float(len(rms))
+    wins, nbase = pick_windows(dur, rms, a.windows)
+    tmp = tempfile.mkdtemp(prefix='trackid-')
+    tried = []
+    try:
+        def run(batch):
+            wavs = []
+            for i, (label, s) in enumerate(batch):
+                w = os.path.join(tmp, f'w{len(tried) + i}.wav')
+                cut(path, s, w)
+                wavs.append(w)
+            res = recognize(wavs)
+            for (label, s), w in zip(batch, wavs):
+                r = res[w]
+                tr = parse_track(r.get('response')) if r.get('ok') else None
+                tried.append({'label': label, 'start': s, 'ok': bool(r.get('ok')), 'error': r.get('error'),
+                              'track': tr})
+        try:
+            run(wins[:nbase])
+            if not any(t['track'] for t in tried) and len(wins) > nbase:
+                run(wins[nbase:])
+            keys = {}
+            for t in tried:
+                if t['track']:
+                    keys.setdefault(t['track']['key'], []).append(t)
+            if keys and max(len(g) for g in keys.values()) == 1 and dur > WIN + 3:
+                # every match rests on a single try: noisy audio can give false matches, so re-check the
+                # strongest one with a window shifted by 4 s (one extra lookup)
+                t0 = max((g[0] for g in keys.values()), key=lambda t: t['track']['matches'])
+                s = t0['start'] + 4 if t0['start'] + 4 + WIN <= dur else max(0.0, t0['start'] - 4)
+                run([('re-check', round(s, 1))])
+        except subprocess.CalledProcessError:
+            die('ffmpeg could not read the audio', 2)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    groups = {}
+    for t in tried:
+        if t['track']:
+            groups.setdefault(t['track']['key'], []).append(t)
+    out = {'file': os.path.basename(path), 'duration': round(dur, 1),
+           'windows': [{'label': t['label'], 'start': t['start'], 'ok': t['ok'], 'error': t['error'],
+                        'match': (f"{t['track']['artist']} – {t['track']['title']}" if t['track'] else None)}
+                       for t in tried]}
+    if not groups:
+        errs = [t for t in tried if not t['ok']]
+        out['status'] = 'error' if len(errs) == len(tried) else 'no_match'
+        if out['status'] == 'error':
+            out['error'] = errs[0]['error'] if errs else 'unknown'
+        return out, (3 if out['status'] == 'error' else 1)
+
+    ranked = sorted(groups.values(), key=lambda g: (-len(g), -max(t['track']['matches'] for t in g)))
+    best = ranked[0]
+    track = dict(best[0]['track'])
+    n_ok = sum(1 for t in tried if t['ok'])
+    rechecked = any(t['label'] == 're-check' for t in tried)
+    unconfirmed = len(best) == 1 and rechecked
+    conf = 'high' if len(best) >= 2 else ('low' if len(ranked) > 1 or unconfirmed else 'medium')
+    followed = load_followed()
+    extra = {'deezer': None if a.no_deezer else deezer(track)}
+    keep = LEVELS[conf] >= LEVELS[getattr(a, 'min_store', None) or 'low']
+    rec = store(track, extra, getattr(a, 'source', None)) if keep else None
+    hits = artist_check(track, followed)
+    out.update({
+        'status': 'match', 'track': track, 'deezer': extra['deezer'],
+        'confidence': {'level': conf, 'windows_matched': len(best), 'windows_tried': len(tried),
+                       'windows_answered': n_ok, 'at': [mmss(t['start']) for t in best],
+                       'unconfirmed': unconfirmed},
+        'also': [f"{g[0]['track']['artist']} – {g[0]['track']['title']} ({', '.join(mmss(t['start']) for t in g)})"
+                 for g in ranked[1:]],
+        'your_artists': hits, 'artists_known': followed is not None,
+        'id': rec['id'] if rec else None, 'crate': f"{track['artist']} – {track['title']}",
+        'stored': rec is not None, 'seen_before': bool(rec and rec['count'] > 1),
+        'buttons': [{'text': '➕ Crate', 'data': f"rr:crate:{rec['id']}"}] if rec else [],
+    })
+    if rec and followed is not None and not any(h['how'] == 'artist' for h in hits):
+        names = split_artists(track['artist'])[:1]
+        if names:
+            out['buttons'].append({'text': f'⭐ Follow {names[0][:24]}', 'data': f"tid:follow:{rec['id']}"})
+            out['follow_name'] = names[0]
+    return out, 0
+
+
+def card(out):
+    if out['status'] == 'error':
+        return f"⚠️ Track lookup failed ({out.get('error')}). Try again in a minute."
+    at = ', '.join(f"{w['label']} {mmss(w['start'])}" for w in out['windows'])
+    if out['status'] == 'no_match':
+        return (f"🎵 No match ({len(out['windows'])} tries: {at}).\n"
+                'Club audio is hard: 15–30 s close to a speaker, without talking, works best.')
+    t, c = out['track'], out['confidence']
+    lines = [f"🎵 {'Maybe: ' if c['level'] == 'low' else ''}{t['artist']} – {t['title']}"]
+    meta = ' · '.join(x for x in [t.get('label') and f"Label {t['label']}", t.get('album'), t.get('released')] if x)
+    if meta:
+        lines.append(meta)
+    if (out.get('deezer') or {}).get('bpm'):
+        lines.append(f"{out['deezer']['bpm']} BPM")
+    lines.append(f"Confidence {c['level']}: {c['windows_matched']} of {c['windows_tried']} tries "
+                 f"({', '.join(c['at'])})")
+    if c.get('unconfirmed'):
+        lines.append('⚠️ Only one try matched and the re-check did not: may be a false match in the noise.')
+    for x in out.get('also') or []:
+        lines.append(f'Also heard: {x}')
+    hits = out.get('your_artists') or []
+    if hits:
+        lines.append('⭐ ' + '; '.join(f"{h['name']} is one of your artists" if h['how'] == 'artist'
+                                       else f"remix by {h['name']}, one of your artists" for h in hits))
+    elif out.get('artists_known'):
+        lines.append('Not one of your followed artists.')
+    links = [x for x in [t.get('shazam_url'), (out.get('deezer') or {}).get('url')] if x]
+    lines += links
+    if out.get('seen_before'):
+        lines.append('(identified before)')
+    for b in out['buttons']:
+        lines.append(f"button: \"{b['text']}\" -> {b['data']}")
+    return '\n'.join(lines)
+
+
+def cmd_list(a):
+    rows = sorted(load_ids()['ids'].values(), key=lambda r: r.get('ts', ''), reverse=True)[:a.n]
+    if a.json:
+        print(json.dumps(rows, indent=1, ensure_ascii=False))
+        return 0
+    if not rows:
+        print('No tracks identified yet.')
+    for r in rows:
+        print(f"{r['ts'][:16].replace('T', ' ')}  {r['id']}  {r['crate']}  {r.get('shazam_url') or ''}")
+    return 0
+
+
+def cmd_show(a):
+    r = load_ids()['ids'].get(a.id.rsplit(':', 1)[-1])
+    if not r:
+        die(f'unknown id {a.id!r}', 1)
+    print(json.dumps(r, indent=1, ensure_ascii=False) if a.json else
+          f"{r['crate']}\n{r.get('label') or ''} {r.get('released') or ''}\n{r.get('shazam_url') or ''}")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ set mode
+SETS_DIR = os.path.join(STATE_DIR, 'sets')
+TRACKINFO = os.environ.get('TRACKID_TRACKINFO') or next(
+    (p for p in (os.path.join(HERE, 'trackinfo'), f'{HOME}/bin/trackinfo') if os.path.exists(p)), f'{HOME}/bin/trackinfo')
+SET_MAX_WIN = 12.0    # Shazam reads at most ~12 s per signature
+SET_MIN_WIN = 5.0
+SET_MIN_PAUSE = 1.0   # floor between real Shazam lookups (fake recognisers in tests may go faster)
+SET_BRIDGE = 300.0    # the same track heard again within 5 min = still the same play
+SET_RECHECK = 6.0     # a lone hit is re-checked with a window this much later
+SET_DEEP_STEP = 20.0  # --deep: sample step inside long ID? stretches
+SET_DEEP_MIN = 360.0  # --deep: only ID? stretches at least this long
+_last_call = [0.0]    # monotonic time of the last real lookup, shared by every pass (the pause holds across passes)
+
+
+def hms(sec, long=False):
+    """m:ss, or h:mm:ss for long recordings."""
+    sec = int(round(max(0.0, sec)))
+    h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+    return f'{h}:{m:02d}:{s:02d}' if long or h else f'{m}:{s:02d}'
+
+
+def stamp(sec, long=False):
+    """[mm:ss] / [hh:mm:ss] for the 1001tracklists / Mixcloud text."""
+    sec = int(round(max(0.0, sec)))
+    h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+    return f'{h:02d}:{m:02d}:{s:02d}' if long else f'{m:02d}:{s:02d}'
+
+
+def length_txt(sec):
+    """'45 s', '31 min', '1 h 05 min' for an ID? stretch."""
+    sec = int(round(max(0.0, sec)))
+    if sec < 60:
+        return f'{sec} s'
+    m = int(round(sec / 60))
+    return f'{m} min' if m < 60 else f'{m // 60} h {m % 60:02d} min'
+
+
+def file_hash(path):
+    """sha256 over size + first, middle and last 4 MiB: quick for multi-GB videos, stable for one file."""
+    size = os.path.getsize(path)
+    h = hashlib.sha256(f'{size}:'.encode())
+    chunk = 4 << 20
+    with open(path, 'rb') as f:
+        for off in sorted({0, max(0, size // 2 - chunk // 2), max(0, size - chunk)}):
+            f.seek(off)
+            h.update(f.read(chunk))
+    return h.hexdigest()[:16]
+
+
+def write_private(path, data):
+    tmp = f'{path}.tmp{os.getpid()}'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+        f.write('\n')
+    os.replace(tmp, path)
+
+
+def set_starts(dur, step, win):
+    """Sample starts: one window centred in each step-long slot."""
+    last = dur - win
+    if last < 0:
+        return [0.0]
+    off = min(max(0.0, (step - win) / 2), last)
+    out, i = [], 0
+    while off + i * step <= last + 1e-6:
+        out.append(round(off + i * step, 1))
+        i += 1
+    return out
+
+
+def set_sample(path, starts, win, cache, cache_f, pause, max_err, log, tag=''):
+    """[{'start', 'track'|None, 'error'|None}] in order; cached hits/misses are reused, errors are retried."""
+    samples, new, fails = [], 0, 0
+    tmp = tempfile.mkdtemp(prefix='trackid-set-')
+    stopped = False
+    try:
+        for i, s in enumerate(starts):
+            k = f'{s:.1f}/{win:g}'
+            if k in cache['samples']:
+                samples.append({'start': s, 'track': cache['samples'][k].get('track'), 'error': None})
+                continue
+            if stopped:
+                samples.append({'start': s, 'track': None, 'error': 'not tried'})
+                continue
+            wait = pause - (time.monotonic() - _last_call[0])
+            if wait > 0:
+                time.sleep(wait)
+            w = os.path.join(tmp, f'set-{s:.1f}.wav')
+            try:
+                cut(path, s, w, win)
+            except subprocess.CalledProcessError:
+                samples.append({'start': s, 'track': None, 'error': 'ffmpeg could not cut this window'})
+                log(f'{tag}{i + 1}/{len(starts)} {hms(s)} ffmpeg failed')
+                continue
+            _last_call[0] = time.monotonic()
+            r = recognize([w]).get(w) or {'ok': False, 'error': 'no answer'}
+            try:
+                os.unlink(w)
+            except OSError:
+                pass
+            new += 1
+            if r.get('ok'):
+                fails = 0
+                tr = parse_track(r.get('response'))
+                cache['samples'][k] = {'track': tr, 'ts': dt.datetime.now().astimezone().isoformat(timespec='seconds')}
+                write_private(cache_f, cache)
+                samples.append({'start': s, 'track': tr, 'error': None, 'fresh': True})
+                log(f"{tag}{i + 1}/{len(starts)} {hms(s)} " +
+                    (f"{tr['artist']} – {tr['title']} (offset {tr.get('offset')})" if tr else 'no match'))
+            else:
+                fails += 1
+                samples.append({'start': s, 'track': None, 'error': r.get('error') or 'lookup failed'})
+                log(f"{tag}{i + 1}/{len(starts)} {hms(s)} lookup failed: {r.get('error')}")
+                if fails >= max_err:
+                    stopped = True
+                    log(f'stopping: {fails} lookups failed in a row; run again later to resume (cache kept)')
+                else:
+                    time.sleep(min(60.0, pause * 2 ** fails))       # back off politely
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return samples, new
+
+
+def zero_of(s):
+    """Where the matched track would have started in the recording (sample start - Shazam's offset)."""
+    o = (s.get('track') or {}).get('offset')
+    return s['start'] - o if isinstance(o, (int, float)) else None
+
+
+def zero_close(a, b, tol):
+    za, zb = zero_of(a), zero_of(b)
+    return za is None or zb is None or abs(za - zb) <= tol
+
+
+def set_confirm(path, samples, win, dur, step, cache, cache_f, pause, max_err, log, only=None):
+    """False matches rarely repeat at a consistent position: a hit counts when a nearby hit of the same track
+    implies the same track start (+-8 s or 8 % of the distance, for tempo changes); a lone hit gets one window
+    6 s later that must agree (+-4 s), else it is dropped. only = judge just these samples (the --deep pass);
+    their neighbours may be any sample. Returns (lookups, dropped)."""
+    hits = [s for s in samples if s['track']]
+    reach = max(SET_BRIDGE, 1.5 * step)
+    lone = []
+    judge = hits if only is None else [s for s in only if s['track']]
+    for s in judge:
+        if any(o is not s and o['track']['key'] == s['track']['key'] and abs(o['start'] - s['start']) <= reach
+               and zero_close(s, o, max(8.0, 0.08 * abs(o['start'] - s['start']))) for o in hits):
+            s['support'] = 'neighbour'
+        else:
+            lone.append(s)
+    if not lone:
+        return 0, []
+    rs = [round(s['start'] + SET_RECHECK if s['start'] + SET_RECHECK + win <= dur
+                else max(0.0, s['start'] - SET_RECHECK), 1) for s in lone]
+    log(f're-check {len(lone)} lone hits')
+    res, new = set_sample(path, rs, win, cache, cache_f, pause, max_err, log, tag='re-check ')
+    def agrees(s, r):
+        return r['track'] and r['track']['key'] == s['track']['key'] and zero_close(s, r, 4.0)
+    # one-sided on purpose: a second try on the other side confirmed false hits in a test (overlapping audio)
+    dropped = []
+    for s, r in zip(lone, res):
+        if r.get('error'):
+            s['support'] = 'unverified'
+        elif agrees(s, r):
+            s['support'] = 'recheck'
+        else:
+            dropped.append({'at': hms(s['start']), 'match': f"{s['track']['artist']} – {s['track']['title']}",
+                            'why': 'unconfirmed'})
+            s['track'], s['noise'] = None, True
+    return new, dropped
+
+
+def merge_set(samples, step, win, dur, min_gap):
+    """Turn the per-window answers into tracklist rows (tracks + 'ID?' gaps) and a list of dropped blips."""
+    # slot = the stretch a sample stands for (half way to each neighbour): the step on the plain grid, less where
+    # --deep added samples; pad = the unheard part of a slot before its window
+    st = [s['start'] for s in samples]
+    slot = {id(s): ((st[i + 1] if i + 1 < len(st) else st[i] + step) - (st[i - 1] if i else st[i] - step)) / 2
+            for i, s in enumerate(samples)}
+    def pad(s):
+        return max(0.0, (slot[id(s)] - win) / 2)
+    def span(ms):
+        return sum(slot[id(x)] for x in ms)
+    hits = [i for i, s in enumerate(samples) if s['track']]
+    noise = []
+    keys = [s['track']['key'] if s['track'] else None for s in samples]
+    drop = [i for j, i in enumerate(hits)    # A x A: a lone different answer between two hits of one track = noise
+            if 0 < j < len(hits) - 1 and keys[hits[j - 1]] == keys[hits[j + 1]] != keys[i]
+            and (j + 2 >= len(hits) or keys[hits[j + 2]] != keys[i])     # A B A B: B continues, not a blip
+            and samples[i]['start'] - samples[hits[j - 1]]['start'] <= 3 * step
+            and samples[hits[j + 1]]['start'] - samples[i]['start'] <= 3 * step]
+    for i in drop:
+        s = samples[i]
+        noise.append({'at': hms(s['start']), 'match': f"{s['track']['artist']} – {s['track']['title']}"})
+        samples[i] = {**s, 'track': None, 'noise': True}
+        slot[id(samples[i])] = slot[id(s)]
+    # runs: consecutive hits of one track (bridging short misses) and the misses between them
+    segs, cur, miss = [], None, []
+    for s in samples:
+        if not s['track']:
+            miss.append(s)
+            continue
+        k = s['track']['key']
+        if cur and cur['key'] == k and s['start'] - cur['hits'][-1]['start'] <= max(SET_BRIDGE, 1.5 * step) \
+                and span(miss) < min_gap:
+            cur['hits'].append(s)
+        else:
+            if cur:
+                segs.append(cur)
+            if miss:
+                segs.append({'kind': 'gap', 'misses': miss})
+            cur = {'kind': 'track', 'key': k, 'hits': [s]}
+        miss = []
+    if cur:
+        segs.append(cur)
+    if miss:
+        segs.append({'kind': 'gap', 'misses': miss})
+
+    rows, prev_end = [], 0.0          # prev_end: end of the last window that heard the previous track
+    for idx, g in enumerate(segs):
+        if g['kind'] == 'track':
+            h = g['hits']
+            first = h[0]['start']
+            ests = sorted(x['start'] - x['track']['offset'] for x in h
+                          if isinstance(x['track'].get('offset'), (int, float)) and 0 <= x['track']['offset'] <= 1200)
+            if ests:
+                est, how = ests[len(ests) // 2], 'offset'
+            else:
+                est, how = first - pad(h[0]), 'sample'
+            start = min(first, max(prev_end, est, 0.0))
+            best = max(h, key=lambda x: x['track'].get('matches') or 0)['track']
+            rows.append({'kind': 'track', 'start': round(start, 1), 'start_from': how,
+                         'first_heard': first, 'last_heard': h[-1]['start'], 'hits': len(h),
+                         'confidence': 'high' if len(h) >= 2 else
+                         'medium' if h[0].get('support') == 'recheck' else 'low', 'track': best})
+            prev_end = h[-1]['start'] + win
+        else:
+            m = g['misses']
+            nxt = segs[idx + 1] if idx + 1 < len(segs) else None
+            gs = max(prev_end if rows else 0.0, m[0]['start'] - pad(m[0]))
+            ge = dur if nxt is None else nxt['hits'][0]['start']
+            if nxt is not None:      # the next track's own start estimate may cover part of the gap
+                h = nxt['hits']
+                ests = sorted(x['start'] - x['track']['offset'] for x in h
+                              if isinstance(x['track'].get('offset'), (int, float)) and 0 <= x['track']['offset'] <= 1200)
+                if ests:
+                    ge = min(ge, max(ests[len(ests) // 2], gs))
+            if len(m) >= 2 and span(m) >= min_gap and ge - gs >= max(step, min_gap / 2):
+                errs = sum(1 for x in m if x.get('error'))
+                rows.append({'kind': 'id', 'start': round(gs, 1), 'misses': len(m), 'errors': errs,
+                             'unchecked': errs == len(m)})
+    for a, b in zip(rows, rows[1:]):      # keep the list strictly increasing
+        if b['start'] <= a['start']:
+            b['start'] = round(a['start'] + 1, 1)
+    for a, b in zip(rows, rows[1:] + [None]):    # an ID? stretch lasts until the next row (or the end)
+        if a['kind'] == 'id':
+            a['end'] = round(max(a['start'], dur if b is None else b['start']), 1)
+    return rows, noise
+
+
+def deep_starts(rows, samples, dur, win):
+    """--deep: window starts every SET_DEEP_STEP s inside ID? stretches of SET_DEEP_MIN s or more, skipping spots
+    an existing sample already covers (within half a deep step). Returns (starts, stretches)."""
+    have = sorted(s['start'] for s in samples)
+    out, n = [], 0
+    for r in rows:
+        if r['kind'] != 'id' or r['end'] - r['start'] < SET_DEEP_MIN:
+            continue
+        n += 1
+        t, last = r['start'], min(r['end'], dur) - win
+        while t <= last + 1e-6:
+            if all(abs(t - h) >= SET_DEEP_STEP / 2 for h in have):
+                out.append(round(t, 1))
+            t += SET_DEEP_STEP
+    return sorted(set(out)), n
+
+
+def set_info(tracks, log):
+    """BPM / key / Camelot / energy per found track via trackinfo (its 'last list' is left as it was)."""
+    rows = [r for r in tracks if r['kind'] == 'track']
+    if not rows:
+        return
+    names = [f"{r['track']['artist']} - {r['track']['title']}" for r in rows]
+    st = os.environ.get('TRACKINFO_STATE') or f'{HOME}/.local/state/trackinfo'
+    last_f = os.path.join(st, 'last-list.json')
+    try:
+        with open(last_f, 'rb') as f:
+            saved = f.read()
+    except OSError:
+        saved = None
+    got = []
+    try:
+        p = subprocess.run(shlex.split(TRACKINFO) + names + ['--json'], capture_output=True, text=True,
+                           timeout=90 + 45 * len(names), stdin=subprocess.DEVNULL)
+        got = json.loads(p.stdout or '[]')
+        if not isinstance(got, list):
+            got = []
+    except (subprocess.SubprocessError, ValueError, OSError) as e:
+        log(f'trackinfo failed: {e}')
+    finally:
+        try:
+            if saved is None:
+                if os.path.exists(last_f):
+                    os.unlink(last_f)
+            else:
+                tmp = f'{last_f}.tmp{os.getpid()}'
+                with open(tmp, 'wb') as f:
+                    f.write(saved)
+                os.replace(tmp, last_f)
+        except OSError as e:
+            log(f'could not restore trackinfo last list: {e}')
+    by = {norm(f"{g.get('artist')} {g.get('title')}"): g for g in got if isinstance(g, dict)}
+    for i, r in enumerate(rows):
+        g = by.get(norm(f"{r['track']['artist']} {r['track']['title']}"))
+        if g is None and len(got) == len(rows) and isinstance(got[i], dict):
+            g = got[i]
+        if g:
+            r['info'] = {k: g.get(k) for k in ('bpm', 'camelot', 'key', 'energy') if g.get(k) is not None}
+
+
+def set_out(path, dur, h, a, samples, new, rows, noise, log_f):
+    long = dur >= 3600
+    tracks = []
+    for n, r in enumerate(rows, 1):
+        row = {'n': n, 'kind': r['kind'], 'start': r['start'], 'at': hms(r['start'], long)}
+        if r['kind'] == 'track':
+            t = r['track']
+            row.update({'artist': t['artist'], 'title': t['title'], 'label': t.get('label'),
+                        'released': t.get('released'), 'isrc': t.get('isrc'), 'shazam_url': t.get('shazam_url'),
+                        'shazam_key': t.get('key'), 'confidence': r['confidence'], 'hits': r['hits'],
+                        'start_from': r['start_from'], 'first_heard': hms(r['first_heard'], long),
+                        'last_heard': hms(r['last_heard'], long)})
+            if r.get('info'):
+                row['info'] = r['info']
+            if r.get('tid'):
+                row['tid'] = r['tid']
+        else:
+            row.update({'misses': r['misses'], 'unchecked': r['unchecked'], 'end': r['end'],
+                        'until': hms(r['end'], long), 'length_s': round(r['end'] - r['start']),
+                        'length': length_txt(r['end'] - r['start'])})
+        tracks.append(row)
+    errs = [s for s in samples if s.get('error')]
+    return {'file': os.path.basename(path), 'duration': round(dur, 1), 'hash': h, 'step': a.step,
+            'window': a.window, 'samples': len(samples), 'looked_up': new, 'cached': sum(1 for s in samples if not s.get('fresh') and not s.get('error')),
+            'matched': sum(1 for s in samples if s['track']), 'errors': len(errs),
+            'complete': not errs, 'tracks': tracks, 'noise': noise, 'log': log_f,
+            'deep': getattr(a, 'deep_info', None),
+            'count': {'tracks': sum(1 for r in tracks if r['kind'] == 'track'),
+                      'ids': sum(1 for r in tracks if r['kind'] == 'id')}}
+
+
+def set_card(o):
+    c = o['count']
+    long = o['duration'] >= 3600
+    lines = [f"🎧 Tracklist · {o['file']} · {hms(o['duration'], long)} · {c['tracks']} tracks"
+             + (f", {c['ids']} ID?" if c['ids'] else '')]
+    for r in o['tracks']:
+        if r['kind'] == 'id':
+            lines.append(f"{r['at']} ID? ({r['length']}" + (', not checked)' if r['unchecked'] else ')'))
+            continue
+        s = f"{r['at']} {r['artist']} – {r['title']}" + (' (?)' if r['confidence'] == 'low' else '')
+        info = r.get('info') or {}
+        extra = [x for x in [info.get('bpm') and f"{round(info['bpm'])} BPM", info.get('camelot')] if x]
+        lines.append(s + (' · ' + ' · '.join(extra) if extra else ''))
+    lines.append(f"{o['matched']} of {o['samples']} samples matched (every {o['step']:g} s)"
+                 + ('; (?) = heard once, unconfirmed' if any(r.get('confidence') == 'low' for r in o['tracks']) else ''))
+    if o.get('deep'):
+        d = o['deep']
+        lines.append(f"Deep: {d['samples']} extra samples (every {d['step']:g} s) in {d['stretches']} long ID? "
+                     f"stretch{'es' if d['stretches'] != 1 else ''}")
+    if not o['complete']:
+        lines.append(f"⚠️ {o['errors']} samples not checked (lookups failed): run again to resume.")
+    return '\n'.join(lines)
+
+
+def set_text(o):
+    """1001tracklists / Mixcloud paste format: 'NN. [mm:ss] Artist - Title [Label]', unknowns as 'ID - ID'."""
+    long = o['duration'] >= 3600
+    out = []
+    for r in o['tracks']:
+        name = 'ID - ID' if r['kind'] == 'id' else \
+            f"{r['artist']} - {r['title']}" + (f" [{r['label']}]" if r.get('label') else '')
+        out.append(f"{r['n']:02d}. [{stamp(r['start'], long)}] {name}")
+    return '\n'.join(out)
+
+
+def cmd_set(argv):
+    p = argparse.ArgumentParser(prog='trackid set', description='timestamped tracklist from a long recording')
+    p.add_argument('file')
+    p.add_argument('--step', type=float, default=60.0, help='seconds between samples (default 60)')
+    p.add_argument('--window', type=float, default=12.0, help='seconds per sample, 5-12 (default 12)')
+    p.add_argument('--pause', type=float, default=4.0, help='seconds between Shazam lookups (min 1, default 4)')
+    p.add_argument('--min-gap', type=float, default=120.0, help='unidentified stretch that becomes "ID?" (s)')
+    p.add_argument('--max-errors', type=int, default=6, help='stop after N failed lookups in a row (resume later)')
+    p.add_argument('--info', action='store_true', help='BPM / key / Camelot per track via trackinfo')
+    p.add_argument('--store', action='store_true', help='save found tracks as tid- ids (➕ Crate buttons)')
+    p.add_argument('--fresh', action='store_true', help='ignore cached samples for this file')
+    p.add_argument('--no-recheck', action='store_true', help='keep lone hits without a confirming lookup')
+    p.add_argument('--deep', action='store_true',
+                   help=f're-sample ID? stretches of {SET_DEEP_MIN / 60:g}+ min every {SET_DEEP_STEP:g} s')
+    p.add_argument('--log', help='progress log (default ~/.local/state/trackid/sets/HASH.log)')
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--json', action='store_true')
+    g.add_argument('--text', action='store_true', help='1001tracklists / Mixcloud paste format')
+    a = p.parse_args(argv)
+    if not os.path.isfile(a.file):
+        die(f'no such file: {a.file}')
+    a.window = min(SET_MAX_WIN, max(SET_MIN_WIN, a.window))
+    a.step = max(a.window, a.step)
+    floor = 0.0 if os.environ.get('TRACKID_RECOGNIZER') else SET_MIN_PAUSE
+    a.pause = max(floor, a.pause)
+    dur, has_audio = probe(a.file)
+    if not has_audio:
+        die('no audio track in this file', 2)
+    if dur < a.window:
+        die(f'recording too short ({dur:.1f} s); for a clip use: trackid FILE', 2)
+    h = file_hash(a.file)
+    os.makedirs(SETS_DIR, mode=0o700, exist_ok=True)
+    cache_f = os.path.join(SETS_DIR, f'{h}.json')
+    log_f = os.path.expanduser(a.log) if a.log else os.path.join(SETS_DIR, f'{h}.log')
+    try:  # held until exit; mode 0666 minus the umask, as open() made it
+        lock = locks.acquire(os.path.join(SETS_DIR, f'{h}.lock'), wait=0, mode=0o666)
+    except OSError:  # no lock support: refused like a busy lock
+        lock = None
+    if lock is None:
+        die(f'already running on this file (see {log_f})', 2)
+    cache = {'samples': {}}
+    if not a.fresh:
+        try:
+            with open(cache_f) as f:
+                c = json.load(f)
+            if isinstance(c, dict) and isinstance(c.get('samples'), dict):
+                cache = c
+        except (OSError, ValueError):
+            pass
+    cache.update({'file': os.path.basename(a.file), 'size': os.path.getsize(a.file), 'duration': round(dur, 1)})
+    fd = os.open(log_f, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    logfh = os.fdopen(fd, 'a')
+
+    def log(msg):
+        logfh.write(f"{dt.datetime.now().strftime('%H:%M:%S')} {msg}\n")
+        logfh.flush()
+
+    starts = set_starts(dur, a.step, a.window)
+    todo = sum(1 for s in starts if f'{s:.1f}/{a.window:g}' not in cache['samples'])
+    log(f'start {os.path.basename(a.file)} ({hms(dur)}, hash {h}): {len(starts)} samples, {todo} to look up, '
+        f'step {a.step:g} s, window {a.window:g} s, pause {a.pause:g} s')
+    if todo:
+        print(f'trackid set: {todo} of {len(starts)} samples to look up (~{max(1, round(todo * (a.pause + 1.5) / 60))}'
+              f' min); progress: {log_f}', file=sys.stderr)
+    samples, new = set_sample(a.file, starts, a.window, cache, cache_f, a.pause, a.max_errors, log)
+    dropped = []
+    if not a.no_recheck:
+        rnew, dropped = set_confirm(a.file, samples, a.window, dur, a.step, cache, cache_f, a.pause, a.max_errors,
+                                    log)
+        new += rnew
+    rows, noise = merge_set(list(samples), a.step, a.window, dur, a.min_gap)
+    a.deep_info = None
+    if a.deep and a.step > SET_DEEP_STEP:
+        ds, nstretch = deep_starts(rows, samples, dur, a.window)
+        if ds:
+            todo = sum(1 for s in ds if f'{s:.1f}/{a.window:g}' not in cache['samples'])
+            log(f'deep: {len(ds)} samples every {SET_DEEP_STEP:g} s in {nstretch} ID? stretches, {todo} to look up')
+            if todo:
+                print(f'trackid set --deep: {todo} more lookups (~{max(1, round(todo * (a.pause + 1.5) / 60))} min)',
+                      file=sys.stderr)
+            dsamp, dnew = set_sample(a.file, ds, a.window, cache, cache_f, a.pause, a.max_errors, log, tag='deep ')
+            new += dnew
+            samples = sorted(samples + dsamp, key=lambda s: s['start'])
+            if not a.no_recheck:
+                rnew, d2 = set_confirm(a.file, samples, a.window, dur, a.step, cache, cache_f, a.pause,
+                                       a.max_errors, log, only=dsamp)
+                new += rnew
+                dropped += d2
+            rows, noise = merge_set(list(samples), a.step, a.window, dur, a.min_gap)
+            a.deep_info = {'step': SET_DEEP_STEP, 'min': SET_DEEP_MIN, 'stretches': nstretch, 'samples': len(ds)}
+    noise += dropped
+    if a.info:
+        log('trackinfo: BPM / key per track')
+        set_info(rows, log)
+    if a.store:
+        for r in rows:
+            if r['kind'] == 'track':
+                r['tid'] = store(r['track'], {})['id']
+    out = set_out(a.file, dur, h, a, samples, new, rows, noise, log_f)
+    log(f"done: {out['count']['tracks']} tracks, {out['count']['ids']} ID?, {out['matched']}/{out['samples']} "
+        f"matched, {out['errors']} errors, {new} lookups")
+    logfh.close()
+    print(json.dumps(out, indent=1, ensure_ascii=False) if a.json else set_text(out) if a.text else set_card(out))
+    if out['errors'] and out['errors'] == len(samples):
+        return 3
+    if not out['complete']:
+        return 4
+    return 0 if out['count']['tracks'] else 1
+
+
+def source_name(v):
+    if not re.fullmatch(r'[a-z][a-z0-9-]{0,15}', v):
+        raise argparse.ArgumentTypeError('source: lowercase letters, digits, dashes (max 16)')
+    return v
+
+
+def main(argv):
+    if argv[:1] == ['set']:
+        return cmd_set(argv[1:])
+    if argv[:1] in (['list'], ['show']):
+        p = argparse.ArgumentParser(prog=f'trackid {argv[0]}')
+        if argv[0] == 'list':
+            p.add_argument('n', nargs='?', type=int, default=10)
+        else:
+            p.add_argument('id')
+        p.add_argument('--json', action='store_true')
+        a = p.parse_args(argv[1:])
+        return cmd_list(a) if argv[0] == 'list' else cmd_show(a)
+    p = argparse.ArgumentParser(prog='trackid', description=__doc__.split('\n')[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    p.add_argument('file')
+    p.add_argument('--json', action='store_true')
+    p.add_argument('--windows', type=int, default=5, help='max tries (3 first, 2 more only without a match)')
+    p.add_argument('--no-deezer', action='store_true')
+    p.add_argument('--source', type=source_name, help='tag stored ids with who asked (e.g. call)')
+    p.add_argument('--min-store', choices=sorted(LEVELS, key=LEVELS.get), default='low',
+                   help='store only matches at least this sure (default low: every match)')
+    a = p.parse_args(argv)
+    out, code = identify(a)
+    print(json.dumps(out, indent=1, ensure_ascii=False) if a.json else card(out))
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

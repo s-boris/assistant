@@ -1,0 +1,911 @@
+#!/usr/bin/env -S python3 -I
+"""divelog: a local scuba dive logbook (store, Telegram form, Subsurface XML + one-page PDF export).
+
+Usage:
+  divelog add [--site S] [--depth M] [--time MIN] [--temp C] [--vis M] [--buddies N] [--when W]
+              [--notes T] [--sight SPECIES]... [--quick "free text"]
+  divelog list [--json]                 divelog show ID|last [--json]
+  divelog edit ID|last [same fields as add] [--clear FIELD]...
+  divelog delete ID                     (moved to the store's trash; `divelog undelete ID` restores)
+  divelog sight ID|last|auto [--at W] SPECIES [--count N] [--note T]
+  divelog stats [--json]
+  divelog export --subsurface FILE.xml | --pdf FILE.pdf [--title T]
+  divelog sites [--search Q] [--area A] [--json]      divelog sites import FILE.json
+  divelog tg start [TEXT] | tg cb DATA | tg text TEXT | tg show   (Telegram form, JSON out)
+
+W (dive date/time, local to the dive site): "now", "2026-11-23 09:30", "23.11 09:30", "23.11.2026",
+"yesterday 14:00", "today 9:30", "09:30". A date without a year is the latest such date not in the future,
+so entries typed days later (no signal on the boat) keep the real dive date.
+--quick parses one line like "Coral Garden 24m 48min 28C vis 20 2 buddies yesterday 9:30 saw whale shark, eagle ray".
+
+Store: $DIVELOG_DIR or ~/.local/state/divelog (dives.json, sites.json, draft.json).
+Config (optional): $DIVELOG_CONFIG or ~/.config/divelog/config.json: {"tz": "Area/City", "title": "...",
+"legs": [{"from": "YYYY-MM-DD", "to": "YYYY-MM-DD", "area": "..."}]} (legs pick the site buttons).
+Nothing leaves the machine.
+"""
+import argparse, contextlib, datetime as dt, fcntl, json, os, re, sys, unicodedata
+from zoneinfo import ZoneInfo
+
+HOME = os.path.expanduser("~")
+DIR = os.environ.get("DIVELOG_DIR") or os.path.join(HOME, ".local/state/divelog")
+CONFIG = os.environ.get("DIVELOG_CONFIG") or os.path.join(HOME, ".config/divelog/config.json")
+VENV_PY = os.environ.get("DIVELOG_PY") or os.path.join(HOME, "opt/dive-venv/bin/python")
+FIELDS = {  # field: (label, unit, min, max)
+    "depth": ("Max depth", "m", 0.5, 200), "time": ("Bottom time", "min", 1, 400),
+    "temp": ("Water", "°C", -2, 40), "vis": ("Visibility", "m", 0, 80), "buddies": ("Buddies", "", 0, 30)}
+STEPS = ["site", "depth", "time", "temp", "vis", "buddies"]
+CHOICES = {"depth": [10, 15, 18, 22, 25, 30], "time": [35, 40, 45, 50, 55, 60], "temp": [26, 27, 28, 29, 30, 31],
+           "vis": [5, 10, 15, 20, 25, 30], "buddies": [0, 1, 2, 3, 4, 5]}
+CODE = {"depth": "d", "time": "t", "temp": "c", "vis": "v", "buddies": "b"}
+QUESTION = {"site": "Which site?", "depth": "Max depth (m)?", "time": "Bottom time (min)?",
+            "temp": "Water temperature (°C)?", "vis": "Visibility (m)?", "buddies": "How many buddies?"}
+
+
+def die(msg, code=1):
+    print(f"divelog: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as e:
+        die(f"cannot read {path}: {e}")
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked():
+    os.makedirs(DIR, exist_ok=True)
+    with open(os.path.join(DIR, ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        yield
+
+
+def config():
+    c = load_json(CONFIG, {})
+    return c if isinstance(c, dict) else {}
+
+
+def tz():
+    name = os.environ.get("DIVELOG_TZ") or config().get("tz")
+    try:
+        return ZoneInfo(name) if name else dt.datetime.now().astimezone().tzinfo
+    except Exception:
+        die(f"unknown time zone {name!r}")
+
+
+def now():
+    seam = os.environ.get("DIVELOG_NOW")  # tests: a fixed local time "YYYY-MM-DDTHH:MM"
+    if seam:
+        return dt.datetime.fromisoformat(seam).replace(tzinfo=None)
+    return dt.datetime.now(tz()).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def fold(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def cap(s):
+    s = (s or "").strip()
+    return s[:1].upper() + s[1:]
+
+
+def slug(s):
+    return fold(s).replace(" ", "-")[:40] or "site"
+
+
+# ---------- dates ----------
+DATE_RES = [
+    (re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})(?:[t ](\d{1,2}):(\d{2}))?\b", re.I), "iso"),
+    (re.compile(r"\b(\d{1,2})\.(\d{1,2})\.?(\d{4}|\d{2})?(?:\s+(\d{1,2})[:.h](\d{2}))?(?![\d.])"), "dmy"),
+]
+TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+REL_RE = re.compile(r"\b(today|yesterday|heute|gestern|vorgestern|now|jetzt)\b", re.I)
+
+
+def parse_when(text, strict=True):
+    """Return (datetime, matched spans) for a date/time text. strict: the whole text must be a date."""
+    t = text or ""  # not stripped: the spans index the caller's text
+    n = now()
+    spans, day, hm = [], None, None
+    for rx, kind in DATE_RES:
+        m = rx.search(t)
+        if not m:
+            continue
+        spans.append(m.span())
+        g = m.groups()
+        try:
+            if kind == "iso":
+                day = dt.date(int(g[0]), int(g[1]), int(g[2]))
+            else:
+                y = int(g[2]) if g[2] else None
+                if y is not None and y < 100:
+                    y += 2000
+                d, mo = int(g[0]), int(g[1])
+                if y is None:
+                    y = n.year
+                    if dt.date(y, mo, d) > n.date():  # "23.11" typed in January = last year's dive
+                        y -= 1
+                day = dt.date(y, mo, d)
+        except ValueError:
+            raise ValueError(f"bad date in {text!r}")
+        if g[3] is not None:
+            hm = (int(g[3]), int(g[4]))
+        break
+    m = REL_RE.search(t)
+    if m and day is None:
+        spans.append(m.span())
+        w = m.group(1).lower()
+        if w in ("now", "jetzt"):
+            day, hm = n.date(), hm or (n.hour, n.minute)
+        else:
+            day = n.date() - dt.timedelta(days={"today": 0, "heute": 0, "yesterday": 1, "gestern": 1,
+                                                 "vorgestern": 2}[w])
+    if hm is None:
+        rest = t
+        for a, b in sorted(spans, reverse=True):
+            rest = rest[:a] + " " * (b - a) + rest[b:]
+        m = TIME_RE.search(rest)
+        if m:
+            spans.append(m.span())
+            hm = (int(m.group(1)), int(m.group(2)))
+    if day is None and hm is None:
+        if strict:
+            raise ValueError(f"cannot read the date/time {text!r} (try 23.11 09:30 or yesterday 14:00)")
+        return None, []
+    if strict:
+        rest = t
+        for a, b in sorted(spans, reverse=True):
+            rest = rest[:a] + rest[b:]
+        if re.sub(r"[\s,]|\bat\b|\bum\b", "", rest, flags=re.I):
+            raise ValueError(f"cannot read the date/time {text!r}")
+    if hm is None:
+        hm = (9, 0) if day != n.date() else (n.hour, n.minute)
+    if not (0 <= hm[0] < 24 and 0 <= hm[1] < 60):
+        raise ValueError(f"bad time in {text!r}")
+    if day is None:  # a bare time: today, or yesterday if it is still ahead of us
+        day = n.date()
+        if dt.datetime.combine(day, dt.time(*hm)) > n + dt.timedelta(minutes=5):
+            day -= dt.timedelta(days=1)
+    return dt.datetime.combine(day, dt.time(*hm)), spans
+
+
+def fmt_when(iso):
+    d = dt.datetime.fromisoformat(iso)
+    return d.strftime("%a %d.%m.%Y %H:%M")
+
+
+# ---------- sites ----------
+def sites():
+    s = load_json(os.path.join(DIR, "sites.json"), [])
+    return s if isinstance(s, list) else []
+
+
+def find_site(name):
+    """Exact (folded) name, id or alias match; else None."""
+    f = fold(name)
+    for s in sites():
+        if f and (f == fold(s["name"]) or f == s["id"].replace("-", " ") or f in [fold(a) for a in s.get("aliases", [])]):
+            return s
+    return None
+
+
+def site_in_text(text):
+    """Longest known site name or alias inside free text: (site, span) or (None, None)."""
+    low = text.lower()
+    best = None
+    for s in sites():
+        for nm in [s["name"]] + s.get("aliases", []):
+            m = re.search(r"(?<!\w)" + re.escape(nm.lower()) + r"(?!\w)", low)
+            if m and (best is None or len(nm) > best[2]):
+                best = (s, m.span(), len(nm))
+    return (best[0], best[1]) if best else (None, None)
+
+
+def cmd_sites(a):
+    if a.action == "import":
+        if not a.file:
+            die("sites import needs a JSON file")
+        new = load_json(a.file, None)
+        if not isinstance(new, list):
+            die("sites file must be a JSON list of {name, lat, lon, …}")
+        with locked():
+            cur = {s["id"]: s for s in sites()}
+            added = 0
+            for x in new:
+                if not isinstance(x, dict) or not x.get("name"):
+                    continue
+                try:
+                    lat, lon = float(x["lat"]), float(x["lon"])
+                except (KeyError, TypeError, ValueError):
+                    print(f"skipped (no lat/lon): {x.get('name')}", file=sys.stderr)
+                    continue
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                    print(f"skipped (bad lat/lon): {x['name']}", file=sys.stderr)
+                    continue
+                sid = x.get("id") or slug(x["name"])
+                added += sid not in cur
+                keep = {k: x[k] for k in ("area", "type", "depth_min", "depth_max", "highlight", "source",
+                                          "precision", "note", "aliases") if x.get(k) not in (None, "", [])}
+                cur[sid] = {"id": sid, "name": x["name"], "lat": round(lat, 5), "lon": round(lon, 5), **keep}
+            save_json(os.path.join(DIR, "sites.json"), sorted(cur.values(), key=lambda s: (s.get("area", ""), s["name"])))
+        print(f"{len(cur)} sites ({added} new)")
+        return
+    rows = [s for s in sites() if (not a.search or fold(a.search) in fold(s["name"] + " " + " ".join(s.get("aliases", []))))
+            and (not a.area or fold(a.area) in fold(s.get("area", "")))]
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return
+    for s in rows:
+        dep = (f" {s['depth_min']:g}–{s['depth_max']:g} m" if s.get("depth_min") is not None else f" ≤{s['depth_max']:g} m") \
+            if s.get("depth_max") is not None else ""
+        print(f"{s['id']:<28} {s.get('area', ''):<10} {s['lat']:.4f},{s['lon']:.4f}{dep}  {s['name']}")
+    if not rows:
+        print("no sites" + (" (import some: divelog sites import FILE)" if not sites() else ""))
+
+
+# ---------- dives ----------
+def store():
+    d = load_json(os.path.join(DIR, "dives.json"), {"dives": [], "trash": []})
+    d.setdefault("dives", []), d.setdefault("trash", [])
+    return d
+
+
+def save_store(d):
+    d["dives"].sort(key=lambda x: (x["when"], x["id"]))
+    save_json(os.path.join(DIR, "dives.json"), d)
+
+
+def pick(d, ref, at=None):
+    dives = d["dives"]
+    if not dives:
+        die("no dives logged yet")
+    if ref == "last":
+        return max(dives, key=lambda x: (x["when"], x["id"]))
+    if ref == "auto":  # the latest dive that started before `at` (a photo's time), else the last one
+        if at:
+            before = [x for x in dives if x["when"] <= at]
+            if before:
+                return max(before, key=lambda x: (x["when"], x["id"]))
+        return max(dives, key=lambda x: (x["when"], x["id"]))
+    try:
+        i = int(ref)
+    except ValueError:
+        die(f"no dive {ref!r} (use a number, last or auto)")
+    for x in dives:
+        if x["id"] == i:
+            return x
+    die(f"no dive #{i}")
+
+
+def checked(field, v):
+    lab, unit, lo, hi = FIELDS[field]
+    try:
+        x = float(str(v).replace(",", "."))
+    except ValueError:
+        raise ValueError(f"{lab}: not a number: {v!r}")
+    if not lo <= x <= hi:
+        raise ValueError(f"{lab}: {v} is outside {lo}–{hi} {unit}".rstrip())
+    return int(x) if field == "buddies" or x.is_integer() else round(x, 1)
+
+
+QUICK = [  # (field, regex); order matters: visibility before depth so "vis 20m" is not a depth
+    ("vis", re.compile(r"\b(?:vis(?:ibility)?|sicht(?:weite)?)\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m?\b", re.I)),
+    ("temp", re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)\s*(?:°\s*c?|c\b|deg\b|grad\b)", re.I)),
+    ("time", re.compile(r"(?<![\w.])(\d+)\s*(?:min(?:s|utes?)?\b|'|’)", re.I)),
+    ("depth", re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)\s*m\b(?!in)", re.I)),
+    ("buddies", re.compile(r"(?<![\w.])(\d+)\s*(?:budd(?:y|ies)|buddys?|people|leute)\b", re.I)),
+]
+SIGHT_RE = re.compile(r"\b(?:saw|seen|sightings?|spotted|gesehen)\s*:?\s*(.+)$", re.I)
+
+
+def parse_quick(text):
+    """Free text → fields dict (site, depth, time, temp, vis, buddies, when, sightings, notes)."""
+    out, t = {}, " " + (text or "") + " "
+    m = SIGHT_RE.search(t)
+    if m:
+        out["sightings"] = [s.strip(" .!") for s in re.split(r",|;|\band\b|\bund\b", m.group(1)) if s.strip(" .!")]
+        t = t[:m.start()] + " "
+    if re.search(r"\bsolo\b", t, re.I):
+        out["buddies"] = 0
+        t = re.sub(r"\bsolo\b", " ", t, flags=re.I)
+    for field, rx in QUICK:
+        m = rx.search(t)
+        if m:
+            out[field] = checked(field, m.group(1))
+            t = t[:m.start()] + " " + t[m.end():]
+    when, spans = parse_when(t, strict=False)
+    if when:
+        out["when"] = when.isoformat(timespec="minutes")
+        for a, b in sorted(spans, reverse=True):
+            t = t[:a] + " " + t[b:]
+    s, span = site_in_text(t)
+    if s:
+        out["site"] = s["name"]
+        t = t[:span[0]] + " " + t[span[1]:]
+    rest = re.sub(r"\s+", " ", re.sub(r"\b(at|um|am|max|depth|tiefe|time|zeit|water|wasser)\b", " ", t, flags=re.I)).strip(" ,.;-")
+    if rest:
+        if "site" not in out and not re.search(r"\d", rest.split(",")[0]):  # leading words = an unknown site
+            head, _, tail = rest.partition(",")
+            out["site"] = head.strip()
+            rest = tail.strip()
+        if rest:
+            out["notes"] = rest
+    return out
+
+
+def apply_fields(dive, f):
+    if f.get("site") is not None:
+        s = find_site(f["site"])
+        dive["site"] = s["name"] if s else f["site"].strip()
+        dive["site_id"] = s["id"] if s else None
+        for k in ("lat", "lon", "area"):
+            dive.pop(k, None)
+            if s and s.get(k) is not None:
+                dive[k] = s[k]
+    for k in FIELDS:
+        if f.get(k) is not None:
+            dive[k] = checked(k, f[k])
+    if f.get("when"):
+        dive["when"] = f["when"]
+    if f.get("notes"):
+        dive["notes"] = f["notes"].strip()
+    for sp in f.get("sightings") or []:
+        dive.setdefault("sightings", []).append({"species": cap(sp), "added": now().isoformat(timespec="minutes")})
+
+
+def fields_from_args(a):
+    f = parse_quick(a.quick) if getattr(a, "quick", None) else {}
+    for k in ("site", "depth", "time", "temp", "vis", "buddies", "notes"):
+        v = getattr(a, k, None)
+        if v is not None:
+            f[k] = v
+    if getattr(a, "when", None):
+        f["when"] = parse_when(a.when)[0].isoformat(timespec="minutes")
+    if getattr(a, "sight", None):
+        f["sightings"] = (f.get("sightings") or []) + a.sight
+    return f
+
+
+def new_dive(d, f):
+    dive = {"id": max([x["id"] for x in d["dives"] + d["trash"]] + [0]) + 1, "when": now().isoformat(timespec="minutes"),
+            "site": None, "logged": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "tz": getattr(tz(), "key", None)}
+    apply_fields(dive, f)
+    if not dive["site"]:
+        raise ValueError("a dive needs a site (--site or a name in --quick)")
+    d["dives"].append(dive)
+    return dive
+
+
+def summary(x):
+    p = [f"#{x['id']}", fmt_when(x["when"]), x.get("site") or "?"]
+    fmt = {"depth": "{} m", "time": "{} min", "temp": "{} °C", "vis": "vis {} m", "buddies": "{} buddies"}
+    p += [fmt[k].format(x[k]).replace("1 buddies", "1 buddy") if k == "buddies" else fmt[k].format(x[k])
+          for k in fmt if x.get(k) is not None]
+    if x.get("sightings"):
+        p.append("🐠 " + ", ".join(s["species"] for s in x["sightings"]))
+    return " · ".join(p)
+
+
+def cmd_add(a):
+    try:
+        f = fields_from_args(a)
+        with locked():
+            d = store()
+            dive = new_dive(d, f)
+            save_store(d)
+    except ValueError as e:
+        die(str(e))
+    print(json.dumps(dive, ensure_ascii=False) if a.json else summary(dive))
+
+
+def cmd_edit(a):
+    try:
+        f = fields_from_args(a)
+        with locked():
+            d = store()
+            dive = pick(d, a.ref)
+            for k in a.clear or []:
+                if k not in FIELDS and k not in ("notes", "sightings"):
+                    raise ValueError(f"cannot clear {k!r}")
+                dive.pop(k, None)
+            apply_fields(dive, f)
+            dive["edited"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            save_store(d)
+    except ValueError as e:
+        die(str(e))
+    print(json.dumps(dive, ensure_ascii=False) if a.json else summary(dive))
+
+
+def cmd_delete(a, restore=False):
+    with locked():
+        d = store()
+        src, dst = ("trash", "dives") if restore else ("dives", "trash")
+        hit = [x for x in d[src] if str(x["id"]) == a.ref]
+        if not hit:
+            die(f"no dive #{a.ref}" + (" in the trash" if restore else ""))
+        d[src].remove(hit[0])
+        d[dst].append(hit[0])
+        save_store(d)
+    print(("restored " if restore else "moved to trash ") + summary(hit[0]))
+
+
+def cmd_sight(a):
+    try:
+        at = parse_when(a.at)[0].isoformat(timespec="minutes") if a.at else None
+    except ValueError as e:
+        die(str(e))
+    with locked():
+        d = store()
+        dive = pick(d, a.ref, at)
+        s = {"species": cap(a.species), "added": now().isoformat(timespec="minutes")}
+        if a.count:
+            s["count"] = a.count
+        if a.note:
+            s["note"] = a.note
+        dive.setdefault("sightings", []).append(s)
+        save_store(d)
+    print(summary(dive))
+
+
+def cmd_list(a):
+    d = store()
+    if a.json:
+        print(json.dumps(d["dives"], ensure_ascii=False, indent=1))
+        return
+    for x in d["dives"]:
+        print(summary(x))
+    if not d["dives"]:
+        print("no dives logged yet")
+
+
+def cmd_show(a):
+    x = pick(store(), a.ref)
+    if a.json:
+        print(json.dumps(x, ensure_ascii=False, indent=1))
+        return
+    print(summary(x))
+    if x.get("notes"):
+        print("notes: " + x["notes"])
+    if x.get("lat") is not None:
+        print(f"site: {x['lat']:.4f},{x['lon']:.4f}")
+
+
+def stats(dives):
+    def vals(k):
+        return [x[k] for x in dives if x.get(k) is not None]
+    species = {}
+    for x in dives:
+        for s in x.get("sightings", []):
+            k = s["species"]
+            species[k] = species.get(k, 0) + 1
+    site_n = {}
+    for x in dives:
+        site_n[x["site"]] = site_n.get(x["site"], 0) + 1
+    deep = max(dives, key=lambda x: x.get("depth") or 0) if vals("depth") else None
+    long_ = max(dives, key=lambda x: x.get("time") or 0) if vals("time") else None
+    avg = lambda k: round(sum(vals(k)) / len(vals(k)), 1) if vals(k) else None
+    return {"dives": len(dives), "bottom_min": sum(vals("time")),
+            "first": dives[0]["when"] if dives else None, "last": dives[-1]["when"] if dives else None,
+            "deepest": {"id": deep["id"], "site": deep["site"], "depth": deep["depth"]} if deep else None,
+            "longest": {"id": long_["id"], "site": long_["site"], "time": long_["time"]} if long_ else None,
+            "avg_temp": avg("temp"), "avg_vis": avg("vis"), "avg_depth": avg("depth"),
+            "sites": dict(sorted(site_n.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "species": dict(sorted(species.items(), key=lambda kv: (-kv[1], kv[0])))}
+
+
+def cmd_stats(a):
+    s = stats(store()["dives"])
+    if a.json:
+        print(json.dumps(s, ensure_ascii=False, indent=1))
+        return
+    if not s["dives"]:
+        print("no dives logged yet")
+        return
+    h, m = divmod(s["bottom_min"], 60)
+    print(f"{s['dives']} dives · {h} h {m:02d} min underwater · {len(s['sites'])} sites")
+    if s["deepest"]:
+        print(f"deepest: {s['deepest']['depth']} m at {s['deepest']['site']} (#{s['deepest']['id']})")
+    if s["longest"]:
+        print(f"longest: {s['longest']['time']} min at {s['longest']['site']} (#{s['longest']['id']})")
+    print(" · ".join(f"avg {k} {s['avg_' + k]} {u}" for k, u in (("depth", "m"), ("temp", "°C"), ("vis", "m"))
+                     if s["avg_" + k] is not None))
+    if s["species"]:
+        print("species: " + ", ".join(f"{k} ×{v}" if v > 1 else k for k, v in s["species"].items()))
+
+
+# ---------- export ----------
+def vis_rating(m):  # Subsurface's visibility is 0–5 stars
+    return 0 if m is None else 1 if m < 5 else 2 if m < 10 else 3 if m < 15 else 4 if m < 25 else 5
+
+
+def export_subsurface(dives, path):
+    import hashlib
+    from xml.etree import ElementTree as ET
+    root = ET.Element("divelog", program="subsurface", version="3")
+    ET.SubElement(root, "settings")
+    ds = ET.SubElement(root, "divesites")
+    uuids = {}
+    for x in dives:
+        key = x.get("site_id") or x["site"]
+        if key in uuids:
+            continue
+        u = hashlib.sha1(key.encode()).hexdigest()[:8]
+        uuids[key] = u
+        attrs = {"uuid": u, "name": x["site"]}
+        if x.get("lat") is not None:
+            attrs["gps"] = f"{x['lat']:.6f} {x['lon']:.6f}"
+        ET.SubElement(ds, "site", attrs)
+    dv = ET.SubElement(root, "dives")
+    for n, x in enumerate(dives, 1):
+        w = dt.datetime.fromisoformat(x["when"])
+        attrs = {"number": str(n), "divesiteid": uuids[x.get("site_id") or x["site"]],
+                 "date": w.strftime("%Y-%m-%d"), "time": w.strftime("%H:%M:%S")}
+        if x.get("time") is not None:
+            mins = float(x["time"])
+            attrs["duration"] = f"{int(mins)}:{int(round((mins % 1) * 60)):02d} min"
+        if x.get("vis") is not None:
+            attrs["visibility"] = str(vis_rating(x["vis"]))
+        e = ET.SubElement(dv, "dive", attrs)
+        if x.get("buddies"):
+            ET.SubElement(e, "buddy").text = f"{x['buddies']} {'buddy' if x['buddies'] == 1 else 'buddies'}"
+        notes = []
+        if x.get("vis") is not None:
+            notes.append(f"Visibility {x['vis']} m")
+        if x.get("sightings"):
+            notes.append("Sightings: " + ", ".join(s["species"] + (f" ×{s['count']}" if s.get("count") else "")
+                                                   for s in x["sightings"]))
+        if x.get("notes"):
+            notes.append(x["notes"])
+        if notes:
+            ET.SubElement(e, "notes").text = "\n".join(notes)
+        if x.get("temp") is not None:
+            ET.SubElement(e, "divetemperature", water=f"{float(x['temp']):.1f} C")
+        dc = ET.SubElement(e, "divecomputer", model="manually added dive")
+        if x.get("depth") is not None:
+            ET.SubElement(dc, "depth", max=f"{float(x['depth']):.1f} m")
+        if x.get("temp") is not None:
+            ET.SubElement(dc, "temperature", water=f"{float(x['temp']):.1f} C")
+    ET.indent(root)
+    tmp = path + ".tmp"
+    ET.ElementTree(root).write(tmp, encoding="utf-8", xml_declaration=False)
+    os.replace(tmp, path)
+
+
+def export_pdf(dives, path, title):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError:
+        if os.environ.get("DIVELOG_REEXEC") or not os.path.exists(VENV_PY):
+            die(f"the PDF export needs reportlab (venv {VENV_PY})")
+        os.environ["DIVELOG_REEXEC"] = "1"
+        os.execv(VENV_PY, [VENV_PY, "-I", os.path.abspath(__file__)] + sys.argv[1:])
+    n = len(dives)
+    fs = 9 if n <= 14 else max(5.5, 9 - (n - 14) * 0.17)  # shrink to keep it on one page
+    st = ParagraphStyle("c", fontName="Helvetica", fontSize=fs, leading=fs * 1.2)
+    head = ParagraphStyle("h", fontName="Helvetica-Bold", fontSize=16, leading=19)
+    sub = ParagraphStyle("s", fontName="Helvetica", fontSize=9.5, leading=12, textColor=colors.HexColor("#444444"))
+    esc = lambda s: (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    s = stats(dives)
+    h, m = divmod(s["bottom_min"], 60)
+    line = f"{s['dives']} dives · {h} h {m:02d} min underwater · {len(s['sites'])} sites"
+    if s["deepest"]:
+        line += f" · deepest {s['deepest']['depth']} m ({esc(s['deepest']['site'])})"
+    for k, u in (("temp", "°C"), ("vis", "m")):
+        if s["avg_" + k] is not None:
+            line += f" · avg {'water' if k == 'temp' else 'visibility'} {s['avg_' + k]} {u}"
+    rows = [["#", "Date", "Site", "Max", "Time", "Water", "Vis", "Bud.", "Sightings · notes"]]
+    for i, x in enumerate(dives, 1):
+        w = dt.datetime.fromisoformat(x["when"])
+        sight = ", ".join(sp["species"] for sp in x.get("sightings", []))
+        txt = "<b>" + esc(sight) + "</b>" if sight else ""
+        if x.get("notes"):
+            txt += (" · " if txt else "") + esc(x["notes"])
+        val = lambda k, u: f"{x[k]} {u}".strip() if x.get(k) is not None else "–"
+        rows.append([str(i), w.strftime("%d.%m.%y %H:%M"), Paragraph(esc(x["site"]), st), val("depth", "m"),
+                     val("time", "min"), val("temp", "°C"), val("vis", "m"), val("buddies", ""), Paragraph(txt, st)])
+    pw = landscape(A4)[0] - 24 * mm
+    widths = [8 * mm, 25 * mm, 46 * mm, 15 * mm, 16 * mm, 16 * mm, 13 * mm, 10 * mm]
+    widths.append(pw - sum(widths))
+    tbl = Table(rows, colWidths=widths, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "Helvetica", fs), ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", fs),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0b4f6c")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eef6f9")]),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"), ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#b8d3dd")),
+        ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+    story = [Paragraph(esc(title), head), Spacer(1, 2 * mm), Paragraph(line, sub), Spacer(1, 4 * mm), tbl]
+    if s["species"]:
+        story += [Spacer(1, 4 * mm), Paragraph("<b>Species seen:</b> " + esc(", ".join(
+            f"{k} ×{v}" if v > 1 else k for k, v in s["species"].items())), sub)]
+    tmp = path + ".tmp.pdf"
+    SimpleDocTemplate(tmp, pagesize=landscape(A4), leftMargin=12 * mm, rightMargin=12 * mm, topMargin=12 * mm,
+                      bottomMargin=12 * mm, title=title, author="divelog").build(story)
+    os.replace(tmp, path)
+
+
+def cmd_export(a):
+    dives = store()["dives"]
+    if not dives:
+        die("no dives logged yet")
+    if not (a.subsurface or a.pdf):
+        die("export needs --subsurface FILE and/or --pdf FILE")
+    for p in filter(None, (a.subsurface, a.pdf)):
+        if not os.path.isdir(os.path.dirname(os.path.abspath(p))):
+            die(f"output folder does not exist: {os.path.dirname(os.path.abspath(p))}")
+    if a.subsurface:
+        export_subsurface(dives, a.subsurface)
+        print(a.subsurface)
+    if a.pdf:
+        export_pdf(dives, a.pdf, a.title or config().get("title") or "Dive logbook")
+        print(a.pdf)
+
+
+# ---------- Telegram form ----------
+def draft_path():
+    return os.path.join(DIR, "draft.json")
+
+
+def leg_for(day):
+    for leg in config().get("legs", []):
+        if leg.get("from", "") <= day <= leg.get("to", "9999"):
+            return leg
+    return {}
+
+
+def site_buttons(dr):
+    leg = leg_for(dr["when"][:10])
+    area, pri = leg.get("area"), {sid: i for i, sid in enumerate(leg.get("sites", []))}  # leg "sites": shown first
+    used = {}
+    for x in store()["dives"]:
+        used[x.get("site_id")] = used.get(x.get("site_id"), 0) + 1
+    cand = [s for s in sites() if s["id"] in pri or not area or fold(area) in fold(s.get("area", ""))] or sites()
+    cand.sort(key=lambda s: (-used.get(s["id"], 0), pri.get(s["id"], 999), s["name"]))
+    btn = [{"text": s["name"][:30], "data": f"dv:s:{s['id']}"[:64]} for s in cand[:8]]
+    rows = [btn[i:i + 2] for i in range(0, len(btn), 2)]
+    return rows + [[{"text": "✏️ Other (type it)", "data": "dv:s:other"}]]
+
+
+def card(dr, step, note=None):
+    lines = [f"🤿 New dive · {fmt_when(dr['when'])}"]
+    if dr.get("site"):
+        lines.append(f"📍 {dr['site']}")
+    vals = [f"{FIELDS[k][0]} {dr[k]}{(' ' + FIELDS[k][1]) if FIELDS[k][1] else ''}" for k in FIELDS if dr.get(k) is not None]
+    if vals:
+        lines.append(" · ".join(vals))
+    if dr.get("sightings"):
+        lines.append("🐠 " + ", ".join(dr["sightings"]))
+    if dr.get("notes"):
+        lines.append("📝 " + dr["notes"])
+    if note:
+        lines.append(note)
+    if step == "confirm":
+        lines += ["", "Save it? (type notes or a fix like \"vis 15\" to change it)"]
+        buttons = [[{"text": "✅ Save", "data": "dv:ok"}, {"text": "❌ Discard", "data": "dv:no"}],
+                   [{"text": "🕒 Earlier date/time", "data": "dv:w"}, {"text": "↩️ Start over", "data": "dv:redo"}]]
+    elif step == "when":
+        lines += ["", "When was the dive? Type it (e.g. 23.11 09:30, yesterday 14:00) or pick:"]
+        buttons = [[{"text": "Today 09:00", "data": "dv:w:t9"}, {"text": "Today 14:00", "data": "dv:w:t14"}],
+                   [{"text": "Yesterday 09:00", "data": "dv:w:y9"}, {"text": "Yesterday 14:00", "data": "dv:w:y14"}]]
+    elif step == "site_text":
+        lines += ["", "Type the site name."]
+        buttons = []
+    else:
+        lines += ["", QUESTION[step]]
+        if step == "site":
+            buttons = site_buttons(dr)
+        else:
+            u = FIELDS[step][1]
+            btn = [{"text": f"{v}{(' ' + u) if u and step != 'temp' else ('°' if step == 'temp' else '')}",
+                    "data": f"dv:{CODE[step]}:{v}"} for v in CHOICES[step]]
+            buttons = [btn[:3], btn[3:], [{"text": "⏭ Skip", "data": "dv:skip"}]]
+    return {"text": "\n".join(lines), "buttons": buttons, "step": step}
+
+
+def next_step(dr):
+    for s in STEPS:
+        if s not in dr["asked"] and dr.get(s) is None:
+            return s
+    return "confirm"
+
+
+def tg_out(dr, step=None, note=None, **extra):
+    step = step or next_step(dr)
+    dr["step"] = step
+    save_json(draft_path(), dr)
+    out = card(dr, step, note)
+    out.update(extra)
+    print(json.dumps(out, ensure_ascii=False))
+
+
+def quick_into(dr, f):
+    for k in ("site", "when", "notes") + tuple(FIELDS):
+        if f.get(k) is not None:
+            if k == "site":
+                s = find_site(f["site"])
+                dr["site"] = s["name"] if s else f["site"]
+            else:
+                dr[k] = f[k]
+    if f.get("sightings"):
+        dr.setdefault("sightings", []).extend(f["sightings"])
+
+
+def cmd_tg(a):
+    with locked():
+        dr = load_json(draft_path(), None)
+        if a.action == "start":
+            replaced = bool(dr)
+            dr = {"when": now().isoformat(timespec="minutes"), "asked": [], "started": now().isoformat(timespec="minutes")}
+            try:
+                if a.arg:
+                    quick_into(dr, parse_quick(a.arg))
+            except ValueError as e:
+                return tg_out(dr, note=f"⚠️ {e}", replaced=replaced)
+            return tg_out(dr, replaced=replaced)
+        if not dr:
+            print(json.dumps({"text": "No dive in progress. Send /dive to log one.", "buttons": [], "step": None}))
+            return
+        if a.action == "show":
+            return tg_out(dr, dr.get("step"))
+        step = dr.get("step") or next_step(dr)
+        if a.action == "text":
+            t = (a.arg or "").strip()
+            try:
+                if step == "when":
+                    dr["when"] = parse_when(t)[0].isoformat(timespec="minutes")
+                    return tg_out(dr, "confirm")
+                if step in ("site", "site_text"):
+                    s = find_site(t)
+                    f = parse_quick(t) if not s else {"site": s["name"]}
+                    if "site" not in f:
+                        f["site"] = t
+                    quick_into(dr, f)
+                    dr["asked"].append("site")
+                    return tg_out(dr)
+                if step in FIELDS and re.fullmatch(r"\d+(?:[.,]\d+)?\s*(?:m|min|°?c|°)?", t, re.I):
+                    dr[step] = checked(step, re.match(r"\d+(?:[.,]\d+)?", t).group(0))
+                    dr["asked"].append(step)
+                    return tg_out(dr)
+                f = parse_quick(t)
+                known = {k for k in f if k not in ("notes", "site")} | ({"site"} if find_site(f.get("site") or "") else set())
+                if step == "confirm" and not known:
+                    dr["notes"] = ((dr.get("notes") or "") + " " + t).strip()  # plain words on the card = notes
+                    return tg_out(dr, "confirm")
+                quick_into(dr, f)
+                return tg_out(dr, "confirm" if step == "confirm" else None)
+            except ValueError as e:
+                return tg_out(dr, step, note=f"⚠️ {e}")
+        data = a.arg or ""
+        if not data.startswith("dv:"):
+            die(f"not a divelog callback: {data!r}")
+        parts = data.split(":")
+        kind, val = parts[1] if len(parts) > 1 else "", ":".join(parts[2:])
+        if kind == "s":
+            if val == "other":
+                return tg_out(dr, "site_text")
+            s = next((x for x in sites() if x["id"] == val), None)
+            if not s:
+                return tg_out(dr, "site", note="⚠️ unknown site, pick again")
+            dr["site"] = s["name"]
+            dr["asked"].append("site")
+            return tg_out(dr)
+        rev = {v: k for k, v in CODE.items()}
+        if kind in rev:
+            try:
+                dr[rev[kind]] = checked(rev[kind], val)
+            except ValueError as e:
+                return tg_out(dr, rev[kind], note=f"⚠️ {e}")
+            dr["asked"].append(rev[kind])
+            return tg_out(dr)
+        if kind == "skip":
+            dr["asked"].append(step)
+            return tg_out(dr)
+        if kind == "w":
+            if not val:
+                return tg_out(dr, "when")
+            m = re.fullmatch(r"([ty])(\d{1,2})", val)
+            if not m:
+                return tg_out(dr, "when", note="⚠️ unknown choice")
+            day = now().date() - dt.timedelta(days=1 if m.group(1) == "y" else 0)
+            dr["when"] = dt.datetime.combine(day, dt.time(int(m.group(2)), 0)).isoformat(timespec="minutes")
+            return tg_out(dr, "confirm")
+        if kind == "redo":
+            keep = {"when": dr["when"], "asked": [], "started": dr.get("started")}
+            return tg_out(keep, note="Starting over.")
+        if kind == "no":
+            os.remove(draft_path())
+            print(json.dumps({"text": "Discarded.", "buttons": [], "step": None}))
+            return
+        if kind == "ok":
+            if not dr.get("site"):
+                return tg_out(dr, "site", note="⚠️ a dive needs a site")
+            d = store()
+            f = {k: dr.get(k) for k in ("site", "when", "notes") + tuple(FIELDS)}
+            f["sightings"] = dr.get("sightings")
+            try:
+                dive = new_dive(d, f)
+            except ValueError as e:
+                return tg_out(dr, "confirm", note=f"⚠️ {e}")
+            save_store(d)
+            os.remove(draft_path())
+            n = len(d["dives"])
+            print(json.dumps({"text": f"✅ Dive #{dive['id']} saved ({n} in the log).\n{summary(dive)}\n\n"
+                                      "📸 Send a fish photo with \"fish?\" and I'll add the species.",
+                              "buttons": [], "step": None, "saved_id": dive["id"]}, ensure_ascii=False))
+            return
+        die(f"unknown callback {data!r}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    def fields(p):
+        p.add_argument("--site")
+        p.add_argument("--depth", type=float)
+        p.add_argument("--time", type=float)
+        p.add_argument("--temp", type=float)
+        p.add_argument("--vis", type=float)
+        p.add_argument("--buddies", type=int)
+        p.add_argument("--when")
+        p.add_argument("--notes")
+        p.add_argument("--sight", action="append")
+        p.add_argument("--quick")
+        p.add_argument("--json", action="store_true")
+    fields(sp.add_parser("add"))
+    p = sp.add_parser("edit")
+    p.add_argument("ref")
+    p.add_argument("--clear", action="append")
+    fields(p)
+    for nm in ("delete", "undelete"):
+        sp.add_parser(nm).add_argument("ref")
+    p = sp.add_parser("sight")
+    p.add_argument("ref")
+    p.add_argument("species")
+    p.add_argument("--at")
+    p.add_argument("--count", type=int)
+    p.add_argument("--note")
+    for nm in ("list", "stats"):
+        sp.add_parser(nm).add_argument("--json", action="store_true")
+    p = sp.add_parser("show")
+    p.add_argument("ref")
+    p.add_argument("--json", action="store_true")
+    p = sp.add_parser("export")
+    p.add_argument("--subsurface")
+    p.add_argument("--pdf")
+    p.add_argument("--title")
+    p = sp.add_parser("sites")
+    p.add_argument("action", nargs="?", choices=["list", "import"], default="list")
+    p.add_argument("file", nargs="?")
+    p.add_argument("--search")
+    p.add_argument("--area")
+    p.add_argument("--json", action="store_true")
+    p = sp.add_parser("tg")
+    p.add_argument("action", choices=["start", "cb", "text", "show"])
+    p.add_argument("arg", nargs="?")
+    a = ap.parse_args()
+    {"add": cmd_add, "edit": cmd_edit, "delete": cmd_delete, "undelete": lambda a: cmd_delete(a, True),
+     "sight": cmd_sight, "list": cmd_list, "show": cmd_show, "stats": cmd_stats, "export": cmd_export,
+     "sites": cmd_sites, "tg": cmd_tg}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

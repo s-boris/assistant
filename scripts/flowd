@@ -1,0 +1,1440 @@
+#!/usr/local/bin/python3.13 -I
+"""flowd: live data-flow stream for the dashboard's Architecture map (Server-Sent Events).
+
+Tails my session transcripts (the main session + its recently active subagents; incrementally, never loaded whole),
+~/inbox and the dashboard data file, turns every step into an event on an edge of the map ("from→to") and streams it,
+filtered, over SSE. nginx serves it as dash.<domain>/live (same basic auth). The container publishes no port for
+it, so an ssh reverse tunnel carries it: nginx VM 127.0.0.1:PORT -> container 127.0.0.1:PORT.
+
+  flowd serve [--port N] [--static DIR]  run the server in the foreground on 127.0.0.1 (--static: also serve DIR's
+                                         index.html + data.json, for local tests and screenshots)
+  flowd ensure      watchdog (cron every minute + boot.sh): start server + tunnel unless switched off; restart a hung one
+  flowd off         KILL SWITCH: stop both and stay off, also across reboots  ·  flowd on: switch back on
+  flowd stop        stop both (the next ensure restarts them)  ·  flowd status: processes + health
+  flowd probe [P]   GET https://dash.<domain>/live/health (or P) through nginx; basic auth from ~/.secrets, never printed
+                    (handle "dash": local = that curl; shadow = it + the hub's check; hub = through core.egress,
+                    the hub puts the credential on the wire, no local file read)
+  flowd edges       list the edge ids
+
+HTTP (127.0.0.1:PORT; nginx location /live)
+  GET /live?edge=ID[,ID][&pulse=1]  SSE. ID = "from→to" (also from-to, from>to), up to 4, "*" = all, "" = none. "hello",
+                               the edge's backlog (ring of 80; Last-Event-ID resumes), then live "ev" events; pulse=1
+                               adds a content-free "pulse" {edge,from,to,kind} for the other edges; ": ping" every 15 s.
+       optional filters (backlog and live, to cut bandwidth): kind=K[,K] (up to 12), from=NODE, to=NODE,
+       dir=in|out (to me / from me), err=1 (errors only: exit != 0, error flag or chip "error"), since=EPOCH (events
+       at/after), q=TEXT (≤ 200 chars, case-insensitive, all words must match). q only ever sees what the event
+       already carries (filtered text, chip, kind, actor, nodes, meta), never hidden or vault content. Bad value -> 400.
+       With filters the backlog is filtered before it is cut; "*" keeps up to 160. hello echoes the filter.
+  GET /live/more?id=N         the full filtered text of event N (the stream cuts texts at 2 KB), JSON
+  GET /live/health             JSON status, no content
+  GET /live/agents             SSE for the dashboard's Agents tab: "hello", then "agents" {now, hours, main, agents[]}
+                               (lib/agentfeed.py snapshot: running / stalled agents + those ended in the last 6 h, the
+                               Main row) whenever it changes, checked every 2 s; ": ping" every 15 s. Up to 6 viewers.
+  GET /live/agent?id=ID|main   SSE: one agent's (or the main session's) activity: "hello", "steps" [backlog, results
+                               folded in], then live "step" events {s, t, k: start|in|tool|res|say|end, n, d, ok, ref,
+                               x, len}; "gone" when the main session rotated (the page reconnects). Up to 8 viewers.
+                               Strictly filtered (agentfeed.clean, fail closed): tool names, the agent's own short
+                               descriptions, ok/error, its prose lines; never inputs, outputs, prompts, the result.
+  GET /live/ci                 SSE for the Health and CI tabs: "hello", then "ci" (lib/cifeed.py snapshot: land queue,
+                               last 15 lands, nightly, hub runner, headline, legacy suites, deploys; branch/step/suite
+                               names, releases, times, counts only)
+                               whenever it changes, checked every 2 s; ": ping" every 15 s. Up to 6 viewers.
+Event: {id, t, edge, from, to, kind, chip, actor, text?, more?, meta{exit, ms, bytes, cmd, desc, hidden, redacted}}
+
+Privacy (tests: ~/opt/flowd-tests/run.sh)
+  * Strict allowlist: text only for known tools and message kinds; an unknown tool, or a result whose call was not
+    seen, is metadata only.
+  * Vault (all data that I can see, not just metadata): a command or path touching
+    vault/tgread/paperless/context/signals/bills/contracts/firefly/gmail/recall/deadlines/gift-radar/missing-docs or my
+    transcripts (VAULT_RE) goes to edge me→vault WITH its content, like every other tool: the command I run and the
+    full output my session receives (answers, flags, cards, digests). Subagent results and every inbox note are shown
+    too; nothing is masked. What happens inside the vault (Telegram/Gmail/paperless/Firefly -> policy filter -> local
+    LLM) never reaches my session, so flowd has no edge for it and cannot show it.
+  * Secrets: outputs of commands/reads touching ~/.secrets, .env, credentials, ssh keys, htpasswd, basic-auth or card
+    files are never shown; every text goes through secretscan.redact and must then pass secretscan.scan, else it is
+    dropped; without secretscan no text is sent at all (fail closed).
+"""
+import collections
+import datetime
+import json
+import os
+import queue
+import re
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+import assistant_profile  # noqa: E402
+
+HOME = os.path.expanduser('~')
+sys.path.insert(0, os.environ.get('FLOWD_SECRETSCAN_DIR', os.path.join(HOME, 'bin')))
+try:
+    import secretscan
+except Exception:          # fail closed: no redaction possible -> no text at all
+    secretscan = None
+try:
+    import agentfeed       # the Agents tab (lib/agentfeed.py: its own, stricter filter); missing -> those routes 503
+except Exception:
+    agentfeed = None
+try:
+    import cifeed          # the System tab's CI card (lib/cifeed.py: land queue, lands, nightly, runner); missing -> 503
+except Exception:          # noqa: BLE001
+    cifeed = None
+
+VERSION = 1
+PROJ = os.environ.get('FLOWD_PROJECTS', os.path.join(HOME, '.claude/projects/-home-node-workspace'))
+INBOX = os.environ.get('FLOWD_INBOX', os.path.join(HOME, 'inbox'))
+DASHDATA = os.environ.get('FLOWD_DASHDATA', os.path.join(HOME, '.local/state/dash/www/data.json'))
+STATE = os.environ.get('FLOWD_STATE', os.path.join(HOME, '.local/state/flowd'))
+OFF = os.environ.get('FLOWD_OFF', os.path.join(HOME, '.config/flowd/off'))
+PORT = int(os.environ.get('FLOWD_PORT', '8790'))
+WEB_VM = assistant_profile.get('network.hosts.web_vm')        # user@host of the nginx VM (profile)
+SERVER_HOST = assistant_profile.get('network.server_host')    # the Unraid server (profile)
+VM = os.environ.get('FLOWD_VM', WEB_VM)
+PUBLIC = 'dash.' + assistant_profile.get('network.domain')
+BASICAUTH = os.path.join(HOME, '.secrets/browser-basicauth.txt')
+TEXT_MAX, FULL_MAX, RING, MAX_CLIENTS = 2000, 32000, 80, 12
+BACKFILL, SUB_BACKFILL, MAX_SUBS = 1_500_000, 262_144, 12
+START = time.time()
+STOP = threading.Event()
+
+NODES = {'telegram': 'Telegram (main bot)', 'app': 'Claude app / terminal', 'me': 'Main session',
+         'anthropic': 'Anthropic API', 'tools': 'Tools (shell, files)', 'subagents': 'Subagents',
+         'browser': 'Browser', 'web': 'Web', 'calendar': 'Calendar', 'github': 'GitHub', 'cron': 'Cron jobs',
+         'inbox': '~/inbox', 'vault': 'Vault', 'unraid': 'Unraid', 'nginx': 'nginx VM'}
+EDGES = ('telegram→me', 'app→me', 'me→anthropic', 'me→tools', 'me→subagents', 'me→browser', 'me→web',
+         'me→calendar', 'me→github', 'cron→inbox', 'inbox→me', 'me→vault', 'me→unraid', 'me→nginx', 'cron→nginx')
+EDGE_OF = {'telegram': 'telegram→me', 'app': 'app→me', 'inbox': 'inbox→me'}   # else me→<target>
+TEXT_KINDS = {'message', 'reply', 'prompt', 'output', 'request', 'response', 'tool_call', 'tool_result', 'launch',
+              'result', 'note', 'heartbeat', 'publish', 'vault_call', 'vault_result'}
+
+# ---------------------------------------------------------------- classification
+VAULT_RE = re.compile(
+    r'(?<![\w-])(?:claude-vault|vault[\w-]*|tgread[\w-]*|paperless[\w-]*|context|signals(?:\.json)?|bills|contracts'
+    r'|firefly|gmail|recall|deadlines|gift-radar|missing-docs)(?!\w)|\.claude/projects|tool-results/', re.I)
+SECRET_RE = re.compile(r'\.secrets\b|(?<![\w-])\.env\b|credential|(?<![\w-])id_(?:rsa|ed25519|ecdsa)|htpasswd|basicauth'
+                       r'|\.netrc|(?<![\w-])card[\w-]*\.(?:json|txt|env)\b', re.I)
+INBOX_RX = re.compile(r'(?:~|' + re.escape(HOME) + r')/inbox\b')
+BASH_EDGES = (
+    ('nginx', re.compile(r'(?<![\w-])proxy\s+(?:push|pull|test|cert|log)\b|' + re.escape(WEB_VM.split('@')[-1]) + r'\b|(?<![\w-])dash-publish\b'
+                         r'|nginx-mirror')),
+    ('unraid', re.compile(r'\bssh\b[^|;&]*?(?<![\w.-])(?:root@)?(?:unraid|' + re.escape(SERVER_HOST) + r')\b|' + re.escape(SERVER_HOST) + r'\b'
+                          r'|(?<![\w-])unraid[\w-]*:|(?<![\w-])(?:unraid-[\w-]+|container-watch|hddheat|hwtrend)\b')),
+    ('github', re.compile(r'(?<![\w-])git\s+(?:-C\s+\S+\s+)?(?:push|pull|fetch|clone|ls-remote)\b|(?<![\w-])gh\s+[a-z]'
+                          r'|github\.com')),
+    ('telegram', re.compile(r'(?:^|[\s;&|(])tg(?:-status)?\s')),
+    ('browser', re.compile(r'(?:^|[\s;&|(])browser\s+[a-z]')),
+    ('inbox', INBOX_RX),
+    ('web', re.compile(r'(?<![\w-])(?:curl|wget|readlater|yt-dlp|deals)\b|https?://(?!(?:127\.|localhost|192\.168\.|172\.))')),
+)
+VAULT_WORDS = {'ask', 'facts', 'plans', 'gmail', 'tg', 'raw', 'media', 'status', 'audit', 'alerts', 'events', 'summarize',
+               'digest', 'get', 'fields', 'search', 'list', 'request', 'release', 'admin', 'deploy', 'sync', 'health',
+               'scan', 'due', 'paid', 'show', 'unread', 'tail', 'cards', 'check', 'login', 'purge', 'exclude', 'gc',
+               'test', 'mode', 'help', 'card', 'add', 'week', 'today'}
+FILE_TOOLS = {'Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Grep', 'Glob', 'Skill', 'ToolSearch', 'TodoWrite'}
+AGENT_TOOLS = {'Agent', 'Task', 'SendMessage', 'TaskStop', 'TaskOutput'}
+
+
+def vault_kind(cmd):
+    """'vault ask tg', 'paperless get (--reason)': program + allowlisted words, never arguments."""
+    m = VAULT_RE.search(cmd)
+    prog = m.group(0).lower() if m else 'vault'
+    if prog.startswith('.claude') or prog.startswith('tool-results'):
+        return 'transcript read'
+    if not re.fullmatch(r'[a-z][a-z.-]{0,23}', prog):
+        prog = 'vault'
+    words = []
+    for w in (re.findall(r'\S+', cmd[m.end():])[:3] if m else []):
+        w = w.strip('"\'').lower()
+        if w not in VAULT_WORDS:
+            break
+        words.append(w)
+    flags = sorted(set(re.findall(r'--(text|content|reason|raw)\b', cmd)))
+    return ' '.join([prog] + words) + (' (' + ', '.join('--' + f for f in flags) + ')' if flags else '')
+
+
+def _s(v, n=FULL_MAX):
+    return v[:n] if isinstance(v, str) else ('' if v is None else json.dumps(v, ensure_ascii=False)[:n])
+
+
+def button_specs(rows):
+    """Inline buttons as the plugin reads them (telegram-plus inlineKeyboard): a flat list is one row; a button is a
+    plain string (label = callback data = the string) or {text, data | callback_data | url}; data defaults to the
+    text, a url button has none (None). Returns [(label, data)]; malformed entries are skipped, never raised."""
+    if not isinstance(rows, list):
+        return []
+    if rows and not isinstance(rows[0], list):
+        rows = [rows]
+    out = []
+    for row in rows:
+        for b in (row if isinstance(row, list) else [row]):
+            if isinstance(b, str):
+                b = {'text': b}
+            if not isinstance(b, dict) or not isinstance(b.get('text'), str) or not b['text']:
+                continue
+            data = None if b.get('url') else (b.get('data') if b.get('data') is not None else
+                                              b.get('callback_data') if b.get('callback_data') is not None else b['text'])
+            out.append((b['text'], data))
+    return out
+
+
+def tool_text(name, short, inp):
+    """What the call sends, as text (still unfiltered)."""
+    g = inp.get
+    if name == 'Bash':
+        return _s(g('command'))
+    if name == 'Read':
+        rng = f" (from line {g('offset')}, {g('limit')} lines)" if g('offset') or g('limit') else ''
+        return _s(g('file_path')) + rng
+    if name == 'Edit':
+        return f"{_s(g('file_path'), 300)}\n--- old\n{_s(g('old_string'), 12000)}\n+++ new\n{_s(g('new_string'), 12000)}"
+    if name == 'Write':
+        return f"{_s(g('file_path'), 300)}\n{_s(g('content'))}"
+    if name == 'MultiEdit':
+        return f"{_s(g('file_path'), 300)} ({len(g('edits') or [])} edits)"
+    if name == 'NotebookEdit':
+        return f"{_s(g('notebook_path'), 300)}\n{_s(g('new_source'))}"
+    if name in ('Grep', 'Glob'):
+        return f"{name.lower()} {_s(g('pattern'), 500)} in {_s(g('path'), 300) or '.'}"
+    if name == 'Skill':
+        return f"skill {_s(g('skill'), 80)} {_s(g('args'), 2000)}".rstrip()
+    if name in ('ToolSearch', 'TodoWrite'):
+        return _s(g('query') or g('todos'))
+    if name == 'WebFetch':
+        return f"{_s(g('url'), 2000)}\n{_s(g('prompt'), 4000)}".rstrip()
+    if name == 'WebSearch':
+        return _s(g('query'), 2000)
+    if name in ('Agent', 'Task'):
+        head = f"[{_s(g('subagent_type'), 40) or 'general-purpose'} · effort {_s(g('effort'), 10) or '-'}] {_s(g('description'), 200)}"
+        return head + '\n\n' + _s(g('prompt'))
+    if name == 'SendMessage':
+        return f"to {_s(g('to') or g('recipient'), 80)}: {_s(g('message') or g('content'))}"
+    if name in ('TaskStop', 'TaskOutput'):
+        return f"{name} {_s(g('task_id'), 80)}"
+    if name.startswith('mcp__plugin_telegram-plus_telegram__'):
+        if short in ('reply', 'edit_message', 'draft'):
+            t = _s(g('text'))
+            labels = [lbl for lbl, _ in button_specs(g('buttons'))]
+            if labels:
+                t += '\n[buttons: ' + ' | '.join(_s(x, 60) for x in labels[:12]) + ']'
+            if g('files'):
+                t += f"\n[{len(g('files'))} file(s) attached]"
+            return t
+        if short == 'react':
+            return _s(g('emoji'), 16)
+        if short == 'send_poll':
+            return _s(g('question'), 500) + '\n' + ' | '.join(_s(o, 80) for o in (g('options') or [])[:12])
+        return ''          # location, pins, deletes, downloads, chat actions: metadata only
+    return _s(inp)         # calendar, browser: their input as JSON
+
+
+def classify(name, inp):
+    """Where a tool call goes and what may be shown. Keys: target, chip, known, vault, secret, hide_result, text, vkind."""
+    inp = inp if isinstance(inp, dict) else {}
+    name = str(name or '?')
+    short = name.split('__')[-1] if name.startswith('mcp__') else name
+    c = {'name': name, 'chip': short[:32], 'known': True, 'vault': False, 'secret': False, 'hide_result': False,
+         'target': 'tools'}
+    if name == 'Bash':
+        cmd = _s(inp.get('command'))
+        c['secret'] = bool(SECRET_RE.search(cmd))
+        if VAULT_RE.search(cmd):
+            c.update(vault=True, target='vault', vkind=vault_kind(cmd))
+        else:
+            for target, rx in BASH_EDGES:
+                if rx.search(cmd):
+                    c['target'] = target
+                    break
+        c['desc'] = _s(inp.get('description'), 200)
+    elif name.startswith('mcp__plugin_telegram-plus_telegram__'):
+        c['target'] = 'telegram'
+        c['hide_result'] = short in ('download_attachment', 'send_location')
+    elif name.startswith('mcp__claude_ai_Google_Calendar__'):
+        c['target'] = 'calendar'
+    elif name.startswith('mcp__browser__'):
+        c.update(target='browser', chip=short.replace('browser_', '')[:32])
+    elif name in ('WebFetch', 'WebSearch'):
+        c['target'] = 'web'
+    elif name in AGENT_TOOLS:
+        c['target'] = 'subagents'
+    elif name in FILE_TOOLS:
+        probe = ' '.join(_s(inp.get(k), 2000) for k in ('file_path', 'notebook_path', 'path', 'skill'))
+        c['secret'] = bool(SECRET_RE.search(probe))
+        if VAULT_RE.search(probe):
+            c.update(vault=True, target='vault', vkind=f'{short} (vault-related path)')
+        elif INBOX_RX.search(probe):
+            c['target'] = 'inbox'
+    else:
+        c.update(known=False, text='')
+        return c
+    c['text'] = tool_text(name, short, inp)
+    return c
+
+
+def result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                t = b.get('type')
+                parts.append(str(b.get('text', '')) if t == 'text' else f'[{str(t or "block")[:20]}]')
+            elif isinstance(b, str):
+                parts.append(b)
+        return '\n'.join(parts)
+    return '' if content is None else str(content)
+
+
+PEM_RE = re.compile(r'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|\Z)', re.S)
+DIGIT_RE = re.compile(r"\d[\d.,:/'’-]*\d")
+
+
+class Filter:
+    def __init__(self):
+        self.cache = collections.OrderedDict()
+        self.loaded = time.time()
+
+    def clean(self, text):
+        """(filtered text or None, info): private-key blocks -> secretscan.redact -> secretscan.scan."""
+        if secretscan is None:
+            return None, {'hidden': 'no secretscan (fail closed)'}
+        if time.time() - self.loaded > 600:          # pick up new or changed secrets
+            secretscan._cache = None
+            self.loaded = time.time()
+        key = text
+        if key in self.cache:
+            return self.cache[key]
+        info = {}
+        raw = text[:FULL_MAX + 512]                 # redact before cutting: a secret is never split by the cut
+        raw, pem = PEM_RE.subn(secretscan.REDACTED, raw)
+        red = secretscan.redact(raw)
+        n = red.count(secretscan.REDACTED) - raw.count(secretscan.REDACTED) + pem
+        if n > 0:
+            info['redacted'] = n
+        red = red[:FULL_MAX]
+        res = (None, {'hidden': 'secret check failed'}) if secretscan.scan(red) else (red, info)
+        self.cache[key] = res
+        while len(self.cache) > 8:
+            self.cache.popitem(last=False)
+        return res
+
+    def event(self, edge, frm, to, kind, chip, actor, t, text=None, meta=None, show=True):
+        meta = {k: v for k, v in (meta or {}).items() if v not in (None, '')}
+        for k in ('desc', 'agent'):
+            if k in meta:
+                v = (self.clean(str(meta[k]))[0] or '')[:200]
+                if v:
+                    meta[k] = v
+                else:
+                    del meta[k]
+        ev = {'edge': edge, 'from': frm, 'to': to, 'kind': kind, 'chip': str(chip)[:40], 'actor': actor,
+              't': round(float(t or time.time()), 3)}
+        if text:
+            if show and kind in TEXT_KINDS:
+                full, info = self.clean(str(text))
+                meta.update(info)
+                if full:
+                    ev['text'] = full[:TEXT_MAX]
+                    if len(full) > TEXT_MAX:
+                        ev['more'] = True
+                        ev['_full'] = full
+            else:
+                meta.setdefault('hidden', 'metadata only')
+        ev['meta'] = meta
+        return ev
+
+
+# ---------------------------------------------------------------- hub (rings + clients)
+KIND_RE = re.compile(r'^[a-z_]{1,24}$')
+
+
+def is_error(ev):
+    m = ev.get('meta') or {}
+    return (m.get('exit') not in (None, 0)) or bool(m.get('error')) or ev.get('chip') == 'error'
+
+
+class EvFilter:
+    """Server-side stream filter (kind, from, to, dir, err, since, q). It only reads fields the event already carries
+    for the viewer (text after redaction, chip, kind, actor, nodes, meta), so a search can never probe hidden content."""
+    def __init__(self, kinds=(), frm=None, to=None, direction=None, err=False, since=None, q=''):
+        self.kinds, self.frm, self.to, self.dir = set(kinds), frm, to, direction
+        self.err, self.since = err, since
+        self.words = [w for w in (q or '').lower().split() if w]
+        self.active = bool(self.kinds or frm or to or direction or err or since or self.words)
+
+    @classmethod
+    def parse(cls, q):
+        """URL query dict -> EvFilter; ValueError on a bad value."""
+        g = lambda k: (q.get(k) or [''])[0].strip()
+        kinds = [k for k in g('kind').split(',') if k]
+        if len(kinds) > 12 or not all(KIND_RE.match(k) for k in kinds):
+            raise ValueError('kind')
+        frm, to, direction = g('from') or None, g('to') or None, g('dir') or None
+        if (frm and frm not in NODES) or (to and to not in NODES):
+            raise ValueError('node')
+        if direction not in (None, 'in', 'out'):
+            raise ValueError('dir')
+        since = g('since')
+        if since:
+            try:
+                since = float(since)
+            except ValueError:
+                raise ValueError('since')
+            if since != since or since < 0:
+                raise ValueError('since')
+        text = g('q')
+        if len(text) > 200:
+            raise ValueError('q')
+        return cls(kinds, frm, to, direction, g('err') in ('1', 'true', 'yes'), since or None, text)
+
+    def echo(self):
+        return {'kind': sorted(self.kinds), 'from': self.frm, 'to': self.to, 'dir': self.dir, 'err': self.err,
+                'since': self.since, 'q': ' '.join(self.words)}
+
+    @staticmethod
+    def hay(ev):
+        m = ev.get('meta') or {}
+        parts = [ev.get('text') or '', ev.get('chip') or '', ev.get('kind') or '', ev.get('actor') or '',
+                 ev.get('from') or '', ev.get('to') or '', NODES.get(ev.get('from'), ''), NODES.get(ev.get('to'), '')]
+        parts += [str(v) for v in m.values() if isinstance(v, (str, int, float)) and not isinstance(v, bool)]
+        return '\n'.join(parts).lower()
+
+    def __call__(self, ev):
+        if not self.active:
+            return True
+        if self.kinds and ev.get('kind') not in self.kinds:
+            return False
+        if (self.frm and ev.get('from') != self.frm) or (self.to and ev.get('to') != self.to):
+            return False
+        if (self.dir == 'in' and ev.get('to') != 'me') or (self.dir == 'out' and ev.get('from') != 'me'):
+            return False
+        if self.err and not is_error(ev):
+            return False
+        if self.since and (ev.get('t') or 0) < self.since:
+            return False
+        if self.words:
+            h = self.hay(ev)
+            return all(w in h for w in self.words)
+        return True
+
+
+class Client:
+    def __init__(self, edges, pulse, match=None):
+        self.edges, self.pulse, self.q, self.dead = set(edges), pulse, queue.Queue(maxsize=1000), False
+        self.match = match or EvFilter()
+
+    def offer(self, ev, live):
+        try:
+            if ('*' in self.edges or ev['edge'] in self.edges) and self.match(ev):
+                self.q.put_nowait(('ev', ev))
+            elif self.pulse and live:
+                self.q.put_nowait(('pulse', {k: ev[k] for k in ('edge', 'from', 'to', 'kind')}))
+        except queue.Full:
+            self.dead = True
+
+
+class Hub:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.seq = int(time.time() * 1000)           # ids keep growing across restarts (Last-Event-ID)
+        self.rings = {e: collections.deque(maxlen=RING) for e in EDGES}
+        self.full = collections.OrderedDict()
+        self.clients, self.count, self.last_t = [], 0, None
+
+    def publish(self, ev, live=True):
+        with self.lock:
+            self.seq += 1
+            ev['id'] = self.seq
+            full = ev.pop('_full', None)
+            if full:
+                self.full[self.seq] = full
+                while len(self.full) > 400:
+                    self.full.popitem(last=False)
+            self.rings[ev['edge']].append(ev)
+            self.count += 1
+            self.last_t = time.time()
+            clients = list(self.clients)
+        for cl in clients:
+            cl.offer(ev, live)
+
+    def backlog(self, edges, after=0, match=None):
+        keep = RING * (2 if '*' in edges else max(1, min(len(edges), 4)))
+        with self.lock:
+            rings = self.rings.values() if '*' in edges else [self.rings[e] for e in edges if e in self.rings]
+            evs = sorted((e for r in rings for e in r if match is None or match(e)), key=lambda e: e['id'])[-keep:]
+        return [e for e in evs if e['id'] > after]
+
+    def add(self, cl):
+        with self.lock:
+            if len(self.clients) >= MAX_CLIENTS:
+                return False
+            self.clients.append(cl)
+            return True
+
+    def remove(self, cl):
+        with self.lock:
+            if cl in self.clients:
+                self.clients.remove(cl)
+
+    def more(self, i):
+        with self.lock:
+            return self.full.get(i)
+
+    def health(self):
+        with self.lock:
+            last = self.last_t
+            return {'ok': True, 'version': VERSION, 'uptime': int(time.time() - START), 'clients': len(self.clients),
+                    'events': self.count, 'last_event_age': None if last is None else int(time.time() - last),
+                    'redaction': secretscan is not None, 'agentfeed': agentfeed is not None, 'cifeed': cifeed is not None, 'edges': list(EDGES)}
+
+
+# ---------------------------------------------------------------- transcript -> events
+CHAN_RE = re.compile(r'<channel\s([^>]*)>(.*?)</channel>', re.S)
+ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+TN_RE = re.compile(r'<(task-id|status|summary|result)>(.*?)</\1>', re.S)
+
+
+def ts(v):
+    try:
+        return datetime.datetime.fromisoformat(str(v).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return time.time()
+
+
+class Processor:
+    def __init__(self, hub, filt):
+        self.hub, self.f = hub, filt
+        self.calls = collections.OrderedDict()   # tool_use id -> classification + start time
+        self.agent_desc, self.launch_desc = {}, {}
+        self.queued = collections.deque(maxlen=50)
+        self.live, self.sess = True, None
+        self.inbox_seen, self.dash_m = None, None
+
+    def emit(self, edge, frm, to, kind, chip, actor, t, text=None, meta=None, show=True):
+        self.hub.publish(self.f.event(edge, frm, to, kind, chip, actor, t, text, meta, show), self.live)
+
+    def api(self, t, actor, direction, chip, text, show=True, meta=None):
+        frm, to = ('me', 'anthropic') if direction == 'request' else ('anthropic', 'me')
+        self.emit('me→anthropic', frm, to, direction, chip, actor, t, text, meta, show)
+
+    # -- entry point: one transcript object
+    def feed(self, o, actor='main', agent=None):
+        typ = o.get('type')
+        t = ts(o.get('timestamp'))
+        if typ == 'attachment':
+            a = o.get('attachment') or {}
+            if a.get('type') == 'queued_command' and isinstance(a.get('prompt'), str) and actor == 'main':
+                self.queued.append(hash(a['prompt'].strip()))
+                self.user_text(a['prompt'], t, actor, queued=True)
+            return
+        if o.get('isMeta') or typ not in ('user', 'assistant'):
+            return
+        msg = o.get('message') if isinstance(o.get('message'), dict) else {}
+        c = msg.get('content')
+        if typ == 'user':
+            if isinstance(c, str):
+                self.user_text(c, t, actor)
+            elif isinstance(c, list):
+                for b in c:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get('type') == 'tool_result':
+                        self.tool_result(b, o, t, actor, agent)
+                    elif b.get('type') == 'text':
+                        self.user_text(str(b.get('text') or ''), t, actor)
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                if b.get('type') == 'text' and str(b.get('text') or '').strip():
+                    self.api(t, actor, 'response', 'text', b['text'])
+                    if actor == 'main':
+                        self.emit('app→me', 'me', 'app', 'output', 'text', actor, t, b['text'])
+                elif b.get('type') == 'tool_use':
+                    self.tool_use(b, t, actor, agent)
+
+    def user_text(self, text, t, actor, queued=False):
+        s = text.strip()
+        if not s:
+            return
+        h = hash(s)
+        if not queued and h in self.queued:   # a queued command that shows up again as a user message
+            self.queued.remove(h)
+            return
+        if actor != 'main':                # a subagent's prompt / messages from the main session
+            self.api(t, actor, 'request', 'prompt', s)
+            return
+        if s.startswith('<channel'):
+            for m in CHAN_RE.finditer(s):
+                self.telegram_in(dict(ATTR_RE.findall(m.group(1))), m.group(2).strip(), t, actor)
+        elif s.startswith('[heartbeat]'):
+            self.emit('inbox→me', 'inbox', 'me', 'heartbeat', 'heartbeat', actor, t, s)
+            self.api(t, actor, 'request', 'heartbeat', s)
+        elif s.startswith('<task-notification'):
+            self.task_note(s, t, actor)
+        elif s.startswith('<system-reminder') or s.startswith('<local-command-caveat'):
+            self.api(t, actor, 'request', 'context', s, show=False)
+        else:
+            self.emit('app→me', 'app', 'me', 'prompt', 'prompt', actor, t, s)
+            self.api(t, actor, 'request', 'prompt', s)
+
+    def telegram_in(self, a, body, t, actor):
+        et = a.get('event_type', '')
+        meta = {}
+        if et == 'button':
+            chip, body = 'button', 'pressed: ' + a.get('button_text', '')
+        elif et == 'reaction':
+            # plugin attrs: reaction (added), removed_reaction (only with forwardReactions "all"), reacted_to_*
+            chip = 'reaction'
+            body = a.get('reaction') or ('removed ' + a['removed_reaction'] if a.get('removed_reaction') else body)
+        elif et:
+            chip = re.sub(r'[^a-z_]', '', et.lower())[:20] or 'event'
+        else:
+            chip = 'voice' if body.startswith('🎙') or a.get('transcript') else 'message'
+        if a.get('reply_to_text'):
+            body = '↪ ' + a['reply_to_text'][:300] + '\n' + body
+        if any(k.startswith('attachment') for k in a) or 'image_path' in a:
+            meta['attachment'] = 'photo' if 'image_path' in a else re.sub(r'[^a-z]', '', a.get('attachment_kind', 'file'))[:12] or 'file'
+        self.emit('telegram→me', 'telegram', 'me', 'message', chip, actor, t, body, meta)
+        self.api(t, actor, 'request', 'telegram ' + chip, body, meta=meta)
+
+    def task_note(self, s, t, actor):
+        d = {k: v.strip() for k, v in TN_RE.findall(s)}
+        aid = d.get('task-id', '')
+        status = re.sub(r'[^a-z_ -]', '', d.get('status', '').lower())[:20] or 'result'
+        text, meta = d.get('summary', ''), {'agent': self.agent_desc.get(aid) or None}
+        if d.get('result'):
+            text += '\n\n' + d['result']
+        self.emit('me→subagents', 'subagents', 'me', 'result', status, actor, t, text, meta)
+        self.api(t, actor, 'request', 'subagent ' + status, text, meta=meta)
+
+    def tool_use(self, b, t, actor, agent):
+        c = classify(b.get('name'), b.get('input'))
+        c.update(t=t, actor=actor)
+        self.calls[b.get('id')] = c
+        while len(self.calls) > 3000:
+            self.calls.popitem(last=False)
+        if c['name'] in ('Agent', 'Task'):
+            self.launch_desc[b.get('id')] = _s((b.get('input') or {}).get('description'), 80)
+        target = c['target']
+        edge = EDGE_OF.get(target, 'me→' + target)
+        kind = 'launch' if c['name'] in ('Agent', 'Task') else ('reply' if target == 'telegram' else
+                                                               'vault_call' if c['vault'] else 'tool_call')
+        meta = {'tool': c['name'], 'desc': c.get('desc'), 'cmd': c.get('vkind')}
+        self.emit(edge, 'me', target, kind, c['chip'], actor, t, c['text'], meta, show=c['known'])
+        self.api(t, actor, 'response', 'tool_use ' + c['chip'], c['text'], show=c['known'], meta={'tool': c['name']})
+
+    def tool_result(self, b, o, t, actor, agent):
+        c = self.calls.pop(b.get('tool_use_id'), None)
+        text = result_text(b.get('content'))
+        err = bool(b.get('is_error'))
+        meta = {'bytes': len(text.encode('utf-8', 'replace'))}
+        if c and c['name'] == 'Bash':
+            m = re.match(r'Exit code (\d+)', text) if err else None
+            meta['exit'] = int(m.group(1)) if m else (1 if err else 0)
+        elif err:
+            meta['error'] = True
+        if c:
+            meta['ms'] = max(0, int((t - c['t']) * 1000))
+            meta['tool'] = c['name']
+        if c is None:                                # call not seen: unknown -> metadata only
+            self.emit('me→tools', 'tools', 'me', 'tool_result', 'result', actor, t, text, meta, show=False)
+            self.api(t, actor, 'request', 'tool_result', text, show=False, meta=meta)
+            return
+        if c['vault']:
+            meta['cmd'] = c['vkind']
+        if c['name'] in ('Agent', 'Task'):
+            r = o.get('toolUseResult') if isinstance(o.get('toolUseResult'), dict) else {}
+            aid = str(r.get('agentId') or '')
+            if aid:
+                self.agent_desc[aid] = self.launch_desc.pop(b.get('tool_use_id'), '') or aid[:8]
+        show = c['known'] and not c['secret'] and not c['hide_result']
+        if c['secret']:
+            meta['hidden'] = 'secret file'
+        target = c['target']
+        edge = EDGE_OF.get(target, 'me→' + target)
+        chip = 'error' if err else 'started' if target == 'subagents' else 'answer' if c['vault'] else 'result'
+        kind = 'vault_result' if c['vault'] else 'tool_result'
+        self.emit(edge, target, 'me', kind, chip, actor, t, text, meta, show)
+        self.api(t, actor, 'request', 'tool_result ' + c['chip'], text, show, dict(meta))
+
+    # -- ~/inbox and the dashboard file (polled)
+    def inbox_tick(self):
+        try:
+            names = {n for n in os.listdir(INBOX) if not n.startswith('.')}
+        except OSError:
+            return
+        if self.inbox_seen is None:          # existing notes: no events
+            self.inbox_seen = names
+            return
+        for n in sorted(names - self.inbox_seen):
+            p = os.path.join(INBOX, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            self.emit('cron→inbox', 'cron', 'inbox', 'note', note_prefix(n), 'cron', st.st_mtime, self._read(p),
+                      {'name': n, 'bytes': st.st_size})
+        self.inbox_seen = names
+
+    @staticmethod
+    def _read(p, n=16000):
+        try:
+            with open(p, 'rb') as fh:
+                return fh.read(n).decode('utf-8', 'replace')
+        except OSError:
+            return ''
+
+    def dash(self):
+        try:
+            st = os.stat(DASHDATA)
+        except OSError:
+            return
+        if self.dash_m is None or st.st_mtime == self.dash_m:
+            self.dash_m = st.st_mtime
+            return
+        self.dash_m = st.st_mtime
+        self.emit('cron→nginx', 'cron', 'nginx', 'publish', 'dash-publish', 'cron', st.st_mtime,
+                  f'dashboard data refreshed ({st.st_size // 1024} KB); dash-publish copies it to the nginx VM',
+                  {'bytes': st.st_size})
+
+
+def note_prefix(n):
+    n = re.sub(r'\.md$', '', n.lower())
+    n = re.sub(r'[-_.]?\d[\d_.-]{3,}.*$', '', n)
+    return re.sub(r'[^a-z0-9-]', '', n)[:40] or 'note'
+
+
+# ---------------------------------------------------------------- tailing
+class Follow:
+    def __init__(self, path, backlog=None):
+        self.path, self.buf, self.pos, self.skip = path, b'', 0, False
+        if backlog is not None:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            self.pos = max(0, size - backlog)
+            self.skip = self.pos > 0
+
+    def read(self, cap=8 << 20):
+        try:
+            size = os.path.getsize(self.path)
+            if size < self.pos:                       # truncated or replaced
+                self.pos, self.buf, self.skip = 0, b'', False
+            if size == self.pos:
+                return []
+            with open(self.path, 'rb') as fh:
+                fh.seek(self.pos)
+                data = fh.read(min(size - self.pos, cap))
+        except OSError:
+            return []
+        self.pos += len(data)
+        lines = (self.buf + data).split(b'\n')
+        self.buf = lines.pop()
+        if len(self.buf) > 64 << 20:
+            self.buf = b''
+        if self.skip and lines:
+            lines, self.skip = lines[1:], False
+        out = []
+        for ln in lines:
+            if ln.strip():
+                try:
+                    o = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(o, dict):
+                    out.append(o)
+        return out
+
+
+def mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return 0.0
+
+
+def log(msg):
+    sys.stderr.write(time.strftime('%F %T ') + msg + '\n')
+    sys.stderr.flush()
+
+
+class Tailer(threading.Thread):
+    def __init__(self, proc):
+        super().__init__(daemon=True)
+        self.p, self.main, self.main_path, self.subs = proc, None, None, {}
+        self.t_scan = self.t_inbox = 0.0
+
+    def run(self):
+        while not STOP.is_set():
+            try:
+                self.tick()
+            except Exception as e:                  # never log content: type + where
+                tb = traceback.extract_tb(e.__traceback__)
+                log(f'tick: {type(e).__name__} at line {tb[-1].lineno if tb else "?"}')
+            STOP.wait(0.5)
+
+    def quiet(self, follow, actor, aid=None):
+        self.p.live = False
+        try:
+            for o in follow.read(cap=BACKFILL + (1 << 20)):
+                self.p.feed(o, actor, aid)
+        finally:
+            self.p.live = True
+
+    def tick(self):
+        now = time.time()
+        if now - self.t_scan >= 5:
+            self.scan(now)
+            self.t_scan = now
+        for path, (fo, actor, aid) in list(self.subs.items()):
+            for o in fo.read():
+                self.p.feed(o, actor, aid)
+        if self.main:
+            for o in self.main.read():
+                self.p.feed(o, 'main')
+        if now - self.t_inbox >= 1:
+            self.p.inbox_tick()
+            self.p.dash()
+            self.t_inbox = now
+
+    def scan(self, now):
+        cands = []
+        try:
+            for n in os.listdir(PROJ):
+                if n.endswith('.jsonl'):
+                    p = os.path.join(PROJ, n)
+                    cands.append((mtime(p), p))
+        except OSError:
+            pass
+        newest = max(cands)[1] if cands else None
+        if newest and newest != self.main_path:
+            self.main_path, self.p.sess, self.subs = newest, newest[:-6], {}
+            self.scan_subs(now)                     # subagents first: their vault results feed the quote mask
+            self.main = Follow(newest, backlog=BACKFILL)
+            self.quiet(self.main, 'main')
+            log('following ' + os.path.basename(newest))
+        else:
+            self.scan_subs(now)
+
+    def scan_subs(self, now):
+        d = os.path.join(self.p.sess, 'subagents') if self.p.sess else None
+        try:
+            files = [(mtime(os.path.join(d, n)), n) for n in os.listdir(d)
+                     if n.startswith('agent-') and n.endswith('.jsonl')] if d else []
+        except OSError:
+            files = []
+        for p in [p for p in self.subs if now - mtime(p) > 1800]:
+            del self.subs[p]
+        for m, n in sorted(files, reverse=True)[:MAX_SUBS]:
+            p = os.path.join(d, n)
+            if p in self.subs or now - m > 600:
+                continue
+            aid = n[6:-6]
+            actor = 'sub:' + self.label(d, aid)
+            try:
+                old = os.path.getctime(p) < START
+            except OSError:
+                continue
+            fo = Follow(p, backlog=SUB_BACKFILL if old else None)
+            self.subs[p] = (fo, actor, aid)
+            if old:
+                self.quiet(fo, actor, aid)
+
+    def label(self, d, aid):
+        try:
+            with open(os.path.join(d, f'agent-{aid}.meta.json')) as fh:
+                desc = str(json.load(fh).get('description') or '')
+        except (OSError, ValueError, AttributeError):
+            desc = ''
+        desc = (self.p.f.clean(desc)[0] or '') if desc else ''
+        return (desc[:48] or aid[:8]).replace('\n', ' ')
+
+
+# ---------------------------------------------------------------- HTTP
+HUB, STATIC = None, None
+
+# Dashboard tab views (the page's beacon GET /live/seen?v=VIEW&why=WHY, behind the dashboard login): one usage
+# event dash.view per real open, the tab name and why only. The page sends why = load (first visible load), tab (he
+# picked a tab) or focus (back in view after > 30 min away); its 5-min data refresh sends nothing. A beacon without
+# why comes from a page loaded before 2026-10-24, which also beaconed on every refresh: it counts only after
+# SEEN_LEGACY_GAP s without any beacon (a tab left open all night = one view). At most one per tab per 5 min.
+SEEN_VIEWS = ('health', 'ci', 'agents', 'today', 'usage', 'activity', 'codebase', 'privacy', 'architecture',
+              'system')   # system = the Health tab's name before 30.10 (a page loaded earlier)
+SEEN_WHY = ('load', 'tab', 'focus')
+SEEN_LEGACY_GAP = 1800
+_SEEN_LAST = {}
+
+
+def seen_log(view, now=None, why=None):
+    now = time.time() if now is None else now
+    if view not in SEEN_VIEWS or (why and why not in SEEN_WHY):
+        return False
+    last_any, _SEEN_LAST[''] = _SEEN_LAST.get('', 0), now      # '' = the last beacon of any tab, counted or not
+    if (not why and now - last_any < SEEN_LEGACY_GAP) or now - _SEEN_LAST.get(view, 0) < 300:
+        return False
+    _SEEN_LAST[view] = now
+    try:
+        from usage import log as usage_log   # ~/bin/lib/usage.py (never raises)
+        return bool(usage_log('dash.view', kind='invoke', channel='script', actor='owner', outcome=view,
+                              attrs={'surface': 'web', 'why': why or 'legacy'}, src='flowd'))
+    except Exception:   # noqa: BLE001  (a beacon never breaks the stream server)
+        return False
+
+
+def sse(event, data, eid=None):
+    s = (f'id: {eid}\n' if eid is not None else '') + f'event: {event}\n'
+    s += 'data: ' + json.dumps(data, ensure_ascii=False, separators=(',', ':')) + '\n\n'
+    return s.encode('utf-8')
+
+
+def norm_edge(v):
+    v = (v or '').strip().replace('->', '→').replace('>', '→')
+    if v in ('', '*') or v in EDGES:
+        return v
+    if '→' not in v and '-' in v:
+        a, _, b = v.partition('-')
+        v = a + '→' + b
+    return v if v in EDGES else None
+
+
+# ---------------------------------------------------------------- Agents tab (/live/agents, /live/agent)
+AGENT_HOURS, BOARD_EVERY = 6, 2.0
+LIST_SLOTS, STEP_SLOTS = threading.BoundedSemaphore(6), threading.BoundedSemaphore(8)
+
+
+class Board:
+    """The Agents tab list, shared by every /live/agents viewer: agentfeed.snapshot at most every BOARD_EVERY s, with
+    the transcripts read incrementally (readers kept here) and traces' rows (the trigger) refreshed every 60 s.
+    The version only moves when something other than the clock changed."""
+
+    def __init__(self):
+        self.lock, self.readers = threading.Lock(), {}
+        self.snap = self.key = self.tr = self.err = None
+        self.t = self.tr_t = 0.0
+        self.ver = 0
+
+    def get(self):
+        with self.lock:
+            now = time.time()
+            if now - self.t >= BOARD_EVERY:
+                self.t = now
+                try:
+                    if self.tr is None or now - self.tr_t > 60:
+                        self.tr, self.tr_t = agentfeed.trace_rows(AGENT_HOURS, now), now
+                    snap = agentfeed.snapshot(AGENT_HOURS, readers=self.readers, now=now, traces=self.tr)
+                    key = json.dumps([snap['main'] and {k: v for k, v in snap['main'].items() if k != 'last'},
+                                      [{k: v for k, v in a.items() if k != 'runtime_s'} for a in snap['agents']]],
+                                     sort_keys=True)
+                    if key != self.key:
+                        self.key, self.snap, self.ver = key, snap, self.ver + 1
+                    self.err = None
+                except Exception as e:                  # type only: never content
+                    self.err = type(e).__name__
+            return self.ver, self.snap, self.err
+
+
+BOARD = Board()
+
+# ---------------------------------------------------------------- Health and CI tabs' CI snapshot (/live/ci)
+CI_EVERY, CI_SLOTS = 2.0, threading.BoundedSemaphore(6)
+
+
+class CIBoard:
+    """The CI card's snapshot, shared by every /live/ci viewer: cifeed.snapshot at most every CI_EVERY s (deploys.jsonl
+    re-read only when it changed; lock, queue tickets and /proc each time). The version moves only on a real change."""
+
+    def __init__(self):
+        self.lock, self.snap, self.key, self.err, self.t, self.ver = threading.Lock(), None, None, None, 0.0, 0
+
+    def get(self):
+        with self.lock:
+            now = time.time()
+            if now - self.t >= CI_EVERY:
+                self.t = now
+                try:
+                    snap = cifeed.snapshot(now)
+                    key = json.dumps({k: v for k, v in snap.items() if k not in ('now', 'nightly')}, sort_keys=True) + \
+                        json.dumps((snap.get('nightly') or {}).get('last'), sort_keys=True)
+                    if key != self.key:
+                        self.key, self.snap, self.ver = key, snap, self.ver + 1
+                    self.err = None
+                except Exception as e:                  # type only: never content
+                    self.err = type(e).__name__
+            return self.ver, self.snap, self.err
+
+
+CIB = CIBoard()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version, sys_version = 'flowd', ''
+
+    def log_message(self, fmt, *args):       # no access log: URLs carry nothing, but keep it quiet
+        pass
+
+    def send_json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlsplit(self.path)
+        q = parse_qs(u.query, keep_blank_values=True)
+        path = u.path.rstrip('/') or '/'
+        if path == '/live':
+            return self.stream(q)
+        if path == '/live/more':
+            raw = (q.get('id') or [''])[0]
+            full = HUB.more(int(raw)) if raw.isdigit() else None
+            return self.send_json(200, {'id': int(raw), 'text': full}) if full else self.send_json(404, {'error': 'gone'})
+        if path == '/live/seen':
+            seen_log((q.get('v') or [''])[0][:20], why=(q.get('why') or [''])[0][:8] or None)
+            return self.send_json(200, {'ok': True})
+        if path == '/live/health':
+            return self.send_json(200, HUB.health())
+        if path == '/live/agents':
+            return self.agents_stream()
+        if path == '/live/agent':
+            return self.agent_stream((q.get('id') or [''])[0])
+        if path == '/live/ci':
+            return self.ci_stream()
+        if STATIC and path in ('/', '/index.html', '/data.json'):
+            name = 'data.json' if path == '/data.json' else 'index.html'
+            try:
+                with open(os.path.join(STATIC, name), 'rb') as fh:
+                    body = fh.read()
+            except OSError:
+                return self.send_json(404, {'error': 'not found'})
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json' if name.endswith('.json') else 'text/html; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        return self.send_json(404, {'error': 'not found'})
+
+    def sse_head(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.end_headers()
+
+    def agents_stream(self):
+        if agentfeed is None:
+            return self.send_json(503, {'error': 'agentfeed unavailable'})
+        if not LIST_SLOTS.acquire(blocking=False):
+            return self.send_json(503, {'error': 'too many viewers'})
+        try:
+            self.sse_head()
+            self.wfile.write(b'retry: 5000\n\n' + sse('hello', {'now': time.time(), 'hours': AGENT_HOURS}))
+            self.wfile.flush()
+            last, quiet = -1, time.time()
+            while not STOP.is_set():
+                ver, snap, err = BOARD.get()
+                if snap is not None and ver != last:
+                    self.wfile.write(sse('agents', dict(snap, now=time.time())))
+                    last, quiet = ver, time.time()
+                elif snap is None and err and last == -1:
+                    self.wfile.write(sse('error', {'error': err}))
+                    last, quiet = -2, time.time()
+                elif time.time() - quiet >= 15:
+                    self.wfile.write(b': ping\n\n')
+                    quiet = time.time()
+                self.wfile.flush()
+                STOP.wait(BOARD_EVERY)
+        except OSError:
+            pass
+        finally:
+            LIST_SLOTS.release()
+
+    def ci_stream(self):
+        if cifeed is None:
+            return self.send_json(503, {'error': 'cifeed unavailable'})
+        if not CI_SLOTS.acquire(blocking=False):
+            return self.send_json(503, {'error': 'too many viewers'})
+        try:
+            self.sse_head()
+            self.wfile.write(b'retry: 5000\n\n' + sse('hello', {'now': time.time()}))
+            self.wfile.flush()
+            last, quiet = -1, time.time()
+            while not STOP.is_set():
+                ver, snap, err = CIB.get()
+                if snap is not None and ver != last:
+                    self.wfile.write(sse('ci', dict(snap, now=cifeed.iso(round(time.time())))))
+                    last, quiet = ver, time.time()
+                elif snap is None and err and last == -1:
+                    self.wfile.write(sse('error', {'error': err}))
+                    last, quiet = -2, time.time()
+                elif time.time() - quiet >= 15:
+                    self.wfile.write(b': ping\n\n')
+                    quiet = time.time()
+                self.wfile.flush()
+                STOP.wait(CI_EVERY)
+        except OSError:
+            pass
+        finally:
+            CI_SLOTS.release()
+
+    def agent_stream(self, aid):
+        if agentfeed is None:
+            return self.send_json(503, {'error': 'agentfeed unavailable'})
+        if aid != 'main' and not agentfeed.ID_RE.match(aid or ''):
+            return self.send_json(400, {'error': 'bad id'})
+        if not STEP_SLOTS.acquire(blocking=False):
+            return self.send_json(503, {'error': 'too many viewers'})
+        try:
+            rd, back = agentfeed.steps(aid, 300)
+            if rd is None:
+                return self.send_json(404, {'error': 'no such agent'})
+            self.sse_head()
+            self.wfile.write(b'retry: 3000\n\n' + sse('hello', {'id': aid, 'now': time.time()}) + sse('steps', back))
+            self.wfile.flush()
+            quiet = t_main = time.time()
+            while not STOP.is_set():
+                evs = rd.read()
+                for e in evs:
+                    self.wfile.write(sse('step', e))
+                if evs:
+                    quiet = time.time()
+                elif time.time() - quiet >= 15:
+                    self.wfile.write(b': ping\n\n')
+                    quiet = time.time()
+                self.wfile.flush()
+                if aid == 'main' and time.time() - t_main > 30:
+                    t_main = time.time()
+                    if agentfeed.main_path() != rd.path:      # nightly rotation: a new main session
+                        self.wfile.write(sse('gone', {'id': aid}))
+                        self.wfile.flush()
+                        return
+                STOP.wait(1.0)
+        except OSError:
+            pass
+        finally:
+            STEP_SLOTS.release()
+
+    def stream(self, q):
+        raw = (q.get('edge') or [''])[0]
+        edges = [norm_edge(x) for x in raw.split(',')] if raw else []
+        if None in edges or len(edges) > 4:
+            return self.send_json(400, {'error': 'unknown edge', 'edges': list(EDGES)})
+        edges = [e for e in edges if e]
+        try:
+            match = EvFilter.parse(q)
+        except ValueError as e:
+            return self.send_json(400, {'error': 'bad filter: ' + str(e)})
+        pulse = (q.get('pulse') or ['0'])[0] in ('1', 'true', 'yes')
+        lei = self.headers.get('Last-Event-ID') or ''
+        after = int(lei) if lei.isdigit() else 0
+        cl = Client(edges, pulse, match)
+        if not HUB.add(cl):
+            return self.send_json(503, {'error': 'too many viewers'})
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Accel-Buffering', 'no')
+            self.end_headers()
+            out = b'retry: 5000\n\n' + sse('hello', {'edge': edges, 'edges': list(EDGES), 'nodes': NODES, 'now': time.time(),
+                                                     'filter': match.echo()})
+            if edges:
+                out += b''.join(sse('ev', e, e['id']) for e in HUB.backlog(edges, after, match))
+            self.wfile.write(out)
+            self.wfile.flush()
+            while not cl.dead and not STOP.is_set():
+                try:
+                    kind, data = cl.q.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b': ping\n\n')
+                    self.wfile.flush()
+                    continue
+                self.wfile.write(sse(kind, data, data['id'] if kind == 'ev' else None))
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            HUB.remove(cl)
+
+
+def serve(port, static=None):
+    global HUB, STATIC
+    STATIC = static
+    HUB = Hub()
+    proc = Processor(HUB, Filter())
+    Tailer(proc).start()
+    srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    srv.daemon_threads = True
+
+    def bye(*_):
+        STOP.set()
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    log(f'flowd v{VERSION} on 127.0.0.1:{port}' + (' (static)' if static else '') +
+        ('' if secretscan else ' WITHOUT secretscan: metadata only'))
+    srv.serve_forever()
+    return 0
+
+
+# ---------------------------------------------------------------- supervisor
+SERVER_MARK = 'flowd serve'
+TUNNEL_MARK = f'{PORT}:127.0.0.1:{PORT}'
+
+
+def _pidfile(name):
+    return os.path.join(STATE, name + '.pid')
+
+
+def alive(name, marker):
+    try:
+        with open(_pidfile(name)) as fh:
+            pid = int(fh.read().strip())
+        with open(f'/proc/{pid}/cmdline', 'rb') as fh:
+            cmd = fh.read().replace(b'\0', b' ').decode('utf-8', 'replace')
+    except (OSError, ValueError):
+        return 0
+    return pid if marker in cmd else 0
+
+
+def spawn(name, argv):
+    os.makedirs(STATE, exist_ok=True)
+    lg = os.path.join(STATE, name + '.log')
+    if os.path.exists(lg) and os.path.getsize(lg) > 1 << 20:
+        os.replace(lg, lg + '.1')
+    with open(lg, 'ab') as fh:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                             start_new_session=True, close_fds=True)
+    with open(_pidfile(name) + '.tmp', 'w') as fh:
+        fh.write(str(p.pid))
+    os.replace(_pidfile(name) + '.tmp', _pidfile(name))
+    return p.pid
+
+
+def stop(name, marker):
+    pid = alive(name, marker)
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(30):
+                time.sleep(0.1)
+                if not alive(name, marker):
+                    break
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.remove(_pidfile(name))
+    except OSError:
+        pass
+    return pid
+
+
+def healthy(timeout=3):
+    import http.client
+    try:
+        c = http.client.HTTPConnection('127.0.0.1', PORT, timeout=timeout)
+        c.request('GET', '/live/health')
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status == 200
+    except OSError:
+        return False
+
+
+def server_argv():
+    return [sys.executable, '-I', os.path.realpath(__file__), 'serve', '--port', str(PORT)]
+
+
+def tunnel_argv():
+    return ['ssh', '-N', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20',
+            '-o', 'ServerAliveCountMax=3', '-o', 'ConnectTimeout=10', '-R', f'127.0.0.1:{PORT}:127.0.0.1:{PORT}', VM]
+
+
+def cmd_ensure():
+    if os.path.exists(OFF):
+        stop('tunnel', TUNNEL_MARK)
+        stop('server', SERVER_MARK)
+        return 0
+    pid = alive('server', SERVER_MARK)
+    if pid and not healthy():
+        time.sleep(2)
+        if not healthy():
+            stop('server', SERVER_MARK)
+            pid = 0
+            print('flowd: server did not answer, restarting')
+    if not pid:
+        spawn('server', server_argv())
+        print('flowd: server started')
+    if not alive('tunnel', TUNNEL_MARK):
+        spawn('tunnel', tunnel_argv())
+        print('flowd: tunnel started')
+    return 0
+
+
+def parse_basicauth(raw):
+    raw = (raw or '').strip()
+    if raw.startswith('{'):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return None
+        u, p = d.get('user') or d.get('username') or d.get('login'), d.get('password') or d.get('pass')
+        return f'{u}:{p}' if u and p else None
+    lines = [x.strip() for x in raw.splitlines() if x.strip() and not x.strip().startswith('#')]
+    kv = {}
+    for x in lines:
+        m = re.match(r'(?:export\s+)?([A-Za-z_]+)\s*[=:]\s*(.+)$', x)
+        if m:
+            kv[m.group(1).lower()] = m.group(2).strip().strip('"\'')
+    u, p = kv.get('user') or kv.get('username') or kv.get('login'), kv.get('password') or kv.get('pass')
+    if u and p:
+        return f'{u}:{p}'
+    if len(lines) == 1 and ':' in lines[0]:
+        return lines[0]
+    if len(lines) == 1 and len(lines[0].split()) == 2:
+        return ':'.join(lines[0].split())
+    if len(lines) == 2:
+        return f'{lines[0]}:{lines[1]}'
+    return None
+
+
+def dash_egress():
+    """core.egress when the handle "dash" is in hub or shadow mode, else None. Local mode (no switch file, the
+    default), tests and a missing core keep the plain probe: curl through nginx with the local basic-auth file."""
+    try:
+        from core import egress as eg
+        return eg if eg.mode('dash') in ('hub', 'shadow') else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def probe_hub(eg, path):
+    """Hub mode: the brain sends only the placeholder; the hub puts dash_basicauth (its ONE user:password line, the
+    paste's userpass form) into the Basic slot toward the bound endpoint https://dash.<domain> (rule: GET /live/health).
+    The local file is never read. The answer comes back masked."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(f'https://{PUBLIC}{path}', method='GET',
+                                 headers={'Authorization': 'Basic ' + eg.secret('dash')})
+    try:
+        with eg.open(req, 'dash', timeout=8) as r:
+            code, body = r.status, r.read()
+    except eg.Refused as e:  # not sent
+        print(f'flowd probe: the hub refused it ({e.code} {e.error}); try `hub egress status`')
+        return 1
+    except urllib.error.HTTPError as e:
+        code, body = e.code, (e.read() if e.fp else b'')
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f'flowd probe: hub unreachable ({type(e).__name__}); `hub egress use dash local` = the local probe')
+        return 1
+    out = body.decode('utf-8', 'replace')[-2000:] + f'\nHTTP {code}\n'
+    print(secretscan.redact(out) if secretscan else out[-300:])
+    return 0 if code == 200 else 1
+
+
+def probe_shadow_check(eg, path):
+    """Shadow mode: the local probe goes out; the hub logs its decision for the same request. Only the
+    placeholder goes along (the hub's copy is the one-line form, the local file is not), via core.egress's own shadow
+    check: never fails the probe, at most its CHECK_TIMEOUT."""
+    try:
+        eg._shadow('dash', f'https://{PUBLIC}{path}', 'GET', [('Authorization', 'Basic ' + eg.PLACEHOLDER + 'dash')], 8)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def cmd_probe(path='/live/health'):
+    eg = dash_egress()
+    if eg is not None and eg.mode('dash') == 'hub':
+        return probe_hub(eg, path)
+    try:
+        with open(BASICAUTH) as fh:
+            cred = parse_basicauth(fh.read())
+    except OSError:
+        cred = None
+    if not cred:
+        print('flowd probe: basic-auth file missing or not understood')
+        return 2
+    cfg = 'user = "%s"\n' % cred.replace('\\', '\\\\').replace('"', '\\"')
+    host = VM.split('@')[-1]
+    r = subprocess.run(['curl', '-sS', '-m', '8', '-K', '-', '--resolve', f'{PUBLIC}:443:{host}', '-o', '-',
+                        '-w', '\nHTTP %{http_code}\n', f'https://{PUBLIC}{path}'],
+                       input=cfg, capture_output=True, text=True)
+    out = (r.stdout or '') + (r.stderr or '')
+    print(secretscan.redact(out) if secretscan else out[-300:])
+    if eg is not None:
+        probe_shadow_check(eg, path)
+    return 0 if '\nHTTP 200' in out else 1
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else 'help'
+    if cmd == 'serve':
+        port, static, a = PORT, None, argv[2:]
+        while a:
+            if a[0] == '--port' and len(a) > 1:
+                port, a = int(a[1]), a[2:]
+            elif a[0] == '--static' and len(a) > 1:
+                static, a = a[1], a[2:]
+            else:
+                print('flowd serve [--port N] [--static DIR]')
+                return 2
+        return serve(port, static)
+    if cmd == 'ensure':
+        return cmd_ensure()
+    if cmd == 'off':
+        os.makedirs(os.path.dirname(OFF), exist_ok=True)
+        with open(OFF, 'w') as fh:
+            fh.write(time.strftime('%F %T') + ' switched off\n')
+        stop('tunnel', TUNNEL_MARK)
+        stop('server', SERVER_MARK)
+        print("flowd: off (kill switch; survives reboots). 'flowd on' switches it back on.")
+        return 0
+    if cmd == 'on':
+        try:
+            os.remove(OFF)
+        except OSError:
+            pass
+        return cmd_ensure()
+    if cmd == 'stop':
+        stop('tunnel', TUNNEL_MARK)
+        stop('server', SERVER_MARK)
+        return 0
+    if cmd == 'status':
+        print('switched off (kill switch)' if os.path.exists(OFF) else 'on')
+        print('server:', alive('server', SERVER_MARK) or 'not running', ' tunnel:', alive('tunnel', TUNNEL_MARK) or 'not running')
+        if healthy():
+            import http.client
+            c = http.client.HTTPConnection('127.0.0.1', PORT, timeout=3)
+            c.request('GET', '/live/health')
+            print(c.getresponse().read().decode())
+        return 0
+    if cmd == 'probe':
+        return cmd_probe(argv[2] if len(argv) > 2 and argv[2].startswith('/live') else '/live/health')
+    if cmd == 'edges':
+        print('\n'.join(EDGES))
+        return 0
+    print(__doc__)
+    return 0 if cmd in ('help', '-h', '--help') else 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

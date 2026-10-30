@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""usage-watch: a token-free alert when the claude.ai usage limit pauses me (no model calls).
+
+  usage-watch run [--dry-run] [--now ISO]     cron, every 10 min: find the newest limit signal; when it differs from
+                                              what the owner last heard, ONE plain `tg` line (held 00:00-08:00)
+  usage-watch status [--json] [--now ISO]     the signal now, what he was told, a held message (read-only)
+
+Signals (read-only; the newest record wins):
+  - the main session's transcripts: ~/.claude/projects/<workspace>/*.jsonl and <session>/subagents/*.jsonl modified
+    in the last 6 h, each read from its end. Limited = an assistant record with isApiErrorMessage and the "You've hit
+    your ... limit" text (apiError usage_limit_reached, HTTP 429); working = a model reply (model not <synthetic>).
+    Tool output or notes that merely quote the text never count.
+  - the nightly evals (~/.local/state/evals/runs/*/result.json, last 26 h): a grader detail or an API-error row's
+    infra detail with that text = limited at the run's end; a run that cost something without it = working.
+Messages (plain `tg`, the alert class; the bot sends them, the model is never asked):
+  limited  "Claude weekly limit hit at 02:00. It resets Thu 12.03 14:00; I'm paused until then (no replies,
+           heartbeat or helpers)." The reset comes from the error (resetsAt, else its text); none: "No reset date
+           given; I'm paused until it resets or the cap is raised at <the error's link>." Another limit while still
+           paused (weekly -> monthly spend): one update line (at most 3 per pause).
+  cleared  "Claude works again: the weekly limit cleared at 14:05 (paused since Tue 10.03 02:00)."
+Dedupe: level-triggered on what he last heard (state.json "told"): nothing repeats while the state holds; a limit that
+clears before he heard of it is dropped (logged). Quiet hours 00:00-08:00 in the profile's zone (locale.tz): every
+message waits for 08:00, a monthly cap without a reset date too. A failed send: exit 1, retried next run (cron-fail
+notes a streak).
+Files: ~/.local/state/usage-watch/ (state.json, log).
+Env (tests): USAGE_WATCH_DIR (state), USAGE_WATCH_PROJECTS (':'-separated transcript dirs), USAGE_WATCH_EVALS (runs
+dir, or "off"), USAGE_WATCH_TG (the sender; with USAGE_WATCH_DIR set and no USAGE_WATCH_TG nothing is sent),
+USAGE_WATCH_CHUNK (bytes per backwards read), ASSISTANT_NOW or --now (the clock), ASSISTANT_PROFILE (profile file).
+Exit: 0 ok · 1 a send failed · 2 usage.
+"""
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import pwd
+import re
+import sys
+
+sys.dont_write_bytecode = True
+_here = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(_here, 'lib')):
+    sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
+import assistant_profile as profile  # noqa: E402
+import botlib  # noqa: E402
+
+from core import clock, jsonstate, locks  # noqa: E402
+
+HOME = os.path.expanduser('~')
+TEST_STATE = bool(os.environ.get('USAGE_WATCH_DIR'))
+DIR = os.environ.get('USAGE_WATCH_DIR') or os.path.join(HOME, '.local/state/usage-watch')
+STATE_F = os.path.join(DIR, 'state.json')
+LOG_F = os.path.join(DIR, 'log')
+_WS = re.sub(r'[^A-Za-z0-9]', '-', os.path.join(HOME, 'workspace'))   # Claude Code's project folder name
+PROJECTS = [p for p in (os.environ.get('USAGE_WATCH_PROJECTS')
+                        or os.path.join(HOME, '.claude', 'projects', _WS)).split(':') if p]
+EVALS = os.environ.get('USAGE_WATCH_EVALS') or os.path.join(HOME, '.local/state/evals/runs')
+TG = os.environ.get('USAGE_WATCH_TG') or (None if TEST_STATE else os.path.join(HOME, 'bin', 'tg'))
+CHUNK = int(os.environ.get('USAGE_WATCH_CHUNK') or 262144)
+TAIL_MAX = 8 << 20          # bytes read from the end of one transcript at most
+LOOKBACK = 6 * 3600         # transcripts modified within this many seconds
+EVALS_LOOKBACK = 26 * 3600
+MAX_FILES = 60
+QUIET = (0, 8)              # owner wall hours: messages wait for the end
+MAX_UPDATES = 3             # limit lines per pause (the first + updates)
+DAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+HIT_RE = re.compile(r"You've hit your (.{1,40}?) limit")
+RESET_LIMIT_RE = re.compile(r'your (\w+) limit resets')
+RESET_TEXT_RE = re.compile(r'resets ([^·(]{1,40}?)\s*(?:\(|·|$)')
+URL_RE = re.compile(r'https://[^\s?·)]+')
+DRY = False
+
+
+def log(msg):
+    if DRY:
+        return
+    try:
+        os.makedirs(DIR, mode=0o700, exist_ok=True)
+        if os.path.exists(LOG_F) and os.path.getsize(LOG_F) > 200_000:
+            with open(LOG_F, encoding='utf-8') as f:
+                keep = f.readlines()[-500:]
+            jsonstate.write_text(LOG_F, ''.join(keep))
+        stamp = dt.datetime.fromtimestamp(clock.now(), profile.tz()).strftime('%Y-%m-%d %H:%M:%S')
+        with open(LOG_F, 'a', encoding='utf-8') as f:
+            f.write(f'{stamp} {msg}\n')
+    except OSError:
+        pass
+
+
+def parse_ts(v):
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        d = dt.datetime.fromisoformat(str(v).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    return d.timestamp() if d.tzinfo else None
+
+
+def limit_info(text, quota):
+    """What a limit text says: kind, reset (epoch or None), reset_text, the limit that resets, the error's link."""
+    m = HIT_RE.search(text)
+    kind = re.sub(r"^(?:your )?org's\s+", '', (m.group(1) if m else 'usage').strip().lower())
+    has_reset = 'resets' in text
+    reset = quota.get('resetsAt') if has_reset and isinstance(quota.get('resetsAt'), (int, float)) else None
+    rt = RESET_TEXT_RE.search(text) if has_reset else None
+    rl = RESET_LIMIT_RE.search(text)
+    url = URL_RE.search(text)
+    info = {'kind': kind, 'reset': float(reset) if reset else None,
+            'reset_text': rt.group(1).strip() if rt else None,
+            'reset_limit': rl.group(1).lower() if rl and rl.group(1).lower() != kind else None,
+            'url': url.group(0).rstrip('.,;') if url else None}
+    info['key'] = kind      # one line per kind and pause: the same limit from another source is no news
+    return info
+
+
+def _text_of(msg):
+    c = msg.get('content') if isinstance(msg, dict) else None
+    if isinstance(c, str):
+        return c
+    for part in c if isinstance(c, list) else []:
+        if isinstance(part, dict) and isinstance(part.get('text'), str):
+            return part['text']
+    return ''
+
+
+def classify(raw):
+    """One transcript line -> {'ts', 'state': 'limited'|'ok', ...} or None (not a model turn or another error)."""
+    if b'"assistant"' not in raw:
+        return None
+    try:
+        r = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(r, dict) or r.get('type') != 'assistant':
+        return None
+    ts = parse_ts(r.get('timestamp'))
+    msg = r.get('message') if isinstance(r.get('message'), dict) else {}
+    if ts is None:
+        return None
+    if r.get('isApiErrorMessage'):
+        text = _text_of(msg)
+        if HIT_RE.search(text) or r.get('apiError') == 'usage_limit_reached':
+            q = r.get('quotaLimits') or (r.get('apiErrorParams') or {}).get('rate_limit_info') or {}
+            return {'ts': ts, 'state': 'limited', **limit_info(text, q if isinstance(q, dict) else {})}
+        return None
+    model = msg.get('model')
+    if isinstance(model, str) and model and model != '<synthetic>':
+        return {'ts': ts, 'state': 'ok'}
+    return None
+
+
+def last_event(path):
+    """The newest limit or reply record of one transcript, read backwards in CHUNK steps (at most TAIL_MAX)."""
+    try:
+        f = open(path, 'rb')
+    except OSError:
+        return None
+    with f:
+        pos = os.fstat(f.fileno()).st_size
+        carry, done = b'', 0
+        while pos > 0 and done < TAIL_MAX:
+            n = min(CHUNK, pos)
+            pos -= n
+            f.seek(pos)
+            lines = (f.read(n) + carry).split(b'\n')
+            done += n
+            carry = lines.pop(0) if pos > 0 else b''      # a line cut by the chunk start waits for the next read
+            for raw in reversed(lines):
+                ev = classify(raw)
+                if ev:
+                    return ev
+        return classify(carry) if pos == 0 and carry else None
+
+
+def transcript_files(now):
+    out = []
+    for d in PROJECTS:
+        for pat in ('*.jsonl', os.path.join('*', 'subagents', '*.jsonl')):
+            for p in glob.glob(os.path.join(d, pat)):
+                try:
+                    m = os.stat(p).st_mtime
+                except OSError:
+                    continue
+                if now - m <= LOOKBACK:
+                    out.append((m, p))
+    out.sort(reverse=True)
+    return out[:MAX_FILES]
+
+
+def evals_events(now):
+    if EVALS == 'off':
+        return []
+    out = []
+    for p in sorted(glob.glob(os.path.join(EVALS, '*', 'result.json')), reverse=True)[:3]:
+        r = jsonstate.load(p, None)
+        started = r.get('started') if isinstance(r, dict) else None
+        if not isinstance(started, (int, float)) or not 0 <= now - started <= EVALS_LOOKBACK:
+            continue
+        tot = r.get('totals') if isinstance(r.get('totals'), dict) else {}
+        end = started + float(tot.get('duration_s') or 0)
+        hit = None
+        for c in r.get('cases') or []:
+            if not isinstance(c, dict):
+                continue
+            infra = c.get('infra') if isinstance(c.get('infra'), dict) else {}   # evals' API-error row (not judged)
+            for g in list(c.get('graders') or []) + [infra]:
+                d = g.get('detail') if isinstance(g, dict) else None
+                if isinstance(d, str) and HIT_RE.search(d):
+                    hit = d[HIT_RE.search(d).start():]
+                    break
+            if hit:
+                break
+        if hit:
+            out.append({'ts': end, 'state': 'limited', 'source': 'evals', **limit_info(hit, {})})
+        elif float(tot.get('cost_usd') or 0) > 0:
+            out.append({'ts': end, 'state': 'ok', 'source': 'evals'})
+    return out
+
+
+def current(now):
+    """The newest signal across the sources, or None (nothing recent: the state stays as it was)."""
+    best = None
+    for m, p in transcript_files(now):
+        if best and m < best['ts'] - 60:
+            break                                          # older files hold no newer record
+        ev = last_event(p)
+        if ev and (best is None or ev['ts'] > best['ts']):
+            ev['source'] = 'subagent' if os.sep + 'subagents' + os.sep in p else 'session'
+            best = ev
+    for ev in evals_events(now):
+        if best is None or ev['ts'] > best['ts']:
+            best = ev
+    return best
+
+
+def when(ts, now):
+    tz = profile.tz()
+    d, n = dt.datetime.fromtimestamp(ts, tz), dt.datetime.fromtimestamp(now, tz)
+    return d.strftime('%H:%M') if d.date() == n.date() else f"{DAYS[d.weekday()]} {d.strftime('%d.%m %H:%M')}"
+
+
+def quiet(now):
+    return QUIET[0] <= dt.datetime.fromtimestamp(now, profile.tz()).hour < QUIET[1]
+
+
+def limit_text(s, now, update=False):
+    head = (f"Claude update: now the {s['kind']} limit too." if update
+            else f"Claude {s['kind']} limit hit at {when(s['since'], now)}.")
+    who = f"The {s['reset_limit']} limit resets" if s.get('reset_limit') else 'It resets'
+    paused = "I'm paused until then (no replies, heartbeat or helpers)."
+    if s.get('reset'):
+        return f"{head} {who} {when(s['reset'], now)}; {paused}"
+    if s.get('reset_text'):
+        return f"{head} {who} {s['reset_text']}; {paused}"
+    where = f" at {s['url']}" if s.get('url') else ''
+    return (f"{head} No reset date given; I'm paused until it resets or the cap is raised{where} "
+            f"(no replies, heartbeat or helpers).")
+
+
+def back_text(s, now):
+    prev = s.get('prev') or {}
+    what = f"the {prev['kind']} limit" if prev.get('kind') else 'the limit'
+    since = f" (paused since {when(prev['since'], now)})" if prev.get('since') else ''
+    return f"Claude works again: {what} cleared at {when(s['since'], now)}{since}."
+
+
+def observe(st, cur):
+    """Fold the newest signal into st['seen'] (the state as the sources show it)."""
+    seen = st.get('seen') or {'state': 'ok'}
+    if cur and cur['state'] == 'limited':
+        if seen.get('state') != 'limited':
+            seen = {'state': 'limited', 'since': cur['ts']}
+            log(f"limit seen: {cur['kind']} ({cur.get('source')})")
+        same = seen.get('kind') == cur.get('kind')
+        for k in ('kind', 'reset', 'reset_text', 'reset_limit', 'url', 'key', 'source'):
+            if cur.get(k) is not None or not same:     # a source without the exact reset keeps the one known
+                seen[k] = cur.get(k)
+        seen['last'] = cur['ts']
+    elif cur:
+        if seen.get('state') == 'limited':
+            log(f"cleared: {seen.get('kind')} ({cur.get('source')})")
+            eps = (st.get('episodes') or [])[-19:]
+            st['episodes'] = [*eps, {'kind': seen.get('kind'), 'since': seen.get('since'), 'until': cur['ts']}]
+            seen = {'state': 'ok', 'since': cur['ts'], 'prev': {'kind': seen.get('kind'), 'since': seen.get('since')}}
+        seen['last'] = cur['ts']
+    st['seen'] = seen
+    return seen
+
+
+def decide(st, now):
+    """-> (text or None, the 'told' record to keep once it is sent)."""
+    seen, told = st['seen'], st.get('told') or {'state': 'ok'}
+    if seen.get('state') == 'limited':
+        keys = (told.get('keys') or []) if told.get('state') == 'limited' else []
+        if seen.get('key') in keys or len(keys) >= MAX_UPDATES:
+            return None, told
+        return limit_text(seen, now, update=bool(keys)), {'state': 'limited', 'keys': [*keys, seen.get('key')]}
+    if told.get('state') == 'limited':
+        return back_text(seen, now), {'state': 'ok'}
+    return None, told
+
+
+def cmd_run(args):
+    global DRY
+    now = clock.now()
+    if args.dry_run:                                       # prints what it would do; writes, logs and sends nothing
+        DRY = True
+        st = jsonstate.load(STATE_F, {}) or {}
+        st = st if isinstance(st, dict) else {}
+        observe(st, current(now))
+        text, _ = decide(st, now)
+        print('(nothing to send)' if text is None else f'(held for {QUIET[1]:02d}:00) {text}' if quiet(now) else text)
+        return 0
+    with locks.hold(os.path.join(DIR, 'lock'), wait=0, dir_mode=0o700) as fd:
+        if fd is None:
+            return 0                                       # another run is at it
+        st = jsonstate.load(STATE_F, {}) or {}
+        if not isinstance(st, dict):
+            st = {}
+        observe(st, current(now))
+        text, told = decide(st, now)
+        st['checked'] = now
+        rc = 0
+        if text is None:
+            if st.get('pending'):
+                log(f'dropped the held message: back to {st["seen"].get("state")} before {QUIET[1]:02d}:00')
+            st['pending'] = None
+        elif quiet(now):
+            if not st.get('pending'):
+                log(f"held for {QUIET[1]:02d}:00: {st['seen'].get('state')}")
+            st['pending'] = {'since': (st.get('pending') or {}).get('since') or now, 'state': st['seen'].get('state')}
+        elif not TG:
+            log('test state without USAGE_WATCH_TG: not sent')
+        else:
+            ok, err = botlib.send_tg(TG, text, timeout=90)
+            if ok:
+                st['told'] = {**told, 'at': now}
+                st['pending'] = None
+                log(f"sent: {st['seen'].get('state')} {st['seen'].get('key') or ''}".rstrip())
+            else:
+                log(f'send failed: {err[:200]}')
+                print(f'usage-watch: send failed: {err[:200]}', file=sys.stderr)
+                rc = 1                                     # told stays: the next run tries again
+        jsonstate.save(STATE_F, st, mode=0o600, dir_mode=0o700)
+    return rc
+
+
+def cmd_status(args):
+    now = clock.now()
+    st = jsonstate.load(STATE_F, {}) or {}
+    cur = current(now)
+    out = {'now': cur, 'seen': st.get('seen'), 'told': st.get('told'), 'pending': st.get('pending'),
+           'checked': st.get('checked'), 'episodes': (st.get('episodes') or [])[-5:], 'quiet': quiet(now)}
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    sig = 'none in the last 6 h' if not cur else (
+        f"{cur['state']} at {when(cur['ts'], now)} ({cur.get('source')})"
+        + (f": {cur['kind']} limit" if cur['state'] == 'limited' else ''))
+    seen = st.get('seen') or {}
+    print(f'signal now: {sig}')
+    print(f"state: {seen.get('state', 'ok')}" + (f" since {when(seen['since'], now)}" if seen.get('since') else ''))
+    told = st.get('told') or {}
+    print(f"told: {told.get('state', 'nothing yet')}" + (f" at {when(told['at'], now)}" if told.get('at') else ''))
+    if st.get('pending'):
+        print(f"held for 08:00 since {when(st['pending']['since'], now)}")
+    for e in out['episodes']:
+        if e.get('since') and e.get('until'):
+            print(f"paused: {e.get('kind')} {when(e['since'], now)} - {when(e['until'], now)}")
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='usage-watch', description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    r = sub.add_parser('run')
+    r.add_argument('--dry-run', action='store_true')
+    r.add_argument('--now')
+    s = sub.add_parser('status')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--now')
+    args = ap.parse_args(argv)
+    if args.now:
+        os.environ['ASSISTANT_NOW'] = args.now
+    return cmd_run(args) if args.cmd == 'run' else cmd_status(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

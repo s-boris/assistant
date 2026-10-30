@@ -1,0 +1,866 @@
+# Every rule of every PreToolUse/PostToolUse guard, what it protects, how
+# often it fired, what covers it now and the proposed decision. Owner-readable version + evidence:
+# ~/reports/plans/v2-h11-guards.md. tests/guards/test_h11_reduced.py checks this table against the code.
+#
+# fires: from the hooks' own logs, decision counts only (no command text):
+#   risk-check   ~/.local/state/risk-check.log, 14.10 23:00 .. 22.10 18:12 (the log holds nothing older)
+#   vault-guard  ~/.local/state/vault-guard/blocked.log, 10.10 .. 22.10 (rule names only by design)
+#   webagent     ~/.local/state/webagent/guard.log, 21.10 .. 22.10;  no-approval  its log, 08.10 .. 16.10
+#   allow = logged MEDIUM (the call ran), block = denied, override = ran with the owner's risk-ok code
+# covered: keep (a keep class: never retired) · boundary (a hard boundary CLAUDE.md names; stays) · gateway-later
+#   (retires once its hub domain is ENFORCED in Cedar and its credential has left this container) ·
+#   target-gone (verified 22.10: nothing it guards is reachable where it is retired) · log-only (never blocks, no
+#   reader of its log lines) · duplicate (another layer that stays catches the same thing) · browser-gate
+# decision: keep · retire-now (everywhere) · retire-scoped (only on the machines in scope; stays elsewhere) ·
+#   retire-later (gateway-later; not in reduced-v1)
+# Verified 22.10 (read-only): no block device in /dev and CapEff 0 in this container; no docker, mail, mdcmd, zfs,
+# btrfs, parted/fdisk binaries here; nothing mounted under /mnt; the server key is forced into dispatcher 3.1
+# (`unraid-ssh status`: resolved verbs, hello hash = the reviewed local copy). Assumed: his other LAN boxes (e.g. the
+# UniFi OS VM, reachable as a normal user) can run any of these, so scoped rules stay there.
+
+# ------------------------------------------------------------------------------------------------ risk-check
+[[rule]]
+hook = "risk-check"
+id = "secret-print"
+level = "HIGH"
+class = "secrets"
+fires = { allow = 0, block = 14, override = 0 }
+protects = "credential values printed into a model context (transcript)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "secret-send"
+level = "HIGH/MEDIUM"
+class = "secrets"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "a ~/.secrets file sent out (tg, curl upload, scp/rsync to a non-owner host)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "secrets-copy"
+level = "MEDIUM"
+class = "secrets"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "copies of credentials spreading inside the box"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "secrets-move"
+level = "MEDIUM"
+class = "secrets"
+fires = { allow = 2, block = 0, override = 0 }
+protects = "credential files moved (H10 relies on the trail)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "secrets-write"
+level = "MEDIUM"
+class = "secrets"
+fires = { allow = 3, block = 0, override = 0 }
+protects = "new credential files written"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "secrets-overwrite"
+level = "HIGH"
+class = "secrets"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "a credential overwritten without a .bak (lost key)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "secrets-delete"
+level = "HIGH"
+class = "secrets"
+fires = { allow = 0, block = 2, override = 2 }
+protects = "credential deletes: his OK + risk-ok (the H10 delete step depends on it)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "crontab-wipe"
+level = "HIGH"
+class = "crontab"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "crontab -r: every scheduled job (reminders included) gone"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "crontab-replace"
+level = "MEDIUM"
+class = "crontab"
+fires = { allow = 21, block = 0, override = 0 }
+protects = "the crontab replaced from a file other than ~/crontab"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "git-force-main"
+level = "HIGH"
+class = "force-push"
+fires = { allow = 0, block = 11, override = 1 }
+protects = "force-push / mirror push to main (history loss, public export)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "git-force"
+level = "MEDIUM"
+class = "force-push"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "force-push to a branch"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "git-delete-branch"
+level = "HIGH/MEDIUM"
+class = "public repos"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "remote branch deletes (main: HIGH)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "gh-public"
+level = "HIGH/MEDIUM"
+class = "public repos"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "anything made public on GitHub (repo, gist, visibility)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "gh-write"
+level = "HIGH/MEDIUM"
+class = "public repos"
+fires = { allow = 3, block = 0, override = 0 }
+protects = "writes to repos that are not his, or his two public ones (hands off)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "gh-delete"
+level = "HIGH"
+class = "public repos"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "gh repo/release delete"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "gh-api-delete"
+level = "HIGH"
+class = "public repos"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "DELETE through gh api"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "vault-admin"
+level = "MEDIUM"
+class = "vault flags"
+fires = { allow = 54, block = 0, override = 0 }
+protects = "vault admin deploy/restart/down/init (the vault is his)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "mail-send"
+level = "HIGH"
+class = "vault flags"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "e-mail sent (vault gmail send/reply/forward, sendmail family): contacting people"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "rm-protected"
+level = "HIGH/MEDIUM"
+class = "Telegram state"
+fires = { allow = 2, block = 2, override = 1 }
+protects = "deleting my core: ~/.claude (incl. channels/telegram state), workspace, memory, hooks, .secrets, brain git"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "move-core"
+level = "MEDIUM"
+class = "Telegram state"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "moving a core directory away (the mv twin of rm-protected)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "risk-ok-subagent"
+level = "HIGH"
+class = "subagent / owner OK"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "only the main session issues risk-ok codes"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "owner-ok-subagent"
+level = "HIGH"
+class = "subagent / owner OK"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "only the main session passes his --owner-ok to the dispatcher"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "rm-hang-var"
+level = "HANG"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "rm shapes Claude Code would hang on (nobody approves): denied at once with a rewrite hint"
+covered = "boundary"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "rm-hang-cd"
+level = "HANG"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "relative rm globs after cd (same hang)"
+covered = "boundary"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "proxy-push"
+level = "MEDIUM"
+class = ""
+fires = { allow = 2, block = 0, override = 0 }
+protects = "nginx config pushed to the public proxy (exposure trail); no hub domain planned"
+covered = "boundary"
+decision = "keep"
+
+[[rule]]
+hook = "risk-check"
+id = "service-write"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 8, block = 0, override = 0 }
+protects = "writes to his services' APIs (Radarr, Sonarr, HA, UniFi ...) with keys held here"
+covered = "gateway-later"
+decision = "retire-later"
+condition = "media + HA domains enforced in Cedar and media.json / ha.json moved to the hub (H8, H9, H10)"
+
+[[rule]]
+hook = "risk-check"
+id = "service-delete"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "deletes in his services (media files, documents): his no-deletion rule"
+covered = "gateway-later"
+decision = "retire-later"
+condition = "same as service-write; the gateway's irreversible effect needs his approval token"
+
+[[rule]]
+hook = "risk-check"
+id = "unraid-rights"
+level = "MEDIUM"
+class = ""
+fires = { allow = 7, block = 0, override = 0 }
+protects = "dispatcher write verbs (docker/vm/userscript/appdata) logged"
+covered = "gateway-later"
+decision = "retire-later"
+condition = "server domain enforced (H9 #8) and the dispatcher key moved (it goes last in H10)"
+
+[[rule]]
+hook = "risk-check"
+id = "rm-home"
+level = "MEDIUM"
+class = ""
+fires = { allow = 314, block = 0, override = 0 }
+protects = "nothing blocked: logs every recursive delete in my home (deletes inside the container are OK'd work)"
+covered = "log-only"
+decision = "retire-now"
+scope = "everywhere"
+
+[[rule]]
+hook = "risk-check"
+id = "rm-unresolved"
+level = "MEDIUM"
+class = ""
+fires = { allow = 43, block = 1, override = 0 }
+protects = "rm -r on a path it can't resolve: asks the vault's local LLM (43 consults, 1 block via the LLM)"
+covered = "duplicate"
+decision = "retire-now"
+scope = "everywhere"
+note = "Claude Code's own rm check + no-approval + rm-hang-* stay; 20 of 44 lines were the safe ${VAR:?} shape"
+
+[[rule]]
+hook = "risk-check"
+id = "array"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "mdcmd/emcmd array start/stop on Unraid"
+covered = "target-gone"
+decision = "retire-now"
+scope = "everywhere"
+note = "Unraid-only binaries; the server runs only dispatcher verbs; code removed in reduced-v1"
+
+[[rule]]
+hook = "risk-check"
+id = "server-config"
+level = "MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "emcmd server settings"
+covered = "target-gone"
+decision = "retire-now"
+scope = "everywhere"
+
+[[rule]]
+hook = "risk-check"
+id = "mover"
+level = "MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "the Unraid mover run by hand"
+covered = "target-gone"
+decision = "retire-now"
+scope = "everywhere"
+
+[[rule]]
+hook = "risk-check"
+id = "docker-change"
+level = "MEDIUM"
+class = ""
+fires = { allow = 3, block = 0, override = 0 }
+protects = "docker start/stop/update"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+note = "no docker CLI or socket here; on the server docker-restart/-update are dispatcher verbs (unraid-rights)"
+
+[[rule]]
+hook = "risk-check"
+id = "docker-remove"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 1, block = 0, override = 0 }
+protects = "containers/images removed"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "docker-volume"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "docker volumes deleted"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "format"
+level = "HIGH"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "mkfs / wipefs / blkdiscard / luksFormat"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "partition"
+level = "HIGH"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "partition tables rewritten"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "disk-erase"
+level = "HIGH"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "shred / hdparm security-erase on a device"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "disk-change"
+level = "MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "cryptsetup open/close/key changes"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "fs-repair"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "xfs_repair (-L loses the log)"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "device-write"
+level = "HIGH"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "writes onto a block device (dd of=/dev/sdX, > /dev/sdX)"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "btrfs"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "btrfs subvolume/device deletes, repairs, balance"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "zfs-*"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "zfs destroy/rollback/receive/set ..."
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "zpool-*"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "zpool destroy/labelclear/create/add ..."
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "local+server"
+
+[[rule]]
+hook = "risk-check"
+id = "server-delete"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "rm/mv-to-null on shares, disks, system dirs of a remote box"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+note = "stays for his other boxes and for local /mnt paths (none mounted today)"
+
+[[rule]]
+hook = "risk-check"
+id = "server-write"
+level = "MEDIUM"
+class = ""
+fires = { allow = 4, block = 0, override = 0 }
+protects = "cp/mv/tar/redirects onto a remote box's data"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+[[rule]]
+hook = "risk-check"
+id = "server-perms"
+level = "HIGH/MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "chmod/chown -R on a remote box"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+[[rule]]
+hook = "risk-check"
+id = "server-script"
+level = "MEDIUM"
+class = ""
+fires = { allow = 10, block = 0, override = 0 }
+protects = "a script run on a remote box (content unchecked)"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+[[rule]]
+hook = "risk-check"
+id = "server-kill"
+level = "MEDIUM"
+class = ""
+fires = { allow = 1, block = 0, override = 0 }
+protects = "kill/pkill on a remote box"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+[[rule]]
+hook = "risk-check"
+id = "server-mount"
+level = "MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "mount/umount on a remote box"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+[[rule]]
+hook = "risk-check"
+id = "server-service"
+level = "MEDIUM"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "systemctl / rc.* stop/restart on a remote box"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+[[rule]]
+hook = "risk-check"
+id = "server-power"
+level = "HIGH"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "reboot/poweroff of a remote box"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+[[rule]]
+hook = "risk-check"
+id = "flash-config"
+level = "HIGH"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "writes to a remote box's /boot (Unraid flash config)"
+covered = "target-gone"
+decision = "retire-scoped"
+scope = "server"
+
+# ------------------------------------------------------------------------------------------------ vault-guard
+# All keep: the vault boundary is a keep class.
+[[rule]]
+hook = "vault-guard"
+id = "paperless-direct"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 129, override = 0 }
+protects = "paperless reached around the vault (port 8000, its token)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "telegram-token"
+level = "deny"
+class = "Telegram state"
+fires = { allow = 0, block = 91, override = 0 }
+protects = "the bot token file (the raw-release code channel)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "vault-host-path-indirect"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 65, override = 0 }
+protects = "the vault's host path built indirectly for ssh/scp/rsync"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "tgread-raw"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 63, override = 0 }
+protects = "tgread / vault tg --raw"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "tgread-secrets"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 65, override = 0 }
+protects = "tgread's session and credentials"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "vault-text-subagent"
+level = "deny"
+class = "subagent / owner OK"
+fires = { allow = 0, block = 31, override = 0 }
+protects = "subagents asking the vault for text/content"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "vault-host-path"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 23, override = 0 }
+protects = "the vault's appdata on the server"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "tgread-data"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 16, override = 0 }
+protects = "tgread's local data dir"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "vault-docker"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 15, override = 0 }
+protects = "docker exec/cp/export/commit/attach on claude-vault"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "personal-data"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 11, override = 0 }
+protects = "card, passport/ID, address files and secure fill's state"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "approvals-state"
+level = "deny"
+class = "subagent / owner OK"
+fires = { allow = 0, block = 5, override = 0 }
+protects = "the one-time approvals store (decisions only from his tap)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "vault-volume"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 4, override = 0 }
+protects = "the claude-vault_data volume"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "vault-compose"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 4, override = 0 }
+protects = "docker compose exec/cp/run in the vault project"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "fill-direct"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 1, override = 0 }
+protects = "the vault's /fill endpoints (only securefill calls them)"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "vault-media-egress"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "released vault media sent out"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "telegram-read-api"
+level = "deny"
+class = "Telegram state"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "Bot API calls that return or steal message contents"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "secrets-subagent"
+level = "deny"
+class = "subagent / owner OK"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "subagents opening ~/.secrets with Read/Grep"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "check-limit"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "fail closed on commands too large to check"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "vault-guard"
+id = "nesting-depth"
+level = "deny"
+class = "vault flags"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "fail closed on commands nested too deep to check"
+covered = "keep"
+decision = "keep"
+
+# ------------------------------------------------------------------------------------------------ the other hooks
+[[rule]]
+hook = "subagent-rules"
+id = "subagent-rules"
+level = "modify"
+class = "subagent / owner OK"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "every subagent brief carries the safety rules and an effort"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "webagent-guard"
+id = "commit-gate"
+level = "deny"
+class = ""
+fires = { allow = 3, block = 4, override = 0 }
+protects = "pay/order/book/delete/cancel clicks only with an approved web task"
+covered = "browser-gate"
+decision = "keep"
+
+[[rule]]
+hook = "abx-raw-guard"
+id = "abx-raw"
+level = "deny"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "agent-browser only through abx (one tab per agent, the commit gate); no log of its own"
+covered = "browser-gate"
+decision = "keep"
+
+[[rule]]
+hook = "securefill-redact"
+id = "securefill-redact"
+level = "redact"
+class = "vault flags"
+fires = { allow = 0, block = 0, override = 0 }
+protects = "released personal values redacted from tool output while a fill session is live"
+covered = "keep"
+decision = "keep"
+
+[[rule]]
+hook = "no-ask"
+id = "no-ask"
+level = "deny"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "AskUserQuestion (nobody watches this terminal; the session would hang)"
+covered = "boundary"
+decision = "keep"
+
+[[rule]]
+hook = "no-approval"
+id = "no-approval"
+level = "deny"
+class = ""
+fires = { allow = 0, block = 25, override = 0 }
+protects = "Bash approval prompts nobody answers (hangs), denied with a rewrite hint"
+covered = "boundary"
+decision = "keep"
+
+[[rule]]
+hook = "hub-stamp"
+id = "hub-stamp"
+level = "stamp"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "the gateway's subagent principal (agent_id stamp on mcp__hub__ calls); never denies"
+covered = "boundary"
+decision = "keep"
+
+[[rule]]
+hook = "pitch-check"
+id = "pitch-check"
+level = "context"
+class = ""
+fires = { allow = 0, block = 0, override = 0 }
+protects = "ledger hits named after a reply with buttons/poll; never denies (not a guard)"
+covered = "boundary"
+decision = "keep"

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Fixture for lint_deps.py (never run): one nonexistent tool the lint must report, plus decoys it must skip.
+# command -v decoy-in-comment
+command -v git >/dev/null || exit 1
+if ! command -v no-such-tool-sh >/dev/null 2>&1; then echo "missing"; fi
+echo "pick which decoy-in-string"
+echo 'command -v decoy-in-single-quotes'
+ssh host sh <<'EOF'
+command -v decoy-in-heredoc >/dev/null && echo remote
+EOF
+x=$(command -v "$dynamic_name")
+echo "$x"

@@ -1,0 +1,34 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.back-offer.schema.json",
+ "title": "remind place-due: the welcome-back message failed (tg); I send it",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "days"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.back-offer"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "days": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "card": {
+   "type": "boolean"
+  }
+ }
+}

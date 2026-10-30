@@ -1,0 +1,50 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://assistant.invalid/schemas/payloads/note.preshow.schema.json",
+ "title": "rave-radar preshow: the week-before card for one show (event id, date, set and track counts)",
+ "type": "object",
+ "required": [
+  "type",
+  "v",
+  "event",
+  "date",
+  "sets",
+  "tracks"
+ ],
+ "additionalProperties": false,
+ "properties": {
+  "type": {
+   "const": "note.preshow"
+  },
+  "v": {
+   "const": 1
+  },
+  "note": {
+   "type": "object",
+   "description": "the note's fingerprint (ingest/update)"
+  },
+  "match": {
+   "type": "object"
+  },
+  "event": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "date": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "sets": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "tracks": {
+   "type": "integer",
+   "minimum": 0
+  }
+ }
+}

@@ -1,0 +1,4 @@
+#!/bin/sh
+# voice-reply ID "short spoken answer": answer a live-voice hand-off.
+# Exit 0 = spoken (sync or pushed into the open call), 3 = not delivered (send it on Telegram), 2 = relay down.
+exec "$(dirname "$(readlink -f "$0")")/voice-relay" reply "$@"

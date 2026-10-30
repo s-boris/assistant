@@ -1,0 +1,69 @@
+#!/bin/sh
+# Cron heartbeat, aware of the heartbeat mod (mod 0.2.x; nextDue hold 2026-10-13).
+# Installed as ~/.local/bin/heartbeat (boot.sh reinstalls it from here when it differs): the entrypoint writes
+# /etc/cron.d/heartbeat AFTER boot.sh at every start, with ~/.local/bin first on its PATH, and cron runs
+# `heartbeat N` through that PATH (verified 2026-10-13), so this shadows the image's /usr/local/bin/heartbeat.
+# The image script reads no mod state: it types once the transcripts are N min old (3 with inbox notes newer
+# than /tmp/heartbeat), so on its own it races the mod, which skips cron's :x4:50-:x5:45 window and was due
+# at 07:50:02 on 2026-10-13 -> cron typed the beat instead.
+#
+# Mod alive (its state file's lastTick < 3 min old) means the mod owns the beats; this only steps in when it fails:
+#  - unanswered: never type; only the real script's stuck-dialog alert may run (session "waiting");
+#  - its last beat (lastBeat) is 2+ min old and no transcript was written since: beats aren't landing -> real script;
+#  - an inbox note newer than the last beat has waited 5+ min: the mod (2 min idle) missed it -> real script;
+#  - before nextDue + 3 min (the mod's own grace: cron window <= 55 s, 15 s ticks, state written ~1/min):
+#    no beat, stuck-dialog alert only; after it the mod is overdue -> real script.
+#  The real script then runs with max(N, idleMin), so the backoff isn't undone, and keeps its own idle checks.
+# Mod dead, off or older (no nextDue): exactly the old behaviour (with max(N, idleMin) while alive).
+# Tests: test/heartbeat-cron.test.mjs (HEARTBEAT_REAL, HEARTBEAT_MOD_STATE, HEARTBEAT_NOW, HEARTBEAT_PROJECT,
+# HEARTBEAT_INBOX, HEARTBEAT_MARKER override; a fake real script/claude on PATH, nothing is typed).
+real=${HEARTBEAT_REAL:-/usr/local/bin/heartbeat}
+state=${HEARTBEAT_MOD_STATE:-$HOME/.local/state/heartbeat-mod.json}
+proj=${HEARTBEAT_PROJECT:-$HOME/.claude/projects/-home-node-workspace}
+inbox=${HEARTBEAT_INBOX:-$HOME/inbox}
+marker=${HEARTBEAT_MARKER:-/tmp/heartbeat}
+min=${1:-30}
+now=${HEARTBEAT_NOW:-$(date +%s)}
+GRACE=180 LAND=120 INBOX_LATE=300
+
+# The real script by absolute path, never this wrapper again (e.g. a copy installed over the image's binary).
+self=$(readlink -f "$0" 2>/dev/null)
+[ -x "$real" ] && [ "$(readlink -f "$real")" != "$self" ] || { echo "heartbeat-cron: no real heartbeat at $real" >&2; exit 1; }
+
+num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+tick=0 idle=0 unanswered=false next=0 beat=0 started=0 skip=0
+if [ -r "$state" ]; then
+  read -r tick idle unanswered next beat started skip <<EOF
+$(jq -r '[(.lastTick // 0), (.idleMin // 0), (.unanswered // false), (.nextDue // 0), (.lastBeat // 0), (.started // 0),
+    (.lastSkip // 0)]
+  | map(if type == "number" then floor elif type == "boolean" then . else 0 end) | map(tostring) | join(" ")' "$state" 2>/dev/null)
+EOF
+fi
+tick=$(num "$tick") idle=$(num "$idle") next=$(num "$next") beat=$(num "$beat") started=$(num "$started") skip=$(num "$skip")
+
+# The mod is handling beats: no beat from here, but a session stuck on a dialog still gets the real script's alert.
+stuck_only() {
+  claude agents --json 2>/dev/null |
+    jq -e --arg cwd "$HOME/workspace" 'first(.[] | select(.cwd == $cwd)) | .status == "waiting"' >/dev/null || exit 0
+  exec "$real" "$min"
+}
+
+if [ $((now - tick / 1000)) -lt 180 ]; then
+  [ "$idle" -gt "$min" ] && min=$idle
+  [ "$unanswered" = true ] && stuck_only
+  b=$((beat / 1000))
+  if [ "$b" -gt 0 ] && [ $((now - b)) -ge $LAND ] &&
+     [ -z "$(find "$proj" -name '*.jsonl' -newermt "@$b" 2>/dev/null | head -n 1)" ]; then
+    exec "$real" "$min"   # the mod's last beat started no turn: its beats aren't landing
+  fi
+  since=$(stat -c %Y "$marker" 2>/dev/null || echo 0)
+  [ "$b" -gt "$since" ] && since=$b
+  [ $((started / 1000)) -gt "$since" ] && since=$((started / 1000))
+  # mod 0.5.0: a note older than the gate's last skip was seen and skipped (digest/mute under the wake rules)
+  [ $((skip / 1000)) -gt "$since" ] && since=$((skip / 1000))
+  if [ -n "$(find "$inbox" -maxdepth 1 -type f -newermt "@$since" ! -newermt "@$((now - INBOX_LATE))" 2>/dev/null | head -n 1)" ]; then
+    exec "$real" "$min"   # a note has waited 5+ min without a beat: the real script's 3-min inbox rule applies
+  fi
+  [ "$next" -gt 0 ] && [ "$now" -lt $((next / 1000 + GRACE)) ] && stuck_only
+fi
+exec "$real" "$min"
