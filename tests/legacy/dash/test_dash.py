@@ -931,7 +931,19 @@ def luhn(num):
     return tot % 10 == 0
 
 
-def sweep(name, text, strs):
+def heat_rows(data):
+    """The cron heatmap's `ok` rows (systems.cron.heat.ok = [[job, runs per hour]]): the runs are one base-36 digit per
+    hour of `hours`, so a quiet job reads as a 24-digit string. Only rows of exactly that shape count; anything else
+    there is swept like any other string."""
+    hm = (((data or {}).get('systems') or {}).get('cron') or {}).get('heat') or {}
+    n = len(hm.get('hours') or []) if isinstance(hm, dict) else 0
+    rows = hm.get('ok') if isinstance(hm, dict) else None
+    return {r[1] for r in rows or [] if n and isinstance(r, list) and len(r) == 2 and isinstance(r[1], str)
+            and re.fullmatch(r'[0-9a-z]{%d}' % n, r[1])}
+
+
+def sweep(name, text, strs, encoded=()):
+    """encoded: strings that are counts in a known encoding (heat_rows), left out of the long-number check only."""
     r = subprocess.run([os.path.join(HOME, 'bin', 'secretscan'), '--stdin', '-q'], input=text, capture_output=True, text=True)
     ok(r.returncode == 0, f'{name}: secretscan clean ({r.stdout.strip()[:200]})')
     joined = '\n'.join(strs)
@@ -948,7 +960,7 @@ def sweep(name, text, strs):
         'url with query': r'https?://\S+\?\S+',
     }
     for label, rx in checks.items():
-        hits = re.findall(rx, joined)
+        hits = re.findall(rx, '\n'.join(s for s in strs if s not in encoded) if label == 'long number in text' else joined)
         ok(not hits, f'{name}: no {label} ({len(hits)} hit(s))')
     cards = [m for m in re.findall(r'(?<!\d)(?:\d[ -]?){13,19}(?!\d)', joined) if luhn(re.sub(r'\D', '', m))]
     ok(not cards, f'{name}: no card-like numbers ({len(cards)})')
@@ -981,13 +993,18 @@ def test_log_privacy(m, data):
 
 def test_privacy(d):
     data_text = open(os.path.join(HOME, '.local', 'state', 'dash', 'data.json')).read()
-    sweep('data.json', data_text, list(strings(json.loads(data_text))))
+    data = json.loads(data_text)
+    probe = {'systems': {'cron': {'heat': {'hours': list(range(24)), 'ok': [['a', '0' * 23 + '1'], ['b', '0791234567'], ['c', '0' * 25]]}}},
+             'x': '0' * 23 + '1'}
+    ok(heat_rows(probe) == {'0' * 23 + '1'} and heat_rows({'systems': {'cron': {'heat': None}}}) == set(),
+       'privacy sweep: only well-formed heatmap rows are exempt from the long-number check')
+    sweep('data.json', data_text, list(strings(data)), heat_rows(data))
     for p in (TEMPLATE, PAGE, FRAG):
         if os.path.exists(p):
             txt = open(p).read()
             m = re.search(r'<script id="dash-data"[^>]*>(.*?)</script>', txt, re.S)
             emb = json.loads(m.group(1).replace('<\\/', '</')) if m else None
-            sweep(os.path.basename(p), txt, list(strings(emb)) if emb else [])
+            sweep(os.path.basename(p), txt, list(strings(emb)) if emb else [], heat_rows(emb) if isinstance(emb, dict) else ())
 
 
 # ------------------------------------------------------------------------------------------- 5. page structure
@@ -1350,8 +1367,11 @@ def test_growth():
             json.dump({'tokens': {'daily': [{'date': d1.isoformat(), 'turns': {'heartbeat': 4, 'telegram': 2, 'you (app/terminal)': 1},
                                              'subagent_runs': 3}]}}, f)
         out = os.path.join(root, 'growth.json')
-        env = dict(os.environ, DASH_GROWTH_OUT=out, DASH_GROWTH_BRAIN=brain, DASH_GROWTH_VAULT=vwt, DASH_GROWTH_TREE=tree,
-                   DASH_GROWTH_DASHDATA=dd)
+        # every DASH_GROWTH_* path points into the fixture: the monorepo too (no repo there), else dash-growth adds the
+        # real ~/opt/assistant history to the fixture's days
+        env = {k: v for k, v in os.environ.items() if not k.startswith('DASH_GROWTH_')}
+        env.update(DASH_GROWTH_OUT=out, DASH_GROWTH_BRAIN=brain, DASH_GROWTH_VAULT=vwt, DASH_GROWTH_TREE=tree,
+                   DASH_GROWTH_DASHDATA=dd, DASH_GROWTH_MONO=os.path.join(root, 'no-mono'))
         r = subprocess.run([gb, '--backfill'], env=env, capture_output=True, text=True, timeout=60)
         ok(r.returncode == 0, f'dash-growth --backfill exits 0 ({r.stderr[-200:]})')
         if r.returncode != 0:
