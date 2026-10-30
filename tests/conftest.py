@@ -55,6 +55,20 @@ def _listed() -> set[str]:
 _RUNNER_SKIP = _listed()
 
 
+def _arg_key(arg: str) -> tuple[str, ...]:
+    return Path(arg.split("::", 1)[0]).parts
+
+
+def pytest_configure(config):
+    """The command line's test paths in path order (stable: a file's node ids keep theirs). pytest 9.1 drops a
+    directory's conftest fixtures for a file named after a file of the parent directory that came after one of
+    its own (`tests/hub/a.py tests/test_suites.py tests/hub/b.py`: b errors with "fixture 'hubhome' not found").
+    `assistant ci` passes the impacted files sorted, then the smoke set: tests/test_suites.py in the first part,
+    tests/hub/test_h17_hubkit_feed.py in the second, so its 8 tests errored on the first run and passed alone."""
+    if len(config.args) > 1:
+        config.args[:] = sorted(config.args, key=_arg_key)
+
+
 def pytest_ignore_collect(collection_path, config):  # noqa: ARG001 (pytest hook signature)
     if not _RUNNER_SKIP:
         return None

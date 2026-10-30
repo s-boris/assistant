@@ -51,3 +51,22 @@ def test_runner_skip_file_lines_hold_for_named_files(tmp_path):
     assert "1 passed, 2 deselected" in r.stdout, r.stdout + r.stderr
     r = subprocess.run(cmd, cwd=t, env={**env, "ASSISTANT_CI_RUNNER": "0"}, capture_output=True, text=True, timeout=120)
     assert "3 passed" in r.stdout, r.stdout + r.stderr
+
+
+def test_a_subdir_conftest_holds_when_a_parent_file_comes_between(tmp_path):
+    """`assistant ci` names the impacted files sorted, then the smoke set: a subdir's file after a file of the parent
+    dir that followed one of its own lost the subdir's conftest fixtures (pytest 9.1). The root conftest sorts."""
+    t = tmp_path / "t"
+    (t / "tests" / "hub").mkdir(parents=True)
+    shutil.copy(ROOT / "tests" / "conftest.py", t / "tests" / "conftest.py")
+    (t / "tests" / "hub" / "conftest.py").write_text("import pytest\n\n\n@pytest.fixture\ndef hubfx():\n    return 1\n")
+    (t / "tests" / "hub" / "test_a.py").write_text("def test_a():\n    pass\n")
+    (t / "tests" / "test_top.py").write_text("def test_top():\n    pass\n")
+    (t / "tests" / "hub" / "test_b.py").write_text("def test_b(hubfx):\n    assert hubfx == 1\n")
+    (t / "pytest.ini").write_text("[pytest]\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env.update(HOME=str(tmp_path))
+    cmd = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "tests/hub/test_a.py", "tests/test_top.py",
+           "tests/hub/test_b.py::test_b"]  # fmt: skip
+    r = subprocess.run(cmd, cwd=t, env=env, capture_output=True, text=True, timeout=120)
+    assert "3 passed" in r.stdout and "error" not in r.stdout, r.stdout + r.stderr
