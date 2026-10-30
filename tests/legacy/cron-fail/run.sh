@@ -143,7 +143,7 @@ run a "$T/bin/argc" "x y" 'it'"'"'s' '' --flag
 eq "argv kept intact" "$out" "4|x y|it's||--flag|"
 
 echo "# crontab lines (stubs, temp HOME)"
-# Every active line using cron-fail or an inline "-failed-" note: real /home/node/bin/X and /home/node/opt/P/bin/X
+# Every active line using cron-fail or an inline "-failed-" note: real /home/node/bin/X, $HOME/bin/X and /home/node/opt/P/bin/X
 # (keepers like voice-relay-up, phonegw-up) -> a failing stub, run with sh (cron's shell) under the temp HOME. The
 # real keepers must never run here: under a temp HOME they would start a second daemon or rebuild the live venv.
 # The note must land in the temp inbox; no literal home paths.
@@ -158,12 +158,12 @@ while IFS= read -r line; do
   nlines=$((nlines + 1))
   hasnt "$label: no literal /home/node/inbox" "$cmd" "/home/node/inbox"
   hasnt "$label: no literal /home/node/.local in redirects" "$cmd" "/home/node/.local"
-  for b in $(printf '%s\n' "$cmd" | grep -oE '/home/node/(bin|opt/[A-Za-z0-9._-]+/bin)/[A-Za-z0-9._-]+' | sort -u); do
+  for b in $(printf '%s\n' "$cmd" | grep -oE '(/home/node|\$HOME)/(bin|opt/[A-Za-z0-9._-]+/bin)/[A-Za-z0-9._-]+' | sort -u); do
     printf '#!/bin/sh\necho "stub %s $*" >> "$HOME/stub.log"\necho "stub failure" >&2\nexit 1\n' "$(basename "$b")" > "$T/fake/$(basename "$b")"
     chmod +x "$T/fake/$(basename "$b")"
   done
   printf '#!/bin/sh\necho "tg $*" >> "$HOME/tg.log"\n' > "$T/fake/tg"; chmod +x "$T/fake/tg"
-  scmd=$(printf '%s\n' "$cmd" | sed "s#/home/node/bin/#$T/fake/#g; s#/home/node/opt/[A-Za-z0-9._-]*/bin/#$T/fake/#g; s#/usr/local/bin/tg#$T/fake/tg#g; s#\\\\%#%#g")
+  scmd=$(printf '%s\n' "$cmd" | sed "s#/home/node/bin/#$T/fake/#g; s#/home/node/opt/[A-Za-z0-9._-]*/bin/#$T/fake/#g; s#\\\$HOME/bin/#$T/fake/#g; s#/usr/local/bin/tg#$T/fake/tg#g; s#\\\\%#%#g")
   rbin='/home/node/[^ ]*bin/'
   [[ $scmd =~ $rbin ]] && { no "$label: every /home/node bin target is stubbed (none runs for real)" "$scmd"; continue; }
   clean
