@@ -2,7 +2,7 @@
 
 Run: python3 -I -m unittest discover -s ~/opt/secretscan-tests -v
 Env: SECRETSCAN_UNDER_TEST (default ~/bin/secretscan.py), SECRETSCAN_ORIG (the pre-H10 copy, for the parity case),
-HUBREDACT (default ~/opt/assistant/packages/hub/hubredact.py: the hub's export, so both sides agree on the format).
+HUBREDACT (default: this tree's packages/hub/hubredact.py, the hub's export, so both sides agree on the format).
 """
 
 import contextlib
@@ -20,7 +20,7 @@ from pathlib import Path
 HOME = Path(os.path.expanduser("~"))
 UNDER = Path(os.environ.get("SECRETSCAN_UNDER_TEST") or HOME / "bin" / "secretscan.py")
 ORIG = os.environ.get("SECRETSCAN_ORIG")
-HUBREDACT = Path(os.environ.get("HUBREDACT") or HOME / "opt" / "assistant" / "packages" / "hub" / "hubredact.py")
+HUBREDACT = Path(os.environ.get("HUBREDACT") or Path(__file__).resolve().parents[3] / "packages" / "hub" / "hubredact.py")
 
 
 def load(path, tag):

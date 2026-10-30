@@ -383,7 +383,7 @@ class RealHaTests(Base):
     sends must be what ha's parser accepts."""
     def setUp(self):
         super().setUp()
-        sys.path.insert(0, os.path.expanduser("~/opt/assistant/tests/legacy/ha"))  # ~/opt/ha-tests moved into the repo 29.10
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ha"))  # the tree's ha suite
         import fake_ha
         self.fake = fake_ha.FakeHA().__enter__()
         tok = os.path.join(self.tmp.name, "tok")

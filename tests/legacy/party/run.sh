@@ -52,8 +52,14 @@ PY
 }
 P() { PARTY_HA="$HERE/fake_ha" FAKE_HA_DIR="$T" PARTY_STATE_DIR="$T/state" PARTY_CACHE="$T/cache/bpm.json" \
       PARTY_CONFIG="$T/config.json" PARTY_INBOX="$T/inbox" PARTY_BPM_API="$B/dz" PARTY_POLL=0.2 "$PARTY" "$@"; }
-ws() { curl -s "$B/_get/$1" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(eval(sys.argv[1]))' "$2"; }
-fresh() { curl -s -X POST "$B/_reset" >/dev/null; find "$T/state" "$T/inbox" -mindepth 1 -delete 2>/dev/null; : > "$T/server.log"; : > "$T/calls.log"; }
+req() {  # req METHOD PATH [BODY]: the fake server's control API (python, not curl: the CI runner has none)
+  python3 -c 'import sys, http.client as h
+c = h.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=10)
+c.request(sys.argv[2], sys.argv[3], body=sys.argv[4].encode() if len(sys.argv) > 4 else None)
+sys.stdout.write(c.getresponse().read().decode())' "$PORT" "$@"
+}
+ws() { req GET "/_get/$1" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(eval(sys.argv[1]))' "$2"; }
+fresh() { req POST /_reset >/dev/null; find "$T/state" "$T/inbox" -mindepth 1 -delete 2>/dev/null; : > "$T/server.log"; : > "$T/calls.log"; }
 writes() { grep -c "^$1 " "$T/server.log"; }
 ctl() { python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); c.update(json.loads(sys.argv[2])); json.dump(c, open(sys.argv[1], "w"))' "$T/ctrl.json" "$1"; }
 
@@ -114,7 +120,7 @@ mkha "Dub Unit" "Half Step" paused idle; : > "$T/server.log"; P tick --cron
 eq "paused: no change" "$(cat "$T/server.log")" ""
 mkha "Dub Unit" "Half Step"; P tick --cron
 eq "known BPM comes from the cache" "$(grep -c 'dz ' "$T/server.log")" "0"
-curl -s -X POST "$B/_set/w4" -d '{"seg": [{"id": 0, "fx": 2}]}' >/dev/null
+req POST /_set/w4 '{"seg": [{"id": 0, "fx": 2}]}' >/dev/null
 mkha "Speed Crew" "Fast Lane"; : > "$T/server.log"; P tick --cron
 eq "he changed the Shelf effect: Shelf released, no write" "$(writes w4)" "0"
 eq "Kitchen still follows" "$(ws w2 's["seg"][0]["sx"]')" "174"
@@ -133,14 +139,14 @@ eq "status after off" "$(P status)" "No party running."
 
 echo "# end of the party (4 h)"
 fresh; mkha "Test Artist" "Night Drive - Radio Edit"; P on --hours 4 >/dev/null
-curl -s -X POST "$B/_set/w4" -d '{"on": false}' >/dev/null   # he switched the Shelf off at 01:00
+req POST /_set/w4 '{"on": false}' >/dev/null   # he switched the Shelf off at 01:00
 out=$(PARTY_NOW=$(( $(date +%s) + 3 * 3600 )) P tick --cron); eq "before the end: silent, still on" "$out$(P status --json | cut -c1-11)" '{"on": true'
 out=$(PARTY_NOW=$(( $(date +%s) + 4 * 3600 + 60 )) P tick --cron); rc=$?
 eq "after 4 h: silent tick, rc 0" "$out$rc" "0"
 eq "after 4 h: Kitchen restored (was off)" "$(ws w2 's["on"], s["seg"][0]["fx"]')" "(False, 0)"
 eq "after 4 h: the Shelf he switched off stays off, effect restored" "$(ws w4 's["on"], s["seg"][0]["fx"], s["bri"]')" "(False, 9, 150)"
 eq "after 4 h: state gone" "$(P status)" "No party running."
-fresh; P on >/dev/null; curl -s -X POST "$B/_set/w4" -d '{"seg": [{"id": 0, "fx": 3}, {"id": 1, "fx": 3}]}' >/dev/null
+fresh; P on >/dev/null; req POST /_set/w4 '{"seg": [{"id": 0, "fx": 3}, {"id": 1, "fx": 3}]}' >/dev/null
 mkha "Speed Crew" "Fast Lane"; P tick --cron; : > "$T/server.log"
 PARTY_NOW=$(( $(date +%s) + 5 * 3600 )) P tick --cron
 eq "auto end leaves a released light alone" "$(writes w4)" "0"

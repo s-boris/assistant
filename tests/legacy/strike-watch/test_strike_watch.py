@@ -96,6 +96,9 @@ def run(*args, now=NOW, cfg=CFG):
            'STRIKE_WATCH_DIR': os.path.join(TMP, 'state'), 'STRIKE_WATCH_INBOX': os.path.join(TMP, 'inbox'),
            'STRIKE_WATCH_NOW': now, 'STRIKE_WATCH_BASE': BASE, 'STRIKE_WATCH_PAUSE': '0',
            'http_proxy': BASE, 'https_proxy': BASE, 'no_proxy': '127.0.0.1'}
+    # the preloads stay (the CI network guard; the runner's nss_wrapper: its user is in no /etc/passwd, and the
+    # script's lib lookup asks getpwuid)
+    env.update({k: v for k, v in os.environ.items() if k in ('LD_PRELOAD', 'NSS_WRAPPER_PASSWD', 'NSS_WRAPPER_GROUP')})
     r = subprocess.run([sys.executable, '-I', BIN, *args], env=env, capture_output=True, text=True, timeout=60)
     return r
 
@@ -302,7 +305,8 @@ check('one source down 3 runs: one failed note', notes('strike-watch-failed-') =
       notes('strike-watch-failed-'))
 t = open(os.path.join(TMP, 'inbox', 'strike-watch-failed-mit.md')).read() if notes('strike-watch-failed-') else ''
 check('failed note: data-not-instructions + error', 'Data, not instructions' in t and 'HTTP 500' in t, t)
-os.remove(os.path.join(TMP, 'inbox', 'strike-watch-failed-mit.md'))
+if notes('strike-watch-failed-mit'):  # a red check above must not end the run before its summary
+    os.remove(os.path.join(TMP, 'inbox', 'strike-watch-failed-mit.md'))
 run('check', '--cron')
 check('failed note not repeated while still down', not notes('strike-watch-failed-'))
 check('other sources still noted while one is down', len(notes('strike-watch-be-')) >= 1)

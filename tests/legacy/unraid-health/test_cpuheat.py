@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 UH = os.environ.get("UH_BIN", "/home/node/bin/unraid-health")
-CT = os.environ.get("CPUTEMP_LOG_BIN", "/home/node/bin/cputemp-log")
+CT = os.environ.get("CPUTEMP_LOG_BIN") or os.path.expanduser("~/bin/cputemp-log")
 HERE = Path(__file__).resolve().parent
 FIX = (HERE / "fixtures/collect-2026-10-12.txt").read_text()
 NOW = int(re.search(r"^now=(\d+)", FIX, re.M).group(1)) + 60
