@@ -3,24 +3,31 @@
 # brain-commit runs "$d/brain" commit "$@" and, on success, "$d/codebase-sync" --bg, where d = the directory of its own
 # resolved path (readlink -f). That is the seam: the script under test is COPIED into $T/bin next to a recording fake
 # brain and codebase-sync, so neither the real brain repo nor GitHub can be reached. The suite refuses a copy that names
-# /home/node, ~/bin or $HOME, or calls brain/codebase-sync other than via "$d/..."; PATH shims for brain and
-# codebase-sync refuse too (exit 99). Exit 0 = all pass. BRAIN_COMMIT_BIN=<path> tests another copy.
+# /home/, ~/bin, $HOME/${HOME} or .brain.git, or calls brain/codebase-sync other than via "$d/..."; PATH shims for
+# brain, codebase-sync and git refuse too (exit 99); HOME is a temp dir holding decoys of the brain repo and the
+# codebase-sync state, which must stay unchanged. The real brain repo is never read: the live session commits to it
+# while CI runs, so comparing its HEAD raced. Exit 0 = all pass. BRAIN_COMMIT_BIN=<path> tests another copy.
 # Covers: success -> brain commit "$@" (quoting kept) + codebase-sync --bg once, output passthrough, codebase-sync
 # output discarded and its failure ignored; brain fails -> no sync + its rc; BRAIN_GIT_DIR / BRAIN_WORK_TREE set ->
 # no sync (empty = unset); codebase-sync missing or not executable -> skipped; called via a symlink; isolation.
 set -uo pipefail
 SRC=${BRAIN_COMMIT_BIN:-$(cd "$(dirname "$0")/../../../scripts" && pwd)/brain-commit}
-grep -qE '/home/node|~/bin|\$HOME' "$SRC" && { echo "refusing: $SRC names a real path (it could run the real brain/codebase-sync)"; exit 2; }
+grep -qE '/home/|~/bin|\$\{?HOME|\.brain\.git' "$SRC" && { echo "refusing: $SRC names a real path (it could run the real brain/codebase-sync)"; exit 2; }
 grep -q '"$d/brain" commit' "$SRC" && grep -q '"$d/codebase-sync" --bg' "$SRC" \
   || { echo "refusing: $SRC does not call brain/codebase-sync via \"\$d/...\" (the sibling seam)"; exit 2; }
-REAL_BRAIN=/home/node/.brain.git REAL_CS_STATE=/home/node/.local/state/codebase-sync
-real_state() { echo "$(git --git-dir="$REAL_BRAIN" rev-parse HEAD 2>/dev/null) $(find "$REAL_CS_STATE" -newer "$T/start" 2>/dev/null | wc -l)"; }
 T=$(mktemp -d "${TMPDIR:-/tmp}/brain-commit-tests.XXXXXX")
 trap 'rm -rf "$T"' EXIT
-touch "$T/start"; real_before=$(real_state)
 export T FAKE=$T/fake HOME=$T/home
 unset BRAIN_GIT_DIR BRAIN_WORK_TREE
 mkdir -p "$T/bin" "$T/shims" "$FAKE" "$HOME" "$T/elsewhere"
+# decoys where a home-relative path would land: a one-commit brain repo and a codebase-sync state dir
+DECOY_BRAIN=$HOME/.brain.git DECOY_CS_STATE=$HOME/.local/state/codebase-sync
+GIT=$(command -v git)
+"$GIT" init -q --bare "$DECOY_BRAIN" && mkdir -p "$DECOY_CS_STATE" && touch "$DECOY_CS_STATE/last" \
+  && "$GIT" -c user.name=t -c user.email=t@t --git-dir="$DECOY_BRAIN" --work-tree="$T/elsewhere" commit -q --allow-empty -m decoy \
+  || { echo "could not set up the decoy brain repo"; exit 2; }
+home_state() { echo "$("$GIT" --git-dir="$DECOY_BRAIN" rev-parse HEAD 2>&1)"; find "$HOME" -printf '%P %y %s %T@\n' | sort; }
+home_before=$(home_state)
 B=$T/bin/brain-commit
 cp "$SRC" "$B"; chmod 755 "$B"
 
@@ -28,7 +35,7 @@ cp "$SRC" "$B"; chmod 755 "$B"
 printf '#!/bin/bash\n(printf "%%s|" "$#" "$@"; echo) >> "$FAKE/brain.log"\necho "brain: committed abc1234 $2"\n[ -s "$FAKE/brain-err" ] && cat "$FAKE/brain-err" >&2\nexit $(cat "$FAKE/brain-rc" 2>/dev/null || echo 0)\n' > "$T/bin/brain"
 printf '#!/bin/bash\n(printf "%%s|" "$#" "$@"; echo) >> "$FAKE/sync.log"\nif [ "$1" = precheck ]; then echo "  bin/x:3 rule#9"; echo "  noise line"; echo "codebase-sync precheck: WOULD BLOCK (1 hit(s))" >&2; exit $(cat "$FAKE/pre-rc" 2>/dev/null || echo 0); fi\necho "codebase-sync: started in the background"; echo "sync noise" >&2\nexit $(cat "$FAKE/sync-rc" 2>/dev/null || echo 0)\n' > "$T/bin/codebase-sync"
 chmod 755 "$T/bin/brain" "$T/bin/codebase-sync"
-for s in brain codebase-sync; do printf '#!/bin/bash\necho "PATH shim %s: refusing $*" | tee -a "%s/refused.log" >&2; exit 99\n' "$s" "$T" > "$T/shims/$s"; chmod +x "$T/shims/$s"; done
+for s in brain codebase-sync git; do printf '#!/bin/bash\necho "PATH shim %s: refusing $*" | tee -a "%s/refused.log" >&2; exit 99\n' "$s" "$T" > "$T/shims/$s"; chmod +x "$T/shims/$s"; done
 export PATH=$T/shims:$PATH
 
 pass=0; fail=0
@@ -87,8 +94,8 @@ reset; run "$T/link/brain-commit" "via link"
 eq "rc 0, brain + sync from \$T/bin" "$rc|$(f brain.log)|$(f sync.log)" "0|2|commit|via link||1|--bg|"
 
 echo "# isolation"
-eq "no PATH shim was used (never brain/codebase-sync from PATH)" "$(cat "$T/refused.log" 2>/dev/null)" ""
-eq "real brain repo HEAD + codebase-sync state untouched" "$(real_state)" "$real_before"
+eq "no PATH shim was used (never brain/codebase-sync/git from PATH)" "$(cat "$T/refused.log" 2>/dev/null)" ""
+eq "decoy brain repo HEAD + codebase-sync state under HOME untouched" "$(home_state)" "$home_before"
 
 echo
 echo "$pass passed, $fail failed"
