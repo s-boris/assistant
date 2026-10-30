@@ -38,9 +38,11 @@ Venue map  ~/.config/night-plan/venues.json (optional, private): {"<venue name>"
            the venue without the town words (case/accents ignored; "town" set: only there). A hit routes to that stop; the walk counts
            toward the arrival window and the way home, the card shows "+N min walk", the address becomes the
            calendar location (unless --address).
-Env (tests): NIGHT_PLAN_API (else ROUTE_API, else transport.opendata.ch), NIGHT_PLAN_CONFIG, NIGHT_PLAN_VENUES,
-           RAVE_RADAR_STATE_DIR,
-           ASSISTANT_PROFILE, NIGHT_PLAN_PAGES (max return pages, default 6).
+Sources   lib core/transport: transport.opendata.ch; when it fails (an error payload, a non-2xx status, a timeout, no
+           JSON) the same lookup goes to timetable.search.ch (route.json, completion.json), mapped to opendata's shape;
+           search.ch shows a changed platform only as the new one.
+Env (tests): NIGHT_PLAN_API (else ROUTE_API, else transport.opendata.ch), TRANSPORT_FALLBACK_API, NIGHT_PLAN_CONFIG,
+           NIGHT_PLAN_VENUES, RAVE_RADAR_STATE_DIR, ASSISTANT_PROFILE, NIGHT_PLAN_PAGES (max return pages, default 6).
 Set times  `night-plan settime add EVENT_REF URL...` watches the venue's, promoter's and artist's pages for the set
            time (cron, token-free), then writes ONE inbox note with the train that fits and a draft calendar change;
            `night-plan settime --help` (lib/night_settime.py).
@@ -55,13 +57,14 @@ import os
 import re
 import sys
 import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib'))
+_here = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(_here, 'lib'))
+if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(_here))   # the repo checkout (scripts/): its own core
 import assistant_profile as profile  # noqa: E402
 import home_place  # noqa: E402
+from core import transport  # noqa: E402
 from sbb import sbb_link  # noqa: E402
 
 HOME_DIR = os.path.expanduser('~')
@@ -69,6 +72,7 @@ API = os.environ.get('NIGHT_PLAN_API') or os.environ.get('ROUTE_API') or 'https:
 CONFIG_F = os.environ.get('NIGHT_PLAN_CONFIG') or f'{HOME_DIR}/.config/night-plan/config.json'
 VENUES_F = os.environ.get('NIGHT_PLAN_VENUES') or f'{HOME_DIR}/.config/night-plan/venues.json'
 STATE_F = os.path.join(os.environ.get('RAVE_RADAR_STATE_DIR') or f'{HOME_DIR}/.local/state/rave-radar', 'state.json')
+_client = {}
 MAX_PAGES = int(os.environ.get('NIGHT_PLAN_PAGES') or 6)
 UA = 'night-plan/1.0 (personal trip planner)'
 GAP_MIN, WAIT_SHOW, TAXI_GAP, STRANDED = 90, 30, 60, 120     # minutes
@@ -105,19 +109,18 @@ def words(s):
     return set(norm(s).split())
 
 
-def api(path, params):
-    url = f'{API}/{path}?{urllib.parse.urlencode(params)}'
+def client():
+    if 'c' not in _client:
+        _client['c'] = transport.Client(api=API, ua=UA, timeout=30)
+    return _client['c']
+
+
+def api(kind, **kw):
+    """core.transport lookup (opendata, else search.ch); both failing -> Fail."""
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': UA}), timeout=30) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        try:
-            why = json.load(e)['errors'][0]['message']
-        except Exception:
-            why = f'HTTP {e.code}'
-        raise Fail(f'transport API error: {why}')
-    except (OSError, ValueError) as e:
-        raise Fail(f'transport API unreachable or broken: {getattr(e, "reason", e)}')
+        return getattr(client(), kind)(**kw)
+    except transport.TransportError as e:
+        raise Fail(str(e)) from None
 
 
 def ts(s):
@@ -182,7 +185,8 @@ def conn(c):
             continue
         rides.append({'line': line_name(j), 'dep': rd, 'arr': ra, 'from': stname(d), 'at': stname(a),
                       'from_id': stid(d), 'at_id': stid(a),
-                      'platform': d.get('platform') or None, 'to': j.get('to') or None, 'night': is_night(j),
+                      'platform': d.get('platform') or (d.get('prognosis') or {}).get('platform') or None,
+                      'to': j.get('to') or None, 'night': is_night(j),
                       'bus': (j.get('category') or '').strip().upper() in BUS_CATS})
     waits = [{'at': b['from'] or a['at'], 'min': mins(b['dep'] - a['arr'])} for a, b in zip(rides, rides[1:])]
     return {'dep': dep, 'arr': arr, 'rides': rides, 'changes': max(len(rides) - 1, 0), 'waits': waits,
@@ -192,12 +196,9 @@ def conn(c):
 
 
 def connections(src, dst, when, arrive=False, limit=6):
-    p = {'from': home_place.query(src), 'to': home_place.query(dst), 'date': when.date().isoformat(), 'time': hm(when),
-         'limit': limit}
-    if arrive:
-        p['isArrivalTime'] = 1
-    data = api('connections', p)
-    out = [c for c in map(conn, data.get('connections') or []) if c]
+    rows = api('connections', frm=home_place.query(src), to=home_place.query(dst), when=when, limit=limit,
+               arrive=arrive)
+    out = [c for c in map(conn, rows) if c]
     # the Swiss timetable answers foreign stops with connections from other days: keep only that night's
     return [c for c in out if abs(((c['arr'] if arrive else c['dep']) - when).total_seconds()) <= 14 * 3600]
 
@@ -219,7 +220,7 @@ def pareto(cs):
 
 # ------------------------------------------------------------------------------------------------ places
 def locations(**p):
-    return [s for s in (api('locations', p).get('stations') or []) if s.get('name')]
+    return [s for s in api('locations', **p) if s.get('name')]
 
 
 def coord(s):

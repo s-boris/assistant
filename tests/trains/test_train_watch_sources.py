@@ -4,7 +4,8 @@ once per run, the answering source logged).
 
 Fixtures (fixtures/): search.ch route.json answers and opendata's router-outage payload recorded live; opendata's
 /connections built to its documented shape for the same two trips (the API was down when the others were recorded).
-scripts/train-watch is loaded from the repo; HTTP goes through a stub of core.http's open, so no network."""
+scripts/train-watch is loaded from the repo (its sources: core.transport); HTTP goes through a stub of core.http's
+open, so no network."""
 
 from __future__ import annotations
 
@@ -48,6 +49,7 @@ def tw(tmp_path, monkeypatch):
     assert spec
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    monkeypatch.setattr(mod.transport.http, "open", mod.transport.http.open)  # Net replaces it: restored after
     return mod
 
 
@@ -57,7 +59,7 @@ class Net:
     def __init__(self, tw, **answers):
         self.urls: list[str] = []
         self.answers = answers
-        tw.web.open = self.open
+        tw.transport.http.open = self.open
 
     def open(self, url, headers=None, timeout=None):
         self.urls.append(url)
@@ -117,7 +119,7 @@ def view(c):
 def test_searchch_recorded_route_maps_to_the_internal_shape(tw):
     got = {
         c["sdep"].strftime("%H:%M"): c
-        for c in conns(tw, tw.sc_connections(fixture("searchch-route.json"), at(tw, "17:36")))
+        for c in conns(tw, tw.transport.searchch_connections(fixture("searchch-route.json"), at(tw, "17:36")))
     }
     ir = got["17:36"]
     assert view(ir) == {
@@ -144,7 +146,7 @@ def test_both_sources_give_the_same_shape_for_the_same_trips(tw):
     od = {c["sdep"].strftime("%H:%M"): view(c) for c in conns(tw, fixture("opendata-connections.json")["connections"])}
     sc = {
         c["sdep"].strftime("%H:%M"): view(c)
-        for c in conns(tw, tw.sc_connections(fixture("searchch-route.json"), at(tw, "17:36")))
+        for c in conns(tw, tw.transport.searchch_connections(fixture("searchch-route.json"), at(tw, "17:36")))
     }
     assert set(od) == {"17:36", "18:33"}
     for k in od:
@@ -152,7 +154,7 @@ def test_both_sources_give_the_same_shape_for_the_same_trips(tw):
 
 
 def test_searchch_walks_and_trams(tw):
-    rows = conns(tw, tw.sc_connections(fixture("searchch-route-walk-tram.json"), at(tw, "17:00")))
+    rows = conns(tw, tw.transport.searchch_connections(fixture("searchch-route-walk-tram.json"), at(tw, "17:00")))
     c = rows[0]
     assert c["lines"] == ["IC8", "Tram 17"]  # the walks are no rides
     assert c["sdep"].strftime("%H:%M") == "17:02" and c["sarr"].strftime("%H:%M") == "18:19"
@@ -164,20 +166,28 @@ def test_searchch_track_change_cancellation_and_replacement_bus(tw):
     data = fixture("searchch-route.json")
     legs = [x for x in data["connections"] if x["departure"].endswith("17:36:00")][0]["legs"]
     legs[0]["track"] = "13!"  # show_trackchanges: the new track, marked
-    c = conns(tw, tw.sc_connections(data, at(tw, "17:36")))
+    c = conns(tw, tw.transport.searchch_connections(data, at(tw, "17:36")))
     r = next(x for x in c if x["sdep"].strftime("%H:%M") == "17:36")["rides"][0]
     assert (r["platform"], r["new_platform"]) == ("", "13")
 
     data = fixture("searchch-route.json")
     legs = [x for x in data["connections"] if x["departure"].endswith("17:36:00")][0]["legs"]
     legs[0]["dep_delay"] = "X"
-    c = next(x for x in conns(tw, tw.sc_connections(data, at(tw, "17:36"))) if x["sdep"].strftime("%H:%M") == "17:36")
+    c = next(
+        x
+        for x in conns(tw, tw.transport.searchch_connections(data, at(tw, "17:36")))
+        if x["sdep"].strftime("%H:%M") == "17:36"
+    )
     assert c["cancelled"] and not tw.plain(c)
 
     data = fixture("searchch-route.json")
     leg = [x for x in data["connections"] if x["departure"].endswith("17:36:00")][0]["legs"][0]
     leg.update({"type": "bus", "*G": "EV", "*L": "", "line": "EV", "type_name": "Ersatzbus"})
-    c = next(x for x in conns(tw, tw.sc_connections(data, at(tw, "17:36"))) if x["sdep"].strftime("%H:%M") == "17:36")
+    c = next(
+        x
+        for x in conns(tw, tw.transport.searchch_connections(data, at(tw, "17:36")))
+        if x["sdep"].strftime("%H:%M") == "17:36"
+    )
     assert (c["lines"], c["rides"][0]["bus"], c["rides"][0]["ev"]) == (["EV"], True, True)
 
 
@@ -191,7 +201,7 @@ def test_searchch_track_change_cancellation_and_replacement_bus(tw):
     ],
 )
 def test_match_same_train_another_way(tw, dep, arr, lines, found):
-    rows = conns(tw, tw.sc_connections(fixture("searchch-route-walk-tram.json"), at(tw, "17:00")))
+    rows = conns(tw, tw.transport.searchch_connections(fixture("searchch-route-walk-tram.json"), at(tw, "17:00")))
     g = {"dep": f"2026-10-30T{dep}:00+01:00", "arr": f"2026-10-30T{arr}:00+01:00", "lines": lines}
     c = tw.match(g, rows)
     assert (c is not None) == found
@@ -202,16 +212,16 @@ def test_match_same_train_another_way(tw, dep, arr, lines, found):
 def test_searchch_wall_times_in_the_repeated_hour(tw):
     first = tw.iso("2031-10-26T02:20:00+02:00")  # 02:20 CEST, the first pass
     second = tw.iso("2031-10-26T02:20:00+01:00")  # 02:20 CET, an hour later
-    assert tw.sc_time("2031-10-26 02:20:00", first) == "2031-10-26T02:20:00+02:00"
-    assert tw.sc_time("2031-10-26 02:20:00", second) == "2031-10-26T02:20:00+01:00"
-    assert tw.sc_time("2031-10-26 02:50:00", first) == "2031-10-26T02:50:00+02:00"
-    assert tw.sc_time("2026-10-30 17:36:00", at(tw, "17:00")) == "2026-10-30T17:36:00+01:00"
-    assert tw.sc_time("", first) is None
+    assert tw.transport.sc_time("2031-10-26 02:20:00", first) == "2031-10-26T02:20:00+02:00"
+    assert tw.transport.sc_time("2031-10-26 02:20:00", second) == "2031-10-26T02:20:00+01:00"
+    assert tw.transport.sc_time("2031-10-26 02:50:00", first) == "2031-10-26T02:50:00+02:00"
+    assert tw.transport.sc_time("2026-10-30 17:36:00", at(tw, "17:00")) == "2026-10-30T17:36:00+01:00"
+    assert tw.transport.sc_time("", first) is None
 
 
 @pytest.mark.parametrize("raw,want", [("+3", 3), ("-1", -1), ("0", 0), ("X", None), ("", None), (None, None)])
 def test_searchch_delay(tw, raw, want):
-    assert tw.sc_delay(raw) == want
+    assert tw.transport.sc_delay(raw) == want
 
 
 # ------------------------------------------------------------------------------------------------ the switch

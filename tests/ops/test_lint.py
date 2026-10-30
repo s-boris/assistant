@@ -96,7 +96,7 @@ def test_ratchet_exempts_reviewed_managed_files(tool):
         "media": {"flock", "urlopen"},
         "menu-usage": {"flock"},
         "missing-docs": {"load_json"},
-        "night-plan": {"load_json", "urlopen"},
+        "night-plan": {"load_json"},
         "parcels": {"flock"},
         "security-watch": {"flock"},
         "unifi-health": {"flock"},

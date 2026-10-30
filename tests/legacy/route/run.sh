@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Offline tests for ~/bin/route (Swiss public transport connections from transport.opendata.ch). Exit 0 = all pass.
+# Offline tests for ~/bin/route (Swiss public transport connections from transport.opendata.ch; its search.ch fallback
+# is off here). Exit 0 = all pass.
 # The seam ROUTE_API points at a loopback mock API (python http.server) that records each request and serves a
 # fixture shaped like the live API (captured 2026-10-15: walk.duration in seconds, nulls for platform/number/to/station).
 # http(s)_proxy also point at the mock, so a request to the real default URL can only reach the mock (recorded as a
@@ -45,6 +46,7 @@ export http_proxy=http://127.0.0.1:$PORT https_proxy=http://127.0.0.1:$PORT HTTP
 # home is door to door (lib/home_place): a fictional profile; geocoder off unless a test fills the cache
 printf '%s' '{"home": {"street": "Probeweg 7", "postcode": "1234", "town": "Testdorf", "town_aliases": ["Testdorp"]}}' > "$T/profile.json"
 export ASSISTANT_PROFILE=$T/profile.json HOME_PLACE_GEO=off HOME_PLACE_CACHE=$T/home-place.json
+export TRANSPORT_FALLBACK_API=off   # opendata alone here; the search.ch fallback: tests/trains/test_transport_callers.py
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok   - $1"; }
 no() { fail=$((fail + 1)); echo "FAIL - $1"; [ -n "${2:-}" ] && printf '       got: %s\n' "$2" | head -30; }
@@ -136,8 +138,12 @@ answer '{"from": null}'; mode ok; run Nowhere Elsewhere
 eq "no 'connections' key: same message" "$rc|$err" "1|no connections found (check spelling; try a nearby stop name)"
 
 echo "# API and network errors: one line, exit 1, no traceback"
-answer '{"errors": [{"message": "Invalid date format"}]}'; mode "code 400"; run A B --date 15.10.2026
+answer '{"errors": [{"message": "Invalid date format"}]}'; mode "code 400"; run A B
 eq "HTTP 400 with API message" "$rc|$err" "1|route: transport API error: Invalid date format"
+answer '{"errors": [{"message": "The router is not reachable"}]}'; mode ok; run A B
+eq "200 with an errors payload" "$rc|$err" "1|route: transport API error: The router is not reachable"
+: > "$FAKE/requests.log"; run A B --date 15.10.2026
+eq "bad --date: one line, no request" "$rc|$err|$(req)" "1|route: --date YYYY-MM-DD, --at/--arrive HH:MM|"
 answer '<html><body>Bad Gateway</body></html>'; mode "code 502"; run A B
 eq "HTTP 502 with HTML" "$rc|$err" "1|route: transport API error: HTTP 502"
 answer '<html>maintenance</html>'; mode ok; run A B

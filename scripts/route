@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Swiss public transport connections (transport.opendata.ch; addresses via swisstopo).
+"""Swiss public transport connections (transport.opendata.ch, else timetable.search.ch via lib core/transport;
+addresses via swisstopo).
 
   route "Exampletown, Examplestrasse" "Otherstrasse 2, Wallisellen" [--arrive 17:00] [--at 15:50] [--date 2026-10-09] [-n 4]
 
 Home is door to door: "home", the home town (or an alias, its station name) or the town's stop on the home street
 means the profile's home address (lib/home_place: geocoded to coordinates, since the API snaps some free addresses
 to another street); the walk there or back shows as "home". --literal takes FROM/TO exactly as typed.
-Other addresses work directly ("Street N, Town").
+Other addresses work directly ("Street N, Town"). Platforms: a changed one shows as the new one ("pl 13!" when
+only search.ch answers and it marks a change).
 """
-import argparse, json, os, sys, urllib.error, urllib.parse
+import argparse, datetime as dt, os, sys
 from datetime import date
 
 _here = os.path.dirname(os.path.realpath(__file__))
@@ -16,24 +18,10 @@ sys.path.insert(0, os.path.join(_here, 'lib'))
 if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
     sys.path.insert(0, os.path.dirname(_here))   # the repo checkout (scripts/): its own core
 import home_place  # noqa: E402
-from core import http as web  # noqa: E402
+from core import transport  # noqa: E402
 
 API = os.environ.get('ROUTE_API', 'https://transport.opendata.ch/v1')   # test seam (~/opt/route-tests)
 URLLIB_UA = 'Python-urllib/%d.%d' % sys.version_info[:2]   # the UA these calls always sent
-
-def get(url, params):
-    """JSON from the API; a network/HTTP/JSON failure is a one-line error (exit 1), not a traceback."""
-    try:
-        with web.open(url + '?' + urllib.parse.urlencode(params), timeout=20, ua=URLLIB_UA) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        try:
-            why = json.load(e)['errors'][0]['message']
-        except Exception:
-            why = f'HTTP {e.code}'
-        sys.exit(f'route: transport API error: {why}')
-    except (OSError, ValueError) as e:      # URLError, timeout, junk instead of JSON
-        sys.exit(f'route: transport API unreachable or broken: {getattr(e, "reason", e)}')
 
 ap = argparse.ArgumentParser()
 ap.add_argument('src'); ap.add_argument('dst')
@@ -42,20 +30,32 @@ ap.add_argument('-n', type=int, default=4)
 ap.add_argument('--literal', action='store_true', help='FROM/TO as typed (no home address)')
 a = ap.parse_args()
 q = (lambda x: x) if a.literal else home_place.query
-params = {'from': q(a.src), 'to': q(a.dst), 'date': a.date, 'limit': a.n}
-if a.arrive:
-    params.update(time=a.arrive, isArrivalTime=1)
-elif a.at:
-    params.update(time=a.at)
-data = get(API + '/connections', params)
-if not data.get('connections'):
+try:
+    t = dt.datetime.strptime(f'{a.date} {a.arrive or a.at}', '%Y-%m-%d %H:%M') if (a.arrive or a.at) else \
+        dt.date.fromisoformat(a.date)
+except ValueError:
+    sys.exit('route: --date YYYY-MM-DD, --at/--arrive HH:MM')
+try:
+    conns = transport.Client(api=API, ua=URLLIB_UA, timeout=20).connections(
+        q(a.src), q(a.dst), t, limit=a.n, arrive=bool(a.arrive))
+except transport.TransportError as e:   # both sources: network/HTTP/JSON failure -> one line (exit 1)
+    sys.exit(f'route: {e}')
+if not conns:
     sys.exit('no connections found (check spelling; try a nearby stop name)')
+data = {'connections': conns}
+
+
+def pl(d):
+    new = (d.get('prognosis') or {}).get('platform')
+    return f"{new}!" if new and new != d.get('platform') else d.get('platform') or '-'
+
+
 for c in data['connections']:
-    print(f"{c['from']['departure'][11:16]} → {c['to']['arrival'][11:16]}  ({c['duration'][3:8]}, {c['transfers']} transfers)")
+    print(f"{c['from']['departure'][11:16]} → {c['to']['arrival'][11:16]}  ({(c.get('duration') or '')[3:8]}, {c.get('transfers')} transfers)")
     for s in c['sections']:
         if s.get('journey'):
             j = s['journey']
-            print(f"   {s['departure']['departure'][11:16]} {s['departure']['station']['name']} [pl {s['departure'].get('platform') or '-'}] → "
+            print(f"   {s['departure']['departure'][11:16]} {s['departure']['station']['name']} [pl {pl(s['departure'])}] → "
                   f"{s['arrival']['arrival'][11:16]} {s['arrival']['station']['name']}  {j.get('category') or ''}{j.get('number') or ''} → {j.get('to') or '?'}")
         elif s.get('walk'):
             dest = (s['arrival'].get('station') or {}).get('name') or (s['arrival'].get('location') or {}).get('name') or ''   # null-safe

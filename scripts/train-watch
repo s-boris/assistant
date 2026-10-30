@@ -46,10 +46,10 @@ result, or an empty source over calendar legs; the legs stay as they were).
 Phone app: a Live Update chip (lib/livecount.py) per leg from 30 min before departure ("Train HH:MM +N min", door legs
 "Leave HH:MM"), updated on delay, held until a late train leaves, ended when cancelled; silent without a paired phone
 (tests: LIVECOUNT_PHONE = a stub phone; test state makes no chips without it).
-Sources: transport.opendata.ch /connections; when it fails (an {"errors": ...} payload even with 200, a non-2xx
-status, a timeout, no JSON) the same lookup goes to timetable.search.ch route.json (keyless; show_delays,
-show_trackchanges, pre=2 with the rows over 5 min before the asked time dropped), mapped to the opendata shape (dep/arr,
-dep_delay/arr_delay, track with "!" = changed, delay "X" or a cancelled flag = cancelled, *G/*L = category/line).
+Sources (lib core/transport): transport.opendata.ch /connections; when it fails (an {"errors": ...} payload even
+with 200, a non-2xx status, a timeout, no JSON) the same lookup goes to timetable.search.ch route.json (keyless;
+show_delays, show_trackchanges, pre=2, rows from 5 min before the asked time kept), mapped to the opendata shape
+(a changed track = the new platform only, delay "X" or a cancelled flag = cancelled, *G/*L = category/line).
 A failed opendata is not asked again in that run (one request per lookup). Which source answered:
 ~/.local/state/trains/sources.log (one line per source and run; a fallback is also said on stderr outside --cron).
 Both failing = the transport API error below.
@@ -65,7 +65,6 @@ import os
 import pwd
 import re
 import sys
-import urllib.error
 import urllib.parse
 
 _here = os.path.dirname(os.path.realpath(__file__))
@@ -74,7 +73,7 @@ for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.pa
     sys.path.insert(0, _lib)                              # own lib dir first; ~/bin/lib for a copy elsewhere
 if not os.path.isdir(os.path.join(_here, 'lib', 'core')) and os.path.isdir(os.path.join(_here, '..', 'core')):
     sys.path.insert(0, os.path.dirname(_here))            # the repo checkout (scripts/): its own core
-from core import http as web, jsonstate, locks  # noqa: E402
+from core import jsonstate, locks, transport  # noqa: E402
 import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
 import assistant_profile as profile  # noqa: E402
 from sbb import sbb_link  # noqa: E402
@@ -88,7 +87,7 @@ DIR = os.environ.get('TRAIN_WATCH_DIR') or f'{HOME_DIR}/.local/state/trains'
 INBOX = os.environ.get('TRAIN_WATCH_INBOX') or f'{HOME_DIR}/inbox'
 LEGS_F, STATE_F, LOCK_F, SOURCES_F = (os.path.join(DIR, n) for n in ('legs.json', 'state.json', '.lock',
                                                                      'sources.log'))
-DOWN = {}                                   # source -> why it failed in this run (not asked again)
+_CLIENT = {}                                # the run's core.transport client (a failed opendata: not asked again)
 SOURCES_SEEN = set()                        # sources already logged in this run
 CRON = False                                # check --cron: no stderr chatter
 CALCACHE_F = os.path.join(os.environ.get('CALCACHE_DIR') or f'{HOME_DIR}/.local/state/calcache', 'events.json')
@@ -421,38 +420,6 @@ def cmd_list(a, now):
 
 
 # ------------------------------------------------------------------------------------------------ transport API
-def api_why(data):
-    """The reason in an error payload: opendata {"errors": [{"message"}]}, search.ch {"messages": [...]}."""
-    for k in ('errors', 'messages'):
-        for x in (data.get(k) or []) if isinstance(data, dict) else []:
-            why = x.get('message') if isinstance(x, dict) else x
-            if why:
-                return str(why)
-    return ''
-
-
-def api(base, path, params):
-    """GET base/path?params -> the JSON object. Fail on a non-2xx status, a timeout, no JSON object or an error
-    payload ({"errors": ...} even with 200, as opendata answers while its router is down)."""
-    url = f'{base}/{path}?{urllib.parse.urlencode(params)}'
-    try:
-        with web.open(url, headers={'User-Agent': UA}, timeout=25) as r:
-            data = json.load(r)
-    except urllib.error.HTTPError as e:
-        try:
-            why = api_why(json.load(e))
-        except Exception:
-            why = ''
-        raise Fail(f'transport API error: {why or f"HTTP {e.code}"}')
-    except (OSError, ValueError) as e:
-        raise Fail(f'transport API unreachable or broken: {getattr(e, "reason", e)}')
-    if not isinstance(data, dict):
-        raise Fail('transport API broken: not a JSON object')
-    if data.get('errors') or (data.get('messages') and not data.get('connections')):
-        raise Fail(f'transport API error: {api_why(data) or "error payload"}')
-    return data
-
-
 def source_log(src, why=''):
     """Which source answered: one line per source and run in DIR/sources.log (kept short); a fallback is also
     said on stderr outside --cron."""
@@ -475,97 +442,19 @@ def source_log(src, why=''):
         pass                                              # a log line never fails the watch
 
 
-def sc_time(s, anchor):
-    """search.ch 'YYYY-MM-DD HH:MM:SS' (his wall time, no offset) -> ISO with offset. In the repeated autumn hour
-    the wall time is two instants: the earliest one not before anchor (the asked time), else the latest."""
-    try:
-        naive = dt.datetime.fromisoformat(str(s or '').strip())
-    except ValueError:
-        return None
-    if naive.tzinfo:
-        return fixed(naive).isoformat()
-    cands = sorted({fixed(naive.replace(tzinfo=tz(), fold=f)) for f in (0, 1)})
-    later = [t for t in cands if t >= anchor - MIN]
-    return (later[0] if later else cands[-1]).isoformat()
-
-
-def sc_delay(v):
-    """search.ch delay '+3' / '-1' / '0' -> minutes; 'X' (cancelled), '' or none -> None."""
-    s = str(v if v is not None else '').strip()
-    return int(s) if re.fullmatch(r'[+-]?\d+', s) else None
-
-
-def sc_cancelled(*ds):
-    return any(isinstance(d, dict) and (flagged_cancel(d) or any(str(d.get(k) or '').strip().upper() == 'X'
-                                                                for k in ('dep_delay', 'arr_delay')))
-               for d in ds)
-
-
-def sc_section(leg, anchor):
-    """One search.ch ride leg -> an opendata section ({journey, departure, arrival}); walks and the end -> None."""
-    x = leg.get('exit') or {}
-    line = str(leg.get('line') or '').strip()
-    kind = str(leg.get('type') or '').lower()
-    if kind == 'walk' or not x or not leg.get('departure') or not (line or leg.get('*G') or leg.get('number')):
-        return None
-    cat, num = str(leg.get('*G') or '').strip(), str(leg.get('*L') or '').strip()
-    if not cat:                                           # no category field: 'IC 8', 'S13', a bare tram/bus '17'
-        m = re.fullmatch(r'([A-Za-z]*)\s*(.*)', line or str(leg.get('number') or '').split(' ')[0])
-        cat, num = m.group(1), m.group(2).strip()
-    if kind in ('bus', 'post', 'night_bus') and cat.upper() not in BUS_CATS:
-        cat = 'B'
-    elif kind == 'tram' and cat.upper() not in TRAM_CATS:
-        cat = 'T'
-    if not num and cat and line.upper().startswith(cat.upper()):
-        num = line[len(cat):].strip()
-    journey = {'category': cat, 'number': num, 'to': leg.get('terminal'), 'operator': leg.get('operator'),
-               'name': ' '.join(str(leg.get(k) or '') for k in ('line', 'type_name')).strip()}
-    if sc_cancelled(leg, x):
-        journey['cancelled'] = True
-    return {'journey': journey,
-            'departure': {'departure': sc_time(leg['departure'], anchor), 'delay': sc_delay(leg.get('dep_delay')),
-                          'platform': leg.get('track'), 'station': {'name': leg.get('name')}, 'prognosis': {}},
-            'arrival': {'arrival': sc_time(x.get('arrival'), anchor), 'delay': sc_delay(x.get('arr_delay')),
-                        'platform': x.get('track'), 'station': {'name': x.get('name')}, 'prognosis': {}}}
-
-
-def sc_connections(data, anchor):
-    """search.ch route.json -> opendata /connections rows, so connection() reads both sources the same way."""
-    out = []
-    for c in data.get('connections') or []:
-        legs = [x for x in (c.get('legs') or []) if isinstance(x, dict)]
-        out.append({'from': {'departure': sc_time(c.get('departure'), anchor), 'delay': sc_delay(c.get('dep_delay')),
-                             'station': {'name': c.get('from')}, 'prognosis': {}},
-                    'to': {'arrival': sc_time(c.get('arrival'), anchor), 'delay': sc_delay(c.get('arr_delay')),
-                           'station': {'name': c.get('to')}, 'prognosis': {}},
-                    'cancelled': sc_cancelled(c),
-                    'sections': [s for s in (sc_section(x, anchor) for x in legs) if s]})
-    return out
+def client():
+    if 'c' not in _CLIENT:
+        _CLIENT['c'] = transport.Client(api=API, fallback=FALLBACK_API, ua=UA, timeout=25, on_source=source_log)
+    return _CLIENT['c']
 
 
 def fetch_connections(frm, to, when, limit):
-    """opendata /connections rows for one lookup; search.ch route.json when opendata fails (an error payload, a
-    non-2xx status, a timeout). A failed opendata is not asked again in this run: one request per lookup."""
-    if 'opendata' not in DOWN:
-        try:
-            data = api(API, 'connections', {'from': frm, 'to': to, 'date': when.date().isoformat(),
-                                            'time': hm(when), 'limit': limit})
-            source_log('opendata')
-            return data.get('connections') or []
-        except Fail as e:
-            DOWN['opendata'] = str(e)
+    """opendata /connections rows for one lookup; search.ch when opendata fails (core.transport: a failed opendata
+    is asked once per run). Rows from up to ROUTE_SLACK before `when`: match() may take a way leaving a bit earlier."""
     try:
-        # pre=2: search.ch leaves a slow connection out when it would head the list (an IR at the asked minute
-        # behind a faster IC soon after); asking two earlier ones keeps it, and those before `when` are dropped
-        data = api(FALLBACK_API, 'route.json', {'from': frm, 'to': to, 'date': when.strftime('%d.%m.%Y'),
-                                                'time': hm(when), 'num': limit, 'pre': 2, 'show_delays': 1,
-                                                'show_trackchanges': 1})
-    except Fail as e:
-        raise Fail(f"{DOWN['opendata']}; fallback search.ch: {e}") from e
-    source_log('search.ch', f"opendata: {DOWN['opendata']}")
-    start = fixed(when).replace(second=0, microsecond=0)
-    keep = start - ROUTE_SLACK                            # match() may take a way leaving a few minutes earlier
-    return [c for c in sc_connections(data, start) if (iso(c['from']['departure']) or start) >= keep]
+        return client().connections(frm, to, when, limit, keep_before=ROUTE_SLACK.total_seconds() / 60)
+    except transport.TransportError as e:
+        raise Fail(str(e)) from None
 
 
 def line_name(j):

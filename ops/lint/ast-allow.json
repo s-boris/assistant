@@ -179,8 +179,7 @@
    "load_json"
   ],
   "scripts/night-plan": [
-   "load_json",
-   "urlopen"
+   "load_json"
   ],
   "scripts/parcels": [
    "flock"
@@ -321,7 +320,7 @@
   "scripts/media": "its locks (flock), its fetches (urlopen) move with a later core.http / core.locks pass",
   "scripts/menu-usage": "its locks (flock) move with a later core.locks pass",
   "scripts/missing-docs": "its JSON reader (load_json) move with a later core.jsonstate pass",
-  "scripts/night-plan": "its JSON reader (load_json), its fetches (urlopen) move with a later core.http / core.jsonstate pass",
+  "scripts/night-plan": "its JSON reader (load_json) moves with a later core.jsonstate pass",
   "scripts/parcels": "its locks (flock) move with a later core.locks pass",
   "scripts/security-watch": "its locks (flock) move with a later core.locks pass",
   "scripts/unifi-health": "its locks (flock) move with a later core.locks pass",
