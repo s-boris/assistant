@@ -39,6 +39,15 @@ def test_low_threshold_off_and_unknown(tmp_path):
     assert hostmem.low(8, str(tmp_path / "missing")) is None  # no reading: never blocks
 
 
+def test_ci_gate_shared_by_the_land_queue_and_the_runner(tmp_path):
+    """avail_gb, LAND_MIN_GB and ci_workers: the numbers ops/assistant.py (land queue, CI driver) and the hub's CI
+    runner (packages/hub/ciworker.py) both use."""
+    assert hostmem.avail_gb(str(meminfo(tmp_path / "m", 3900000))) == 3.9
+    assert hostmem.avail_gb(str(tmp_path / "missing")) is None
+    assert hostmem.LAND_MIN_GB == 6.0 and hostmem.CI_FLOOR_GB == 2.0 and hostmem.CI_WORKER_GB == 0.5
+    assert hostmem.ci_workers(3.9) == 3 and hostmem.ci_workers(1.0) == 1 and hostmem.ci_workers(60.0) == 116
+
+
 def test_min_gb_env_then_conf_then_default(tmp_path, monkeypatch):
     conf = tmp_path / "min-mem-gb"
     monkeypatch.delenv("X_MIN_MEM_GB", raising=False)

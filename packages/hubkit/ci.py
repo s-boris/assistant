@@ -100,8 +100,12 @@ def _has_main(wt: Path) -> bool:
     return r.returncode == 0
 
 
-def submit(wt: Path, head: str, tree: str, base: str | None, branch: str, with_main: bool = True) -> dict:
-    """with_main False: no base (a full run: the runner has nothing to diff against)."""
+def submit(
+    wt: Path, head: str, tree: str, base: str | None, branch: str, with_main: bool = True,
+    min_mem_gb: float | None = None,
+) -> dict:  # fmt: skip
+    """with_main False: no base (a full run: the runner has nothing to diff against). min_mem_gb: the land queue's
+    memory gate (GB of the host's MemAvailable, 0 = off); the runner claims the job only at or above it."""
     data, h, b = flat(wt, head, base if with_main else None)
     body = {
         "rid": hub.new_rid(),
@@ -111,6 +115,8 @@ def submit(wt: Path, head: str, tree: str, base: str | None, branch: str, with_m
         "branch": branch[:80],
         "bundle": base64.b64encode(data).decode(),
     }
+    if min_mem_gb is not None:
+        body["min_mem_gb"] = round(float(min_mem_gb), 2)
     ans = hub.call("POST", "/ci/jobs", body, timeout=60)
     if b:  # accepted: the runner fetches it into its mirror first thing; the chain follows main
         _git(wt, "update-ref", SEED_REF, b)

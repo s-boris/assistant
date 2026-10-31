@@ -100,7 +100,8 @@
         host's MemAvailable is below 6 GB (ASSISTANT_LAND_MIN_MEM_GB, else ~/.config/assistant/land-min-mem holding
         a number; 0 = off): the entries stay queued, `land status` and waiters show "waiting: memory 3.9 GB < 6 GB".
         CI's pytest and legacy workers are capped by MemAvailable too (2 GB kept free, 0.5 GB per worker; an
-        explicit ASSISTANT_CI_*_WORKERS count wins).
+        explicit ASSISTANT_CI_*_WORKERS count wins). The hub's CI runner honours the same gate: each job carries the
+        number, the runner claims no job below it and caps the worker counts it hands a job the same way.
   assistant land status [qN | BRANCH] [--json] [--wait]   the queue: queued (position, lane), testing (batch,
         members, phase, seconds), landed (commit, time), red / conflict / error (exit, red line, batch-mates),
         superseded; starts the worker when something waits. With qN or BRANCH and --wait: follow that entry
@@ -232,7 +233,7 @@ def _find_core() -> None:
 
 
 _find_core()
-from core import clock, paths  # noqa: E402
+from core import clock, hostmem, paths  # noqa: E402
 
 HEADER = "# managed: ~/opt/assistant — edit there, deploy with assistant land"
 KEEP = 3
@@ -1926,7 +1927,8 @@ def land_queue() -> bool:
         return False
 
 
-LAND_MIN_MEM_GB = 6.0  # the queue starts a batch only while the host's MemAvailable is at least this (land_min_mem)
+LAND_MIN_MEM_GB = hostmem.LAND_MIN_GB  # the queue starts a batch only while MemAvailable is at least this; the hub's
+# CI runner starts a job only then too (each runner job carries land_min_mem() as min_mem_gb)
 
 
 def land_min_mem() -> float:
@@ -1945,18 +1947,10 @@ def land_min_mem() -> float:
 
 
 def mem_available() -> float | None:
-    """The host's MemAvailable (/proc/meminfo) in GB (GiB); None = unknown. Test mode reads only the
+    """The host's MemAvailable (/proc/meminfo, core.hostmem: decimal GB); None = unknown. Test mode reads only the
     ASSISTANT_MEMINFO seam (a file in meminfo format); unset there = unknown (no gate, no cap)."""
-    src = test_seam("ASSISTANT_MEMINFO") if paths.test_mode() else "/proc/meminfo"
-    if not src:
-        return None
-    try:
-        for ln in Path(src).read_text(encoding="ascii", errors="replace").splitlines():
-            if ln.startswith("MemAvailable:"):
-                return int(ln.split()[1]) / (1 << 20)  # kB
-    except (OSError, ValueError, IndexError):
-        pass
-    return None
+    src = test_seam("ASSISTANT_MEMINFO") if paths.test_mode() else hostmem.MEMINFO
+    return hostmem.avail_gb(src) if src else None
 
 
 def landq_mem_wait() -> tuple[float, float] | None:
@@ -2977,7 +2971,7 @@ def _runner_submit(wt: Path, head: str, tree: str, base: str | None, branch: str
     try:
         from hubkit import ci as hci
 
-        return hci.submit(wt, head, tree, base, branch), ""
+        return hci.submit(wt, head, tree, base, branch, min_mem_gb=land_min_mem()), ""
     except Exception as e:  # the runner is optional in shadow mode; enforce refuses without its record
         return None, f"{type(e).__name__}: {e}"[:200]
 
@@ -3130,7 +3124,8 @@ def ci_hub(tree: Path, base: str | None, wait: float, full: bool = False) -> int
     branch = git(tree, "rev-parse", "--abbrev-ref", "HEAD")
     try:
         name = branch if branch != "HEAD" else ""
-        job = hci.submit(tree, head, tid, None if full else base, name, with_main=not full)
+        need = land_min_mem()  # the runner claims the job only at or above the land queue's memory gate
+        job = hci.submit(tree, head, tid, None if full else base, name, with_main=not full, min_mem_gb=need)
         say(f"runner job {job['id']} for {head[:12]} (tree {tid[:12]}) ...")
         ans = hci.wait(job["id"], wait)
     except Exception as e:
@@ -4855,14 +4850,13 @@ def _host_cpus() -> float:
         return float(os.cpu_count() or 1)
 
 
-CI_MEM_FLOOR_GB = 2.0  # CI workers leave this much of the host's MemAvailable free (_mem_cap)
-CI_MEM_PER_WORKER_GB = 0.5  # ... and count this much each
 CGROUP_MEM_MAX = "/sys/fs/cgroup/memory.max"
 
 
 def _mem_cap() -> int | None:
     """Workers memory allows, None when unlimited: the cgroup limit (~400 MB each) and the host's MemAvailable
-    (mem_available: CI_MEM_FLOOR_GB kept free, CI_MEM_PER_WORKER_GB each; bites only on a box short of memory)."""
+    (mem_available, hostmem.ci_workers: 2 GB kept free, 0.5 GB each; bites only on a box short of memory). The hub's
+    CI runner caps the explicit counts it hands a job with the same hostmem.ci_workers."""
     caps = []
     try:
         v = Path(CGROUP_MEM_MAX).read_text().strip()
@@ -4872,7 +4866,7 @@ def _mem_cap() -> int | None:
         pass
     have = mem_available()
     if have is not None:
-        caps.append(max(1, int((have - CI_MEM_FLOOR_GB) / CI_MEM_PER_WORKER_GB)))
+        caps.append(hostmem.ci_workers(have))
     return min(caps) if caps else None
 
 

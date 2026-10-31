@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""ciworker: the CI runner in the ci container. Stdlib only, one file; the loader runs it from a
-release. No network (network_mode none), no secrets: it reads jobs from the spool it shares with the hub, runs
-`assistant ci` on each and writes the result back; the hub signs results, never this process.
+"""ciworker: the CI runner in the ci container. Stdlib only, one file (+ core.hostmem from the release's
+app/ci/lib, the land queue's memory gate); the loader runs it from a release. No network (network_mode none), no
+secrets: it reads jobs from the spool it shares with the hub, runs `assistant ci` on each and writes the result
+back; the hub signs results, never this process.
 
 Job (HUB_SPOOL/ci/jobs/<id>.json + <id>.bundle, written by hubd) -> claimed by renaming the json into run/ -> the
 bundle fetched into the mirror (<work>/mirror.git: every tree sent so far; a bundle is incremental against the seed it
@@ -29,7 +30,15 @@ and its fetch + checkout run one job at a time (_git). slots() = the spool's ci/
 1..SLOTS_MAX. Rollback: `hub ci slots 1` (one job at a time, as before). A further job starts only while the
 container's unreclaimable memory (cgroup anon + shmem) leaves MEM_RESERVE_MB below its limit and START_GAP s after
 the last start (the jobs' pyright peaks apart), and gets
-cpus // (jobs running) pytest and legacy workers (a lone job keeps the driver's own count, all CPUs). The result's
+cpus // (jobs running) pytest and legacy workers (a lone job keeps the driver's own count, all CPUs).
+
+Memory gate (the land queue's, ops/assistant.py land_min_mem; core.hostmem shared): no job is claimed, the first one
+neither, while the host's MemAvailable is below the job's min_mem_gb (the brain's setting, sent with the job; missing
+= hostmem.LAND_MIN_GB, 0 = off). /proc/meminfo in this container is the host's (Docker does not namespace it; the
+8 GB limit is the cgroup's, mem_room). The oldest job waits at the front (later ones too); a job that would only be
+skipped (skip_why) is claimed anyway. The heartbeat says host_mem_gb and mem_hold ("host MemAvailable 3.9 GB < 6 GB").
+The explicit worker counts a job gets beside others skip the driver's own memory cap, so workers() applies it:
+hostmem.ci_workers (2 GB kept free, 0.5 GB per worker). The result's
 "runner" says what the job had: slots, workers, parallel (most jobs at once while it ran), mem_peak_mb (the
 container's anon + shmem peak while it ran), oom_kills (the cgroup's oom kills while it ran).
 
@@ -53,6 +62,20 @@ import sys
 import tempfile
 import threading
 import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REL_DIR = os.path.dirname(HERE)
+# core.hostmem (stdlib only): the release's app/ci/lib/core (hubkit.release CI_CORE), else the repo's core/ (tests);
+# neither = no memory gate (the start event says so)
+for _lib in (os.path.join(HERE, "ci", "lib"), os.path.dirname(REL_DIR)):
+    if os.path.isfile(os.path.join(_lib, "core", "hostmem.py")):
+        if _lib not in sys.path:
+            sys.path.append(_lib)
+        break
+try:
+    from core import hostmem
+except ImportError:
+    hostmem = None  # type: ignore[assignment]
 
 EVERY = 5.0
 JOB_TIMEOUT = 1500.0
@@ -80,8 +103,6 @@ def skip_steps(job: dict, repo: str) -> str:
 
 RELEASE = os.environ.get("HUB_RELEASE", "")
 SUPERSEDED = "skipped: superseded by job"  # ops/assistant.py RUNNER_SUPERSEDED: never a shared blocker
-HERE = os.path.dirname(os.path.abspath(__file__))
-REL_DIR = os.path.dirname(HERE)
 _stop = threading.Event()
 _tc: dict = {"path": None, "id": None, "ok": None, "why": ""}
 SLOTS = 2  # jobs at once unless the spool's ci/slots.json or HUB_CI_SLOTS says otherwise (1 = the old serial runner)
@@ -94,6 +115,8 @@ MEM_RESERVE_MB = 1300
 # once beside the first pytest workers (3.4 GB anon at that moment in the emulation, ~2.7 GB at most otherwise).
 START_GAP = float(os.environ.get("HUB_CI_START_GAP") or 30.0)
 CGROUP = os.environ.get("HUB_CI_CGROUP", "/sys/fs/cgroup")
+MEMINFO = os.environ.get("HUB_CI_MEMINFO") or None  # a test seam; None = hostmem.MEMINFO (/proc/meminfo, the host's)
+_hold: dict = {"why": None}  # the memory gate's hold (next_job), for the heartbeat
 _lock = threading.Lock()  # _running and each job's sample fields
 _git = threading.Lock()  # the shared mirror: one fetch + checkout at a time
 _tc_lock = threading.Lock()
@@ -137,6 +160,8 @@ def beat() -> None:
             "slots": slots(),
             "toolchain": _tc["id"],
             "toolchain_ok": _tc["ok"],
+            "host_mem_gb": None if (m := host_mem()) is None else round(m, 2),
+            "mem_hold": _hold["why"],
         }
         try:
             _atomic(spool("ci-heartbeat.json"), json.dumps(body).encode())
@@ -277,10 +302,37 @@ def cpus() -> int:
         return os.cpu_count() or 1
 
 
+def host_mem() -> float | None:
+    """The host's MemAvailable in GB (core.hostmem), None = unknown or no hostmem."""
+    return hostmem.avail_gb(MEMINFO) if hostmem else None
+
+
+def min_mem(job: dict) -> float:
+    """The job's memory gate in GB: its min_mem_gb (the brain's land_min_mem), else hostmem.LAND_MIN_GB; 0 = off."""
+    v = job.get("min_mem_gb")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+        return float(v)
+    return hostmem.LAND_MIN_GB if hostmem else 0.0
+
+
+def mem_hold(job: dict) -> str | None:
+    """Why the job may not start yet: "host MemAvailable 3.9 GB < 6 GB" while the host is below min_mem(job), else
+    None (enough, unknown, the gate off, or the job would only be skipped: a skip runs nothing)."""
+    if hostmem is None:
+        return None
+    why = hostmem.low(min_mem(job), MEMINFO)
+    return why if why and not skip_why(job) else None
+
+
 def workers(n_running: int) -> int | None:
     """pytest/legacy workers for a job that starts while n_running jobs (itself included) run: None = the driver's
-    own count (a lone job: all CPUs), else the CPUs shared out, at least 2."""
-    return None if n_running <= 1 else max(2, cpus() // n_running)
+    own count (a lone job: all CPUs, capped by the driver's own memory cap), else the CPUs shared out, at least 2, and
+    at most what the host's MemAvailable allows (hostmem.ci_workers: an explicit count skips the driver's cap)."""
+    if n_running <= 1:
+        return None
+    n = max(2, cpus() // n_running)
+    have = host_mem()
+    return n if have is None or hostmem is None else min(n, hostmem.ci_workers(have))
 
 
 def _sample() -> None:
@@ -654,14 +706,33 @@ def recover() -> None:
                 pass
 
 
+def _set_hold(why: str | None) -> None:
+    """The hold for the heartbeat (its reading moves); the log gets one line when it starts and one when it ends."""
+    if bool(why) != bool(_hold["why"]):
+        print(json.dumps({"event": "ci_mem_hold" if why else "ci_mem_go", "why": why}), flush=True)
+    _hold["why"] = why
+
+
 def next_job() -> tuple[dict, str] | None:
+    """The oldest queued job, claimed (moved to run/); None = none, or the memory gate holds it (mem_hold)."""
     jd = spool("ci", "jobs")
     try:
         names = sorted((os.stat(os.path.join(jd, n)).st_mtime, n) for n in os.listdir(jd) if n.endswith(".json"))
     except OSError:
         return None
+    if not names:
+        _set_hold(None)
     for _, n in names:
         src, dst = os.path.join(jd, n), spool("ci", "run", n)
+        try:
+            with open(src, encoding="utf-8") as f:
+                peek = json.load(f)
+        except (OSError, ValueError):
+            peek = None
+        why = mem_hold(peek) if isinstance(peek, dict) else None
+        _set_hold(why)
+        if why:  # first in, first out: the front job waits for memory, the rest behind it
+            return None
         try:
             os.replace(src, dst)
             with open(dst, encoding="utf-8") as f:
@@ -691,6 +762,9 @@ def main() -> int:
     print(json.dumps({"event": "ci_work", "root": root, "killed": killed, "swept": sweep(root)}), flush=True)
     tc, why = toolchain()  # checked once at start: the heartbeat says whether jobs can run
     print(json.dumps({"event": "ci_toolchain", "id": _tc["id"], "ok": tc is not None, "why": why}), flush=True)
+    have = host_mem()
+    gate = {"event": "ci_mem_gate", "hostmem": hostmem is not None, "host_mem_gb": have and round(have, 2)}
+    print(json.dumps(gate), flush=True)
     beat()
     threading.Thread(target=_sample, daemon=True).start()
     threads: list[threading.Thread] = []

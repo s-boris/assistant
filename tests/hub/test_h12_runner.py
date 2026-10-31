@@ -661,3 +661,122 @@ def test_start_kills_orphans_of_an_earlier_runner(tmp_path):
     finally:
         other.kill()
         other.wait()
+
+
+def _meminfo(path: Path, gb: float) -> str:
+    """A /proc/meminfo with gb (decimal, as core.hostmem counts) of MemAvailable."""
+    path.write_text(f"MemTotal: 65618092 kB\nMemFree: 500000 kB\nMemAvailable: {int(gb * 1e6)} kB\n")
+    return str(path)
+
+
+def test_memory_gate_holds_the_claim_and_caps_the_workers(tmp_path, monkeypatch):
+    """The land queue's memory gate in the runner (core.hostmem, shared with ops/assistant.py): a job's min_mem_gb
+    (the brain's land_min_mem), else hostmem.LAND_MIN_GB; below it next_job claims nothing (the job stays queued, the
+    heartbeat says why), a job that would only be skipped goes through; workers() caps the explicit counts it hands
+    a job beside others by MemAvailable (they skip the driver's own memory cap)."""
+    w = _mod("ciworker")
+    assert w.hostmem is not None  # the repo's core/ here; the release's app/ci/lib/core in the runner
+    spool = tmp_path / "spool"
+    for d in ("jobs", "run", "results"):
+        (spool / "ci" / d).mkdir(parents=True)
+    monkeypatch.setenv("HUB_SPOOL", str(spool))
+    monkeypatch.delenv("HUB_HEARTBEAT", raising=False)
+    mi = tmp_path / "meminfo"
+    monkeypatch.setattr(w, "MEMINFO", _meminfo(mi, 3.9))
+    assert w.min_mem({}) == w.hostmem.LAND_MIN_GB == 6.0
+    assert w.min_mem({"min_mem_gb": 3}) == 3.0 and w.min_mem({"min_mem_gb": 0}) == 0.0
+    assert w.min_mem({"min_mem_gb": True}) == 6.0 and w.min_mem({"min_mem_gb": -1}) == 6.0
+    hold = "host MemAvailable 3.9 GB < 6 GB"
+    now = time.time()
+    job = {"id": "a" * 16, "branch": "m", "created": now}
+    assert w.mem_hold(job) == hold
+    assert w.mem_hold({**job, "min_mem_gb": 0}) is None  # the gate off (the brain's 0)
+    assert w.mem_hold({**job, "min_mem_gb": 3.5}) is None  # the brain's lower setting
+    assert w.mem_hold({**job, "created": now - w.QUEUE_MAX_AGE - 5}) is None  # would only be skipped: no memory used
+    jobs = spool / "ci" / "jobs"
+    (jobs / f"{'a' * 16}.json").write_text(json.dumps(job))
+    (jobs / f"{'b' * 16}.json").write_text(json.dumps({**job, "id": "b" * 16, "branch": "n", "min_mem_gb": 0}))
+    os.utime(jobs / f"{'b' * 16}.json", (now + 5, now + 5))  # queued after a
+    assert w.next_job() is None  # the front job waits for memory, the one behind it too (first in, first out)
+    assert sorted(p.name for p in jobs.iterdir()) == [f"{'a' * 16}.json", f"{'b' * 16}.json"]
+    assert w._hold["why"] == hold
+    w.beat()
+    hb = _hb(spool)
+    assert hb["mem_hold"] == hold and hb["host_mem_gb"] == 3.9, hb
+    _meminfo(mi, 12.0)
+    got = w.next_job()
+    assert got and got[0]["id"] == "a" * 16 and (spool / "ci" / "run" / f"{'a' * 16}.json").exists()
+    assert w._hold["why"] is None
+    w.beat()
+    assert _hb(spool)["mem_hold"] is None and _hb(spool)["host_mem_gb"] == 12.0
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / "cpu.max").write_text("800000 100000\n")
+    w.CGROUP = str(cg)
+    _meminfo(mi, 60.0)
+    assert w.workers(1) is None and w.workers(2) == 4 and w.workers(4) == 2  # plenty: the CPU rule
+    _meminfo(mi, 3.9)
+    assert w.workers(1) is None and w.workers(2) == 3  # (3.9 - 2) / 0.5: hostmem.ci_workers, the driver's own cap
+    _meminfo(mi, 2.4)
+    assert w.workers(2) == 1 and w.workers(4) == 1  # below the CPU rule's floor of 2
+    monkeypatch.setattr(w, "MEMINFO", str(tmp_path / "missing"))
+    assert w.host_mem() is None and w.workers(2) == 4 and w.mem_hold(job) is None  # no reading: never blocks
+
+
+def test_runner_process_waits_for_memory_then_runs(tmp_path):
+    """A real ciworker from a release with app/ci/lib/core (hubkit.release CI_CORE): a job whose min_mem_gb the host
+    is below stays queued (the heartbeat and the log say so) and runs once memory frees up."""
+    rel = make_release(tmp_path)
+    _tc_git(rel)
+    lib = rel / "app" / "ci" / "lib" / "core"
+    lib.mkdir(parents=True)
+    for f in (REPO / "core").glob("*.py"):
+        shutil.copy(f, lib / f.name)
+    spool = tmp_path / "spool"
+    for d in ("jobs", "run", "results"):
+        (spool / "ci" / d).mkdir(parents=True)
+    head, tree, bundle = git_repo(tmp_path / "repo")
+    jobs = spool / "ci" / "jobs"
+    jid = "c" * 16
+    shutil.copy(bundle, jobs / f"{jid}.bundle")
+    job = {"id": jid, "commit": head, "tree": tree, "branch": "mem", "schema": "t_x", "min_mem_gb": 5}
+    job["created"] = time.time()
+    (jobs / f"{jid}.json").write_text(json.dumps(job))
+    mi = tmp_path / "meminfo"
+    _meminfo(mi, 3.0)
+    env = {
+        "PATH": os.environ["PATH"],
+        "HUB_SPOOL": str(spool),
+        "HUB_RELEASE": rel.name,
+        "HUB_HEARTBEAT": str(tmp_path / "hb"),
+        "HUB_CI_WORK": str(tmp_path / "work"),
+        "HUB_CI_MEMINFO": str(mi),
+    }
+    p = subprocess.Popen(
+        [sys.executable, "-I", "-B", str(rel / "app" / "ciworker.py")],
+        env=env,
+        cwd=rel,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    hold = "host MemAvailable 3.0 GB < 5 GB"
+    res = spool / "ci" / "results" / f"{jid}.json"
+    try:
+        end = time.monotonic() + 30
+        while time.monotonic() < end and _hb(spool).get("mem_hold") != hold:
+            time.sleep(0.1)
+        hb = _hb(spool)
+        time.sleep(2.0)  # two more claim rounds: still nothing taken
+        held = (jobs / f"{jid}.json").exists() and not res.exists()
+        _meminfo(mi, 9.0)
+        end = time.monotonic() + 60
+        while time.monotonic() < end and not res.exists():
+            time.sleep(0.2)
+    finally:
+        p.terminate()
+        out = p.communicate(timeout=30)[0].decode()
+    assert hb.get("mem_hold") == hold and hb.get("host_mem_gb") == 3.0, (hb, out)
+    assert held, out
+    assert '"hostmem": true' in out and '"event": "ci_mem_hold"' in out and '"event": "ci_mem_go"' in out, out
+    got = json.loads(res.read_text())
+    assert got["ok"] is True, (got, out)

@@ -9,11 +9,14 @@ can't write results (the spool isn't in its container) and can't sign them.
 Spool (HUB_SPOOL/ci): jobs/<id>.bundle + jobs/<id>.json (the job; .json last = visible) -> the runner moves the json
 to run/ while it works -> results/<id>.json -> the hub signs, stores and moves it to done/ (pruned after 7 days).
 
-Routes (brain): POST /ci/jobs {rid, commit, tree, base, branch, bundle (base64, <= 5 MB)} -> {id, state}
+Routes (brain): POST /ci/jobs {rid, commit, tree, base, branch, bundle (base64, <= 5 MB), min_mem_gb} -> {id, state}
+  (min_mem_gb, optional: the land queue's memory gate; the runner claims the job only while the host's MemAvailable
+  is at least that, 0 = off; missing = the runner's default, core.hostmem.LAND_MIN_GB)
   GET /ci/jobs/<id>             {id, state (queued|running|done|lost), ok, record, sig, valid}
   GET /ci/records?tree=T|commit=C   the newest finished record for that tree or commit (+ sig, valid) or 404
   POST /ci/verify {record, sig}  {valid}: the brain checks a record it kept
-  GET /ci/slots                 {set (N or null), runner: {slots, jobs, ts}}: the runner's job slots (heartbeat)
+  GET /ci/slots                 {set (N or null), runner: {slots, jobs, ts, release, host_mem_gb, mem_hold}}: the
+                                runner's job slots and memory gate (heartbeat)
   POST /ci/slots {slots: N|null}   N (1..SLOTS_MAX) jobs at once from the runner's next claim on, no restart;
                                 null = the release's default (ciworker SLOTS); rollback to one at a time: 1
   GET /protected/<digest>        hubverify: is that protected set accepted (+ the running one)
@@ -41,6 +44,7 @@ SPOOL = os.environ.get("HUB_SPOOL", "/var/spool/hub")
 STATE = os.environ.get("HUB_STATE") or os.path.dirname(os.environ.get("HUB_LOADER_STATE", "")) or "/var/lib/hub"
 RELEASE = os.environ.get("HUB_RELEASE", "")
 MAX_BUNDLE = 16 << 20  # hubkit.ci's; incremental bundles are KBs, a cold mirror gets the whole tree
+MIN_MEM_MAX = 1024  # GB: a job's min_mem_gb (the land queue's memory gate) above this is refused
 # a pytest step's test selection (impacted|full + counts), its one retry and quarantined ids, the legacy step's red
 # or slow suites {suite: [ok, secs]} and the red ones' stderr tails {suite: text}: signed with the step
 STEP_EXTRA = ("selection", "rerun", "quarantined", "suites", "tails")
@@ -265,6 +269,11 @@ async def r_submit(h: Any, who: str, s: str, a: dict, q: dict) -> Any:
         raise hs.BadRequest("bundle: not a git bundle")
     if len(bundle) > MAX_BUNDLE:
         raise hs.BadRequest(f"bundle: over {MAX_BUNDLE >> 20} MB")
+    min_mem = a.get("min_mem_gb")  # the land queue's memory gate: the runner claims the job only at or above it
+    if min_mem is not None and (
+        not isinstance(min_mem, (int, float)) or isinstance(min_mem, bool) or not 0 <= min_mem <= MIN_MEM_MAX
+    ):
+        raise hs.BadRequest(f"min_mem_gb: 0..{MIN_MEM_MAX} or null")
 
     async def make() -> dict[str, Any]:
         jid = secrets.token_hex(8)
@@ -282,6 +291,8 @@ async def r_submit(h: Any, who: str, s: str, a: dict, q: dict) -> Any:
             "schema": s,
             "created": round(time.time(), 3),
         }
+        if min_mem is not None:
+            job["min_mem_gb"] = float(min_mem)
         await hs.run(
             c,
             "INSERT INTO ci_jobs(id, commit_sha, tree, base, branch, bundle_sha256, state, created)"
@@ -307,7 +318,8 @@ def _slots_view() -> dict[str, Any]:
     except (OSError, ValueError):
         hb = {}
     hb = hb if isinstance(hb, dict) else {}
-    return {"set": n, "runner": {k: hb.get(k) for k in ("slots", "jobs", "ts", "release")}}
+    keys = ("slots", "jobs", "ts", "release", "host_mem_gb", "mem_hold")
+    return {"set": n, "runner": {k: hb.get(k) for k in keys}}
 
 
 async def r_slots_get(h: Any, who: str, s: str, a: dict, q: dict) -> Any:

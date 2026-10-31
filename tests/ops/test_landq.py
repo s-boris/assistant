@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import sqlite3
+import sys
 import time
 
 import pytest
@@ -338,7 +339,7 @@ def test_quick_check_red_and_rebase_conflict_fail_at_once(env, q):
 
 
 def meminfo(path, gb: float) -> str:
-    path.write_text(f"MemTotal: 65618092 kB\nMemFree: 500000 kB\nMemAvailable: {int(gb * (1 << 20))} kB\n")
+    path.write_text(f"MemTotal: 65618092 kB\nMemFree: 500000 kB\nMemAvailable: {int(gb * 1e6)} kB\n")  # core.hostmem
     return str(path)
 
 
@@ -361,6 +362,26 @@ def test_memory_gate_holds_the_batch_until_memory_frees_up(env, q):
     r = env.run("land", "status", "q1", "--wait")
     assert r.returncode == 0 and "landed m1 on main" in r.stdout, (r.stdout, r.stderr)
     assert not env.state("landq", "hold.json").exists()
+
+
+def test_runner_jobs_carry_the_memory_gate(tool, monkeypatch, tmp_path):
+    """The land's runner job carries land_min_mem() (min_mem_gb): the hub's CI runner claims it only at or above
+    that, so a land the queue let through never starts its heavy run there on a host that went short since."""
+    import types
+
+    seen: list[dict] = []
+    fake = types.ModuleType("hubkit.ci")
+    fake.submit = lambda *a, **kw: seen.append(kw) or {"id": "j1"}  # type: ignore[attr-defined]
+    pkg = types.ModuleType("hubkit")
+    pkg.ci = fake  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hubkit", pkg)
+    monkeypatch.setitem(sys.modules, "hubkit.ci", fake)
+    monkeypatch.delenv("ASSISTANT_LAND_RUNNER", raising=False)
+    monkeypatch.setenv("ASSISTANT_LAND_MIN_MEM_GB", "4.5")
+    assert tool._runner_submit(tmp_path, "a" * 40, "b" * 40, None, "x") == ({"id": "j1"}, "")
+    monkeypatch.setenv("ASSISTANT_LAND_MIN_MEM_GB", "0")
+    tool._runner_submit(tmp_path, "a" * 40, "b" * 40, None, "x")
+    assert [kw.get("min_mem_gb") for kw in seen] == [4.5, 0.0]
 
 
 def test_memory_gate_settings_and_worker_cap(tool, monkeypatch, tmp_path):

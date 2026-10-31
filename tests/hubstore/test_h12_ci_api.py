@@ -122,15 +122,36 @@ def test_bad_submissions_and_callers(hub, tmp_path):
     assert hub.call("POST", "/ci/jobs", {"commit": "xyz", "tree": tree, "bundle": b64}, schema=s)[0] == 400
     assert hub.call("POST", "/ci/jobs", {"commit": head, "tree": tree, "bundle": b64}, who="tg", schema=s)[0] == 403
     assert hub.call("GET", "/ci/records?tree=nothex", schema=s)[0] == 400
+    for mm in (-1, 2000, "6", True):
+        body = {"commit": head, "tree": tree, "bundle": b64, "min_mem_gb": mm}
+        assert hub.call("POST", "/ci/jobs", body, schema=s)[0] == 400, mm
+
+
+def test_job_carries_the_land_queues_memory_gate(hub, tmp_path):
+    """min_mem_gb (the brain's land_min_mem) lands in the spool's job, where the runner reads it before its claim;
+    without it the job has none (the runner's default)."""
+    head, tree, b64 = bundle(tmp_path)
+    s = "t_h12m"
+    spool = hub.root / "spool" / "ci" / "jobs"
+    for rid, mm in (("h12-job-mem1", 4.5), ("h12-job-mem2", 0)):
+        body = {"rid": rid, "commit": head, "tree": tree, "bundle": b64, "min_mem_gb": mm}
+        code, j = hub.call("POST", "/ci/jobs", body, schema=s)
+        assert code == 200, j
+        assert json.loads((spool / f"{j['id']}.json").read_text())["min_mem_gb"] == mm
+    j = hub.call("POST", "/ci/jobs", {"rid": "h12-job-mem3", "commit": head, "tree": tree, "bundle": b64}, schema=s)[1]
+    assert "min_mem_gb" not in json.loads((spool / f"{j['id']}.json").read_text())
 
 
 def test_runner_slots_set_read_and_default(hub):
     """POST /ci/slots writes the spool's ci/slots.json (the runner reads it before each claim), null removes it (the
     release default); out of 1..4 or another caller is refused; GET shows the set value and the runner's heartbeat."""
     f = hub.root / "spool" / "ci" / "slots.json"
-    (hub.root / "spool" / "ci-heartbeat.json").write_text(json.dumps({"slots": 2, "jobs": ["a" * 16], "ts": 1.0}))
+    hold = "host MemAvailable 3.9 GB < 6 GB"
+    hb = {"slots": 2, "jobs": ["a" * 16], "ts": 1.0, "host_mem_gb": 3.9, "mem_hold": hold}
+    (hub.root / "spool" / "ci-heartbeat.json").write_text(json.dumps(hb))
     code, ans = hub.call("POST", "/ci/slots", {"slots": 1})
     assert code == 200 and ans["set"] == 1 and ans["runner"]["jobs"] == ["a" * 16], ans
+    assert ans["runner"]["host_mem_gb"] == 3.9 and ans["runner"]["mem_hold"] == hold  # the runner's memory gate
     assert json.loads(f.read_text())["slots"] == 1
     assert hub.call("GET", "/ci/slots")[1]["set"] == 1
     for bad in (0, 5, "2", True):

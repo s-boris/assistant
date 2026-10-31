@@ -1,8 +1,10 @@
 """core.hostmem: the host's free memory. Stdlib only.
 
-This container's /proc/meminfo is the host's, so MemAvailable here is the server's.
+This container's /proc/meminfo is the host's, so MemAvailable here is the server's (the hub's ci container's too:
+Docker does not namespace /proc/meminfo; a memory limit shows only in the cgroup).
 
   read(path=None)           (MemAvailable kB, MemTotal kB), or None when unreadable
+  avail_gb(path=None)       MemAvailable in GB, or None when unreadable
   min_gb(env, conf, default)  a guard threshold in GB: the env var, else the conf file's first line, else default
   low(min_gb, path=None)    "host MemAvailable 6.1 GB < 8 GB" while below min_gb, else None (also when min_gb <= 0
                             = off, or meminfo is unreadable: the guard never blocks on a reading it does not have)
@@ -10,6 +12,9 @@ This container's /proc/meminfo is the host's, so MemAvailable here is the server
                             restart (the interactive-search release cache): before each search, take() raises
                             SearchStop when the host is low on memory or the cap is used up (check(): the same
                             test without counting)
+  LAND_MIN_GB               the CI memory gate: the land queue (ops/assistant.py land_min_mem) starts no batch and
+                            the hub's CI runner (packages/hub/ciworker.py) no job below this MemAvailable
+  ci_workers(avail_gb)      pytest / legacy workers MemAvailable allows: CI_FLOOR_GB kept free, CI_WORKER_GB each
   sample(path, ...)         append one `ts MemAvailable_kB MemTotal_kB` row (tab-separated), keep_days of rows
   rows(path)                the sampler's rows as (epoch, avail_kB, total_kB)
 
@@ -23,10 +28,27 @@ from datetime import datetime
 
 from core import clock, jsonstate
 
-__all__ = ["MEMINFO", "SearchGuard", "SearchStop", "low", "min_gb", "read", "rows", "sample"]
+__all__ = [
+    "CI_FLOOR_GB",
+    "CI_WORKER_GB",
+    "LAND_MIN_GB",
+    "MEMINFO",
+    "SearchGuard",
+    "SearchStop",
+    "avail_gb",
+    "ci_workers",
+    "low",
+    "min_gb",
+    "read",
+    "rows",
+    "sample",
+]
 
 MEMINFO = "/proc/meminfo"
 KB_PER_GB = 1e6
+LAND_MIN_GB = 6.0  # a CI batch on a box short of memory pushed load to ~50 and starved the hub (DNS EAI_AGAIN)
+CI_FLOOR_GB = 2.0  # CI workers leave this much MemAvailable free (ci_workers) ...
+CI_WORKER_GB = 0.5  # ... and count this much each
 
 
 def read(path: str | None = None) -> tuple[int, int] | None:
@@ -42,6 +64,17 @@ def read(path: str | None = None) -> tuple[int, int] | None:
     if "MemAvailable" not in vals or "MemTotal" not in vals:
         return None
     return vals["MemAvailable"], vals["MemTotal"]
+
+
+def avail_gb(path: str | None = None) -> float | None:
+    m = read(path)
+    return None if m is None else m[0] / KB_PER_GB
+
+
+def ci_workers(avail: float) -> int:
+    """Workers (pytest xdist or legacy suites) a CI run may start with avail GB of MemAvailable: CI_FLOOR_GB kept
+    free, CI_WORKER_GB each, at least 1. Bites only on a host short of memory (28 CPUs need 16 GB)."""
+    return max(1, int((avail - CI_FLOOR_GB) / CI_WORKER_GB))
 
 
 def min_gb(env: str, conf: str | None, default: float) -> float:

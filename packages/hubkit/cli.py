@@ -32,7 +32,8 @@
   hub egress status|check|use|endpoints   the hub's egress injector (placeholder handles, audit then
                             enforce), the brain-side mode per handle, the owner-pasted endpoints file; hubkit.egress
   hub ci slots [N|default] [--json]   the CI runner's jobs at once (ciworker slots): show, set N (1..4, from its
-                            next claim on, no restart) or back to the release's default; rollback = `hub ci slots 1`
+                            next claim on, no restart) or back to the release's default; rollback = `hub ci slots 1`;
+                            also the runner's memory gate ("waiting: host MemAvailable 3.9 GB < 6 GB")
   hub wf status|engine|probe|ls|show|start|send|cancel|watches|cron   the hub's workflow engine (DBOS) and the
                             watch schedules; hubkit.wf has the details
 
@@ -260,6 +261,7 @@ def cmd_ci_slots(a: argparse.Namespace) -> int:
         f"ci slots: {run.get('slots') or '?'} (runner)"
         + (f", set {ans['set']}" if ans.get("set") else ", release default")
         + f"; running {len(run.get('jobs') or [])}"
+        + (f"; waiting: {run['mem_hold']}" if run.get("mem_hold") else "")
         + ("; the runner reads a change before its next claim" if raw != "get" else "")
     )
     _out(ans, a.json, line)
