@@ -102,6 +102,10 @@ TRACES_BIN = os.environ.get('DASH_TRACES', P('bin', 'traces'))   # 'off' = no Tr
 #   off       no hub block, no card (the page before the hub feed; the Telegram channel check runs here again)
 HUB_MODE_FILE = os.environ.get('DASH_HUB_MODE_FILE', P('.config', 'dash', 'hub-mode'))
 HUB_URL = os.environ.get('DASH_HUB_URL', 'http://claude-hub:8702')
+HUB_LAST = os.path.join(STATE_DIR, 'hub-last.json')   # the last good /feed snapshot (a missed GET reuses it)
+HUB_LAST_MAX = 1800
+HUB_SENTINEL = os.environ.get('DASH_HUB_SENTINEL', P('.local', 'state', 'hub-sentinel', 'state.json'))
+HUB_DOWN_AFTER = 120   # s: "down" only after this long (hub-sentinel's minute probes) or a part down this long
 CACHE_VERSION = 3
 KIND_KEYS = ('main', 'subagent', 'headless')
 OWNER_TURNS = {'telegram': 'telegram', 'you (app/terminal)': 'app'}
@@ -1935,15 +1939,40 @@ def hub_mode():
 
 
 def hub_block(mode):
-    """The hub feed's snapshot (one GET, 3 s): states, counts and ids only. None when off, unreachable or malformed."""
+    """The hub feed's snapshot (one GET, 3 s): states, counts and ids only. None when off or malformed.
+    One missed GET is not "hub down" (a loaded host misses a 3 s answer or a docker DNS lookup): the last good
+    snapshot (HUB_LAST, up to HUB_LAST_MAX s old) comes back with reach {state, down_s}: "down" only once hub-sentinel
+    (its /health every minute) has seen the hub fail for HUB_DOWN_AFTER s, else "slow". No last snapshot and the
+    sentinel not saying down: None, as before."""
     if mode == 'off':
         return None
     try:
         with urllib.request.urlopen(HUB_URL.rstrip('/') + '/feed', timeout=3) as r:
             d = json.load(r)
     except (OSError, ValueError):
+        d = None
+    if d is not None:
+        if not (isinstance(d, dict) and isinstance(d.get('parts'), list)):
+            return None
+        try:
+            atomic_write(HUB_LAST, json.dumps(d))
+        except OSError:
+            pass
+        return d
+    now = now_local().timestamp()
+    st = read_json(HUB_SENTINEL, {})
+    ds = st.get('down_since') if isinstance(st, dict) else None
+    down_s = int(max(0, now - ds)) if isinstance(ds, (int, float)) and not isinstance(ds, bool) else None
+    last = read_json(HUB_LAST, None)
+    at = last.get('at') if isinstance(last, dict) else None
+    if not (isinstance(last, dict) and isinstance(last.get('parts'), list) and isinstance(at, (int, float))
+            and now - at <= HUB_LAST_MAX):
+        last = None
+    if last is None and down_s is None:
         return None
-    return d if isinstance(d, dict) and isinstance(d.get('parts'), list) else None
+    out = dict(last or {'parts': []})
+    out['reach'] = {'state': 'down' if down_s is not None and down_s >= HUB_DOWN_AFTER else 'slow', 'down_s': down_s}
+    return out
 
 
 def check(name, status, value, detail=None):

@@ -1998,6 +1998,29 @@ def test_hub_slo_render(tmpdir):
                  ('service', 'Telegram adapter'), ('container', 'claude-hub-pg'), ('service', 'zznewsvc')],
        f'hub card: services nested under their container, an unknown one last ({rows_})')
     ok('3 containers · 3 key services · zznewsvc warn' in card, 'hub card: "N containers · M key services" + what is wrong')
+    # one missed probe is not "down": a part down for under 2 min (since, on the hub's clock at) reads "slow" (amber)
+    part = lambda i, st='ok', since=0: {'id': i, 'label': i, 'kind': 'container', 'state': st, 'since': since}
+    base = {'at': 1000, 'parts': [part('claude-hub'), part('claude-hub-pg', 'down', 970), part('claude-hub-browser', 'down', 400)]}
+    dom, card = render(None, 'settle')
+    ok('claude-hub-pg slow' in card and 'claude-hub-browser down' in card and 'class="chip warn">slow<' in card
+       and 'class="chip critical">down<' in card, 'hub settle: down < 2 min reads slow, down >= 2 min stays down')
+    base = {'at': 1000, 'parts': [part('claude-hub'), part('claude-hub-pg', 'down', 970)]}
+    dom, card = render(None, 'slow')
+    head = re.search(r'<article[^>]*id="sys-hub"[^>]*>', dom)
+    ok(bool(head) and re.search(r'class="[^"]*\bwarn\b', head.group(0)) and 'critical' not in head.group(0),
+       f'hub settle: only a fresh down part = an amber card, not a red one ({head.group(0) if head else None})')
+    # dash-data's missed GET: the last snapshot with reach slow (amber) or down (red, after the sentinel's 2 min)
+    base = {'at': 1000, 'parts': [part('claude-hub')], 'reach': {'state': 'slow', 'down_s': None}}
+    dom, card = render(None, 'reach-slow')
+    ok('hub slow to answer (last snapshot shown)' in card, 'hub reach: a missed GET reads slow, not down')
+    base = {'at': 1000, 'parts': [part('claude-hub')], 'reach': {'state': 'down', 'down_s': 300}}
+    dom, card = render(None, 'reach-down')
+    ok('hub not answering for 5 min' in card, 'hub reach: down after the sentinel saw 2+ min')
+    # the cards keep one fixed order whatever their status (a red hub card does not jump to the top)
+    order = ['sys-phone', 'sys-voice', 'sys-vault', 'sys-web', 'sys-home', 'sys-hub', 'sys-server', 'sys-agents']
+    grid = dom[dom.find('class="sys-grid"'):]
+    ids = [i for i in re.findall(r'<article[^>]*\bid="(sys-[a-z]+)"', grid) if i in order]
+    ok('sys-hub' in ids and ids == [i for i in order if i in ids], f'health: cards in the fixed order, not by status ({ids})')
 
 
 def test_render(tmpdir):

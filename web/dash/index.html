@@ -2260,9 +2260,26 @@ details.ag-ended > summary { cursor: pointer; margin: 6px 2px 8px; font-size: 13
   }
   function sseOk(key) { if (RETRY[key]) { RETRY[key].n = 0; clearTimeout(RETRY[key].t); } }
   var HUB = { snap: null, live: false, es: null, timer: null };
-  var HUB_SYS = { ok: 'ok', warn: 'warn', down: 'critical', unknown: 'unknown' };
+  var HUB_SYS = { ok: 'ok', warn: 'warn', slow: 'warn', down: 'critical', unknown: 'unknown' };
   var HUB_HOST = { 'hub-gateway': 'claude-hub', 'tg-adapter': 'claude-hub-tg' };   // key service -> the container it runs in
-  function hubData() { return HUB.live && HUB.snap ? HUB.snap : (D && D.hub) || null; }
+  // The hub probes each part once per tick (a 1.5-2 s connect; a failed docker DNS lookup counts): on a loaded host one
+  // miss flips a part to down. A part reads "down" only after HUB_DOWN_AFTER s in that state (its `since`, on the hub's
+  // clock `at`); before that it reads "slow" (amber). Same rule for the hub itself: D.hub.reach (dash-data's missed GET).
+  var HUB_DOWN_AFTER = 120;
+  function hubSettle(H) {
+    if (!H || !Array.isArray(H.parts) || typeof H.at !== 'number') return H;
+    var out = {}, k;
+    for (k in H) out[k] = H[k];
+    out.parts = H.parts.map(function (p) {
+      if (!p || p.state !== 'down' || typeof p.since !== 'number' || H.at - p.since >= HUB_DOWN_AFTER) return p;
+      var q = {}, j;
+      for (j in p) q[j] = p[j];
+      q.state = 'slow';
+      return q;
+    });
+    return out;
+  }
+  function hubData() { return hubSettle(HUB.live && HUB.snap ? HUB.snap : (D && D.hub) || null); }
   function hubPart(H, id) { return ((H || {}).parts || []).filter(function (p) { return p.id === id; })[0] || null; }
   function hubTgCheck() {
     var H = hubData(), p = hubPart(H, 'tg-adapter');
@@ -2321,15 +2338,16 @@ details.ag-ended > summary { cursor: pointer; margin: 6px 2px 8px; font-size: 13
       svc.forEach(function (p) { if (HUB_HOST[p.id] === c.id) { placed[p.id] = 1; partRows.push(partRow(p, true)); } });
     });
     svc.forEach(function (p) { if (!placed[p.id]) partRows.push(partRow(p, true)); });
-    var st = worst(H.parts.map(function (p) { return HUB_SYS[p.state] || null; }));
-    var bad = H.parts.filter(function (p) { return p.state === 'down' || p.state === 'warn'; });
+    var R = H.reach || null, rWhy = R ? (R.state === 'down' ? 'hub not answering for ' + Math.round((R.down_s || 0) / 60) + ' min' : 'hub slow to answer (last snapshot shown)') : null;
+    var st = worst(H.parts.map(function (p) { return HUB_SYS[p.state] || null; }).concat(R ? [R.state === 'down' ? 'critical' : 'warn'] : []));
+    var bad = H.parts.filter(function (p) { return p.state === 'down' || p.state === 'warn' || p.state === 'slow'; });
     var G = H.gateway || {}, A = H.approvals || {}, T = H.tg || {}, B = T.brain || {}, TR = H.traces || {};
     var apN = A.live_pending != null ? A.live_pending : (A.store === 'sqlite' ? null : A.pending);   // the live store's count
     var when = H.at ? new Date(H.at * 1000).toLocaleTimeString('de-CH', { timeZone: 'Europe/Zurich', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '?';
     return sysCard({
       key: 'hub', title: 'Hub & gateway', status: st, icon: 'server',
-      summary: plural(cont.length, 'container') + ' · ' + plural(svc.length, 'key service') + (bad.length ? ' · ' + bad.map(function (p) { return p.label + ' ' + p.state; }).join(', ') : '') + (sloMissed(H).length ? ' · ' + plural(sloMissed(H).length, 'service level') + ' missed' : ''),
-      why: bad.length ? bad.map(function (p) { return p.label + ' ' + p.state; }).join(', ') : null,
+      summary: (rWhy ? rWhy + ' · ' : '') + plural(cont.length, 'container') + ' · ' + plural(svc.length, 'key service') + (bad.length ? ' · ' + bad.map(function (p) { return p.label + ' ' + p.state; }).join(', ') : '') + (sloMissed(H).length ? ' · ' + plural(sloMissed(H).length, 'service level') + ' missed' : ''),
+      why: rWhy || bad.length ? [rWhy].concat(bad.map(function (p) { return p.label + ' ' + p.state; })).filter(Boolean).join(', ') : null,
       stats: [
         stat('Calls 1 h', G.calls_1h),
         stat('Errors 1 h', G.errors_1h, null, G.errors_1h ? 'hot' : null),
@@ -2352,7 +2370,7 @@ details.ag-ended > summary { cursor: pointer; margin: 6px 2px 8px; font-size: 13
     ((H || {}).parts || []).forEach(function (p) { by[p.id] = p; });
     (root || document).querySelectorAll('svg.arch [data-part]').forEach(function (g) {
       var p = by[g.getAttribute('data-part')];
-      if (p && p.state !== 'planned' && p.state !== 'off') { g.setAttribute('data-state', p.state); g.setAttribute('data-stale', HUB.live ? '0' : '1'); }
+      if (p && p.state !== 'planned' && p.state !== 'off') { g.setAttribute('data-state', p.state === 'slow' ? 'warn' : p.state); g.setAttribute('data-stale', HUB.live ? '0' : '1'); }
       else { g.removeAttribute('data-state'); g.removeAttribute('data-stale'); }
     });
   }
@@ -2826,10 +2844,8 @@ details.ag-ended > summary { cursor: pointer; margin: 6px 2px 8px; font-size: 13
     };
   }
 
-  function sysOrder(cards) {   // problems first, then the given order
-    var order = cards.map(function (c, i) { return { c: c, i: i, r: SYS_RANK[(/\b(ok|warn|critical|unknown)\b/.exec(c.className) || [])[1]] }; });
-    order.sort(function (x, y) { return (x.r - y.r) || (x.i - y.i); });
-    return order;
+  function sysOrder(cards) {   // the given order (renderHealth's list), never by status (a status flip must not move cards); the hero lists problems
+    return cards.map(function (c, i) { return { c: c, i: i, r: SYS_RANK[(/\b(ok|warn|critical|unknown)\b/.exec(c.className) || [])[1]] }; });
   }
   function redrawSys() {   // both tabs from the current data (a live status flip): the hero counts across them
     var v = document.getElementById('view-health'), old = {};
@@ -3010,6 +3026,7 @@ details.ag-ended > summary { cursor: pointer; margin: 6px 2px 8px; font-size: 13
   // The summary strip on top counts the problems of both tabs (Health and CI); then the board, the components, all checks.
   function renderHealth(v) {
     var S = D.systems || {};
+    // the card order, defined once (sysOrder keeps it): phone, voice, vault, web agent, home, hub, server, agents
     var cards = [phoneCard(S.phone), voiceCard(S.voice), vaultCard(S.vault), webCard(S.web), homeCard(S.home), D.hub_mode && D.hub_mode !== 'off' ? hubCard(hubData()) : null, serverCard(), agentsLink(agentsCard())]
       .filter(Boolean);
     var order = sysOrder(cards), cio = ciIssues();   // the CI tab's problems count here too (tapping one opens the CI tab)
@@ -3978,6 +3995,7 @@ details.ag-ended > summary { cursor: pointer; margin: 6px 2px 8px; font-size: 13
         h('span', { text: AG.ok === true ? 'live' : AG.ok === false ? 'snapshot from ' + agClock(A.now) + ' (live feed offline)' : liveOk() ? 'connecting…' : 'snapshot from ' + agClock(A.now) }))));
     if (A.main) v.appendChild(agCard(A.main, true));
     var act = L.filter(function (a) { return a.status === 'running' || a.status === 'stalled'; }), old = L.filter(function (a) { return act.indexOf(a) < 0; });
+    act = act.slice().sort(function (x, y) { return ((x.start || 0) - (y.start || 0)) || (String(x.id) < String(y.id) ? -1 : 1); });   // by start: a new agent joins at the end, a stall moves nothing
     v.appendChild(h('h2', { class: 'ag-sec', text: 'Working now' }));
     v.appendChild(act.length ? h('div', { class: 'ag-list' }, act.map(function (a) { return agCard(a); })) : h('div', { class: 'ag-empty', text: 'Nothing running right now.' }));
     if (old.length) {   // ended runs: one line each (title · ran · $), open by default (phone too); a fold closed by hand stays closed through the live repaint

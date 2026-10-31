@@ -840,7 +840,25 @@ def test_hub(root):
         ok(d['hub_mode'] == 'off' and d['hub'] is None, 'hub: off = no block')
         ok('Telegram channel' not in [c['name'] for c in d['health']['checks']], 'hub: off has no channel check either')
         d = data_of(run(dict(env, DASH_HUB_URL='http://127.0.0.1:9'), now, '--stdout'))
-        ok(d['hub'] is None, 'hub: unreachable feed = no block, no failure')
+        ok(d['hub'] is None, 'hub: unreachable feed, last snapshot too old (at 1.0) = no block, no failure')
+        # one missed GET is not "hub down": the last good snapshot comes back marked slow; down only once hub-sentinel
+        # has seen /health fail for 2+ min
+        ok(os.path.isfile(os.path.join(home, '.local', 'state', 'dash', 'hub-last.json')), 'hub: a good GET keeps the last snapshot')
+        w(os.path.join(home, '.local', 'state', 'dash', 'hub-last.json'), json.dumps(dict(feed, at=now.timestamp() - 60)))
+        down = dict(env, DASH_HUB_URL='http://127.0.0.1:9', DASH_HUB_SENTINEL=os.path.join(root, 'sentinel.json'))
+        d = data_of(run(down, now, '--stdout'))
+        ok(d['hub']['seq'] == 7 and d['hub']['reach'] == {'state': 'slow', 'down_s': None},
+           f'hub: a missed GET, sentinel up = last snapshot, reach slow ({d["hub"].get("reach")})')
+        w(os.path.join(root, 'sentinel.json'), json.dumps({'down_since': int(now.timestamp()) - 60}))
+        d = data_of(run(down, now, '--stdout'))
+        ok(d['hub']['reach'] == {'state': 'slow', 'down_s': 60}, f'hub: down 1 min = still slow ({d["hub"].get("reach")})')
+        w(os.path.join(root, 'sentinel.json'), json.dumps({'down_since': int(now.timestamp()) - 300}))
+        d = data_of(run(down, now, '--stdout'))
+        ok(d['hub']['seq'] == 7 and d['hub']['reach'] == {'state': 'down', 'down_s': 300},
+           f'hub: down 5 min by the sentinel = down ({d["hub"].get("reach")})')
+        os.remove(os.path.join(home, '.local', 'state', 'dash', 'hub-last.json'))
+        d = data_of(run(down, now, '--stdout'))
+        ok(d['hub'] == {'parts': [], 'reach': {'state': 'down', 'down_s': 300}}, 'hub: down, no last snapshot = an empty down block')
     finally:
         srv.shutdown()
 
