@@ -80,11 +80,12 @@ def test_job_running_queued_and_pickup(stubs):
     r = call("vault.ask", source="tg", chat="Alex", question="where?", wait_s=5)
     assert r.ok and r.data["state"] == "running" and r.data["job"] == JID and "vault_job" in r.text
     q = call("vault.facts", source="tg", chat="Alex", wait_s=0)
-    assert q.ok and q.data == {"state": "queued", "job": JID}
+    assert q.ok and q.data == {"state": "queued", "job": JID, "status": "pending", "hint": f"vault_job {JID}"}
     assert not [c for c in stubs.calls("vault") if c[:2] == ["job", "wait"] and "0" == c[4]]  # wait 0: no wait call
     stubs.on("vault", ["job", "wait", JID], done({"kind": "who", "answer": "Sam"}))
-    j = call("vault.job", id=JID, wait_s=100)
-    assert j.ok and j.data["result"]["answer"] == "Sam" and stubs.calls("vault")[-1][4] == "100"
+    j = call("vault.job", id=JID, wait_s=60)
+    assert j.ok and j.data["result"]["answer"] == "Sam" and stubs.calls("vault")[-1][4] == "60"
+    assert "status" not in j.data and "hint" not in j.data  # done: no pending handle
 
 
 @pytest.mark.parametrize(
@@ -313,6 +314,73 @@ def _gw(stubs, sql, args=()):
 
     with sqlite3.connect(stubs.dir.parent / "state" / "gateway.db") as c:
         return c.execute(sql, args).fetchall()
+
+
+def test_wait_is_capped_at_the_call_budget(stubs):
+    """wait_s over the budget (230 is valid input) still asks `vault job wait` for at most CALL_BUDGET_S seconds."""
+    stubs.on("vault", ["--async"], JID).on("vault", ["job", "wait"], done({"answer": 1}))
+    assert call("vault.ask", source="tg", chat="Alex", question="where?", wait_s=230).ok
+    assert call("vault.job", id=JID, wait_s=230).ok
+    waits = [int(c[4]) for c in stubs.calls("vault") if c[:2] == ["job", "wait"]]
+    assert len(waits) == 2 and all(90 <= w <= V.CALL_BUDGET_S for w in waits)
+
+
+def _slow_budget(monkeypatch):
+    monkeypatch.setattr(V, "CALL_BUDGET_S", 2.0)
+    monkeypatch.setattr(V, "KILL_GRACE_S", 1.0)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("vault.ask", {"source": "tg", "chat": "Alex", "question": "where?"}),
+    ("vault.gmail_get", {"ref": "main:1234", "deep": True}),
+    ("vault.facts", {"source": "gmail", "ref": "main:1234"}),
+    ("vault.tg_summarize", {"hours": 24}),
+])  # fmt: skip
+def test_slow_vault_answers_pending_before_the_cap(stubs, monkeypatch, tool, args):
+    """A fake vault whose `job wait` hangs past the budget: the call is cut at budget + grace and answers status
+    pending with the job id and the vault_job hint, never a timeout (the job lives on in the vault)."""
+    import time
+
+    _slow_budget(monkeypatch)
+    stubs.on("vault", ["--async"], JID).on("vault", ["job", "wait"], done({"answer": 1}), sleep=30)
+    t = time.monotonic()
+    r = call(tool, **args, wait_s=230)
+    took = time.monotonic() - t
+    assert r.ok, r.error
+    assert {k: r.data[k] for k in ("status", "job", "hint")} == {
+        "status": "pending",
+        "job": JID,
+        "hint": f"vault_job {JID}",
+    }
+    assert r.data["state"] == "running" and "vault_job" in r.text
+    assert took < V.CALL_BUDGET_S + V.KILL_GRACE_S + 2  # cut, not the fake's 30 s
+    assert _gw(stubs, "SELECT tool, code FROM calls") == [(tool, "pending")]
+    assert _gw(stubs, "SELECT job, tool, state FROM jobs") == [(JID, tool, "running")]  # the job log keeps it
+
+
+def test_slow_submit_leaves_no_wait(stubs, monkeypatch):
+    """The submit alone used the budget: pending at once, no `vault job wait` call."""
+    _slow_budget(monkeypatch)
+    stubs.on("vault", ["--async"], JID, sleep=2.2)
+    r = call("vault.ask", source="tg", chat="Alex", question="where?")
+    assert r.ok and r.data["status"] == "pending" and r.data["job"] == JID
+    assert not [c for c in stubs.calls("vault") if c[:2] == ["job", "wait"]]
+
+
+def test_vault_job_pickup_is_cut_at_the_budget_too(stubs, monkeypatch):
+    _slow_budget(monkeypatch)
+    stubs.on("vault", ["job", "wait"], done({"answer": 1}), sleep=30)
+    r = call("vault.job", id=JID, wait_s=230)
+    assert r.ok and r.data["status"] == "pending" and r.data["hint"] == f"vault_job {JID}"
+    assert _gw(stubs, "SELECT tool, code FROM calls") == [("vault.job", "pending")]
+
+
+def test_vault_running_answer_carries_the_hint(stubs):
+    """The vault's own exit 12 (still running at --max) gets the same pending handle."""
+    stubs.on("vault", ["--async"], JID)
+    stubs.on("vault", ["job", "wait"], {"id": JID, "state": "running", "elapsed_s": 20}, rc=12)
+    r = call("vault.gmail_get", ref="main:1234")
+    assert r.ok and r.data["status"] == "pending" and r.data["hint"] == f"vault_job {JID}"
 
 
 def test_pending_code_and_job_log(stubs):

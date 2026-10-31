@@ -33,9 +33,9 @@ Input:
 - `kind` (yesno | when | who | deadline | actionable | requests | count | short | interests | digest | mail_card (optional)): answer shape: yesno, when, who, deadline, actionable, requests, count, short, interests, digest (tg, no chat needed), mail_card (gmail)
 - `account` (string /^[A-Za-z0-9_.-]{1,32}$/ (optional)): gmail: account label
 - `retrieval` (hybrid | keyword (optional)): tg: hybrid = keyword + semantic
-- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20
+- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20
 
-Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress` (concise leaves out progress, elapsed_s)
+Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress`, `status`, `hint` (concise leaves out progress, elapsed_s)
 Example: `tool call vault.ask '{"source": "tg", "chat": "Alex", "question": "when do we meet?", "kind": "when"}'`
 Example: `tool call vault.ask '{"source": "gmail", "ref": "main:1234", "kind": "deadline"}'`
 
@@ -51,21 +51,22 @@ Input:
 - `since` (string /^(\d{1,4}[hdwm]|\d{4}-\d\d-\d\d)$/ (optional)): tg window, default 60d
 - `n` (integer (optional)): tg: newest N messages of the window (default 400)
 - `account` (string /^[A-Za-z0-9_.-]{1,32}$/ (optional))
-- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20
+- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20
 
-Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress` (concise leaves out progress, elapsed_s)
+Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress`, `status`, `hint` (concise leaves out progress, elapsed_s)
 Example: `tool call vault.facts '{"source": "tg", "chat": "Alex", "since": "30d"}'`
 Example: `tool call vault.facts '{"source": "gmail", "ref": "main:1234"}'`
 
 ## vault.job
 
-The answer of a vault job another vault tool started (state running): waits up to wait_s seconds.
+The answer of a vault job another vault tool started (status pending): waits up to wait_s seconds (at most
+95 per call; still pending then: call it again).
 
 Input:
 - `id` (string /^[0-9a-f]{16}$/, required): the job id a vault tool returned
-- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20
+- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20
 
-Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress` (concise leaves out progress, elapsed_s)
+Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress`, `status`, `hint` (concise leaves out progress, elapsed_s)
 Example: `tool call vault.job '{"id": "0000000000000000"}'`
 
 ## vault.tg_summarize
@@ -77,9 +78,9 @@ Input:
 - `since` (string /^(\d{1,4}[hdwm]|\d{4}-\d\d-\d\d)$/ (optional)): instead of hours: 2d, 2026-10-20
 - `chat` (string (optional)): one chat only
 - `unread` (boolean): only unread chats
-- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20
+- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20
 
-Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress` (concise leaves out progress, elapsed_s)
+Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress`, `status`, `hint` (concise leaves out progress, elapsed_s)
 Example: `tool call vault.tg_summarize '{"hours": 24}'`
 Example: `tool call vault.tg_summarize '{"unread": true}'`
 
@@ -92,9 +93,9 @@ Input:
 - `deep` (boolean): the full card with dates (reads the mail; slower)
 - `account` (string /^[A-Za-z0-9_.-]{1,32}$/ (optional))
 - `folder` (string (optional))
-- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20
+- `wait_s` (integer, default 20): seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20
 
-Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress` (concise leaves out progress, elapsed_s)
+Output: `state`, `job`, `result`, `elapsed_s`, `position`, `eta_s`, `progress`, `status`, `hint` (concise leaves out progress, elapsed_s)
 Example: `tool call vault.gmail_get '{"ref": "main:1234"}'`
 Example: `tool call vault.gmail_get '{"ref": "main:1234", "deep": true}'`
 
@@ -170,4 +171,4 @@ Example: `tool call vault.inbox '{}'`
 
 ## CLI and cron
 
-`vault` (CLI; skill vault): the same paths by hand, plus what is NOT a tool on purpose: text and content releases, raw and media requests, tier-2 paperless fields (all need his ✅ in the vault bot), deploys, people, firefly, index, admin. Slow answers: the tools submit a vault job (`vault --async …`) and wait wait_s (default 20 s); `running` → `vault_job {id}` later (results kept 30 min). In the main session keep wait_s ≤ 20 (never block a turn on the vault); a background subagent may wait up to 230.
+`vault` (CLI; skill vault): the same paths by hand, plus what is NOT a tool on purpose: text and content releases, raw and media requests, tier-2 paperless fields (all need his ✅ in the vault bot), deploys, people, firefly, index, admin. Slow answers: the tools submit a vault job (`vault --async …`) and wait wait_s (default 20 s); `running` (status pending) → `vault_job {id}` later (results kept 30 min). A call answers within 95 s whatever wait_s asks (the hub's per-call cap is 120 s). In the main session keep wait_s ≤ 20 (never block a turn on the vault); a background subagent waits in rounds: vault_job again while it is pending.

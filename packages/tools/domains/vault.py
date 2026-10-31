@@ -9,7 +9,9 @@ become one: they stay owner-✅ only, through the vault bot (skill vault). Every
 runs: an allowlist of commands and options; values are refused when they start with "-". So a subagent that holds
 these tools still only gets answers.
 Slow paths (ask, facts, summarize, mail cards) run as vault jobs (`vault --async`): the tool waits up to wait_s
-seconds and returns the answer, else {state: running, job}; vault.job picks it up later. Env: TOOLS_VAULT_BIN.
+seconds and returns the answer, else {state: running, status: pending, job, hint}; vault.job picks it up later.
+Every job tool answers within CALL_BUDGET_S (95 s), whatever wait_s asks: the hub ends a call at 120 s and the caller
+would lose the job id. Env: TOOLS_VAULT_BIN.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import dataclasses
 import json
 import os
 import re
+import time
 from datetime import datetime
 from typing import Annotated, Any, ClassVar, Literal, TypeGuard
 
@@ -30,8 +33,9 @@ NOTES = (
     "`vault` (CLI; skill vault): the same paths by hand, plus what is NOT a tool on purpose: text and content"
     " releases, raw and media requests, tier-2 paperless fields (all need his ✅ in the vault bot), deploys, people,"
     " firefly, index, admin. Slow answers: the tools submit a vault job (`vault --async …`) and wait wait_s (default"
-    " 20 s); `running` → `vault_job {id}` later (results kept 30 min). In the main session keep wait_s ≤ 20 (never"
-    " block a turn on the vault); a background subagent may wait up to 230."
+    " 20 s); `running` (status pending) → `vault_job {id}` later (results kept 30 min). A call answers within 95 s"
+    " whatever wait_s asks (the hub's per-call cap is 120 s). In the main session keep wait_s ≤ 20 (never block a"
+    " turn on the vault); a background subagent waits in rounds: vault_job again while it is pending."
 )
 
 REGISTRY.add_domain(
@@ -94,6 +98,11 @@ OPTIONS = frozenset(
     }
 )
 JOB_RE = re.compile(r"[0-9a-f]{16}")
+# A vault job tool call answers within this many seconds, whatever wait_s asks: the hub ends a call at 120 s, and a
+# caller cut off there loses the job id. Still running by then: state running, status pending + the job id.
+CALL_BUDGET_S = 95.0
+# past the budget, a `vault job wait` that has not ended is stopped (the job itself lives on in the vault)
+KILL_GRACE_S = 15.0
 
 
 def guard(argv: list[str]) -> list[str]:
@@ -192,8 +201,8 @@ WaitS = Annotated[
     Field(
         ge=0,
         le=230,
-        description="seconds to wait for the vault's answer (0 = only start the job); not done by then: "
-        "state running + job id for vault_job. Main session: <= 20",
+        description="seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call);"
+        " not done by then: status pending + job id for vault_job. Main session: <= 20",
     ),
 ]
 
@@ -206,9 +215,17 @@ class JobOut(ToolOutput):
     position: int | None = Field(default=None, description="queue position while waiting")
     eta_s: float | None = None
     progress: Any = None
+    status: Literal["pending"] | None = Field(default=None, description="pending = not answered yet: see hint")
+    hint: str | None = Field(default=None, description="pending: the call that picks the answer up")
     DETAIL: ClassVar[tuple[str, ...]] = ("progress", "elapsed_s")
     # the job's own times for the gateway's job log (vault-answer SLO); never part of the output
     _times: JobTimes | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _pending(self) -> JobOut:
+        if self.state != "done" and self.job:
+            self.status, self.hint = "pending", f"vault_job {self.job}"
+        return self
 
     def job_times(self) -> JobTimes | None:
         return self._times
@@ -300,8 +317,28 @@ def _job_view(j: dict[str, Any]) -> JobOut:
     raise ToolError("failed", f"job {jid} {state}: {msg}"[:300])
 
 
-def job_wait(jid: str, wait_s: int) -> JobOut:
-    rc, out, err = vault_run(["job", "wait", jid, "--max", str(wait_s), "--json"], timeout=wait_s + 100)
+def _left(t0: float) -> float:
+    """Seconds left of the call's CALL_BUDGET_S (t0: time.monotonic() at the call's start)."""
+    return CALL_BUDGET_S - (time.monotonic() - t0)
+
+
+def _still_pending(jid: str, state: Literal["running", "queued"] = "running") -> JobOut:
+    return JobOut(state=state, job=jid).with_times(JobTimes(job=jid, state=state))
+
+
+def job_wait(jid: str, wait_s: int, t0: float | None = None) -> JobOut:
+    """`vault job wait JID`: the answer, or the job still running once wait_s (at most the call's budget) is over.
+    A wait that outlasts the budget + KILL_GRACE_S is stopped and the job reported pending, never a timeout."""
+    t0 = time.monotonic() if t0 is None else t0
+    w = int(max(0.0, min(float(wait_s), _left(t0))))
+    try:
+        rc, out, err = vault_run(
+            ["job", "wait", jid, "--max", str(w), "--json"], timeout=max(1.0, _left(t0) + KILL_GRACE_S)
+        )
+    except ToolError as e:
+        if e.code != "timeout":
+            raise
+        return _still_pending(jid)
     if rc in (0, 1, 12) and out.startswith("{"):
         return _job_view(parse_json(out, "vault job wait"))
     raise vault_fail(rc, out, err, "job wait")
@@ -309,14 +346,19 @@ def job_wait(jid: str, wait_s: int) -> JobOut:
 
 def job_submit(argv: list[str], wait_s: int) -> JobOut:
     """`vault --async ARGV`: the job id at once; then wait up to wait_s for the answer. The answer's job times are
-    marked started (the gateway's job log keeps this call's tool for the job)."""
+    marked started (the gateway's job log keeps this call's tool for the job). The whole call stays within
+    CALL_BUDGET_S: a slow submit leaves less to wait, none left = pending at once."""
+    t0 = time.monotonic()
     rc, out, err = vault_run(["--async", *argv], timeout=90)
     jid = first_line(out)
     if rc != 0 or not JOB_RE.fullmatch(jid):
         raise vault_fail(rc or 1, out, err, argv[0])
     if wait_s <= 0:
         return JobOut(state="queued", job=jid).with_times(JobTimes(job=jid, state="queued", started=True))
-    res = job_wait(jid, wait_s)
+    if _left(t0) < 1:
+        res = _still_pending(jid)
+    else:
+        res = job_wait(jid, wait_s, t0)
     return res.with_times(dataclasses.replace(res.job_times() or JobTimes(job=jid, state=res.state), started=True))
 
 
@@ -585,7 +627,8 @@ def facts(a: FactsIn) -> JobOut:
 
 @tool("vault.job", effect="read", labels_out=("private",), rate="120/min", timeout_s=330, examples=({"id": "0" * 16},))
 def job(a: JobIn) -> JobOut:
-    """The answer of a vault job another vault tool started (state running): waits up to wait_s seconds."""
+    """The answer of a vault job another vault tool started (status pending): waits up to wait_s seconds (at most
+    95 per call; still pending then: call it again)."""
     return job_wait(a.id, a.wait_s)
 
 

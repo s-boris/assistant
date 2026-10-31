@@ -69,6 +69,9 @@ best = max((r for r in rules if argv[: len(r["argv"])] == r["argv"]), key=lambda
 if best is None:
     sys.stderr.write(name + ": no stub for " + " ".join(argv) + "\\n")
     sys.exit(2)
+if best.get("sleep"):
+    import time
+    time.sleep(best["sleep"])
 sys.stdout.write(best.get("out", ""))
 sys.stderr.write(best.get("err", ""))
 sys.exit(best.get("rc", 0))
@@ -96,9 +99,10 @@ sys.exit(best.get("rc", 0))
     def _save(self) -> None:
         self.rules_f.write_text(self._json.dumps(self.rules))
 
-    def on(self, name: str, argv: list[str], out: object = "", rc: int = 0, err: str = "") -> Stubs:
+    def on(self, name: str, argv: list[str], out: object = "", rc: int = 0, err: str = "", sleep: float = 0) -> Stubs:
+        """sleep: the fake answers after this many seconds (a slow backend)."""
         text = out if isinstance(out, str) else self._json.dumps(out)
-        self.rules.setdefault(name, []).append({"argv": argv, "out": text, "rc": rc, "err": err})
+        self.rules.setdefault(name, []).append({"argv": argv, "out": text, "rc": rc, "err": err, "sleep": sleep})
         self._save()
         return self
 

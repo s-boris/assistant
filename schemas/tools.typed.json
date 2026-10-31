@@ -9108,7 +9108,7 @@
      },
      "wait_s": {
       "default": 20,
-      "description": "seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20",
+      "description": "seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20",
       "maximum": 230,
       "minimum": 0,
       "title": "Wait S",
@@ -9151,6 +9151,19 @@
       ],
       "default": null,
       "title": "Eta S"
+     },
+     "hint": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending: the call that picks the answer up",
+      "title": "Hint"
      },
      "job": {
       "anyOf": [
@@ -9205,6 +9218,20 @@
       ],
       "title": "State",
       "type": "string"
+     },
+     "status": {
+      "anyOf": [
+       {
+        "const": "pending",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending = not answered yet: see hint",
+      "title": "Status"
      }
     },
     "required": [
@@ -9421,7 +9448,7 @@
      },
      "wait_s": {
       "default": 20,
-      "description": "seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20",
+      "description": "seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20",
       "maximum": 230,
       "minimum": 0,
       "title": "Wait S",
@@ -9464,6 +9491,19 @@
       ],
       "default": null,
       "title": "Eta S"
+     },
+     "hint": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending: the call that picks the answer up",
+      "title": "Hint"
      },
      "job": {
       "anyOf": [
@@ -9518,6 +9558,20 @@
       ],
       "title": "State",
       "type": "string"
+     },
+     "status": {
+      "anyOf": [
+       {
+        "const": "pending",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending = not answered yet: see hint",
+      "title": "Status"
      }
     },
     "required": [
@@ -9588,7 +9642,7 @@
      },
      "wait_s": {
       "default": 20,
-      "description": "seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20",
+      "description": "seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20",
       "maximum": 230,
       "minimum": 0,
       "title": "Wait S",
@@ -9631,6 +9685,19 @@
       ],
       "default": null,
       "title": "Eta S"
+     },
+     "hint": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending: the call that picks the answer up",
+      "title": "Hint"
      },
      "job": {
       "anyOf": [
@@ -9685,6 +9752,20 @@
       ],
       "title": "State",
       "type": "string"
+     },
+     "status": {
+      "anyOf": [
+       {
+        "const": "pending",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending = not answered yet: see hint",
+      "title": "Status"
      }
     },
     "required": [
@@ -10101,7 +10182,7 @@
      },
      "wait_s": {
       "default": 20,
-      "description": "seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20",
+      "description": "seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20",
       "maximum": 230,
       "minimum": 0,
       "title": "Wait S",
@@ -10144,6 +10225,19 @@
       ],
       "default": null,
       "title": "Eta S"
+     },
+     "hint": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending: the call that picks the answer up",
+      "title": "Hint"
      },
      "job": {
       "anyOf": [
@@ -10198,6 +10292,20 @@
       ],
       "title": "State",
       "type": "string"
+     },
+     "status": {
+      "anyOf": [
+       {
+        "const": "pending",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending = not answered yet: see hint",
+      "title": "Status"
      }
     },
     "required": [
@@ -10207,7 +10315,7 @@
     "type": "object"
    },
    "rate": "120/min",
-   "summary": "The answer of a vault job another vault tool started (state running): waits up to wait_s seconds."
+   "summary": "The answer of a vault job another vault tool started (status pending): waits up to wait_s seconds (at most"
   },
   "vault.plans": {
    "approval": "none",
@@ -10408,7 +10516,7 @@
      },
      "wait_s": {
       "default": 20,
-      "description": "seconds to wait for the vault's answer (0 = only start the job); not done by then: state running + job id for vault_job. Main session: <= 20",
+      "description": "seconds to wait for the vault's answer (0 = only start the job; capped at 95 per call); not done by then: status pending + job id for vault_job. Main session: <= 20",
       "maximum": 230,
       "minimum": 0,
       "title": "Wait S",
@@ -10448,6 +10556,19 @@
       ],
       "default": null,
       "title": "Eta S"
+     },
+     "hint": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending: the call that picks the answer up",
+      "title": "Hint"
      },
      "job": {
       "anyOf": [
@@ -10502,6 +10623,20 @@
       ],
       "title": "State",
       "type": "string"
+     },
+     "status": {
+      "anyOf": [
+       {
+        "const": "pending",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "pending = not answered yet: see hint",
+      "title": "Status"
      }
     },
     "required": [
