@@ -2035,6 +2035,12 @@ suite = "media-remux"
 seam = "MEDIA_REMUX_BIN"
 
 [[file]]
+src = "scripts/arr-restart"
+dest = "bin/arr-restart"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
+[[file]]
 src = "scripts/media-remux-tv"
 dest = "bin/media-remux-tv"
 mode = "0755"

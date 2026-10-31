@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""arr-restart: the nightly restart of Radarr, then Sonarr (06:45, after media-remux's 00:30-06:00 grab window).
+
+Why: Radarr (.NET) grew to 14 GB RAM over three days and starved the Unraid host (free RAM 28.6 -> 1.2 GB, load
+108, the hub's DNS failed); a restart freed about 15 GB. A nightly restart keeps that from building up again.
+
+Per service, one after the other (radarr, then sonarr):
+  blocked while its download queue has an item importing or importPending (Radarr/Sonarr's trackedDownloadState),
+  or while its remux job runs (media-remux / media-remux-tv: that job's run lock is busy). A block is re-checked
+  every 30 s for up to 5 min; still blocked -> that restart is skipped for today (one line, exit 0).
+  The remux job's lock is held through the restart and the wait, so no tick starts against a restarting app (the
+  tick finds the lock busy and exits 0).
+  `unraid-do docker-restart NAME` (an ungated verb: no tap), then wait (<= 5 min) until GET /api/v3/system/status
+  answers.
+One line per service per run on stdout (the cron log): what happened and the host's MemAvailable before / after
+(this container's /proc/meminfo shows the host's memory).
+
+  arr-restart [--only radarr|sonarr] [--dry-run]     --dry-run: checks + the line, no restart
+
+Off switch: touch ~/.config/arr-restart/off (the run prints one line and restarts nothing).
+Exit 0 done or skipped, 1 usage, 2 a restart failed or the app did not answer in time.
+Env (tests): ARR_RESTART_MEDIA (module with get/ApiError, default ~/bin/media), ARR_RESTART_UNRAID_DO (default
+~/bin/unraid-do), ARR_RESTART_OFF, ARR_RESTART_MEMINFO (default /proc/meminfo), ARR_RESTART_REMUX_LOCK,
+ARR_RESTART_REMUX_TV_LOCK, ARR_RESTART_BLOCK_WAIT (s, 300), ARR_RESTART_UP_WAIT (s, 300), ARR_RESTART_POLL (s, 30).
+Tests: ~/opt/assistant/tests/media/test_arr_restart.py
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import pwd
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(HERE, 'lib')):
+    sys.path.insert(0, _lib)
+if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(HERE))
+from core import locks  # noqa: E402
+
+OFF_F = os.environ.get('ARR_RESTART_OFF') or f'{HOME}/.config/arr-restart/off'
+MEMINFO = os.environ.get('ARR_RESTART_MEMINFO') or '/proc/meminfo'
+UNRAID_DO = os.environ.get('ARR_RESTART_UNRAID_DO') or f'{HOME}/bin/unraid-do'
+BLOCK_WAIT = float(os.environ.get('ARR_RESTART_BLOCK_WAIT') or 300)
+UP_WAIT = float(os.environ.get('ARR_RESTART_UP_WAIT') or 300)
+POLL = float(os.environ.get('ARR_RESTART_POLL') or 30)
+IMPORTING = ('importing', 'importPending')
+# service -> (container, the remux job whose run lock guards it); restarted in this order
+SERVICES = {
+    'radarr': ('radarr', 'media-remux',
+               os.environ.get('ARR_RESTART_REMUX_LOCK') or f'{HOME}/.local/state/media-remux/lock'),
+    'sonarr': ('sonarr', 'media-remux-tv',
+               os.environ.get('ARR_RESTART_REMUX_TV_LOCK') or f'{HOME}/.local/state/media-remux-tv/lock'),
+}
+SLEEP = time.sleep
+RUN = subprocess.run      # tests swap these two on the loaded module, never on subprocess / time
+M = None
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+def media():
+    global M
+    if M is None:
+        p = os.environ.get('ARR_RESTART_MEDIA')
+        own = os.path.join(HERE, 'media')
+        M = _load('media', p or (own if os.path.isfile(own) else os.path.expanduser('~/bin/media')))
+    return M
+
+
+def mem_avail_gb():
+    try:
+        with open(MEMINFO) as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) / 1e6       # kB -> GB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def fmt_gb(v):
+    return '?' if v is None else f'{v:.1f}'
+
+
+def importing(svc):
+    """Queue items importing / importPending -> their titles (paged; includeMovie / includeSeries off)."""
+    out, page = [], 1
+    inc = 'includeMovie=false' if svc == 'radarr' else 'includeSeries=false&includeEpisode=false'
+    while page <= 20:
+        d = media().get(svc, f'/api/v3/queue?page={page}&pageSize=200&{inc}') or {}
+        recs = d.get('records') or []
+        out += [r.get('title') or '?' for r in recs if r.get('trackedDownloadState') in IMPORTING]
+        if not recs or page * 200 >= (d.get('totalRecords') or 0):
+            break
+        page += 1
+    return out
+
+
+def blocked(svc):
+    """None, or why this service can't restart now. Raises the media module's ApiError when it can't be read."""
+    busy = importing(svc)
+    if busy:
+        return f'{len(busy)} queue item(s) importing ({", ".join(busy[:2])[:120]})'
+    return None
+
+
+def is_up(svc):
+    try:
+        return bool(media().get(svc, '/api/v3/system/status', timeout=15))
+    except Exception:  # noqa: BLE001  (down, starting, or refused: not up yet)
+        return False
+
+
+def restart_one(svc, dry=False):
+    """-> (ok, line)."""
+    container, job, lock_f = SERVICES[svc]
+    ApiError = media().ApiError
+    before = mem_avail_gb()
+    deadline = time.monotonic() + BLOCK_WAIT
+    fd, why = None, None
+    try:
+        while True:
+            fd = locks.acquire(lock_f, wait=0)
+            if fd is None:
+                why = f'a {job} run is in progress'
+            else:
+                try:
+                    why = blocked(svc)
+                except ApiError as e:
+                    return False, f'{svc}: cannot read its queue ({str(e)[:160]}); not restarted'
+            if not why:
+                break
+            locks.release(fd)
+            fd = None
+            if time.monotonic() >= deadline:
+                return True, f'{svc}: skipped, {why}; host MemAvailable {fmt_gb(before)} GB'
+            SLEEP(POLL)
+        if dry:
+            return True, f'{svc}: would restart (dry run); host MemAvailable {fmt_gb(before)} GB'
+        t0 = time.monotonic()
+        r = RUN([UNRAID_DO, 'docker-restart', container], capture_output=True, text=True, timeout=300,
+                stdin=subprocess.DEVNULL)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or '').strip().splitlines()
+            return False, (f'{svc}: docker-restart failed (exit {r.returncode}: {(err[-1] if err else "")[:160]}); '
+                           f'host MemAvailable {fmt_gb(before)} GB')
+        up_by = time.monotonic() + UP_WAIT
+        while not is_up(svc):
+            if time.monotonic() >= up_by:
+                return False, (f'{svc}: restarted, but /api/v3/system/status did not answer within {UP_WAIT:g} s; '
+                               f'host MemAvailable {fmt_gb(before)} -> {fmt_gb(mem_avail_gb())} GB')
+            SLEEP(min(10.0, POLL))
+        return True, (f'{svc}: restarted, up after {time.monotonic() - t0:.0f} s; host MemAvailable '
+                      f'{fmt_gb(before)} -> {fmt_gb(mem_avail_gb())} GB')
+    finally:
+        locks.release(fd)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='arr-restart', description='nightly restart of Radarr, then Sonarr')
+    ap.add_argument('--only', choices=sorted(SERVICES))
+    ap.add_argument('--dry-run', action='store_true')
+    a = ap.parse_args(argv)
+    stamp = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M')
+    if os.path.exists(OFF_F):
+        print(f'{stamp} off switch {OFF_F} is set: nothing restarted', flush=True)
+        return 0
+    rc = 0
+    for svc in SERVICES:
+        if a.only and svc != a.only:
+            continue
+        ok, line = restart_one(svc, dry=a.dry_run)
+        print(f'{stamp} {line}', flush=True)
+        rc = rc if ok else 2
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())

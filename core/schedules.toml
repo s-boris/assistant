@@ -2641,6 +2641,27 @@ why = "remux downgrade: old Default QP remuxes -> encodes, 1 grab per tick 00:30
 target = "cron-back 29.10"
 cron_line = "*/20 * * * * mkdir -p \"$HOME/.local/state/media-remux\" && cron-fail --after 4 media-remux flock -n -E 0 \"$HOME/.local/state/cron-fail/media-remux.run\" timeout -k 10 900 $HOME/bin/media-remux --cron >> \"$HOME/.local/state/media-remux/cron.log\" 2>&1"
 
+[jobs.arr-restart]
+line = "arr-restart"
+cron = "45 6 * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/arr-restart"]
+out = "arr-restart/cron.log"
+err = "out"
+dirs = ["arr-restart"]
+timeout = 1800
+after = 1
+feature = "media"
+owner_facing = false
+catch_up = false
+why = "nightly Radarr then Sonarr restart after the remux grab window (Radarr's memory grew to 14 GB); skips while an item imports or a remux run holds its lock (switch: ~/.config/arr-restart/off)"
+target = "arr-restart"
+cron_line = "45 6 * * * mkdir -p \"$HOME/.local/state/arr-restart\" && cron-fail --after 1 arr-restart flock -n -E 0 \"$HOME/.local/state/cron-fail/arr-restart.run\" timeout -k 10 1800 $HOME/bin/arr-restart >> \"$HOME/.local/state/arr-restart/cron.log\" 2>&1"
+
 # Five tagged ~/crontab lines: the voice and phone inbox polls and the nightly CI stay in cron; the media digests run
 # from cron.
 [jobs.voice-inbox]
