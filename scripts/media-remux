@@ -50,6 +50,11 @@ and its candidates are cached in candidates.json (id, title, year, quality, size
 candidate is re-read alone (GET /api/v3/movie/{id}) right before its search, so a movie re-profiled, replaced or
 deleted since is skipped as the full list would have skipped it; a movie that became a remux candidate during the
 day is found by the next night's refresh. --follow reads only its grabbed movies (/api/v3/movie/{id}).
+Searches: Radarr keeps every interactive-search result in memory until it restarts (its release cache is never
+purged; ~50 MB a search, 14 GB after ~250 searches starved the host). So before each search: host MemAvailable
+(/proc/meminfo, the server's) under 8 GB (MEDIA_REMUX_MIN_MEM_GB, else ~/.config/media-remux/min-mem-gb; 0 = off)
+-> no more searches this run, one "memory guard:" line in the cron log, exit 0; and at most 40 searches a night
+(--cron, MEDIA_REMUX_NIGHT_SEARCHES; counted in the night's state) or per --run / --plan (MEDIA_REMUX_RUN_SEARCHES).
 Gates for every grab: Radarr queue <= 10 items, the movie not already queued, the cache pool's live free space
 (unraid-capacity's collector) minus the queue's remaining bytes minus the release >= 100 GB and the pool < 90 %
 used; a gate failing stops the grabs of that tick.
@@ -60,7 +65,9 @@ Env (tests): MEDIA_REMUX_MEDIA (module with get/api/ApiError, default ~/bin/medi
 (default ~/bin/arr-unblock), MEDIA_REMUX_MISMATCH (default ~/bin/arr-mismatch), MEDIA_REMUX_STATE_DIR,
 MEDIA_REMUX_INBOX, MEDIA_REMUX_OFF, MEDIA_REMUX_NOW (epoch),
 MEDIA_REMUX_CACHE_FREE_GB + MEDIA_REMUX_CACHE_USED_PCT (skip the server probe), MEDIA_REMUX_NIGHT_MAX (15),
-MEDIA_REMUX_QUEUE_MAX (10), MEDIA_REMUX_CACHE_FLOOR_GB (100), MEDIA_REMUX_SEARCHES (searches per tick, 4).
+MEDIA_REMUX_QUEUE_MAX (10), MEDIA_REMUX_CACHE_FLOOR_GB (100), MEDIA_REMUX_SEARCHES (searches per tick, 4),
+MEDIA_REMUX_NIGHT_SEARCHES (40), MEDIA_REMUX_RUN_SEARCHES (40), MEDIA_REMUX_MIN_MEM_GB (8),
+MEDIA_REMUX_MEMINFO (default /proc/meminfo).
 Tests: ~/opt/assistant/tests/legacy/media-remux/run.sh
 """
 import argparse
@@ -83,7 +90,7 @@ for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.pa
 if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
     sys.path.insert(0, os.path.dirname(HERE))
 import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
-from core import jsonstate, locks  # noqa: E402
+from core import hostmem, jsonstate, locks  # noqa: E402
 
 
 def _env(name, default):
@@ -114,6 +121,10 @@ QUEUE_MAX = _env('MEDIA_REMUX_QUEUE_MAX', 10)
 CACHE_FLOOR = _env('MEDIA_REMUX_CACHE_FLOOR_GB', 100.0) * GB
 CACHE_USED_MAX = 90.0
 SEARCHES = _env('MEDIA_REMUX_SEARCHES', 4)
+NIGHT_SEARCHES = _env('MEDIA_REMUX_NIGHT_SEARCHES', 40)   # release searches a night (--cron)
+RUN_SEARCHES = _env('MEDIA_REMUX_RUN_SEARCHES', 40)       # release searches per --run / --plan
+MIN_MEM_GB = hostmem.min_gb('MEDIA_REMUX_MIN_MEM_GB', f'{HOME}/.config/media-remux/min-mem-gb', 8.0)
+MEMINFO = os.environ.get('MEDIA_REMUX_MEMINFO') or hostmem.MEMINFO
 PROTOCOLS = set((os.environ.get('MEDIA_REMUX_PROTOCOLS') or 'usenet').split(','))
 NO_RELEASE_RETRY = 30 * 86400
 PLAN_REUSE = 14 * 86400  # a plan's no-release verdict spares the search this long
@@ -380,10 +391,21 @@ def current_file(c):
     return f
 
 
-def evaluate(c, scores, movie=None):
-    """Live search for one candidate -> plan row (release or reason). movie: its record, when just read."""
+def search_guard(st=None):
+    """The run's search budget (core.hostmem.SearchGuard): st given = a --cron tick, capped by the night's count."""
+    if st is not None:
+        return hostmem.SearchGuard(MIN_MEM_GB, NIGHT_SEARCHES, 'night', MEMINFO,
+                                   tally=st['nights'].setdefault(night_key(), {'grabs': 0}))
+    return hostmem.SearchGuard(MIN_MEM_GB, RUN_SEARCHES, 'per-run', MEMINFO)
+
+
+def evaluate(c, scores, movie=None, guard=None):
+    """Live search for one candidate -> plan row (release or reason). movie: its record, when just read. guard:
+    take()n right before the search (raises core.hostmem.SearchStop: memory low or the cap used up)."""
     f = current_file(c)
     cur = dict(c, score=f.get('customFormatScore') or 0, lang=lang_score(cf_names(f), scores))
+    if guard is not None:
+        guard.take()
     rels = radarr(f'/api/v3/release?movieId={c["id"]}', timeout=SEARCH_TIMEOUT) or []
     if movie is None:                                     # the full record: alternate titles + release dates
         movie = radarr(f'/api/v3/movie/{c["id"]}') or {}
@@ -496,6 +518,11 @@ def retry_due(s):
 def grab_round(st, max_grabs, only=None, dry=False, cron=False):
     """Search + grab up to max_grabs; returns (grabbed, lines)."""
     lines, grabbed, searched = [], 0, 0
+    guard = search_guard(st if cron else None)
+    try:
+        guard.check()           # before the reads: a low host skips even the night's movie list refresh
+    except hostmem.SearchStop as e:
+        return 0, [str(e)]
     scores = profile()
     if only:
         movie = radarr(f'/api/v3/movie/{only}')
@@ -537,7 +564,11 @@ def grab_round(st, max_grabs, only=None, dry=False, cron=False):
                 gone.add(mid)
                 continue
         searched += 1
-        row = evaluate(c, scores, movie)
+        try:
+            row = evaluate(c, scores, movie, guard)
+        except hostmem.SearchStop as e:
+            lines.append(str(e))
+            break
         for w in [] if dry else row.get('wrong') or []:
             log(f'NOT-THIS-FILM {c["id"]} {c["title"]} ({c["year"]}): skipped {w["title"]}: {w["why"]}')
         if not row.get('release'):
@@ -711,6 +742,11 @@ def maybe_note(st):
 
 # ----------------------------------------------------------------------------- modes
 def do_plan(a):
+    try:
+        search_guard().check()
+    except hostmem.SearchStop as e:
+        print(f'media-remux: {e}', file=sys.stderr if a.json else sys.stdout)
+        return 0
     scores = profile()
     movies = [radarr(f'/api/v3/movie/{a.movie}')] if a.movie else radarr('/api/v3/movie', timeout=120)
     cands = candidates(movies)
@@ -720,10 +756,15 @@ def do_plan(a):
         cands = cands[:a.limit]
     old = jsonstate.load(PLAN_F, None) or {}
     rows = old.get('rows') or {}
-    out = []
+    out, stopped, guard = [], None, search_guard()
     for c in cands:
         try:
-            row = evaluate(c, scores)
+            row = evaluate(c, scores, guard=guard)
+        except hostmem.SearchStop as e:
+            stopped = f'{e} (searched {len(out)} of {len(cands)} candidates; the rest keep their last plan row)'
+            if not a.json:
+                print(stopped, flush=True)
+            break
         except ApiError as e:
             row = dict(c, reason=f'search failed: {e}'[:200], checked=int(now()))
         rows[str(c['id'])] = row
@@ -734,7 +775,9 @@ def do_plan(a):
     picked = [r for r in out if r.get('release')]
     tot = {'candidates': len(cands), 'with_release': len(picked), 'override': sum(1 for r in picked if r['override']),
            'gb_now': round(sum(r['size'] for r in out) / GB, 1),
-           'gb_saved': round(sum(r['saved'] for r in picked) / GB, 1)}
+           'gb_saved': round(sum(r['saved'] for r in picked) / GB, 1), 'searched': len(out)}
+    if stopped:
+        tot['stopped'] = stopped
     if a.json:
         print(json.dumps({'totals': tot, 'rows': out}, ensure_ascii=False, indent=1))
     else:
@@ -792,8 +835,8 @@ def main():
                 n, more = grab_round(st, a.max, only=a.movie, dry=a.dry_run)
                 lines += more + [f'{"would grab" if a.dry_run else "grabbed"} {n}']
             elif a.cron and not os.path.exists(OFF_F) and in_window():
-                left = NIGHT_MAX - st['nights'].get(night_key(), {}).get('grabs', 0)
-                if left > 0:
+                nt = st['nights'].get(night_key(), {})
+                if nt.get('grabs', 0) < NIGHT_MAX and nt.get('searches', 0) < NIGHT_SEARCHES:
                     lines += grab_round(st, 1, cron=True)[1]
             if a.cron:
                 p = maybe_note(st)

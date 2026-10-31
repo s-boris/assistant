@@ -46,6 +46,12 @@ parser, size), waiving only the upgrade rejection. 2160p picks import by themsel
                                                           <= 300 GB per night; first tick after 06:30 -> ONE
                                                           ~/inbox/media-remux-tv-DATE.md line (only when something
                                                           happened)
+Searches: Sonarr keeps every interactive-search result in memory until it restarts (its release cache is never
+purged; Radarr's same cache grew to 14 GB and starved the host). So before each release search (a season search, each
+per-episode search, a retry): host MemAvailable (/proc/meminfo, the server's) under 8 GB (MEDIA_REMUX_TV_MIN_MEM_GB,
+else ~/.config/media-remux-tv/min-mem-gb; 0 = off) -> no more searches this run, one "memory guard:" line in the cron
+log, exit 0; and at most 40 release searches a night (--cron, MEDIA_REMUX_TV_NIGHT_SEARCHES; counted in the night's
+state) or per --run / --plan (MEDIA_REMUX_TV_RUN_SEARCHES; a plan's unsearched seasons are estimated).
 Gates for every grab: Sonarr's queue <= 10 downloads, the series/season not already queued, the cache pool's live free
 space minus the Sonarr + Radarr queues' remaining bytes minus the release >= 100 GB and the pool < 90 % used, and the
 night's GB budget. A failing gate stops the tick's grabs.
@@ -56,7 +62,9 @@ Env (tests): MEDIA_REMUX_TV_MEDIA (module with get/api/ApiError/q, default ~/bin
 (default ~/bin/arr-unblock), MEDIA_REMUX_TV_STATE_DIR, MEDIA_REMUX_TV_INBOX, MEDIA_REMUX_TV_OFF, ASSISTANT_NOW (the
 clock, core.clock), MEDIA_REMUX_TV_CACHE_FREE_GB + MEDIA_REMUX_TV_CACHE_USED_PCT (skip the server probe),
 MEDIA_REMUX_TV_NIGHT_MAX (15), MEDIA_REMUX_TV_NIGHT_GB (300), MEDIA_REMUX_TV_QUEUE_MAX (10),
-MEDIA_REMUX_TV_CACHE_FLOOR_GB (100), MEDIA_REMUX_TV_SEARCHES (season searches per tick, 2), MEDIA_REMUX_TV_GAP (5).
+MEDIA_REMUX_TV_CACHE_FLOOR_GB (100), MEDIA_REMUX_TV_SEARCHES (season searches per tick, 2), MEDIA_REMUX_TV_GAP (5),
+MEDIA_REMUX_TV_NIGHT_SEARCHES (40), MEDIA_REMUX_TV_RUN_SEARCHES (40), MEDIA_REMUX_TV_MIN_MEM_GB (8),
+MEDIA_REMUX_TV_MEMINFO (default /proc/meminfo).
 Tests: ~/opt/assistant/tests/media/test_media_remux_tv.py
 """
 import argparse
@@ -80,7 +88,7 @@ for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.pa
 if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
     sys.path.insert(0, os.path.dirname(HERE))
 import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
-from core import clock, jsonstate, locks  # noqa: E402
+from core import clock, hostmem, jsonstate, locks  # noqa: E402
 
 
 def _env(name, default):
@@ -120,6 +128,10 @@ CACHE_FLOOR = _env('MEDIA_REMUX_TV_CACHE_FLOOR_GB', 100.0) * GB
 CACHE_USED_MAX = 90.0
 SEARCHES = _env('MEDIA_REMUX_TV_SEARCHES', 2)
 GAP = _env('MEDIA_REMUX_TV_GAP', 5.0)
+NIGHT_SEARCHES = _env('MEDIA_REMUX_TV_NIGHT_SEARCHES', 40)   # release searches (GETs) a night (--cron)
+RUN_SEARCHES = _env('MEDIA_REMUX_TV_RUN_SEARCHES', 40)       # release searches per --run / --plan
+MIN_MEM_GB = hostmem.min_gb('MEDIA_REMUX_TV_MIN_MEM_GB', f'{HOME}/.config/media-remux-tv/min-mem-gb', 8.0)
+MEMINFO = os.environ.get('MEDIA_REMUX_TV_MEMINFO') or hostmem.MEMINFO
 PROTOCOLS = set((os.environ.get('MEDIA_REMUX_TV_PROTOCOLS') or 'usenet').split(','))
 NO_RELEASE_RETRY = 30 * 86400
 PLAN_REUSE = 14 * 86400  # a plan's no-release verdict spares the search this long
@@ -420,11 +432,22 @@ def pick(releases, unit, scores, minscore):
     return [], (f'{len(releases)} releases, none fits ({top})' if releases else 'no releases found')
 
 
-def search(unit, ep_limit=None, pause=None):
+def search_guard(st=None):
+    """The run's search budget (core.hostmem.SearchGuard): st given = a --cron tick, capped by the night's count."""
+    if st is not None:
+        return hostmem.SearchGuard(MIN_MEM_GB, NIGHT_SEARCHES, 'night', MEMINFO,
+                                   tally=st['nights'].setdefault(night_key(), {'grabs': 0, 'bytes': 0}))
+    return hostmem.SearchGuard(MIN_MEM_GB, RUN_SEARCHES, 'per-run', MEMINFO)
+
+
+def search(unit, ep_limit=None, pause=None, guard=None):
     """Releases for one season: the season search, or per remux episode when the season's answer is over the
-    gateway's cap. -> (releases, mode, episodes searched)."""
+    gateway's cap. -> (releases, mode, episodes searched). guard: take()n before every release GET (raises
+    core.hostmem.SearchStop: memory low or the cap used up)."""
+    take = guard.take if guard is not None else (lambda: None)
     for attempt in (1, 2):
         try:
+            take()
             rs = sonarr(f'/api/v3/release?seriesId={unit["sid"]}&seasonNumber={unit["season"]}',
                         timeout=SEARCH_TIMEOUT) or []
             return rs, 'season', None
@@ -445,6 +468,7 @@ def search(unit, ep_limit=None, pause=None):
             pause()
         done += 1
         searched.append(f['id'])
+        take()
         try:
             rs += sonarr(f'/api/v3/release?episodeId={f["ep_ids"][0]}', timeout=SEARCH_TIMEOUT) or []
         except ApiError as e:
@@ -453,8 +477,8 @@ def search(unit, ep_limit=None, pause=None):
     return rs, 'episodes', (done, searched)
 
 
-def evaluate(unit, prof, ep_limit=None, pause=None):
-    rs, mode, done = search(unit, ep_limit, pause)
+def evaluate(unit, prof, ep_limit=None, pause=None, guard=None):
+    rs, mode, done = search(unit, ep_limit, pause, guard)
     picks, reason = pick(rs, unit, prof['scores'], prof['min'])
     row = {k: unit[k] for k in ('sid', 'title', 'year', 'season', 'profile', 'target', 'size', 'need')}
     row.update(eps=sum(max(1, len(f['eps'])) for f in unit['files']), files=len(unit['files']), mode=mode,
@@ -579,6 +603,11 @@ def season_key(u):
 def grab_round(st, max_grabs, only=None, dry=False, cron=False):
     """Search + grab up to max_grabs releases; returns (grabbed, lines)."""
     lines, grabbed, searched = [], 0, 0
+    guard = search_guard(st if cron else None)
+    try:
+        guard.check()           # before the reads: a low host skips the series list too
+    except hostmem.SearchStop as e:
+        return 0, [str(e)]
     profs = profiles()
     # TODO before this job is scheduled: read the full series list at most once a night (a candidate cache, re-read
     # per series with /api/v3/series/{id} before its search), as media-remux does for Radarr's movie list: a */20
@@ -618,7 +647,11 @@ def grab_round(st, max_grabs, only=None, dry=False, cron=False):
             lines.append(f'stop: {why}')
             break
         searched += 1
-        row = evaluate(u, profs[u['profile_id']], pause=lambda: SLEEP(GAP))
+        try:
+            row = evaluate(u, profs[u['profile_id']], pause=lambda: SLEEP(GAP), guard=guard)
+        except hostmem.SearchStop as e:
+            lines.append(str(e))
+            break
         lines.append(row_line(row))
         if not row['picks']:
             if not dry:
@@ -804,7 +837,7 @@ def plan_order(units):
     return first + sorted(rest, key=lambda u: -u['size'])
 
 
-def estimate(rows, units):
+def estimate(rows, units, why='time budget'):
     """Seasons not searched, or searched per episode only in part: their saving from the series' searched ratio; a
     series with no searched season at all from the ratio of all searched seasons with the same target (1080p /
     2160p), marked est_from = 'class'."""
@@ -822,7 +855,7 @@ def estimate(rows, units):
         if r is None:
             r = {k: u[k] for k in ('sid', 'title', 'year', 'season', 'profile', 'target', 'size', 'need')}
             r.update(eps=sum(max(1, len(f['eps'])) for f in u['files']), files=len(u['files']), picks=None,
-                     saved=0, reason='not searched (time budget)')
+                     saved=0, reason=f'not searched ({why})')
             rows[season_key(u)] = r
         if not (a and a[1]):
             a = cls.get(u['target'])
@@ -836,11 +869,17 @@ def estimate(rows, units):
 
 
 def do_plan(a):
+    guard = search_guard()
+    try:
+        guard.check()
+    except hostmem.SearchStop as e:
+        print(f'media-remux-tv: {e}', file=sys.stderr if a.json else sys.stdout)
+        return 0
     profs = profiles()
     units = candidates(sonarr('/api/v3/series', timeout=120) or [], profs, a.series)
     order = plan_order(units)
     deadline = time.monotonic() + a.budget * 60
-    rows, n = {}, 0
+    rows, n, why = {}, 0, 'time budget'
     for u in order:
         if time.monotonic() >= deadline:
             break
@@ -848,7 +887,12 @@ def do_plan(a):
             SLEEP(GAP)
         n += 1
         try:
-            row = evaluate(u, profs[u['profile_id']], ep_limit=a.ep_sample, pause=lambda: SLEEP(GAP))
+            row = evaluate(u, profs[u['profile_id']], ep_limit=a.ep_sample, pause=lambda: SLEEP(GAP), guard=guard)
+        except hostmem.SearchStop as e:
+            why = 'memory guard' if str(e).startswith('memory guard') else 'search cap'
+            if not a.json:
+                print(f'{e} (the seasons left are estimated)', flush=True)
+            break
         except ApiError as e:
             row = {k: u[k] for k in ('sid', 'title', 'year', 'season', 'profile', 'target', 'size', 'need')}
             row.update(eps=sum(max(1, len(f['eps'])) for f in u['files']), files=len(u['files']), picks=None,
@@ -857,7 +901,7 @@ def do_plan(a):
         if not a.json:
             print(row_line(row) if row.get('picks') is not None else f'- {row["title"]} S{row["season"]:02d}: '
                   f'{row["reason"]}', flush=True)
-    estimate(rows, units)
+    estimate(rows, units, why)
     jsonstate.save(PLAN_F, {'at': int(now()), 'rows': rows}, mode=0o600, ensure_ascii=False)
     tot = totals(rows)
     if a.report:
@@ -960,7 +1004,8 @@ def write_report(path, rows, tot):
         out.append('')
     out += ['## No candidate / kept', ''] + (kept or ['- none']) + ['']
     if unsearched:
-        out += ['## Not searched (time budget; estimated from the searched series with the same target)', '']
+        out += ['## Not searched (time budget or search stop; estimated from the searched series with the same target)',
+                '']
         out += unsearched + ['']
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, 'w') as f:
@@ -994,7 +1039,8 @@ def tick(a, st):
         lines += more + [f'{"would grab" if a.dry_run else "grabbed"} {n}']
     elif a.cron and not os.path.exists(OFF_F) and in_window():
         nt = night(st)
-        if nt.get('grabs', 0) < NIGHT_MAX and nt.get('bytes', 0) < NIGHT_BYTES:
+        if (nt.get('grabs', 0) < NIGHT_MAX and nt.get('bytes', 0) < NIGHT_BYTES
+                and nt.get('searches', 0) < NIGHT_SEARCHES):
             lines += grab_round(st, 1, cron=True)[1]
     if a.cron:
         p = maybe_note(st)

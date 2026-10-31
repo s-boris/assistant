@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""hostmem: the host's free memory over time (read-only; this container's /proc/meminfo is the server's).
+
+Before this, only single readings of MemAvailable existed (unraid-health's latest snapshot, arr-restart's
+before/after line), so a slow leak (Radarr's interactive-search cache) showed only once the host starved.
+
+  hostmem sample            (cron, every 10 min) append one row to the samples file; rows older than 14 days go
+  hostmem tail [N]          the last N rows (default 12 = 2 h), GB
+  hostmem low [--hours H]   lowest, mean and latest MemAvailable over the last H hours (default 24), GB
+  hostmem --help
+
+Samples: ~/.local/state/hostmem/samples.tsv, one tab-separated row per sample:
+  ts (local ISO 8601)   MemAvailable_kB   MemTotal_kB
+GB = kB / 1e6 (as arr-restart prints them). Exit 0 ok, 1 usage, 2 meminfo unreadable (sample) or no rows.
+Env (tests): HOSTMEM_STATE_DIR, HOSTMEM_MEMINFO (default /proc/meminfo), HOSTMEM_KEEP_DAYS (14), ASSISTANT_NOW.
+Tests: ~/opt/assistant/tests/core/test_hostmem.py
+"""
+import argparse
+import os
+import pwd
+import sys
+from datetime import datetime
+
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(HERE, 'lib')):
+    sys.path.insert(0, _lib)
+if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(HERE))
+from core import clock, hostmem  # noqa: E402
+
+
+def _keep_days():
+    try:
+        return float(os.environ.get('HOSTMEM_KEEP_DAYS') or 14)
+    except ValueError:
+        return 14.0
+
+
+STATE_DIR = os.environ.get('HOSTMEM_STATE_DIR') or f'{HOME}/.local/state/hostmem'
+SAMPLES = f'{STATE_DIR}/samples.tsv'
+MEMINFO = os.environ.get('HOSTMEM_MEMINFO') or hostmem.MEMINFO
+KB = hostmem.KB_PER_GB
+
+
+def fmt(ts, avail, total):
+    return f'{datetime.fromtimestamp(ts).astimezone():%Y-%m-%d %H:%M}  {avail / KB:5.1f} GB free of {total / KB:.1f}'
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='hostmem', description="the host's MemAvailable over time")
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('sample')
+    t = sub.add_parser('tail')
+    t.add_argument('n', nargs='?', type=int, default=12)
+    lo = sub.add_parser('low')
+    lo.add_argument('--hours', type=float, default=24.0)
+    a = ap.parse_args(argv)
+    if a.cmd == 'sample':
+        if hostmem.sample(SAMPLES, keep_days=_keep_days(), meminfo=MEMINFO) is None:
+            print(f'hostmem: cannot read MemAvailable from {MEMINFO}', file=sys.stderr)
+            return 2
+        return 0
+    rs = hostmem.rows(SAMPLES)
+    if a.cmd == 'tail':
+        for r in rs[-max(a.n, 0):] if a.n > 0 else []:
+            print(fmt(*r))
+        return 0 if rs else 2
+    rs = [r for r in rs if r[0] >= clock.now() - a.hours * 3600]
+    if not rs:
+        print(f'hostmem: no samples in the last {a.hours:g} h', file=sys.stderr)
+        return 2
+    lowest = min(rs, key=lambda r: r[1])
+    mean = sum(r[1] for r in rs) / len(rs)
+    print(f'last {a.hours:g} h, {len(rs)} samples: lowest {lowest[1] / KB:.1f} GB '
+          f'({datetime.fromtimestamp(lowest[0]).astimezone():%Y-%m-%d %H:%M}), mean {mean / KB:.1f} GB, '
+          f'latest {rs[-1][1] / KB:.1f} GB of {rs[-1][2] / KB:.1f} GB')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

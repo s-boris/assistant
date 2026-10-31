@@ -2056,6 +2056,14 @@ smoke = "{dest} --help >/dev/null"
 suite = "fx-watch"
 seam = "FX_WATCH_BIN"
 
+# Host MemAvailable sampler (core.hostmem): one row every 10 min, 14 days; the remux jobs' memory guard shares
+# core.hostmem.
+[[file]]
+src = "scripts/hostmem"
+dest = "bin/hostmem"
+mode = "0755"
+smoke = "{dest} --help >/dev/null"
+
 [[file]]
 src = "scripts/hwtrend"
 dest = "bin/hwtrend"

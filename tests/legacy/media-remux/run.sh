@@ -12,6 +12,9 @@ export MEDIA_REMUX_CACHE_FREE_GB=500 MEDIA_REMUX_CACHE_USED_PCT=50
 # the this-film check is arr-mismatch's own (pure functions, no API calls of its own): the live one, not a fake
 export MEDIA_REMUX_MISMATCH=${MEDIA_REMUX_MISMATCH:-$(getent passwd "$(id -u)" | cut -d: -f6)/bin/arr-mismatch}
 mkdir -p "$FAKE_DIR" "$T/inbox"
+# the memory guard reads the host's MemAvailable before each search: a fake with room, so the host never decides
+export MEDIA_REMUX_MEMINFO="$T/meminfo"
+printf 'MemTotal:       65618092 kB\nMemAvailable:   28600000 kB\n' >"$MEDIA_REMUX_MEMINFO"
 pass=0 fail=0
 ok() { if [ "$1" = 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $2"; fi; }
 mk() { python3 "$HERE/mk.py" "$FAKE_DIR" "$@"; }

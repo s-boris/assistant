@@ -304,6 +304,16 @@ def world():
     return f
 
 
+def meminfo(path, avail_kb):
+    """A fake /proc/meminfo (the host's MemAvailable the memory guard reads before each release search)."""
+    path.write_text(f"MemTotal:       65618092 kB\nMemAvailable:   {avail_kb} kB\n")
+    return path
+
+
+def release_gets(mod):
+    return [p for _s, m, p in mod.M.calls if m == "GET" and p.startswith("/api/v3/release")]
+
+
 @pytest.fixture
 def tv(tmp_path, monkeypatch):
     def make(now=NIGHT, fake=None):
@@ -314,10 +324,18 @@ def tv(tmp_path, monkeypatch):
             "MEDIA_REMUX_TV_CACHE_FREE_GB": 500,
             "MEDIA_REMUX_TV_CACHE_USED_PCT": 50,
             "MEDIA_REMUX_TV_GAP": 0,
+            "MEDIA_REMUX_TV_MEMINFO": meminfo(tmp_path / "meminfo", 28600000),
             "ASSISTANT_NOW": now,
         }.items():
             monkeypatch.setenv(k, str(v))
-        for k in ("MEDIA_REMUX_TV_NIGHT_MAX", "MEDIA_REMUX_TV_NIGHT_GB", "MEDIA_REMUX_TV_SEARCHES"):
+        for k in (
+            "MEDIA_REMUX_TV_NIGHT_MAX",
+            "MEDIA_REMUX_TV_NIGHT_GB",
+            "MEDIA_REMUX_TV_SEARCHES",
+            "MEDIA_REMUX_TV_NIGHT_SEARCHES",
+            "MEDIA_REMUX_TV_RUN_SEARCHES",
+            "MEDIA_REMUX_TV_MIN_MEM_GB",
+        ):
             monkeypatch.delenv(k, raising=False)
         ldr = importlib.machinery.SourceFileLoader("media_remux_tv_under_test", str(SCRIPT))
         mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(ldr.name, ldr))
@@ -436,7 +454,9 @@ def test_cron_inside_the_window_grabs_one(tv, tmp_path):
     assert body["guid"] == "guid-Big.Show.S01E01.1080p.WEB-DL"  # the biggest remux season first
     st = json.loads((tmp_path / "state" / "state.json").read_text())
     night = st["nights"]["2026-10-30"]
-    assert night == {"grabs": 1, "bytes": 4 * G}
+    # 1 season search (over the gateway cap) + 1 episode search before the grab
+    assert night == {"grabs": 1, "bytes": 4 * G, "searches": len(release_gets(mod))}
+    assert night["searches"] >= 2
     assert [g["status"] for g in st["grabs"].values()] == ["grabbed"]
     assert st["seasons"]["6:1"]["status"] == "partial"
     assert "GRAB" in (tmp_path / "state" / "actions.log").read_text()
@@ -460,6 +480,68 @@ def test_night_caps_stop_grabs(tv, tmp_path, monkeypatch):
     mod.save_state(st)
     assert mod.main(["--cron"]) == 0
     assert not mod.M.posts
+
+
+def test_memory_guard_stops_searches_and_exits_clean(tv, tmp_path, capsys):
+    mod = tv()
+    meminfo(tmp_path / "meminfo", 7_500_000)  # 7.5 GB < 8 GB
+    assert mod.main(["--cron"]) == 0
+    assert not release_gets(mod) and not mod.M.posts
+    assert not any(p == "/api/v3/series" for _s, _m, p in mod.M.calls)  # no series list read either
+    out = capsys.readouterr()
+    assert "memory guard: host MemAvailable 7.5 GB < 8 GB: no more searches this run" in out.out
+    assert out.err == ""
+    assert mod.main(["--run", "--max", "3"]) == 0
+    assert not release_gets(mod) and not mod.M.posts
+    assert mod.main(["--plan"]) == 0
+    assert not release_gets(mod)
+    assert "memory guard" in capsys.readouterr().out
+    assert not (tmp_path / "state" / "plan.json").exists()
+
+
+def test_memory_guard_mid_run_stops_before_the_next_search(tv, tmp_path, capsys):
+    mod = tv()
+    real = mod.M.api
+
+    def api(svc, method, path, body=None, timeout=None):
+        if path.startswith("/api/v3/release"):  # the host runs low right after the first search
+            meminfo(tmp_path / "meminfo", 2_000_000)
+        return real(svc, method, path, body, timeout)
+
+    mod.M.api = api
+    assert mod.main(["--run", "--max", "5", "--dry-run"]) == 0
+    assert len(release_gets(mod)) == 1
+    assert "memory guard: host MemAvailable 2.0 GB < 8 GB" in capsys.readouterr().out
+
+
+def test_night_search_cap(tv, tmp_path, monkeypatch, capsys):
+    mod = tv()
+    st = mod.load_state()
+    st["nights"]["2026-10-30"] = {"grabs": 0, "bytes": 0, "searches": 40}
+    mod.save_state(st)
+    assert mod.main(["--cron"]) == 0
+    assert not release_gets(mod) and not mod.M.posts
+    # one search left: the season search is the last; its over-cap fallback to episode searches stops at the cap
+    st["nights"]["2026-10-30"] = {"grabs": 0, "bytes": 0, "searches": 39}
+    mod.save_state(st)
+    assert mod.main(["--cron"]) == 0
+    assert len(release_gets(mod)) == 1 and not mod.M.posts
+    assert json.loads((tmp_path / "state" / "state.json").read_text())["nights"]["2026-10-30"]["searches"] == 40
+    assert capsys.readouterr().out == ""  # a cap stop is quiet in the cron log
+
+
+def test_run_and_plan_search_cap(tv, monkeypatch, capsys):
+    mod = tv()
+    monkeypatch.setattr(mod, "RUN_SEARCHES", 2)  # MEDIA_REMUX_TV_RUN_SEARCHES=2
+    assert mod.main(["--run", "--max", "9", "--dry-run"]) == 0
+    assert len(release_gets(mod)) == 2
+    assert "stop: per-run search cap 2 reached" in capsys.readouterr().out
+    mod.M.calls.clear()
+    assert plan(mod) == 0
+    rows = rows_of(capsys)["rows"]
+    assert len(release_gets(mod)) == 2
+    assert any(r.get("reason") == "not searched (search cap)" for r in rows.values())
+    assert sum(1 for r in rows.values() if r.get("picks") is not None) <= 2
 
 
 def test_off_switch_and_dry_run(tv, tmp_path, capsys):

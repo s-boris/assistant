@@ -90,6 +90,26 @@ why = "daily hardware trend sample; exit 1 = alerts noted, not a failure"
 target = "cron-back 29.10"
 cron_line = "7 8 * * * mkdir -p \"$HOME/.local/state/hwtrend\" && cron-fail --after 0 --ok 1 hwtrend flock -n -E 0 \"$HOME/.local/state/cron-fail/hwtrend.run\" timeout -k 10 300 $HOME/bin/hwtrend >> \"$HOME/.local/state/hwtrend/cron.log\" 2>&1"
 
+[jobs.hostmem]
+line = "hostmem"
+cron = "*/10 * * * *"
+class = "M"
+group = "collectors"
+queue = "fast"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/hostmem", "sample"]
+out = "hostmem/cron.log"
+err = "out"
+dirs = ["hostmem"]
+timeout = 60
+after = 3
+feature = "server-health"
+owner_facing = false
+why = "host MemAvailable sample every 10 min (samples.tsv, 14 days): the memory trend the arr search cache leak lacked"
+target = "hostmem"
+cron_line = "*/10 * * * * mkdir -p \"$HOME/.local/state/hostmem\" && cron-fail --after 3 hostmem flock -n -E 0 \"$HOME/.local/state/cron-fail/hostmem.run\" timeout -k 10 60 $HOME/bin/hostmem sample >> \"$HOME/.local/state/hostmem/cron.log\" 2>&1"
+
 [jobs.cputemp-log]
 line = "cputemp-log"
 cron = "*/5 * * * *"

@@ -49,19 +49,20 @@ def test_registry_census_shape(reg):
     and board-eval (M), minus board-done, tasks-sync and the retired board-reality, remind-due, practice,
     readlater-update and browser-update (removed; Chrome lives in the hub's browser image); dayline (M) is back with
     the restored dashboard (30.10), plus the hourly scorecard (M, 30.10), the land queue's worker (K, 30.10) and
-    the nightly arr-restart (M) and media-remux-tv (M); a new registry entry updates these counts).
+    the nightly arr-restart (M), media-remux-tv (M) and the hostmem sampler (M); a new registry entry updates these
+    counts).
     Which runner has a job (cron, hub, keepers, window) moves with each switch-over, so that split is checked for
     consistency, not pinned."""
-    # + media-remux-tv (M, 31.10)
+    # + media-remux-tv (M, 31.10), + hostmem (M)
     # cron-back 29.10: + cron-runs (K), and the two shared lines (damp/window-watch, scraper-canary/deadlines-validate)
     # are one line per job again
-    assert len(reg.lines) == 150 and len(reg.jobs) == 150
+    assert len(reg.lines) == 151 and len(reg.jobs) == 151
     by_class: dict[str, set] = {}
     for e in reg.jobs.values():
         by_class.setdefault(e.cls, set()).add(e.line)
     # plan §6.1, lines per class (+ keepers, hub-sentinel, eventwf-fallback, voice-inbox, phone-inbox, ci-nightly and
     # usage-watch in K, drill-fail, the two media digests and board-eval in M; no R line is left)
-    assert {c: len(v) for c, v in by_class.items()} == {"W": 11, "X": 4, "T": 10, "C": 8, "V": 11, "M": 86,
+    assert {c: len(v) for c, v in by_class.items()} == {"W": 11, "X": 4, "T": 10, "C": 8, "V": 11, "M": 87,
                                                         "K": 20}  # fmt: skip
     assert sorted(e.name for e in reg.keepers()) == ["browser-ensure", "cputemp-log", "eventwf-fallback", "flowd",
                                                      "hub-feed", "llm-idle-check", "tg-adapter-ensure-live",
