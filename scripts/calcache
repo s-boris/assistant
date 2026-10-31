@@ -24,10 +24,14 @@ train {from, to, lines} (SBB-link stops, "home" for a Home end of the title; pla
 `train-watch sync --from-cache`; for timed ✈️ events flight [{no, from, to, dep, arr}] (flight-number lines of the
 description, lib/flights.py; local airport times) for `flight-watch sync --from-cache`.
 Descriptions and locations are never stored: the location is reduced to its town
-(postcode town, stop town, a lone place name; never a street). Cancelled and declined events are skipped.
+(postcode town, stop town, a lone place name; never a street; with no postcode and a street or stop name first, a
+later comma part naming a known town (a profile town or a name in the title: "Car park X, Zürich (…)" for
+"🚌 Zürich → …") before a comma or parenthesis). Cancelled and declined events are skipped.
 Busy = any timed event, also one marked free (concerts and the like are often marked free); all-day events are
 markers and never busy. away_overnight: a timed event that ends after 04:00 on a later day, or an all-day event of
-2+ days, away from the home town; an all-day event abroad; a ✈️ or 🏨 title. abroad: a foreign country in the
+2+ days, away from the home town; a timed travel leg (🚆 🚌 ✈️ 🚗) that ends after 04:00 on a later day, wherever
+it goes (an overnight coach, night train or flight: that night is spent on the way); an all-day event abroad; a ✈️
+or 🏨 title. abroad: a foreign country in the
 location or a foreign flag emoji in the title. id_check: the title or description asks for ID or an age limit
 ("18+", "ID", "Ausweis", "photo ID"); only the flag is kept, never the text.
 Exit: 0 ok, 1 age: missing/stale, 2 usage or bad input (import: not a list_events result, or 0 events over a
@@ -158,6 +162,34 @@ def stop_town(stop):
     return norm_town(s)
 
 
+def loc_parts(loc):
+    """Comma parts of a location; a comma inside parentheses does not split ('Zürich (Bay 3, level 1)' is one part)."""
+    out, cur, depth = [], '', 0
+    for ch in loc:
+        depth += (ch == '(') - (ch == ')' and depth > 0)
+        if ch == ',' and depth == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    return [p.strip() for p in out + [cur] if p.strip()]
+
+
+def known_town(parts, title):
+    """The first part that is a plain town name (the text before a parenthesis) the setup already knows: a profile
+    town or alias, or a name the title spells as a whole word ('🚌 Zürich → Antwerp' knows 'Zürich'). None else."""
+    known = [profile.get('home.town', '') or '', profile.get('work.town', '') or ''] + \
+        list(profile.get('home.town_aliases', []) or [])
+    for p in parts:
+        t = norm_town(p.split('(')[0])
+        if not t:
+            continue
+        if any(name and t.casefold() == str(name).casefold() for name in known) or \
+                re.search(r'(?<!\w)' + re.escape(t) + r'(?!\w)', str(title or ''), re.I):
+            return t
+    return None
+
+
 def place(location, title, travel):
     """(town or None, abroad) from a location string; never returns a street. Title '@Town' (a working-location
     marker) names the town when there is no location."""
@@ -165,7 +197,7 @@ def place(location, title, travel):
     if not loc:
         m = re.fullmatch(r'@\s*([^\W\d][\w .\'-]{1,38})', str(title or '').strip())
         return (norm_town(m.group(1)) if m else None), False
-    parts = [p.strip() for p in loc.split(',') if p.strip()]
+    parts = loc_parts(loc)
     country = parts[-1].casefold() if parts and parts[-1].casefold() in COUNTRIES else None
     abroad = bool(country and country not in HOME_COUNTRY)
     if country:
@@ -175,10 +207,10 @@ def place(location, title, travel):
         if m:
             return norm_town(m.group(1)), abroad
     if travel in ('train', 'bus') and parts:
-        return stop_town(loc), abroad
+        return (stop_town(parts[0]) or known_town(parts[1:], title)), abroad
     if not parts:
         return (norm_town(loc) if country else None), abroad
-    return norm_town(parts[-1]), abroad
+    return (norm_town(parts[-1]) or known_town(parts[:-1], title)), abroad
 
 
 def parse_lines(text):
@@ -248,7 +280,9 @@ def normalize(e):
         busy_evening = any(max(start, midnight(d) + dt.timedelta(hours=EVENING[0]))
                            < min(end, midnight(d) + dt.timedelta(hours=EVENING[1]))
                            for d in days_between(start.date(), end.date()))
-        away = away_from_home and end > midnight(start.date() + dt.timedelta(days=1)) + dt.timedelta(hours=NIGHT_END_H)
+        # an event across the night elsewhere, or a travel leg across the night (on the way, wherever it goes)
+        overnight = end > midnight(start.date() + dt.timedelta(days=1)) + dt.timedelta(hours=NIGHT_END_H)
+        away = (away_from_home or bool(travel)) and overnight
     away = bool(away or any(i in title for i in AWAY_ICONS))
     flag = next((f for f in FLAG_RE.findall(title)
                  if ''.join(chr(ord(c) - 0x1F1E6 + 97) for c in f) not in HOME_COUNTRY), None)

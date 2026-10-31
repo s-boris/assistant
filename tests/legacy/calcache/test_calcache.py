@@ -298,6 +298,111 @@ class CalCache(unittest.TestCase):
         self.assertEqual(self.ev(16)["train"], {"from": None, "to": None, "lines": ["S1"]})
         self.assertNotIn("train", self.ev(3))
 
+    # ------------------------------------------------------------------ overnight legs, towns without a postcode
+    def imp_events(self, evs):
+        raw = self.write("legs.json", {"events": evs, "timeZone": "Europe/Zurich"})
+        r = self.run_cc("import", raw)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_known_town_without_postcode(self):
+        self.imp_events(
+            [
+                timed(
+                    41,
+                    "🚌 Zürich → Antwerp night coach",
+                    "2026-03-04T21:30:00+01:00",
+                    "2026-03-05T09:00:00+01:00",
+                    "Carparkplatz Sihlquai, Zürich (Bay 3, upper level)",
+                ),
+                timed(
+                    42,
+                    "🚌 Night coach",
+                    "2026-03-06T10:00:00+01:00",
+                    "2026-03-06T12:00:00+01:00",
+                    "Carparkplatz Nord, Somewhere (Bay 3)",
+                ),  # not named in the title: no guess
+                timed(
+                    43,
+                    "🚆 Werkstadt → Bern",
+                    "2026-03-07T10:00:00+01:00",
+                    "2026-03-07T11:00:00+01:00",
+                    "Perronweg 2, Werkstadt (Gleis 4)",
+                ),  # a profile town
+                timed(
+                    44,
+                    "Concert",
+                    "2026-03-08T20:00:00+01:00",
+                    "2026-03-08T23:00:00+01:00",
+                    "Halle 5, Basel (Hall 2, gate B)",
+                ),  # a comma inside the parentheses does not split
+                timed(
+                    45, "Gig in Luzern", "2026-03-09T20:00:00+01:00", "2026-03-09T23:00:00+01:00", "Luzern, Seeweg 3"
+                ),  # street last: the known town before it
+                timed(
+                    46, "Gig", "2026-03-10T20:00:00+01:00", "2026-03-10T23:00:00+01:00", "Somewhere, Seeweg 3"
+                ),  # street last, town unknown: none
+            ]
+        )
+        self.assertEqual(self.ev(41)["town"], "Zürich")
+        self.assertIsNone(self.ev(42)["town"])
+        self.assertEqual(self.ev(43)["town"], "Werkstadt")
+        self.assertEqual(self.ev(44)["town"], "Basel")
+        self.assertEqual(self.ev(45)["town"], "Luzern")
+        self.assertIsNone(self.ev(46)["town"])
+        txt = open(os.path.join(self.dir, "events.json"), encoding="utf-8").read()
+        for bad in ("Carparkplatz", "Sihlquai", "Bay 3", "Perronweg", "Seeweg", "Halle 5"):
+            self.assertNotIn(bad, txt)
+
+    def test_overnight_travel_leg_is_a_night_away(self):
+        self.imp_events(
+            [
+                # overnight legs with no town at all: the night is spent on the way
+                timed(51, "🚌 Night coach", "2026-03-04T21:30:00+01:00", "2026-03-05T09:00:00+01:00"),
+                timed(
+                    52, "🚆 Night train", "2026-03-06T20:00:00+01:00", "2026-03-07T08:00:00+01:00", "Bahnhof Bachwil"
+                ),
+                # back home before 04:00, or the same day: not a night away
+                timed(53, "🚆 Basel SBB → Home", "2026-03-08T23:30:00+01:00", "2026-03-09T00:40:00+01:00", "Basel SBB"),
+                timed(
+                    54, "🚆 Home → Bern", "2026-03-10T18:00:00+01:00", "2026-03-10T19:00:00+01:00", "Bahnhof Bachwil"
+                ),
+                # a non-travel event at home across the night stays a night at home
+                timed(55, "Movie night", "2026-03-11T20:00:00+01:00", "2026-03-12T06:00:00+01:00", "9999 Bachwil"),
+            ]
+        )
+        on = {i: self.ev(i)["flags"]["away_overnight"] for i in (51, 52, 53, 54, 55)}
+        self.assertEqual(on, {51: True, 52: True, 53: False, 54: False, 55: False})
+        self.assertTrue(json.loads(self.run_cc("busy", "2026-03-04", "--json").stdout)["away_overnight"])
+        self.assertFalse(json.loads(self.run_cc("busy", "2026-03-05", "--json").stdout)["away_overnight"])
+
+    def test_trip_starts_on_the_night_of_an_overnight_coach(self):
+        """calcache -> core.away (cat trip mode, damp watch): the coach night opens the trip."""
+        import datetime as dt
+        import sys
+
+        self.imp_events(
+            [
+                timed(
+                    61,
+                    "🚌 Zürich → Antwerp night coach",
+                    "2026-03-04T21:30:00+01:00",
+                    "2026-03-05T09:00:00+01:00",
+                    "Carparkplatz Sihlquai, Zürich (Bay 3)",
+                ),
+                allday(62, "Customer visit", "2026-03-05", "2026-03-07", "Antwerpen, Belgium"),
+                timed(63, "✈️ BRU → ZRH", "2026-03-07T18:00:00+01:00", "2026-03-07T19:30:00+01:00"),
+            ]
+        )
+        sys.path.insert(0, TREE)
+        try:
+            from core import away
+        finally:
+            sys.path.remove(TREE)
+        trips = away.trips(self.cache()["events"], 2)
+        self.assertEqual(len(trips), 1)
+        self.assertEqual(trips[0]["from"], dt.date(2026, 3, 4))
+        self.assertEqual(trips[0]["back"], dt.date(2026, 3, 7))
+
     def test_paged_stdin_and_days(self):
         p1 = self.write("p1.json", {"events": EVENTS[:8], "nextPageToken": "x"})
         p2 = self.write("p2.json", [{"events": EVENTS[8:]}])
