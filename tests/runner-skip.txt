@@ -39,7 +39,7 @@ tests/legacy/cron-fail  # its lints read the live ~/crontab and ~/workspace/JOBS
 tests/legacy/evals-inspect  # red in the runner probe: run.sh calls /usr/bin/python3 (none in the runner)
 tests/legacy/evals  # red in the runner probe: run.sh calls /usr/bin/python3 (none in the runner)
 tests/legacy/remind  # red in the runner probe: realcheck.py imports assistant_profile (not on the runner path)
-tests/legacy/tg-cmd  # its picture cards render with Pillow under the tool's python3 (the runner's has none): 13 red
+tests/tgcmd/test_tg_cmd_pictures.py  # its picture cards and cardimg render with Pillow under the tools' python3 (the runner's has none)
 tests/legacy/webagent  # test_hook_wrapper runs the live ~/.claude/hooks/webagent-guard.sh (/usr/bin/python3)
 tests/ops/test_codebase_sync.py  # the export repo's pre-commit hook runs /usr/bin/python3 (none in the runner): a sync exits 3 there
 tests/legacy/cifeed  # not run in that probe: runner not probed yet

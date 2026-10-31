@@ -724,8 +724,6 @@ src = "scripts/gym"
 dest = "bin/gym"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
-suite = "gym"
-seam = "GYM_BIN"
 
 [[file]]
 src = "scripts/ha-autopilot-watch"
@@ -1136,15 +1134,13 @@ src = "packages/tgadapter/bind.py"
 dest = "bin/lib/tgadapter/bind.py"
 mode = "0644"
 
-# botlib (delegates to core; its legacy suite reads BOTLIB_PATH) and four watchers on core
+# botlib (delegates to core; tests/core/test_botlib.py) and four watchers on core
 # helpers (legacy suites via their *_BIN seams). Smokes only import + print help.
 [[file]]
 src = "scripts/lib/botlib.py"
 dest = "bin/lib/botlib.py"
 mode = "0644"
 smoke = "/usr/bin/python3 -I -c \"import sys; sys.path.insert(0, sys.argv[1]); import botlib; assert botlib.CORE\" {lib}"
-suite = "botlib"
-seam = "BOTLIB_PATH"
 
 [[file]]
 src = "scripts/train-watch"
@@ -1331,8 +1327,6 @@ src = "scripts/tg-cmd"
 dest = "bin/tg-cmd"
 mode = "0755"
 smoke = "{dest} --help >/dev/null && {dest} --list >/dev/null"
-suite = "tg-cmd"
-seam = "TGCMD_BIN"
 
 # Approvals: the CLI and its package next to core in ~/bin/lib (tg-adapter keeps the same DDL: schemas/approvals.sql
 # = adapters/tg/src/approvals.sql). Store: ~/.local/state/assistant/approvals.db (vault-guard rule approvals-state).

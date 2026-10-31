@@ -162,7 +162,7 @@
   "scripts/gym": [
    "urlopen"
   ],
-  "tests/legacy/gym/test_gym_plan.py": [
+  "tests/gym/gym_testlib.py": [
    "urlopen"
   ],
   "scripts/media": [
@@ -312,7 +312,7 @@
   "scripts/emby": "its fetches (urlopen) move with a later core.http pass",
   "scripts/gift-radar": "its locks (flock) move with a later core.locks pass",
   "scripts/gym": "its fetches (urlopen) move with a later core.http pass",
-  "tests/legacy/gym/test_gym_plan.py": "the fetch-plan test patches gym's urllib.request.urlopen with a fake; it follows the script's later core.http pass",
+  "tests/gym/gym_testlib.py": "the fake hub (a test double of the hub's egress fetch) forwards to the Jefit stub with urlopen; it follows the script's later core.http pass",
   "scripts/media": "its locks (flock), its fetches (urlopen) move with a later core.http / core.locks pass",
   "scripts/menu-usage": "its locks (flock) move with a later core.locks pass",
   "scripts/missing-docs": "its JSON reader (load_json) move with a later core.jsonstate pass",

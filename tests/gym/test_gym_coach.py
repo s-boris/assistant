@@ -1,6 +1,5 @@
-"""Offline tests for the post-workout recap (`gym recap`, ~/bin/lib/gymcoach.py) and tg-cmd's /gym WORD.
-Synthetic log only (made-up values, test_gym_plan.make_db).
-Run: python3 -m unittest test_gym_coach   (GYM_BIN=/copy/gym and TGCMD_BIN=/copy/tg-cmd test copies)."""
+"""The post-workout recap (`gym recap`, gymcoach.py) and tg-cmd's /gym WORD. Synthetic log only (made-up values,
+gym_testlib.make_db); tg-cmd runs against a fake gym (TG_CMD_BIN)."""
 
 import datetime as dt
 import importlib.machinery
@@ -9,28 +8,26 @@ import json
 import os
 import subprocess
 import sys
-import unittest
 
-import test_gym as base
-import test_gym_plan as tp
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-TGCMD = os.environ.get("TGCMD_BIN", os.path.expanduser("~/bin/tg-cmd"))
+import gym_testlib as base  # noqa: E402
 
 
-class Coach(unittest.TestCase):
+class TestCoach:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         cls.m = base.load_module()
 
-    def setUp(self):
-        self.e = base.Env(now=tp.NOW)
+    def setup_method(self):
+        self.e = base.Env(now=base.NOW)
         self.e.env.update(
             GYM_CALCACHE="off", GYM_RAVE_RADAR="off", USAGE="off", GYM_INBOX=os.path.join(self.e.dir, "inbox")
         )
-        self.conn, self.xid = tp.make_db(self.e.env["GYM_DB"], self.m)
+        self.conn, self.xid = base.make_db(self.e.env["GYM_DB"], self.m)
         self.state = os.path.dirname(self.e.env["GYM_DB"])
 
-    def tearDown(self):
+    def teardown_method(self):
         self.conn.close()
         self.e.close()
 
@@ -40,7 +37,7 @@ class Coach(unittest.TestCase):
             return json.load(fh)
 
     def add(self, date, items, sets=3):
-        tp.add_session(self.conn, dt.date.fromisoformat(date), items, self.xid, sets=sets)
+        base.add_session(self.conn, dt.date.fromisoformat(date), items, self.xid, sets=sets)
         self.conn.commit()
 
     def j(self, *args, now=None, code=0):
@@ -56,13 +53,13 @@ class Coach(unittest.TestCase):
         ]
         self.add("2026-10-18", items)
         d = self.j("recap")
-        self.assertEqual(d["date"], "2026-10-18")
-        self.assertEqual(d["day"], a["key"])
-        self.assertTrue(d["prs"])
-        self.assertTrue(d["skipped"])
-        self.assertIn("💪 Session 18.10. · " + a["key"], d["text"])
-        self.assertIn("🏆 PR:", d["text"])
-        self.assertEqual(self.e.run("recap", "--date", "2026-10-17", code=3).stdout, "")
+        assert d["date"] == "2026-10-18"
+        assert d["day"] == a["key"]
+        assert d["prs"]
+        assert d["skipped"]
+        assert "💪 Session 18.10. · " + a["key"] in d["text"]
+        assert "🏆 PR:" in d["text"]
+        assert self.e.run("recap", "--date", "2026-10-17", code=3).stdout == ""
 
     def test_recap_cron_two_polls_then_one_note(self):
         inbox = self.e.env["GYM_INBOX"]
@@ -71,34 +68,32 @@ class Coach(unittest.TestCase):
             return sorted(os.listdir(inbox)) if os.path.isdir(inbox) else []
 
         self.e.run("recap", "--cron")  # first run: silent baseline
-        self.assertEqual(notes(), [])
+        assert notes() == []
         self.add("2026-10-18", [("Barbell Squat", 100.0, 5)], sets=2)
         self.e.run("recap", "--cron")  # seen once: wait
-        self.assertEqual(notes(), [])
+        assert notes() == []
         self.add_set_to_last()  # still logging: changed
         self.e.run("recap", "--cron")
-        self.assertEqual(notes(), [])
+        assert notes() == []
         self.e.run("recap", "--cron")  # same twice: settled
-        self.assertEqual(len(notes()), 1)
+        assert len(notes()) == 1
         with open(os.path.join(inbox, notes()[0])) as fh:
             body = fh.read()
-        self.assertIn("gym recap", body)
-        self.assertNotIn("kg", body)
-        self.assertNotIn("100", body)
+        assert "gym recap" in body
+        assert "kg" not in body
+        assert "100" not in body
         self.e.run("recap", "--cron")
         self.e.run("recap", "--cron")
-        self.assertEqual(len(notes()), 1)  # once per session
+        assert len(notes()) == 1  # once per session
         self.add("2026-10-01", [("Barbell Squat", 100.0, 5)])  # late backfill of an old day
         self.e.run("recap", "--cron")
         self.e.run("recap", "--cron")
-        self.assertEqual(len(notes()), 1)
+        assert len(notes()) == 1
 
     def test_recap_cron_usage_runs_are_not_errors(self):
         """Every --cron poll is a healthy run: the usage store folds an exec outcome outside usage.OK_OUT into a
         failed run + an error event, so the poll state (init/pending/note/none/old) goes into attrs, not outcome."""
-        loader = importlib.machinery.SourceFileLoader(
-            "usage_t", os.path.join(os.path.dirname(os.path.realpath(base.BIN)), "lib", "usage.py")
-        )
+        loader = importlib.machinery.SourceFileLoader("usage_t", str(base.staged() / "lib" / "usage.py"))
         spec = importlib.util.spec_from_loader("usage_t", loader)
         usage = importlib.util.module_from_spec(spec)
         loader.exec_module(usage)
@@ -117,12 +112,10 @@ class Coach(unittest.TestCase):
             with open(os.path.join(ustate, "spool", name)) as fh:
                 rows += [json.loads(x) for x in fh if x.strip()]
         rows = [r for r in rows if r.get("f") == "gym.recap" and r.get("k") == "exec"]
-        self.assertEqual(len(rows), 6)
+        assert len(rows) == 6
         for r in rows:
-            self.assertIn(r.get("o") or "ok", usage.OK_OUT, r)
-        self.assertEqual(
-            [(r.get("at") or {}).get("state") for r in rows], ["init", "pending", "note", "none", "old", "none"]
-        )
+            assert (r.get("o") or "ok") in usage.OK_OUT, r
+        assert [(r.get("at") or {}).get("state") for r in rows] == ["init", "pending", "note", "none", "old", "none"]
 
     def add_set_to_last(self):
         lid = self.conn.execute("SELECT MAX(id) FROM exercise_logs").fetchone()[0]
@@ -146,10 +139,10 @@ def _png(path, w=10, h=10):
         f.write(chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
-class TgCmdGym(unittest.TestCase):
+class TestTgCmdGym:
     """tg-cmd /gym WORD with a fake gym (prints its argv; --card writes a PNG)."""
 
-    def setUp(self):
+    def setup_method(self):
         import tempfile
 
         self.tmp = tempfile.TemporaryDirectory()
@@ -166,27 +159,25 @@ class TgCmdGym(unittest.TestCase):
         self.env = dict(os.environ, TG_CMD_BIN=d, TG_CMD_TEST="1", USAGE="off")
         self.env.pop("TG_CMD_PICTURES", None)
 
-    def tearDown(self):
+    def teardown_method(self):
         self.tmp.cleanup()
 
     def run_tg(self, *args, pictures=False):
         env = dict(self.env, **({"TG_CMD_PICTURES": "1"} if pictures else {}))
-        return subprocess.run([sys.executable, TGCMD, *args], env=env, capture_output=True, text=True, timeout=60)
+        return subprocess.run(
+            [sys.executable, str(base.staged() / "tg-cmd"), *args], env=env, capture_output=True, text=True, timeout=60
+        )
 
     def test_words(self):
-        self.assertIn("📈 fake plan next", self.run_tg("gym").stdout)
-        self.assertIn("📈 fake recap", self.run_tg("gym", "last").stdout)
-        self.assertIn("📈 fake recap", self.run_tg("gym", "recap").stdout)
+        assert "📈 fake plan next" in self.run_tg("gym").stdout
+        assert "📈 fake recap" in self.run_tg("gym", "last").stdout
+        assert "📈 fake recap" in self.run_tg("gym", "recap").stdout
         hint = self.run_tg("gym", "zumba")
-        self.assertEqual(hint.returncode, 0)
-        self.assertIn("/gym recap", hint.stdout)
+        assert hint.returncode == 0
+        assert "/gym recap" in hint.stdout
         if os.path.exists(self.log):  # the fake gym never ran for it
             with open(self.log) as fh:
-                self.assertNotIn("zumba", fh.read())
-        self.assertEqual(self.run_tg("gym", "a", "b").returncode, 2)
-        self.assertIn("📈 fake recap", self.run_tg("gym", "last", pictures=True).stdout)  # text, no photo JSON
-        self.assertIn("/gym ", self.run_tg("--list").stdout)  # its text argument lives in the tools registry
-
-
-if __name__ == "__main__":
-    unittest.main()
+                assert "zumba" not in fh.read()
+        assert self.run_tg("gym", "a", "b").returncode == 2
+        assert "📈 fake recap" in self.run_tg("gym", "last", pictures=True).stdout  # text, no photo JSON
+        assert "/gym " in self.run_tg("--list").stdout  # its text argument lives in the tools registry

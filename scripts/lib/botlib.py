@@ -3,7 +3,7 @@ Import:  sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file
 Thin layer over the harness core (~/bin/lib/core, repo ~/opt/assistant): atomic_write / save_json /
 load_json / write_inbox delegate to core.jsonstate and core.notes (atomic + fsync; a replaced file keeps its mode);
 send_tg and lockdown_mode live here. Without an importable core (a copy outside ~/bin) the local fallback bodies run.
-New code imports core directly. Tests: ~/opt/botlib-tests/run.sh (BOTLIB_PATH=/copy/botlib.py tests a copy)."""
+New code imports core directly. Tests: tests/core/test_botlib.py."""
 
 import json
 import os
