@@ -18,6 +18,9 @@ mk() { python3 "$HERE/mk.py" "$FAKE_DIR" "$@"; }
 posts() { [ -f "$FAKE_DIR/posts.jsonl" ] && grep -c "$1" "$FAKE_DIR/posts.jsonl" || echo 0; }
 st() { python3 -c "import json,sys; d=json.load(open('$T/state/state.json')); print(eval(sys.argv[1]))" "$1"; }
 NIGHT=1793232000   # 2026-10-29 00:00 UTC (the fake media module has no zone: UTC)
+# every call runs on this pinned clock unless a step sets its own: none reads the wall clock (31.10: an unpinned
+#   --run's follow, 48 h after the fixture's 00:40 grab, marked movie 1 lost before section 4 could import it)
+export MEDIA_REMUX_NOW=$NIGHT
 
 # 1 plan: picks, kept rejections, profile Best / too new / not a remux never listed; read-only
 mk base
@@ -68,7 +71,7 @@ ok $? "no fitting release -> no-release, no grab"
 ok $? "1080p-only movie kept (no-release), its 1080p release never grabbed"
 ! grep -q '"guid": "hd' "$FAKE_DIR/posts.jsonl"; ok $? "no 1080p grab at all"
 grep -q '"movieId": 3' "$FAKE_DIR/posts.jsonl"; [ $? = 1 ]; ok $? "Best never grabbed"
-"$BIN" --run --max 1 --movie 3 >"$T/out" 2>&1; grep -q 'profile Best: never touched' "$T/out"; ok $? "--movie on Best refused"
+MEDIA_REMUX_NOW=$((NIGHT + 6000)) "$BIN" --run --max 1 --movie 3 >"$T/out" 2>&1; grep -q 'profile Best: never touched' "$T/out"; ok $? "--movie on Best refused"
 MEDIA_REMUX_NOW=$((NIGHT + 6000)) "$BIN" --run --max 1 --movie 2 >"$T/out" 2>&1
 grep -q 'grabbed 0' "$T/out" && [ "$(posts 'api/v3/release')" = 1 ]; ok $? "--movie on a 1080p-only movie grabs nothing"
 # a grab made before the 2160p HDR rule (29.10) is still followed: Old Drama's 1080p pick, blocked as not an upgrade
