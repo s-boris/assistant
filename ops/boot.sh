@@ -21,6 +21,10 @@ apti() {
   sudo DEBIAN_FRONTEND=noninteractive apt-get $apt_o install -y -qq "$@" >/dev/null 2>&1
 }
 
+# A rebuilt image may ship a ca-certificates older than bookworm-security's (deb12u2 drops the compromised
+# emSign ECC Root CA - G3): upgrade it whenever that root is still trusted.
+[ -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem ] && apti ca-certificates
+
 # Restart cause (~/bin/restart-cause): ONE ~/inbox note per container start that wasn't a deliberate `restart`, with
 # what restarted (container, host) and a cause guess from read-only server verbs. First, so a slow boot
 # (apt reinstalls after a rebuild) doesn't push it past its 15-min window; backgrounded (needs the network).

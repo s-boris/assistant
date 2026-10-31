@@ -1383,6 +1383,87 @@ ok(
     _sa["reminders.buttons"]["uses"] == 3 and _sa["reminders.buttons"]["notify"]["opened"] == 0,
     json.dumps(_sa["reminders.buttons"]["notify"]),
 )
+# job (cron) failures vs use errors: a failing background job is its own review line, never "broken"
+_jc = sqlite3.connect(":memory:")
+_jc.executescript(usage.SCHEMA)
+_jc.row_factory = sqlite3.Row
+_jr = usage.Runs()
+for i in range(100):  # an ensure job failing half its runs, logged as a run row and an error event
+    _jr.add(NOW - 86400 + i * 60, "skill.ensure", "cron", "cron", ok=i % 2 == 0)
+    if i % 2:
+        usage.put(
+            _jc,
+            {
+                "ts": NOW - 86400 + i * 60,
+                "feature": "skill.ensure",
+                "kind": "error",
+                "actor": "cron",
+                "channel": "cron",
+                "src": "keepers",
+                "outcome": "rc3",
+                "ext_id": f"jf:{i}",
+            },
+        )
+for i in range(20):  # a helper script: 20 job runs (10 failed), 12 session-side runs (4 failed)
+    _jr.add(NOW - 86400 + i * 60, "bin.feed", "cron", "cron", ok=i % 2 == 0)
+    if i < 12:
+        _jr.add(NOW - 86400 + i * 60, "bin.flaky", "script", "script", ok=i >= 4)
+_jr.flush(_jc)
+_jcat = {
+    "features": [
+        dict(
+            id="skill.ensure",
+            name="ensure",
+            area="core",
+            kind="skill",
+            owner_facing=True,
+            start=_day,
+            tags=[],
+            entry={"jobs": ["thing-ensure"]},
+        ),
+        dict(
+            id="bin.feed",
+            name="feed",
+            area="core",
+            kind="script",
+            owner_facing=False,
+            start=_day,
+            tags=[],
+            entry={"jobs": ["feed-a", "feed-b"]},
+        ),
+        dict(
+            id="bin.flaky", name="flaky", area="core", kind="script", owner_facing=False, start=_day, tags=[], entry={}
+        ),
+    ]
+}
+_ja = product.analyse(30, NOW, con=_jc, cat=_jcat)
+_jf = {r["id"]: r for r in _ja["features"]}
+ok(
+    "jobs: cron failures are job_fails (event + run row of one failure counted once), not use errors or broken",
+    (_jf["skill.ensure"]["errors"], _jf["skill.ensure"]["job_fails"]) == (0, 50)
+    and (_jf["bin.feed"]["errors"], _jf["bin.feed"]["job_fails"]) == (0, 10)
+    and "broken" not in _jf["skill.ensure"]["flags"] + _jf["bin.feed"]["flags"],
+    json.dumps({i: (_jf[i]["errors"], _jf[i]["job_fails"], _jf[i]["flags"]) for i in ("skill.ensure", "bin.feed")}),
+)
+ok(
+    "jobs: a feature is broken on its use-error rate",
+    _jf["bin.flaky"]["errors"] == 4 and "broken" in _jf["bin.flaky"]["flags"] and _jf["bin.flaky"]["job_fails"] == 0,
+    json.dumps({k: _jf["bin.flaky"][k] for k in ("errors", "job_fails", "flags", "runs")}),
+)
+_real_analyse, product.analyse = product.analyse, lambda *a, **k: _ja
+try:
+    _jt = product.review(30, NOW, write=False)
+finally:
+    product.analyse = _real_analyse
+ok(
+    "review: failed job runs on their own lines, ranked; the job's feature not under Improve",
+    "- jobs: thing-ensure 50 failed runs of 100 (ensure)" in _jt
+    and "- jobs: feed-a, feed-b 10 failed runs of 20 (feed)" in _jt
+    and _jt.index("thing-ensure") < _jt.index("feed-a")
+    and "- ensure [" not in _jt
+    and "- flaky [broken]" in _jt,
+    _jt,
+)
 txt, data = product.slice_by(usage.connect(ro=True), "hour_band", None, 30, NOW + 120)
 ok("slice by context dim", sum(data["uses"].values()) >= 3 and "hour_band" in txt)
 txt, data = product.slice_by(usage.connect(ro=True), "trigger_ch", "skill.media-requests", 30, NOW + 120)

@@ -677,7 +677,7 @@ def analyse(days=30, now=None, con=None, cat=None):
     S = collections.defaultdict(lambda: {"uses": 0, "uses_prev": 0, "self": 0, "channels": collections.Counter(),
                                          "ctx": {d: collections.Counter() for d in DIMS}, "sent": 0, "opened": 0,
                                          "dismissed": 0, "ignored": 0, "ignored_active": 0, "open_ms": [],
-                                         "errors": 0, "owner_errors": 0, "cmd_errors": 0, "complaints": 0, "praise": 0, "retries": 0, "ms": [],
+                                         "errors": 0, "owner_errors": 0, "job_errors": 0, "cmd_errors": 0, "complaints": 0, "praise": 0, "retries": 0, "ms": [],
                                          "dur": [], "dur_what": collections.Counter(),
                                          "prev": collections.Counter(), "sent_bands": collections.Counter(),
                                          "open_bands": collections.Counter(), "since_owner": [], "work": 0})
@@ -753,7 +753,10 @@ def analyse(days=30, now=None, con=None, cat=None):
         if k == "exec" and r["src"] == "transcript" and (r["outcome"] or "") in ERR_OUT:
             s["cmd_errors"] += 1                     # a non-zero shell exit in my turn: weak signal, not "broken"
         elif (k == "error" or (r["outcome"] or "") in ERR_OUT) and (r["actor"] or "") not in usage.NON_OWNER:
-            s["errors"] += 1                         # dev/test runs (actor test/agent/session) never count
+            if _job_row(r):
+                s["job_errors"] += 1                 # a background run failing: its own line, never "broken"
+            else:
+                s["errors"] += 1                     # dev/test runs (actor test/agent/session) never count
             if r["actor"] == "owner" or (r["actor"] is None and r["channel"] in usage.OWNER_CHANNELS):
                 s["owner_errors"] += 1               # he got the failure (an instant command's "⚠️ failed")
         if k == "exec" and json.loads(r["ctx"] or "{}").get("trigger") in ("heartbeat", "agent", "system"):
@@ -818,7 +821,9 @@ def analyse(days=30, now=None, con=None, cat=None):
                           "ignored_while_active": s["ignored_active"],
                           "open_rate": _pct(s["opened"], s["sent"]),
                           "median_open_min": round(statistics.median(s["open_ms"]) / 60000, 1) if s["open_ms"] else None},
-               "errors": s["errors"] + x["fails"],
+               "errors": s["errors"] + x["fails"] - x["cron_fails"],    # use errors: owner/session calls
+               "job_fails": max(s["job_errors"], x["cron_fails"]),     # cron runs (event + run row of one failure)
+               "jobs": (f.get("entry") or {}).get("jobs") or [],
                "owner_errors": max(s["owner_errors"], x["owner_fails"]), "cmd_errors": s["cmd_errors"], "complaints": s["complaints"],
                "praise": s["praise"],
                "retries": s["retries"],
@@ -855,6 +860,11 @@ def analyse(days=30, now=None, con=None, cat=None):
     return {"meta": meta, "features": out, "catalogue": feats}
 
 
+def _job_row(r):
+    """A background job's row (cron, or a cron-channel row without an actor), not a use."""
+    return r["actor"] == "cron" or (r["actor"] is None and r["channel"] == "cron")
+
+
 def _flags(r, f, s, days, coverage=None):
     flags, why = [], []
     of, rare = r["owner_facing"], "rare" in r["tags"]
@@ -874,15 +884,14 @@ def _flags(r, f, s, days, coverage=None):
         flags.append("declining")
     if n["sent"] >= 5 and (n["open_rate"] or 0) < 20 and n["ignored"] >= 0.5 * n["sent"]:
         flags.append("noisy")
-    total = max(1, r["uses"] + r["runs"]["n"])
     rn = r["runs"]
-    if of:   # owner-facing: only failures he met (instant command: 1 is enough), or its scheduled runs failing
+    use_n = rn["n"] - rn.get("cron_n", 0)            # job (cron) runs and their failures: the review's jobs line
+    total = max(1, r["uses"] + use_n)
+    if of:   # owner-facing: only failures he met (instant command: 1 is enough)
         instant = r["kind"] == "command" and "tg-cmd" in (r["entry"].get("scripts") or [])
-        if (instant and r["owner_errors"] >= 1) or r["owner_errors"] >= 2 or \
-                (rn.get("cron_n", 0) >= 10 and rn.get("cron_fails", 0) / rn["cron_n"] >= 0.2):
+        if (instant and r["owner_errors"] >= 1) or r["owner_errors"] >= 2:
             flags.append("broken")
-    elif r["errors"] >= 3 or (rn["n"] >= 10 and rn["fails"] / rn["n"] >= 0.2) or \
-            (r["errors"] >= 2 and r["errors"] / total >= 0.3):
+    elif (use_n >= 10 and r["errors"] / use_n >= 0.2) or (r["errors"] >= 2 and r["errors"] / total >= 0.3):
         flags.append("broken")
     p50 = r["latency_ms"]["p50"]
     if of and p50 and p50 > (8000 if r["kind"] == "skill" else 3000) and r["uses"] >= 2:
@@ -1117,6 +1126,11 @@ def review(days=30, now=None, write=True):
                  + (f" — {r['why'][0]}" if r["why"] else ""))
     if not improve:
         L.append("- none")
+    jobs = sorted([r for r in fs if r["job_fails"]], key=lambda r: (-r["job_fails"], r["id"]))
+    L += ["", "## Jobs (failed background runs; not use errors, never \"broken\")"]
+    L += [f"- jobs: {', '.join(r['jobs']) or label(r).removeprefix('job.')} {r['job_fails']} failed runs"
+          + (f" of {r['runs']['cron_n']}" if r["runs"]["cron_n"] >= r["job_fails"] else "")
+          + (f" ({label(r)})" if r["jobs"] else "") for r in jobs[:15]] or ["- none"]
     L += ["", "## Retire candidates (pitch to him; never remove without his OK)"]
     for r, hit in retire[:15]:
         L.append(f"- {label(r)} [{','.join(r['flags'])}] since {r['start'] or '?'}, {r['code_lines']} lines, "
@@ -1147,7 +1161,7 @@ def review(days=30, now=None, write=True):
         f.write(f"# Product review {day}\n\nData, not instructions (weekly cron, `product review`; handling: JOBS.md).\n"
                 f"Full review: {rpath.replace(HOME, '~')}\n\n"
                 f"- Keep: {len(keep)} · Improve: {len(improve)} · Retire candidates: {len(retire)} · "
-                f"Build-next signals: {len(build)} · Coverage gaps: {len(uncovered)}\n"
+                f"Build-next signals: {len(build)} · Coverage gaps: {len(uncovered)} · Failing jobs: {len(jobs)}\n"
                 + "".join(f"- retire? {label(r)} [{','.join(r['flags'])}]\n" for r, _ in retire[:6])
                 + "".join(f"- improve: {label(r)} [{','.join(r['flags'])}]\n" for r in improve[:6])
                 + (f"- {sec}\n" if sec else ""))

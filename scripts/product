@@ -5,12 +5,12 @@ Lib: ~/bin/lib/product.py (catalogue sources, flags, hypotheses); events: `usage
   product catalogue [build|show|check] [--json]   build = regenerate ~/.config/product/features.json (cron nightly);
         show = features per area; check = owner-facing features with no events yet + event ids not in the catalogue
   product report [--days 30] [--json] [--all] [--feature ID] [--by DIM]
-        per feature: uses, trend, last use, channel/context mix, notifications sent/opened/ignored, errors,
-        complaints, retries, latency, runs/day, code lines, flags (unused untried stopped declining noisy broken
-        slow friction) + why-not-used hypotheses. --by DIM slices uses by any context dimension or column
-        (hour_band weekend zone driving event office_day screen batt net dnd car buds alarm_in tv lights trigger
-        modality channel hour dow …).
-  product review [--cron] [--dry-run] [--days 30]   weekly keep / improve / retire / build-next with evidence ->
+        per feature: uses, trend, last use, channel/context mix, notifications sent/opened/ignored, use errors,
+        failed job runs (cron; never "broken"), complaints, retries, latency, runs/day, code lines, flags (unused
+        untried stopped declining noisy broken slow friction) + why-not-used hypotheses. --by DIM slices uses by
+        any context dimension or column (hour_band weekend zone driving event office_day screen batt net dnd car
+        buds alarm_in tv lights trigger modality channel hour dow …).
+  product review [--cron] [--dry-run] [--days 30]   weekly keep / improve / jobs / retire / build-next with evidence ->
         ~/reports/product/review-DATE.md + ~/inbox/product-review-DATE.md (handling: JOBS.md)
   product card [--days 30]   the /usage answer (<= 10 lines)
 """
