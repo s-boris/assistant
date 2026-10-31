@@ -1,20 +1,26 @@
 """train-watch's timetable sources: transport.opendata.ch and the timetable.search.ch fallback read into one internal
 shape, and the switch (an opendata error payload, a non-2xx status, a timeout or junk -> search.ch, opendata asked
-once per run, the answering source logged).
+once per run, the answering source logged); Belgian legs and stations opendata resolves elsewhere go to iRail, and a
+station no source resolves right is "can't watch", never "cancelled".
 
 Fixtures (fixtures/): search.ch route.json answers and opendata's router-outage payload recorded live; opendata's
 /connections built to its documented shape for the same two trips (the API was down when the others were recorded).
+iRail: /connections Antwerpen-Centraal -> Brussels Airport recorded live (intermediate stops trimmed) and its
+unknown-stop answer; opendata's answer for the same trip (it resolves "Brussels Airport" to Schiphol Airport).
 scripts/train-watch is loaded from the repo (its sources: core.transport); HTTP goes through a stub of core.http's
 open, so no network."""
 
 from __future__ import annotations
 
+import argparse
 import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import sys
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -37,6 +43,7 @@ def tw(tmp_path, monkeypatch):
         "ASSISTANT_PROFILE": str(prof),
         "TRAIN_WATCH_API": "https://opendata.test/v1",
         "TRAIN_WATCH_FALLBACK_API": "https://searchch.test/api",
+        "TRAIN_WATCH_IRAIL_API": "https://irail.test/v1",
         "TRAIN_WATCH_DIR": str(tmp_path / "state"),
         "TRAIN_WATCH_INBOX": str(tmp_path / "inbox"),
         "HOME_PLACE_GEO": "off",
@@ -61,21 +68,26 @@ class Net:
         self.answers = answers
         tw.transport.http.open = self.open
 
+    @staticmethod
+    def host(url):
+        return next((h for h in ("opendata", "irail") if f"{h}.test" in url), "searchch")
+
     def open(self, url, headers=None, timeout=None):
         self.urls.append(url)
         assert timeout == 25 and headers and "User-Agent" in headers
-        kind, payload = self.answers["opendata" if "opendata.test" in url else "searchch"]
+        kind, payload = self.answers[self.host(url)]
         body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         if kind == "ok":
             return io.BytesIO(body)
-        if kind == "http":
-            raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, io.BytesIO(body))  # type: ignore[arg-type]
+        if kind.startswith("http"):  # "http" = 503, "http400" = that status
+            code = int(kind[4:] or 503)
+            raise urllib.error.HTTPError(url, code, "Error", {}, io.BytesIO(body))  # type: ignore[arg-type]
         if kind == "timeout":
             raise TimeoutError("timed out")
         raise AssertionError(kind)
 
     def hosts(self):
-        return ["opendata" if "opendata.test" in u else "searchch" for u in self.urls]
+        return [self.host(u) for u in self.urls]
 
 
 def at(tw, hhmm, day="2026-10-30"):
@@ -302,3 +314,149 @@ def test_fallback_keeps_the_planned_slow_train(tw):
     }
     c = tw.match(g, tw.connections(g, tw.iso(g["dep"]), 4))
     assert c and c["lines"] == ["IR16"] and c["ddelay"] == 1
+
+
+# ------------------------------------------------------------------------------------------------ iRail (Belgium)
+BE_LEG = {
+    "id": "be000001",
+    "from": "Antwerpen-Centraal",
+    "to": "Brussels Airport",
+    "dep": "2026-11-12T08:49:00+01:00",
+    "arr": "2026-11-12T09:19:00+01:00",
+    "lines": [],
+    "title": "Antwerpen-Centraal → Brussels Airport",
+    "source": "calendar",
+}
+
+
+def irail(**changes):
+    """The recorded iRail answer; changes = {"<connection index>.<departure|arrival>.<field>": value}."""
+    data = fixture("irail-connections.json")
+    for path, v in changes.items():
+        i, end, field = path.split(".")
+        if field == "platform":
+            data["connection"][int(i)][end]["platforminfo"] = {"name": v, "normal": "0"}
+        else:
+            data["connection"][int(i)][end][field] = v
+    return data
+
+
+def belgian_net(tw, irail_answer=None, opendata=None):
+    return Net(
+        tw,
+        opendata=opendata or ("ok", fixture("opendata-schiphol.json")),
+        irail=irail_answer or ("ok", irail()),
+        searchch=("ok", {}),
+    )
+
+
+def test_irail_maps_to_the_internal_shape(tw):
+    rows = conns(tw, tw.transport.irail_connections(irail()))
+    got = [view(c) for c in rows]
+    assert [(c["sdep"][11:16], c["sarr"][11:16], c["lines"]) for c in got] == [
+        ("08:19", "08:49", ["EC"]),
+        ("08:49", "09:19", ["IC"]),
+        ("08:54", "09:47", ["IC", "IC"]),
+    ]
+    assert got[0]["sdep"].endswith("+01:00")
+    assert got[2]["rides"] == [
+        ("IC", "Antwerp-Central", "Brussels-North", "24", "", 0, 0, False, False, False),
+        ("IC", "Brussels-North", "Brussels Airport - Zaventem", "6", "", 0, 0, False, False, False),
+    ]
+    assert not any(c["cancelled"] for c in got)
+
+
+def test_schiphol_mismatch_goes_to_irail_and_the_leg_is_on_time(tw):
+    """opendata resolves "Brussels Airport" to Schiphol Airport and finds nothing: iRail has the planned train."""
+    net = belgian_net(tw)
+    st: dict = {"noted": []}
+    found, c, missing = tw.assess(BE_LEG, at(tw, "07:00", "2026-11-12"), st, live=False)
+    assert (found, missing) == ([], False)
+    assert c["sdep"] == at(tw, "08:49", "2026-11-12") and c["lines"] == ["IC"] and c["rides"][0]["platform"] == "23"
+    assert net.hosts() == ["opendata", "irail"]
+    u = urllib.parse.urlsplit(net.urls[1])
+    assert u.path == "/v1/connections/"
+    q = dict(urllib.parse.parse_qsl(u.query))
+    assert q == {"from": "Antwerpen-Centraal", "to": "Brussels Airport", "date": "121126", "time": "0849",
+                 "timesel": "departure", "results": "4", "format": "json", "lang": "en"}  # fmt: skip
+    tw.connections(BE_LEG, at(tw, "08:09", "2026-11-12"), 6)  # the alternative's lookup: iRail straight away
+    assert net.hosts() == ["opendata", "irail", "irail"]
+    assert (Path(tw.DIR) / "sources.log").read_text(encoding="utf-8").count(" irail") == 1
+
+
+def test_irail_delay_and_platform_change(tw):
+    late = {"1.departure.delay": "420", "1.arrival.delay": "300", "1.departure.platform": "21"}  # seconds
+    belgian_net(tw, ("ok", irail(**late)))
+    found, c, _ = tw.assess(BE_LEG, at(tw, "08:20", "2026-11-12"), {"noted": []})
+    keys = [k for k, _ in found]
+    assert keys == ["delay5", "platform:Antwerp-Central:21"]
+    assert (c["ddelay"], c["adelay"], c["dep"]) == (7, 5, at(tw, "08:56", "2026-11-12"))
+    assert "leaves 08:56 (+7 min), arrives 09:24 (+5 min)" in found[0][1]
+
+
+def test_irail_cancelled(tw):
+    belgian_net(tw, ("ok", irail(**{"1.departure.canceled": "1"})))
+    found, c, missing = tw.assess(BE_LEG, at(tw, "08:20", "2026-11-12"), {"noted": []})
+    assert c["cancelled"] and not missing
+    assert found[0] == ("cancelled", "cancelled: IC 08:49 from Antwerp-Central")
+
+
+def test_belgian_stops_on_opendata_go_to_irail(tw):
+    od = fixture("opendata-schiphol.json")
+    od["to"] = {"id": "8819406", "name": "Brussels Airport"}  # resolved right, but Belgian: iRail is live there
+    net = belgian_net(tw, opendata=("ok", od))
+    found, c, _ = tw.assess(BE_LEG, at(tw, "07:00", "2026-11-12"), {"noted": []}, live=False)
+    assert not found and c["lines"] == ["IC"] and net.hosts() == ["opendata", "irail"]
+
+
+def test_belgian_stop_unknown_on_irail_stays_on_opendata(tw):
+    od = fixture("opendata-connections.json")
+    od["from"], od["to"] = {"id": "8821006", "name": "Bern"}, {"id": "8503000", "name": "Zürich HB"}
+    net = belgian_net(tw, ("http400", fixture("irail-unknown-stop.json")), ("ok", od))
+    rows = tw.connections({"from": "Bern", "to": "Zürich HB"}, at(tw, "17:36"), 4)
+    assert [c["lines"] for c in rows] == [["IR16"], ["EC", "IC5"]]
+    assert net.hosts() == ["opendata", "irail"]
+
+
+@pytest.mark.parametrize(
+    "irail_answer, why",
+    [
+        (("http400", fixture("irail-unknown-stop.json")), "no source knows the stations (Brussels Airport → Schiphol"),
+        (("ok", irail()), "stations resolve elsewhere (Liège-Guillemins → Brussels Airport - Zaventem)"),
+    ],
+    ids=["unknown-on-irail", "elsewhere-on-irail"],
+)
+def test_station_mismatch_is_cant_watch_never_cancelled(tw, capsys, irail_answer, why):
+    leg = dict(BE_LEG, to="Brussels Airport" if irail_answer[0] != "ok" else "Liège-Guillemins")
+    belgian_net(tw, irail_answer)  # opendata: Schiphol Airport either way
+    with pytest.raises(tw.Unwatchable, match=re.escape(why)):
+        tw.assess(leg, at(tw, "08:40", "2026-11-12"), {"noted": []})
+    # check: silent, no note, no miss counted; status: "can't watch", no problems
+    now = at(tw, "08:40", "2026-11-12")
+    tw.legs_save([leg], now)
+    tw._ROUTE.clear()
+    assert tw.cmd_check(argparse.Namespace(cron=True, dry_run=False, now=None), now) == 0
+    assert capsys.readouterr().out == ""
+    assert not list(Path(tw.INBOX).glob("*"))
+    st = json.loads((Path(tw.DIR) / "state.json").read_text(encoding="utf-8"))["legs"][leg["id"]]
+    assert st.get("miss", 0) == 0 and st["noted"] == []
+    assert tw.cmd_status(argparse.Namespace(id=leg["id"], json=True, now=None), now) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert (out["watch"], out["fine"], out["problems"], out["live"]) == (False, None, [], None)
+    assert why in out["why"]
+
+
+@pytest.mark.parametrize(
+    "asked, got, same",
+    [
+        ("Brussels Airport", {"name": "Schiphol Airport"}, False),
+        ("Leuven", {"name": "Leuk"}, False),
+        ("Brussels Airport", {"name": "Brussels Airport - Zaventem"}, True),
+        ("Antwerpen-Centraal", {"name": "Antwerp-Central", "standardname": "Antwerpen-Centraal"}, True),
+        ("Geneva", {"name": "Genève"}, True),
+        ("Zuerich HB", {"name": "Zürich HB"}, True),
+        ("Airport", {"name": "Schiphol Airport"}, True),  # noise words alone: can't tell
+    ],
+)
+def test_same_place(tw, asked, got, same):
+    assert tw.same_place(asked, got) is same

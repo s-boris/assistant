@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""train-watch: silent live watch of the owner's planned train legs (transport.opendata.ch, else search.ch; read-only).
+"""train-watch: silent live watch of the owner's planned train legs (opendata, else search.ch; Belgium: iRail).
 
   train-watch sync FILE|- [FILE ...]   import the 🚆 events from saved Google Calendar list_events JSON (the MCP
                                        result; a page object with "events" or "items", a list of pages, or a list
@@ -14,8 +14,9 @@
   train-watch rm ID
   train-watch check [--cron] [--dry-run] [--now ISO]
   train-watch status ID [--json] [--now ISO]  live verdict for one leg at any time; writes no note and no state
-                                       (--json: {id, from, to, dep, arr, lines, fine, live, problems, alt}; live/alt
-                                       = {dep, arr, delay, cancelled, lines, platform, changes, text[, link]} or null)
+                                       (--json: {id, from, to, dep, arr, lines, watch, fine, live, problems,
+                                       alt}; live/alt = {dep, arr, delay, cancelled, lines, platform, changes,
+                                       text[, link]} or null; a leg it can't watch: watch false, why, fine null)
 
 Legs: ~/.local/state/trains/legs.json ({"legs": [{id, from, to, dep, arr, lines, title, source, event_id}]};
 stations are exact stop names, from the SBB link in a 🚆 event's description, else from its "A → B" title).
@@ -53,18 +54,27 @@ show_delays, show_trackchanges, pre=2, rows from 5 min before the asked time kep
 A failed opendata is not asked again in that run (one request per lookup). Which source answered:
 ~/.local/state/trains/sources.log (one line per source and run; a fallback is also said on stderr outside --cron).
 Both failing = the transport API error below.
+Belgium and stations opendata gets wrong: opendata names the stops it resolved (core.transport Client.ends). A leg
+with a Belgian stop (UIC id 88…) or an end resolved to another place (no shared place word, spelling variants
+allowed: "Brussels Airport" -> Schiphol Airport, "Leuven" -> Leuk) or to nothing goes to iRail (api.irail.be
+/connections, Belgian rail with live delays, cancellations and platforms, mapped to the opendata shape) and is
+watched the same way. A stop iRail doesn't know either, or one iRail resolves elsewhere too: the leg can't be
+watched, silently (check: no note, no miss counted, "ID: can't watch (why)" outside --cron; status: "Status: can't watch").
+A wrong station never reads as "cancelled". A Belgian stop iRail doesn't know (opendata resolved it right): opendata.
 Env (tests): TRAIN_WATCH_API (else ROUTE_API, else transport.opendata.ch), TRAIN_WATCH_FALLBACK_API (else
-timetable.search.ch/api), TRAIN_WATCH_DIR, TRAIN_WATCH_INBOX, TRAIN_WATCH_NOW (ISO), TRAIN_WATCH_WINDOW (minutes,
-default 180), CALCACHE_DIR (calcache's cache dir).
+timetable.search.ch/api), TRAIN_WATCH_IRAIL_API (else api.irail.be/v1), TRAIN_WATCH_DIR, TRAIN_WATCH_INBOX,
+TRAIN_WATCH_NOW (ISO), TRAIN_WATCH_WINDOW (minutes, default 180), CALCACHE_DIR (calcache's cache dir).
 """
 import argparse
 import datetime as dt
+import difflib
 import hashlib
 import json
 import os
 import pwd
 import re
 import sys
+import unicodedata
 import urllib.parse
 
 _here = os.path.dirname(os.path.realpath(__file__))
@@ -83,11 +93,13 @@ import livecount  # noqa: E402
 HOME_DIR = os.path.expanduser('~')
 API = os.environ.get('TRAIN_WATCH_API') or os.environ.get('ROUTE_API') or 'https://transport.opendata.ch/v1'
 FALLBACK_API = os.environ.get('TRAIN_WATCH_FALLBACK_API') or 'https://timetable.search.ch/api'
+IRAIL_API = os.environ.get('TRAIN_WATCH_IRAIL_API') or 'https://api.irail.be/v1'
 DIR = os.environ.get('TRAIN_WATCH_DIR') or f'{HOME_DIR}/.local/state/trains'
 INBOX = os.environ.get('TRAIN_WATCH_INBOX') or f'{HOME_DIR}/inbox'
 LEGS_F, STATE_F, LOCK_F, SOURCES_F = (os.path.join(DIR, n) for n in ('legs.json', 'state.json', '.lock',
                                                                      'sources.log'))
 _CLIENT = {}                                # the run's core.transport client (a failed opendata: not asked again)
+_ROUTE = {}                                 # (from, to) -> None (opendata) or [wrong ends] (iRail) per run
 SOURCES_SEEN = set()                        # sources already logged in this run
 CRON = False                                # check --cron: no stderr chatter
 CALCACHE_F = os.path.join(os.environ.get('CALCACHE_DIR') or f'{HOME_DIR}/.local/state/calcache', 'events.json')
@@ -101,10 +113,19 @@ LATER_STOP = dt.timedelta(minutes=30)      # match by arrival: the stop may be t
 REACH = dt.timedelta(minutes=3)             # an alternative must leave at least this far from now
 ROUTE_SLACK = dt.timedelta(minutes=5)       # same planned train, another way to/from it: this much off at the ends
 TRAIN_ICON = '\U0001F686'
+BELGIUM = '88'                              # UIC country code of a stop id: these legs go to iRail
+NAME_NOISE = {'airport', 'aeroport', 'aeroporto', 'flughafen', 'station', 'bahnhof', 'gare', 'stazione', 'hb', 'hbf',
+              'bf', 'sbb', 'cff', 'ffs', 'centraal', 'central', 'centrale', 'centre', 'zentrum', 'city', 'main',
+              'nord', 'noord', 'north', 'sud', 'zuid', 'south', 'ost', 'oost', 'east', 'west', 'midi', 'the', 'de'}
 BUS_CATS = {'B', 'BN', 'BUS', 'NFB', 'KB', 'EXB', 'BP', 'EV'}
 TRAM_CATS = {'T', 'TN', 'TRAM'}
 LINE_RE = re.compile(r'(?i:\b(?:bus|tram)\s+[A-Z]?\d+[A-Z]?\b)|\b(?:SN|S|ICN|ICE|IC|IR|RE|R|EC|EN|NJ|TGV|RJX|RJ|PE)\d{1,4}\b')
 LINK_RE = re.compile(r'https://app\.sbbmobile\.ch/timetable\?[^\s)>\]]+')
+
+
+class Unwatchable(Exception):
+    """A leg no source can look up right: a station resolved to another place (another name, often another country)
+    or unknown everywhere. Silent: check writes no note and counts no miss, status says "can't watch"."""
 
 
 class Fail(Exception):
@@ -444,7 +465,8 @@ def source_log(src, why=''):
 
 def client():
     if 'c' not in _CLIENT:
-        _CLIENT['c'] = transport.Client(api=API, fallback=FALLBACK_API, ua=UA, timeout=25, on_source=source_log)
+        _CLIENT['c'] = transport.Client(api=API, fallback=FALLBACK_API, ua=UA, timeout=25, on_source=source_log,
+                                        irail=IRAIL_API)
     return _CLIENT['c']
 
 
@@ -519,8 +541,76 @@ def connection(c):
             'cancelled': flagged_cancel(c, c.get('from'), c.get('to')) or any(r['cancelled'] for r in rides)}
 
 
+def name_tokens(s):
+    s = unicodedata.normalize('NFKD', str(s or '').casefold()).encode('ascii', 'ignore').decode()
+    s = s.replace('ae', 'a').replace('oe', 'o').replace('ue', 'u')         # Zuerich = Zürich
+    return {w for w in re.findall(r'[a-z0-9]+', s) if len(w) >= 3 and w not in NAME_NOISE}
+
+
+def same_place(asked, got):
+    """Does the resolved stop `got` ({name[, standardname]}) stand for the asked name? A shared place word, spelling
+    variants included (Geneva/Genève, Antwerp/Antwerpen, Brussels/Bruxelles); Brussels Airport is not Schiphol
+    Airport, Leuven is not Leuk. An ask of noise words alone (just "Airport") can't be told: taken as the same."""
+    want = name_tokens(asked)
+    have = name_tokens(got.get('name')) | name_tokens(got.get('standardname'))
+    if not want:
+        return True
+    return any(a == b or difflib.SequenceMatcher(None, a, b).ratio() >= 0.7 for a in want for b in have)
+
+
+def wrong_ends(g, ends, unresolved=True):
+    """The leg's ends a source resolved to another place (home ends are coordinates: never; an end the source didn't
+    name: can't tell). unresolved: an end the source resolved to nothing (opendata: null) counts too."""
+    out = []
+    for k in ('from', 'to'):
+        if home_place.is_home(g[k]) or k not in (ends or {}):
+            continue
+        got = ends[k]
+        if (got is None and unresolved) or (got is not None and not same_place(g[k], got)):
+            out.append(f"{g[k]} → {got['name'] if got else 'no stop'}")
+    return out
+
+
+def belgian(ends):
+    return any(str((e or {}).get('id') or '').startswith(BELGIUM) for e in (ends or {}).values())
+
+
+def fetch_irail(frm, to, when, limit):
+    try:
+        return client().irail_connections(frm, to, when, limit)
+    except transport.TransportError as e:
+        if e.status in (400, 404):                        # a stop iRail doesn't know
+            raise Unwatchable(f'iRail: {e}') from None
+        raise Fail(f'iRail: {e}') from None
+
+
 def connections(g, when, limit):
-    rows = fetch_connections(home_place.query(g['from']), home_place.query(g['to']), when.astimezone(tz()), limit)
+    """The leg's live connections, from the source that knows its stations: opendata (search.ch when it fails);
+    iRail when a stop is Belgian (UIC 88) or opendata resolved a station to another place or to nothing (it has no
+    Brussels Airport: that name resolves to Schiphol). Unwatchable when no source resolves both ends right."""
+    frm, to, when = home_place.query(g['from']), home_place.query(g['to']), when.astimezone(tz())
+    key = (g['from'], g['to'])
+    rows = None
+    if key not in _ROUTE:
+        rows = fetch_connections(frm, to, when, limit)
+        ends = client().ends
+        wrong = wrong_ends(g, ends)
+        _ROUTE[key] = wrong if wrong or belgian(ends) else None
+    wrong = _ROUTE[key]
+    if wrong is not None:                                 # Belgian or misresolved on opendata: iRail
+        try:
+            irows = fetch_irail(frm, to, when, limit)
+        except Unwatchable:
+            if wrong:
+                raise Unwatchable(f"no source knows the stations ({'; '.join(wrong)})") from None
+            _ROUTE[key] = None                            # Belgian on opendata, unknown on iRail: opendata it is
+        else:
+            off = wrong_ends(g, client().ends, unresolved=False)
+            if off:
+                raise Unwatchable(f"stations resolve elsewhere ({'; '.join(off)})")
+            return [x for x in map(connection, irows) if x]
+    if rows is None:
+        rows = fetch_connections(frm, to, when, limit)
     return [x for x in map(connection, rows) if x]
 
 
@@ -744,6 +834,9 @@ def cmd_check(a, now):
             elif not a.cron:
                 print(f"{g['id']}: {'ok' if not found else 'known: ' + ', '.join(k for k, _ in found)}")
             st['last'] = now.isoformat()
+        except Unwatchable as e:                          # never "cancelled": nothing the watch can see
+            if not a.cron:
+                print(f"{g['id']}: can't watch ({e})")
         except Fail as e:
             errors += 1
             print(f"train-watch: {g['id']}: {e}", file=sys.stderr)
@@ -772,7 +865,7 @@ def status_json(g, found, c, now):
         if x and (c is None or c['cancelled'] or x['arr'] < c['arr']):
             alt = dict(conn_json(x), link=next((l[5:] for l in link(g, x, x['sdep'])), None))
     return {'id': g['id'], 'from': place(g['from']), 'to': place(g['to']), 'dep': g['dep'], 'arr': g.get('arr'),
-            'lines': g.get('lines') or [], 'fine': not found, 'live': conn_json(c),
+            'lines': g.get('lines') or [], 'watch': True, 'fine': not found, 'live': conn_json(c),
             'problems': [{'key': k, 'text': t} for k, t in found], 'alt': alt}
 
 
@@ -782,7 +875,17 @@ def cmd_status(a, now):
         die(f'no leg {a.id} (train-watch list)')
     st = dict(read_json(STATE_F, {'legs': {}}).get('legs', {}).get(g['id']) or {})
     try:
-        found, c, _missing = assess(g, now, st, live=False)
+        try:
+            found, c, _missing = assess(g, now, st, live=False)
+        except Unwatchable as e:
+            if a.json:
+                print(json.dumps({'id': g['id'], 'from': place(g['from']), 'to': place(g['to']), 'dep': g['dep'],
+                                  'arr': g.get('arr'), 'lines': g.get('lines') or [], 'watch': False, 'why': str(e),
+                                  'fine': None, 'live': None, 'problems': [], 'alt': None}, ensure_ascii=False))
+            else:
+                print(leg_head(g))
+                print(f"Status: can't watch ({e})")
+            return 0
         if a.json:
             print(json.dumps(status_json(g, found, c, now), ensure_ascii=False))
             return 0
