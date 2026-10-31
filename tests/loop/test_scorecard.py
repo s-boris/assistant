@@ -208,6 +208,7 @@ def test_spans_are_numbers_only_and_land_spans_move_the_cursor(src, monkeypatch)
     res = sc.compute()
     n = sc.spans(res, st, src["now"])
     assert sent[0][1][0]["name"] == "scorecard"
+    assert sent[0][1][0]["status"]["code"] != 2  # a regression is data, not a failed run
     attrs = sent[0][1][0]["attributes"]
     assert attrs and all(set(a["value"]) & {"intValue", "doubleValue"} for a in attrs)
     assert all(otlp.NUM_KEY_RE.match(a["key"]) for a in attrs)

@@ -263,6 +263,26 @@ def test_hub_mode_reads_a_list_over_the_cap_in_pages(world):
     assert all(vals["radarr"].encode() not in c["raw"] for c in Hub.seen)
 
 
+def test_a_list_that_needed_pages_asks_for_pages_at_once_next_time(world):
+    E, far, vals, home = world
+    E.set_mode("radarr", "hub")
+    Far.big = json.dumps(_big_list("x"), indent=2).encode()
+    url = far + "/api/v3/movie?includeX=true"
+    with E.open(url, "radarr", headers={"X-Api-Key": E.secret("radarr")}, timeout=60) as r:
+        first = json.load(r)
+    hints = json.loads((home / ".local" / "state" / "assistant" / "egress-paged.json").read_text())
+    assert list(hints) == ["radarr /api/v3/movie"]  # handle + path: no query, no value
+    n = len(Hub.seen)
+    with E.open(url, "radarr", headers={"X-Api-Key": E.secret("radarr")}, timeout=60) as r:
+        assert json.load(r) == first
+    calls = Hub.seen[n:]
+    assert calls and all("page" in c["body"] for c in calls)  # no unpaged read the hub refuses first
+    small = far + "/api/v3/system/status"
+    n = len(Hub.seen)
+    E.open(small, "radarr", headers={"X-Api-Key": E.secret("radarr")}, timeout=60).close()
+    assert "page" not in Hub.seen[n]["body"]  # only the path that needed pages
+
+
 def test_an_older_hub_without_paging_keeps_the_refusal(world, tmp_path):
     E, far, vals, home = world
     E.set_mode("radarr", "hub")

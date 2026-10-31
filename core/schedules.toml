@@ -83,11 +83,12 @@ out = "hwtrend/cron.log"
 err = "out"
 timeout = 300
 after = 0
+ok = [1]
 feature = "server-health"
 owner_facing = false
-why = "daily hardware trend sample"
+why = "daily hardware trend sample; exit 1 = alerts noted, not a failure"
 target = "cron-back 29.10"
-cron_line = "7 8 * * * mkdir -p \"$HOME/.local/state/hwtrend\" && cron-fail --after 0 hwtrend flock -n -E 0 \"$HOME/.local/state/cron-fail/hwtrend.run\" timeout -k 10 300 $HOME/bin/hwtrend >> \"$HOME/.local/state/hwtrend/cron.log\" 2>&1"
+cron_line = "7 8 * * * mkdir -p \"$HOME/.local/state/hwtrend\" && cron-fail --after 0 --ok 1 hwtrend flock -n -E 0 \"$HOME/.local/state/cron-fail/hwtrend.run\" timeout -k 10 300 $HOME/bin/hwtrend >> \"$HOME/.local/state/hwtrend/cron.log\" 2>&1"
 
 [jobs.cputemp-log]
 line = "cputemp-log"
@@ -1358,11 +1359,12 @@ out = "hddheat/cron.log"
 err = "out"
 timeout = 300
 after = 0
+ok = [1]
 feature = "server-health"
 owner_facing = true
-why = "disk temperatures (alert notes)"
+why = "disk temperatures (alert notes); exit 1 = texted or held, not a failure"
 target = "cron-back 29.10"
-cron_line = "*/10 * * * * mkdir -p \"$HOME/.local/state/hddheat\" && cron-fail --after 0 hddheat flock -n -E 0 \"$HOME/.local/state/cron-fail/hddheat.run\" timeout -k 10 300 $HOME/bin/hddheat >> \"$HOME/.local/state/hddheat/cron.log\" 2>&1"
+cron_line = "*/10 * * * * mkdir -p \"$HOME/.local/state/hddheat\" && cron-fail --after 0 --ok 1 hddheat flock -n -E 0 \"$HOME/.local/state/cron-fail/hddheat.run\" timeout -k 10 300 $HOME/bin/hddheat >> \"$HOME/.local/state/hddheat/cron.log\" 2>&1"
 
 [jobs.cache-ttl-watch]
 line = "cache-ttl-watch"

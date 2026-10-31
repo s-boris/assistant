@@ -4,7 +4,7 @@
 // values into the task's tab over CDP (Playwright connectOverCDP on the headed Chrome), masks the filled inputs, writes
 // keyed fingerprints for the redaction hook, and prints field keys with ok/fail. Never a value, on stdout, stderr or in
 // a file. Input: one JSON object on stdin ({op: keygen|probe|fill|mask|shot, ...}); output: one JSON object.
-// Tests: ~/opt/webagent-tests/securefill.
+// Tests: tests/legacy/webagent/securefill in ~/opt/assistant.
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';

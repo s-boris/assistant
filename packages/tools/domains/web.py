@@ -19,8 +19,9 @@ from tools.clirun import bin_path, first_line, no_dash, run, run_json
 from tools.core import REGISTRY, Domain, Format, ToolError, ToolInput, ToolOutput, tool
 
 NOTES = (
-    "`webagent` / `abx` / `securefill` (CLIs; skill web-agent; tests ~/opt/webagent-tests, ~/opt/agent-browser/tests):"
-    " the whole task protocol stays there and with the browser subagent: start, step, stop (the approval card),"
+    "`webagent` / `abx` / `securefill` (CLIs; skill web-agent; tests: the webagent suite here,"
+    " ~/opt/agent-browser/tests): the whole task protocol stays there and with the browser subagent: start, step,"
+    " stop (the approval card),"
     " approve (his ✅ only), resume, done, abort; abx start/stop and page commands; securefill session start, fill,"
     " commit, tick, mask, shot. None of those is a tool: the commit gate (webagent-guard, abx's built-in gate) and"
     " the vault's ✅ for his data stay the only way to act on a page."

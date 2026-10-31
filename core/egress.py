@@ -13,7 +13,10 @@ the brain's container one handle at a time without touching the tool again:
                                answers masked. The response is file-like (read, status, getcode, headers, getheader,
                                a context manager). A GET whose answer is over the hub's cap (response_too_large) is
                                asked again in JSON-array pages ("page": {"from": N}, for a binding with max_upstream)
-                               and joined into one compact JSON array, so the caller reads it as one answer. Like
+                               and joined into one compact JSON array, so the caller reads it as one answer; the
+                               handle + URL path is remembered for PAGED_TTL (state file egress-paged.json, no
+                               query, no values), so the next GET there asks for pages at once instead of making the
+                               hub read the whole list and refuse it first. Like
                                urllib, a status >= 400 raises urllib.error.HTTPError (in hub
                                mode a 3xx too: the hub never follows a redirect); a hub refusal raises Refused (a
                                URLError: code, error, hint); an unreachable hub raises urllib.error.URLError.
@@ -33,6 +36,7 @@ import io
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,6 +51,8 @@ MODES = ("local", "shadow", "hub")
 SWITCH = "egress.json"
 CHECK_TIMEOUT = 1.5
 MAX_PAGES = 64  # a paged GET: at most this many hub calls (and 2 tries when the list moves under it)
+PAGED_TTL = 7 * 86400  # a GET that needed pages asks for pages at once for this long (then one unpaged try again)
+PAGED_FILE = "egress-paged.json"
 HUB_SLACK = 10.0  # the hub's own call may take the tool's timeout; its answer comes this much later at most
 HANDLE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 HANDLES: dict[str, tuple[str, str | None]] = {
@@ -239,6 +245,37 @@ def _shadow(handle: str, u: str, m: str, hs: list[tuple[str, str]], timeout: flo
         return  # a shadow check never fails the call (no hub token, hub down, a refused path under test, ...)
 
 
+def _paged_key(handle: str, method: str, url: str) -> str | None:
+    if method != "GET":
+        return None
+    return f"{handle} {urllib.parse.urlsplit(url).path or '/'}"
+
+
+def _paged_hints() -> dict[str, float]:
+    try:
+        d = json.loads(paths.state(PAGED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: float(v) for k, v in d.items() if isinstance(v, (int, float))} if isinstance(d, dict) else {}
+
+
+def _paged_hint(key: str, on: bool) -> None:
+    """Remember (on) or forget a GET that needed pages. Best effort: a hint that cannot be saved costs one refusal."""
+    try:
+        now = time.time()
+        d = {k: t for k, t in _paged_hints().items() if now - t < PAGED_TTL and k != key}
+        if on:
+            d[key] = now
+        f = paths.state(PAGED_FILE)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f".{f.name}.{os.getpid()}")
+        tmp.write_text(json.dumps(d, sort_keys=True), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, f)
+    except (OSError, ValueError):
+        pass
+
+
 def _paged(req: dict[str, Any], timeout: float) -> tuple[int, dict[str, Any], bytes | None]:
     """A GET the hub found too large, asked again page by page -> (code, answer, joined body or None).
     A refusal (an older hub answers response_too_large again; not_pageable, ...) or an answer without "page" (the far
@@ -296,10 +333,19 @@ def open(  # mirrors core.http.open
                            "timeout": timeout}  # fmt: skip
     if body is not None:
         req["body_b64"] = base64.b64encode(body).decode("ascii")
-    code, ans = _hub("/egress/fetch", req, timeout + HUB_SLACK)
+    key = _paged_key(handle, m, u)
     raw: bytes | None = None
-    if code == 502 and ans.get("error") == "response_too_large" and m == "GET":
+    t = _paged_hints().get(key) if key else None
+    if key and t is not None and time.time() - t < PAGED_TTL:  # it needed pages lately: ask for them at once
         code, ans, raw = _paged(req, timeout)
+        if code != 200:  # an older hub, a refusal: forget it, the next call tries unpaged first again
+            _paged_hint(key, False)
+    else:
+        code, ans = _hub("/egress/fetch", req, timeout + HUB_SLACK)
+        if code == 502 and ans.get("error") == "response_too_large" and key:
+            code, ans, raw = _paged(req, timeout)
+            if raw is not None:
+                _paged_hint(key, True)
     if code != 200:
         raise Refused(code, str(ans.get("error") or "error"), str(ans.get("hint") or ""))
     try:

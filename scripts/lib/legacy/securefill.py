@@ -60,7 +60,7 @@ Flow (one web task = webagent task id; CLI ~/bin/securefill; browser half ~/bin/
             shown itself; re-checked right before typing (result "hidden"). Hidden fields are neither asked for nor filled.
 State ~/.local/state/securefill (0700): keys/ (one-time keys), sess/<task>.json (the task's fill session), req/<task>.json
 (pending per-fill request, older vaults), fp/ (live fingerprints) and fp.key, log.jsonl (counts and outcomes only).
-Tests: ~/opt/webagent-tests/securefill.
+Tests: tests/legacy/webagent/securefill in ~/opt/assistant.
 """
 import base64
 import glob

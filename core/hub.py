@@ -435,13 +435,19 @@ def _commit(con: sqlite3.Connection, s: dict[str, Any]) -> dict[str, int]:
 
 
 def unit(fn: Callable[[LedgerConnection], Any], *, tries: int = 3, **kw: Any) -> Any:
-    """Run fn on a fresh ledger(**kw) and commit; on a Conflict, run it again (up to `tries` times)."""
+    """Run fn on a fresh ledger(**kw) and commit; on a Conflict, run it again (up to `tries` times). A hub that goes
+    away between the snapshot and the commit raises sqlite3.OperationalError, like ledger() and close() do."""
     last: Exception | None = None
     for _ in range(max(1, tries)):
         con = ledger(**kw)
         try:
             res = fn(con)
-            con.commit_hub()
+            try:
+                con.commit_hub()
+            except Conflict:
+                raise
+            except HubError as e:
+                raise sqlite3.OperationalError(f"hub: {e}") from None
             return res
         except Conflict as e:
             last = e

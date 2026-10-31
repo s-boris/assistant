@@ -29,7 +29,9 @@ ok | high (this hour over the bar, not 3 in a row) | regressed | no-data (too fe
 
 `run()` (cron, hourly): one vault sample, compute, the dashboard section ~/.local/state/scorecard/scorecard.json,
 spans to Phoenix through the local OTLP receiver (core.otlp: one "scorecard" span with every metric's value / base / n
-as numbers, one "land" span per new land row; cron runs already go there as cron.<job>), then the notes.
+as numbers, status OK even when a metric regressed (a regression is data, reported by the notes and the
+scorecard.*.regressed attributes; an ERROR status would read as a failed job in setup health), one "land" span
+per new land row; cron runs already go there as cron.<job>), then the notes.
 State ~/.local/state/scorecard/state.json: alerts {metric: day}, the vault samples (9 days), the land span cursor.
 `targets(days)`: the loop targets (packages/loop/targets.json: G1 = E7, G2 = E8, G3/G3h/G3p = E13, G4, E9, E10)
 measured now through loop.signals, so the 05.11 re-measure reads them here.
@@ -471,9 +473,10 @@ def spans(res: dict[str, Any], st: dict[str, Any], now: float) -> int:
             if isinstance(m.get(k), (int, float)):
                 attrs[f"scorecard.{m['id']}.{k}"] = m[k]
         attrs[f"scorecard.{m['id']}.regressed"] = int(m["status"] == "regressed")
+    attrs["scorecard.regressed"] = int(res["summary"]["regressed"])
     sent = 0
-    sc = otlp.make_span(SERVICE, secrets.token_hex(16), start=now - 1, end=now, attrs=attrs,
-                        error=res["summary"]["regressed"] > 0)  # fmt: skip
+    # never ERROR for a regression: setup health counts ERROR spans as failed runs of the job
+    sc = otlp.make_span(SERVICE, secrets.token_hex(16), start=now - 1, end=now, attrs=attrs)
     if otlp.emit([sc], SERVICE, timeout=5.0):
         sent += 1
     cur = float(st.get("land_cursor") or now - BASE_DAYS * 86400)
