@@ -53,6 +53,8 @@ SECRETS = os.path.expanduser(os.environ.get("MEDIA_SECRETS") or "~/.secrets/medi
 STATE_DIR = os.path.expanduser(os.environ.get("ARR_UNBLOCK_STATE") or "~/.local/state/arr-unblock")
 LOG = os.path.expanduser(os.environ.get("ARR_UNBLOCK_LOG") or "~/.local/state/arr-unblock.log")
 REMUX_STATE = os.path.expanduser(os.environ.get("ARR_UNBLOCK_REMUX_STATE") or "~/.local/state/media-remux/state.json")
+REMUX_TV_STATE = os.path.expanduser(os.environ.get("ARR_UNBLOCK_REMUX_TV_STATE")
+                                    or "~/.local/state/media-remux-tv/state.json")
 INBOX = os.path.expanduser(os.environ.get("ARR_UNBLOCK_INBOX") or "~/inbox")
 TIMEOUT = 30
 CMD_WAIT = float(os.environ.get("ARR_UNBLOCK_CMD_WAIT") or 150)    # ManualImport command (moves can take a bit)
@@ -193,10 +195,23 @@ def remux_owned():
         return set()
 
 
-def group_candidates(records, owned=frozenset()):
+def remux_tv_owned():
+    """Sonarr episodeIds whose grab media-remux-tv still follows (it imports those itself, like remux_owned)."""
+    try:
+        with open(REMUX_TV_STATE) as f:
+            gs = (json.load(f) or {}).get("grabs") or {}
+        return {int(e) for g in gs.values() if (g or {}).get("status") == "grabbed"
+                for e in ((g.get("release") or {}).get("ep_ids") or [])}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return set()
+
+
+def group_candidates(records, owned=frozenset(), owned_eps=frozenset()):
     groups = {}
     for r in records:
         if r.get("movieId") in owned and not r.get("seriesId"):
+            continue
+        if r.get("seriesId") and r.get("episodeId") in owned_eps:
             continue
         if is_candidate(r):
             groups.setdefault(r.get("downloadId") or f"queue-{r.get('id')}", []).append(r)
@@ -575,7 +590,8 @@ def run(mode, approve=None):
     try:
         work = []
         for svc in ("radarr", "sonarr"):
-            groups = group_candidates(queue(svc), remux_owned() if svc == "radarr" and not approve else frozenset())
+            groups = group_candidates(queue(svc), remux_owned() if svc == "radarr" and not approve else frozenset(),
+                                      remux_tv_owned() if svc == "sonarr" and not approve else frozenset())
             for dl, recs in groups.items():
                 if approve:
                     if approve[0] != svc or not any(str(r.get("id")) == approve[1] for r in recs):

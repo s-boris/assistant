@@ -1,0 +1,1027 @@
+#!/usr/bin/env python3
+"""media-remux-tv: replace old Bluray-1080p Remux episode files in Sonarr with reasonable encodes (the TV half of
+media-remux, which does the same for Radarr's movies).
+
+Candidates: every episode file of quality "Bluray-1080p Remux", grouped per series and season. The target follows
+the series' quality profile:
+  a profile without any 2160p quality ("Up to 1080p")  -> the best WEB 1080p (WEBDL-1080p / WEBRip-1080p) by the
+                                                           profile's custom-format score, then the smaller file
+  a profile with 2160p ("Up to 4K", "... Prefer German") -> the movie rule: 2160p HDR only (WEBDL-2160p / Bluray-2160p
+                                                           with an HDR custom format (HDR10, HDR10+, DV HDR10,
+                                                           PQ, HLG ...; never DV without fallback or DV SDR), no
+                                                           "SDR" in the name),
+                                                           <= 6 GB per episode (<= 3 GB when the series runs < 35 min)
+Every pick: usenet only (MEDIA_REMUX_TV_PROTOCOLS), no custom format the profile scores <= -1000 (LQ, x265 HD,
+Upscaled, obfuscated, no group, ...), a score >= the profile's minimum and >= 0, Sonarr's own rejections except the
+upgrade/cutoff ones, mapped to this series and season, the parsed series title one of the series' titles, >= 0.3 GB
+per episode (no junk), and it must SAVE >= 50 % (new <= half the remux files it replaces).
+Language parity: the release's languages must include every language of the current file (Sonarr's mediaInfo audio
+languages, else its parsed languages) that is German, English or the series' original language. A German or
+German-DL file is never replaced by one without German audio.
+Season packs first: when every episode file of the season is a remux, the best full-season pack (fullSeason, this
+season) is taken if one fits; else single (or multi-) episode releases from the same search, per remux file.
+Search: Sonarr's interactive search, GET /api/v3/release?seriesId=&seasonNumber= (no grab). The egress gateway caps
+an answer at 8 MB; a season whose answer is larger is searched per remux episode (GET /api/v3/release?episodeId=,
+singles only: episode searches carry no packs); so is one that times out twice (the gateway waits 30 s).
+Never Sonarr's EpisodeSearch/SeasonSearch commands (they grab).
+
+Grab = Sonarr's own grab (POST /api/v3/release guid + indexerId). Sonarr imports it as an upgrade and moves the old
+remux to its recycle bin (/data/Movies/.recycle, shared with Radarr, emptied after 3 days). Nothing is deleted here.
+A WEB 1080p pick ranks below the remux in Sonarr's quality order, so its import blocks as "not an upgrade": --follow
+(every --cron tick) imports those with Sonarr's ManualImport after arr-unblock's Sonarr checks (series, episodes,
+parser, size), waiving only the upgrade rejection. 2160p picks import by themselves.
+
+  media-remux-tv --plan [--series ID] [--budget MIN] [--ep-sample N] [--report FILE] [--json]
+        read-only (GET only): candidates, the pick per season, GB saved. Order: each series' biggest season first,
+        then the other seasons by size, until the time budget (default 40 min, MEDIA_REMUX_TV_GAP s between searches,
+        default 5); a season over the gateway cap is sampled with N episode searches (default 3). Seasons left
+        unsearched or unsampled are estimated from the series' searched ones (marked "est."). Writes plan.json in the
+        state dir and, with --report, a Markdown report.
+  media-remux-tv --run --max N [--series ID] [--dry-run]    search + grab up to N releases now (gates as --cron except
+                                                          the time window and the night caps)
+  media-remux-tv --follow                                   grabbed -> imported / failed; blocked imports override
+  media-remux-tv --status [--json]                          grabbed, imported, failed, kept, GB freed
+  media-remux-tv --cron                                     schedule tick (*/20): --follow always; inside 00:30-06:00
+                                                          up to 2 season searches and 1 grab per tick, <= 15 grabs and
+                                                          <= 300 GB per night; first tick after 06:30 -> ONE
+                                                          ~/inbox/media-remux-tv-DATE.md line (only when something
+                                                          happened)
+Gates for every grab: Sonarr's queue <= 10 downloads, the series/season not already queued, the cache pool's live free
+space minus the Sonarr + Radarr queues' remaining bytes minus the release >= 100 GB and the pool < 90 % used, and the
+night's GB budget. A failing gate stops the tick's grabs.
+Off switch: touch ~/.config/media-remux-tv/off (--cron and --run then grab nothing; --follow still finishes grabs).
+Not scheduled by default: the hub/cron entry is added when the owner switches it on.
+State ~/.local/state/media-remux-tv/ (state.json, plan.json, actions.log, lock). Exit 0 ok, 1 usage, 2 Sonarr down.
+Env (tests): MEDIA_REMUX_TV_MEDIA (module with get/api/ApiError/q, default ~/bin/media), MEDIA_REMUX_TV_UNBLOCK
+(default ~/bin/arr-unblock), MEDIA_REMUX_TV_STATE_DIR, MEDIA_REMUX_TV_INBOX, MEDIA_REMUX_TV_OFF, ASSISTANT_NOW (the
+clock, core.clock), MEDIA_REMUX_TV_CACHE_FREE_GB + MEDIA_REMUX_TV_CACHE_USED_PCT (skip the server probe),
+MEDIA_REMUX_TV_NIGHT_MAX (15), MEDIA_REMUX_TV_NIGHT_GB (300), MEDIA_REMUX_TV_QUEUE_MAX (10),
+MEDIA_REMUX_TV_CACHE_FLOOR_GB (100), MEDIA_REMUX_TV_SEARCHES (season searches per tick, 2), MEDIA_REMUX_TV_GAP (5).
+Tests: ~/opt/assistant/tests/media/test_media_remux_tv.py
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import sys
+import time
+import unicodedata
+from datetime import UTC, datetime, timedelta
+
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser('~')
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(pwd.getpwuid(os.getuid()).pw_dir, 'bin', 'lib'), os.path.expanduser('~/bin/lib'),
+             os.path.join(HERE, 'lib')):
+    sys.path.insert(0, _lib)
+if not os.path.isdir(os.path.join(HERE, 'lib', 'core')) and os.path.isdir(os.path.join(HERE, '..', 'core')):
+    sys.path.insert(0, os.path.dirname(HERE))
+import core.notes as notes  # noqa: E402  (module import: inbox-lint follows notes.write into the inbox)
+from core import clock, jsonstate, locks  # noqa: E402
+
+
+def _env(name, default):
+    v = os.environ.get(name)
+    try:
+        return type(default)(v) if v not in (None, '') else default
+    except ValueError:
+        return default
+
+
+STATE_DIR = os.environ.get('MEDIA_REMUX_TV_STATE_DIR') or f'{HOME}/.local/state/media-remux-tv'
+STATE_F, PLAN_F = f'{STATE_DIR}/state.json', f'{STATE_DIR}/plan.json'
+LOG_F, LOCK_F = f'{STATE_DIR}/actions.log', f'{STATE_DIR}/lock'
+INBOX = os.environ.get('MEDIA_REMUX_TV_INBOX') or f'{HOME}/inbox'
+OFF_F = os.environ.get('MEDIA_REMUX_TV_OFF') or f'{HOME}/.config/media-remux-tv/off'
+REMUX = 'Bluray-1080p Remux'
+WEB_1080 = ('WEBDL-1080p', 'WEBRip-1080p')
+TIER_UHD = ('WEBDL-2160p', 'Bluray-2160p')
+GB = 1e9
+UHD_EP_CAP, UHD_EP_CAP_SHORT, SHORT_RUNTIME = 6 * GB, 3 * GB, 35
+MIN_EP = 0.3 * GB        # a release under this per episode is junk (mislabelled, sample, fake)
+MAX_SHARE = 0.5          # the pick must be <= half of what it replaces (saves >= 50 %)
+BAD_CF = -1000           # a custom format the profile scores this low or lower is a hard no
+SDR_RE = re.compile(r'\bSDR\b', re.I)
+HDR_CF = {'HDR', 'HDR10', 'HDR10+', 'HDR10+ Boost', 'HDR (undefined)', 'PQ', 'HLG', 'DV HDR10', 'DV HDR10+',
+          'DV HLG', 'DV HDR10+ Boost'}   # Sonarr's HDR custom formats (TRaSH names)
+NOT_HDR = {'DV SDR', 'DV (w/o HDR fallback)'}
+KEEP_LANGS = {'German', 'English'}   # plus the series' original language: these never get lost
+AUDIO = {'eng': 'English', 'ger': 'German', 'deu': 'German', 'gsw': 'German', 'jpn': 'Japanese', 'fre': 'French',
+         'fra': 'French', 'spa': 'Spanish', 'ita': 'Italian', 'chi': 'Chinese', 'zho': 'Chinese', 'kor': 'Korean',
+         'dut': 'Dutch', 'nld': 'Dutch', 'por': 'Portuguese', 'rus': 'Russian', 'swe': 'Swedish', 'dan': 'Danish',
+         'nor': 'Norwegian', 'pol': 'Polish', 'tur': 'Turkish', 'hin': 'Hindi'}
+NIGHT_MAX = _env('MEDIA_REMUX_TV_NIGHT_MAX', 15)
+NIGHT_BYTES = _env('MEDIA_REMUX_TV_NIGHT_GB', 300.0) * GB
+QUEUE_MAX = _env('MEDIA_REMUX_TV_QUEUE_MAX', 10)
+CACHE_FLOOR = _env('MEDIA_REMUX_TV_CACHE_FLOOR_GB', 100.0) * GB
+CACHE_USED_MAX = 90.0
+SEARCHES = _env('MEDIA_REMUX_TV_SEARCHES', 2)
+GAP = _env('MEDIA_REMUX_TV_GAP', 5.0)
+PROTOCOLS = set((os.environ.get('MEDIA_REMUX_TV_PROTOCOLS') or 'usenet').split(','))
+NO_RELEASE_RETRY = 30 * 86400
+PLAN_REUSE = 14 * 86400  # a plan's no-release verdict spares the search this long
+LOST_AFTER = 48 * 3600
+WIN_START, WIN_END, NOTE_AT = (0, 30), (6, 0), (6, 30)
+SEARCH_TIMEOUT = 240
+IGNORE_REJ = re.compile(r'equal or higher preference|meets quality cutoff|equal or higher custom format|'
+                        r'not an upgrade|not a custom format upgrade|custom format score.*(upgrade|improve)|'
+                        r'upgrades? (are )?not allowed|better quality|cutoff', re.I)
+UPGRADE_REJ = re.compile(r'not an upgrade|not a custom format upgrade|custom format.*(upgrade|score)|'
+                         r'equal or higher|better quality', re.I)
+TOO_LARGE = re.compile(r'response_too_large|too large', re.I)
+SLOW = re.compile(r'upstream_timeout|timed out|no answer in', re.I)
+IMPORT_STUCK = ('importBlocked', 'importPending')
+ARTICLES = {'the', 'a', 'an', 'der', 'die', 'das'}
+
+M = None          # the media module (get/api/ApiError/q), loaded on first use; tests set it
+_UB = None
+SLEEP = time.sleep
+
+
+def _load(name, path):
+    ldr = importlib.machinery.SourceFileLoader(name, path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, ldr))
+    ldr.exec_module(mod)
+    return mod
+
+
+def _sibling(env, name):
+    p = os.environ.get(env)
+    if p:
+        return p
+    own = os.path.join(HERE, name)
+    return own if os.path.isfile(own) else os.path.expanduser(f'~/bin/{name}')
+
+
+def media():
+    global M
+    if M is None:
+        M = _load('media', _sibling('MEDIA_REMUX_TV_MEDIA', 'media'))
+    return M
+
+
+class ApiError(Exception):
+    """Any error of the media module's API calls (its ApiError is re-raised as this)."""
+
+
+def unblock():
+    global _UB
+    if _UB is None:
+        _UB = _load('arr_unblock', _sibling('MEDIA_REMUX_TV_UNBLOCK', 'arr-unblock'))
+    return _UB
+
+
+def now():
+    return clock.now()
+
+
+def local(ts=None):
+    tz = getattr(media(), 'ZRH', None) or UTC
+    return datetime.fromtimestamp(now() if ts is None else ts, tz)
+
+
+def gb(n):
+    return f'{(n or 0) / GB:.1f} GB'
+
+
+def log(line):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG_F, 'a') as f:
+        f.write(f'{local().strftime("%Y-%m-%d %H:%M")} {line}\n')
+
+
+def load_state():
+    st = jsonstate.load(STATE_F, None) or {}
+    for k in ('grabs', 'seasons', 'nights', 'outside'):
+        st.setdefault(k, {})
+    return st
+
+
+def save_state(st):
+    jsonstate.save(STATE_F, st, mode=0o600, ensure_ascii=False, indent=1)
+
+
+# ----------------------------------------------------------------------------- Sonarr reads
+def call(svc, method, path, body=None, timeout=None):
+    m = media()
+    try:
+        if method == 'GET':
+            return m.get(svc, path, timeout=timeout)
+        return m.api(svc, method, path, body, timeout=timeout)
+    except m.ApiError as e:
+        raise ApiError(str(e)) from None
+
+
+def sonarr(path, timeout=None):
+    return call('sonarr', 'GET', path, timeout=timeout)
+
+
+def qname(x):
+    return ((x.get('quality') or {}).get('quality') or {}).get('name')
+
+
+def cf_names(x):
+    return [c.get('name') for c in x.get('customFormats') or [] if c.get('name')]
+
+
+def profiles():
+    """id -> {name, scores {custom format: score}, min, target '1080p' | '2160p'}."""
+    out = {}
+    for p in sonarr('/api/v3/qualityprofile') or []:
+        allowed = set()
+        for it in p.get('items') or []:
+            if it.get('quality') and it.get('allowed'):
+                allowed.add(it['quality'].get('name'))
+            for sub in it.get('items') or []:
+                if it.get('allowed') and sub.get('quality'):
+                    allowed.add(sub['quality'].get('name'))
+        out[p['id']] = {'name': p.get('name'), 'min': p.get('minFormatScore') or 0,
+                        'scores': {f['name']: f.get('score') or 0 for f in p.get('formatItems') or []},
+                        'target': '2160p' if any('2160p' in (n or '') for n in allowed) else '1080p'}
+    return out
+
+
+def norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '').lower().replace('ß', 'ss'))
+    s = ''.join(c for c in s if not unicodedata.combining(c)).replace('&', ' and ')
+    s = re.sub(r'\(\s*\d{4}\s*\)\s*$', '', s.strip())
+    s = re.sub(r'\s(19|20)\d\d$', '', s)
+    return ''.join(w for w in re.split(r'[\W_]+', s) if w and w not in ARTICLES)
+
+
+def series_keys(s):
+    names = [s.get('title'), s.get('sortTitle'), s.get('cleanTitle')]
+    names += [a.get('title') for a in s.get('alternateTitles') or []]
+    return {norm(n) for n in names if n} - {''}
+
+
+def file_langs(f):
+    """The current file's languages: Sonarr's mediaInfo audio streams (ISO codes), else its parsed languages."""
+    codes = re.split(r'[/,\s]+', str((f.get('mediaInfo') or {}).get('audioLanguages') or '').strip())
+    langs = {AUDIO.get(c.lower(), c.title()) for c in codes if c}
+    if not langs:
+        langs = {lang.get('name') for lang in f.get('languages') or [] if lang.get('name')}
+    return langs - {'', 'Unknown', 'Und'}
+
+
+def required_langs(files, series):
+    keep = KEEP_LANGS | {((series.get('originalLanguage') or {}).get('name') or 'English')}
+    need = set()
+    for f in files:
+        need |= file_langs(f) & keep
+    return need
+
+
+def candidates(series_list, profs, only=None):
+    """Remux files grouped per season -> [unit]. A unit: one series season with its remux files (biggest first)."""
+    units = []
+    for s in series_list:
+        if only and s.get('id') != only:
+            continue
+        if not (s.get('statistics') or {}).get('episodeFileCount'):
+            continue
+        prof = profs.get(s.get('qualityProfileId'))
+        if not prof:
+            continue
+        files = sonarr(f'/api/v3/episodefile?seriesId={s["id"]}', timeout=120) or []
+        rem = [f for f in files if qname(f) == REMUX]
+        if not rem:
+            continue
+        eps = sonarr(f'/api/v3/episode?seriesId={s["id"]}', timeout=120) or []
+        by_file = {}
+        for e in eps:
+            if e.get('episodeFileId'):
+                by_file.setdefault(e['episodeFileId'], []).append(e)
+        per = {}
+        for f in files:
+            per.setdefault(f.get('seasonNumber'), []).append(f)
+        for sn, fs in sorted(per.items()):
+            rs = [f for f in fs if qname(f) == REMUX]
+            if not rs:
+                continue
+            rfiles = [{'id': f['id'], 'size': f.get('size') or 0, 'langs': sorted(file_langs(f)),
+                       'eps': sorted(e['episodeNumber'] for e in by_file.get(f['id'], [])),
+                       'ep_ids': sorted(e['id'] for e in by_file.get(f['id'], []))} for f in rs]
+            units.append({'sid': s['id'], 'title': s.get('title') or '?', 'year': s.get('year'), 'season': sn,
+                          'profile': prof['name'], 'target': prof['target'], 'profile_id': s.get('qualityProfileId'),
+                          'runtime': s.get('runtime') or 0, 'files': rfiles,
+                          'size': sum(f['size'] for f in rfiles), 'all_remux': len(rs) == len(fs),
+                          'need': sorted(required_langs(rs, s)), 'keys': sorted(series_keys(s))})
+    return units
+
+
+# ----------------------------------------------------------------------------- judging
+def ep_cap(unit):
+    return UHD_EP_CAP_SHORT if 0 < (unit.get('runtime') or 0) < SHORT_RUNTIME else UHD_EP_CAP
+
+
+def covers(r, unit):
+    """The remux files a release replaces -> (files, None) or (None, why)."""
+    sn = r.get('mappedSeasonNumber')
+    sn = r.get('seasonNumber') if sn is None else sn
+    if sn != unit['season']:
+        return None, 'other season'
+    if r.get('fullSeason'):
+        if not unit['all_remux']:
+            return None, 'season pack over non-remux files'
+        return list(unit['files']), None
+    nums = set(r.get('mappedEpisodeNumbers') or r.get('episodeNumbers') or [])
+    if not nums:
+        return None, 'no episode numbers'
+    fs = [f for f in unit['files'] if set(f['eps']) & nums]
+    have = {n for f in fs for n in f['eps']}
+    if not fs or not nums <= have:
+        return None, 'covers episodes that are no remux'
+    if not have <= nums:
+        return None, 'splits a multi-episode file'
+    return fs, None
+
+
+def judge(r, unit, scores, minscore):
+    """-> (files it replaces, None) when acceptable, else (None, reason)."""
+    qn, names, size = qname(r), cf_names(r), r.get('size') or 0
+    if unit['target'] == '2160p':
+        if qn not in TIER_UHD:
+            return None, f'quality {qn} (2160p HDR only)'
+        if not set(names) & HDR_CF or set(names) & NOT_HDR:
+            return None, 'no HDR'
+        if SDR_RE.search(r.get('title') or ''):
+            return None, 'SDR'
+    elif qn not in WEB_1080:
+        return None, f'quality {qn} (WEB 1080p only)'
+    if r.get('protocol') not in PROTOCOLS:
+        return None, f'protocol {r.get("protocol")}'
+    bad = [n for n in names if scores.get(n, 0) <= BAD_CF]
+    if bad:
+        return None, 'custom format ' + ', '.join(bad)
+    if (r.get('customFormatScore') or 0) < max(0, minscore):
+        return None, 'score below the profile minimum'
+    other = [x for x in r.get('rejections') or [] if not IGNORE_REJ.search(str(x))]
+    if other:
+        return None, 'sonarr: ' + str(other[0])[:80]
+    if r.get('downloadAllowed') is False:
+        return None, 'download not allowed'
+    if r.get('mappedSeriesId') not in (None, 0, unit['sid']):
+        return None, 'mapped to another series'
+    if not unit['keys'] or norm(r.get('seriesTitle') or '') not in set(unit['keys']):
+        return None, 'not this series'
+    langs = {lang.get('name') for lang in r.get('languages') or []}
+    if not set(unit['need']) <= langs:
+        return None, 'language parity (needs ' + '+'.join(unit['need']) + ')'
+    fs, why = covers(r, unit)
+    if why:
+        return None, why
+    n = sum(max(1, len(f['eps'])) for f in fs)
+    cur = sum(f['size'] for f in fs)
+    if size < MIN_EP * n:
+        return None, 'too small (junk)'
+    if unit['target'] == '2160p' and size > ep_cap(unit) * n:
+        return None, f'over {gb(ep_cap(unit))} per episode'
+    if size > MAX_SHARE * cur:
+        return None, 'saves under 50 %'
+    return fs, None
+
+
+def rel_info(r, fs):
+    return {'title': r.get('title'), 'guid': r.get('guid'), 'indexerId': r.get('indexerId'),
+            'indexer': r.get('indexer'), 'protocol': r.get('protocol'), 'size': r.get('size') or 0,
+            'quality': qname(r), 'score': r.get('customFormatScore') or 0, 'pack': bool(r.get('fullSeason')),
+            'languages': [lang.get('name') for lang in r.get('languages') or [] if lang.get('name')],
+            'files': [f['id'] for f in fs], 'eps': sorted(n for f in fs for n in f['eps']),
+            'ep_ids': sorted(i for f in fs for i in f['ep_ids']), 'old_size': sum(f['size'] for f in fs)}
+
+
+def pick(releases, unit, scores, minscore):
+    """-> (picks, reason): a season pack when one fits, else the best release per remux file."""
+    ok, why = [], {}
+    for r in releases:
+        fs, reason = judge(r, unit, scores, minscore)
+        if reason:
+            k = reason.split(':')[0].split(' (')[0]
+            why[k] = why.get(k, 0) + 1
+        else:
+            ok.append((-(r.get('customFormatScore') or 0), r.get('size') or 0, r, fs))
+    ok.sort(key=lambda t: t[:2])
+    packs = [(r, fs) for *_k, r, fs in ok if r.get('fullSeason')]
+    if packs:
+        return [rel_info(*packs[0])], None
+    picks, taken = [], set()
+    for *_k, r, fs in ok:
+        if r.get('fullSeason') or any(f['id'] in taken for f in fs):
+            continue
+        picks.append(rel_info(r, fs))
+        taken |= {f['id'] for f in fs}
+    if picks:
+        return picks, None
+    top = ', '.join(f'{k} {v}' for k, v in sorted(why.items(), key=lambda kv: -kv[1])[:3])
+    return [], (f'{len(releases)} releases, none fits ({top})' if releases else 'no releases found')
+
+
+def search(unit, ep_limit=None, pause=None):
+    """Releases for one season: the season search, or per remux episode when the season's answer is over the
+    gateway's cap. -> (releases, mode, episodes searched)."""
+    for attempt in (1, 2):
+        try:
+            rs = sonarr(f'/api/v3/release?seriesId={unit["sid"]}&seasonNumber={unit["season"]}',
+                        timeout=SEARCH_TIMEOUT) or []
+            return rs, 'season', None
+        except ApiError as e:
+            if TOO_LARGE.search(str(e)):
+                break
+            if not SLOW.search(str(e)):
+                raise
+            if attempt == 1 and pause:    # the gateway gives up after 30 s; the indexers' cache often answers
+                pause()                   # the second ask at once
+    rs, done = [], 0
+    for f in sorted(unit['files'], key=lambda f: -f['size']):
+        if ep_limit is not None and done >= ep_limit:
+            break
+        if not f['ep_ids']:
+            continue
+        if done and pause:
+            pause()
+        done += 1
+        try:
+            rs += sonarr(f'/api/v3/release?episodeId={f["ep_ids"][0]}', timeout=SEARCH_TIMEOUT) or []
+        except ApiError as e:
+            if not (TOO_LARGE.search(str(e)) or SLOW.search(str(e))):
+                raise
+    return rs, 'episodes', done
+
+
+def evaluate(unit, prof, ep_limit=None, pause=None):
+    rs, mode, done = search(unit, ep_limit, pause)
+    picks, reason = pick(rs, unit, prof['scores'], prof['min'])
+    row = {k: unit[k] for k in ('sid', 'title', 'year', 'season', 'profile', 'target', 'size', 'need')}
+    row.update(eps=sum(max(1, len(f['eps'])) for f in unit['files']), files=len(unit['files']), mode=mode,
+               checked=int(now()), picks=picks, saved=sum(p['old_size'] - p['size'] for p in picks))
+    row['covered'] = sum(p['old_size'] for p in picks)
+    if mode == 'episodes':
+        row['searched_eps'] = done
+        row['sampled'] = done < len([f for f in unit['files'] if f['ep_ids']])
+    if reason:
+        row['reason'] = reason
+        if unit['target'] == '2160p':   # for the owner's call only: what a WEB 1080p would save (never grabbed)
+            alt, _ = pick(rs, dict(unit, target='1080p'), prof['scores'], prof['min'])
+            if alt:
+                row['alt_1080'] = {'saved': sum(p['old_size'] - p['size'] for p in alt), 'title': alt[0]['title'],
+                                   'size': sum(p['size'] for p in alt), 'pack': alt[0]['pack']}
+    return row
+
+
+def row_line(row):
+    head = f'{row["title"]} S{row["season"]:02d} ({row["eps"]} ep, {gb(row["size"])})'
+    if not row.get('picks'):
+        return f'- {head}: keep ({row.get("reason")})'
+    first = row['picks'][0]
+    more = f' + {len(row["picks"]) - 1} more' if len(row['picks']) > 1 else ''
+    kind = 'pack' if first['pack'] else 'episodes'
+    return (f'- {head} -> {kind} {gb(sum(p["size"] for p in row["picks"]))}, saves {gb(row["saved"])}'
+            f'{" (sampled)" if row.get("sampled") else ""}\n    {first["title"]} ({gb(first["size"])}, '
+            f'{"+".join(first["languages"]) or "?"}){more}')
+
+
+# ----------------------------------------------------------------------------- gates
+def cache_space():
+    """(free bytes, used %) of the cache pool, live; None when unknown."""
+    if os.environ.get('MEDIA_REMUX_TV_CACHE_FREE_GB'):
+        return float(os.environ['MEDIA_REMUX_TV_CACHE_FREE_GB']) * GB, _env('MEDIA_REMUX_TV_CACHE_USED_PCT', 50.0)
+    try:
+        u = _load('ucap', _sibling('MEDIA_REMUX_TV_CAPACITY', 'unraid-capacity'))
+        raw, err = u.collect(u.SSH_HOST)
+        if err or not raw:
+            return None
+        smp = u.build_sample(raw)
+        smp = smp[0] if isinstance(smp, tuple) else smp
+        pool = ((smp or {}).get('pools') or {}).get('cache') or {}
+        if not pool.get('size'):
+            return None
+        return pool['free'], 100.0 * pool['used'] / pool['size']
+    except Exception as e:  # noqa: BLE001  (an unknown cache means no grab, never a crash)
+        log(f'cache probe failed: {type(e).__name__}: {e}')
+        return None
+
+
+def queue_records(svc):
+    recs, page = [], 1
+    while True:
+        d = call(svc, 'GET', f'/api/v3/queue?page={page}&pageSize=200') or {}
+        recs += d.get('records') or []
+        if len(recs) >= (d.get('totalRecords') or 0) or not d.get('records'):
+            return recs
+        page += 1
+
+
+def downloads(recs):
+    """Queue records -> one per download (a season pack has a record per episode)."""
+    out = {}
+    for r in recs:
+        out.setdefault(r.get('downloadId') or f'q{r.get("id")}', r)
+    return list(out.values())
+
+
+def gate(release_size, queue, other_left):
+    """None = go, else why not. queue: Sonarr's downloads; other_left: Radarr's remaining bytes."""
+    if len(queue) > QUEUE_MAX:
+        return f'download queue holds {len(queue)} downloads (> {QUEUE_MAX})'
+    cs = cache_space()
+    if cs is None:
+        return 'cache pool free space unknown'
+    free, used = cs
+    if used >= CACHE_USED_MAX:
+        return f'cache pool {used:.0f} % used'
+    left = sum(r.get('sizeleft') or 0 for r in queue) + other_left
+    if free - left - release_size < CACHE_FLOOR:
+        return f'cache pool: {gb(free)} free - {gb(left)} queued - {gb(release_size)} < {gb(CACHE_FLOOR)} floor'
+    return None
+
+
+def night_key(ts=None):
+    return (local(ts) - timedelta(hours=12)).date().isoformat()   # the night of 28 -> 29 counts as 28
+
+
+def in_window(ts=None):
+    d = local(ts)
+    return WIN_START <= (d.hour, d.minute) < WIN_END
+
+
+def night(st):
+    return st['nights'].get(night_key(), {'grabs': 0, 'bytes': 0})
+
+
+def count_grab(st, size):
+    """Grabs inside the window count toward that night's caps; a --run outside it is counted per day."""
+    if in_window():
+        n = st['nights'].setdefault(night_key(), {'grabs': 0, 'bytes': 0})
+        n['grabs'] += 1
+        n['bytes'] = n.get('bytes', 0) + size
+    else:
+        day = local().date().isoformat()
+        st['outside'][day] = st['outside'].get(day, 0) + 1
+
+
+# ----------------------------------------------------------------------------- grab
+RETRY_REASONS = ('download failed', 'gone from the queue')
+
+
+def season_key(u):
+    return f'{u["sid"]}:{u["season"]}'
+
+
+def grab_round(st, max_grabs, only=None, dry=False, cron=False):
+    """Search + grab up to max_grabs releases; returns (grabbed, lines)."""
+    lines, grabbed, searched = [], 0, 0
+    profs = profiles()
+    units = candidates(sonarr('/api/v3/series', timeout=120) or [], profs, only)
+    units.sort(key=lambda u: -u['size'])
+    plan = (jsonstate.load(PLAN_F, None) or {}).get('rows') or {}
+    raw = queue_records('sonarr')
+    queue = downloads(raw)
+    other = sum(r.get('sizeleft') or 0 for r in downloads(queue_records('radarr')))
+    busy = {(r.get('seriesId'), r.get('seasonNumber')) for r in raw}
+    budget = NIGHT_BYTES - night(st).get('bytes', 0) if cron else float('inf')
+    for u in units:
+        if grabbed >= max_grabs or (cron and searched >= SEARCHES):
+            break
+        s = st['seasons'].get(season_key(u)) or {}
+        if not only:
+            if s.get('status') == 'grabbed':
+                continue
+            if s.get('status') == 'kept' and now() - s.get('checked', 0) < NO_RELEASE_RETRY:
+                continue
+            p = plan.get(season_key(u)) or {}
+            if p.get('reason') and not p.get('picks') and now() - p.get('checked', 0) < PLAN_REUSE:
+                continue
+        if (u['sid'], u['season']) in busy:
+            lines.append(f'{u["title"]} S{u["season"]:02d}: already in the download queue, skipped')
+            continue
+        pending = {fid for g in st['grabs'].values() if g.get('status') == 'grabbed' and g['sid'] == u['sid']
+                   and g['season'] == u['season'] for fid in (g.get('release') or {}).get('files') or []}
+        if pending:   # a season grabbed in part: only its other remux files, and no pack over the pending ones
+            u = dict(u, files=[f for f in u['files'] if f['id'] not in pending], all_remux=False)
+            u['size'] = sum(f['size'] for f in u['files'])
+            if not u['files']:
+                continue
+        why = gate(0, queue, other)
+        if why:
+            lines.append(f'stop: {why}')
+            break
+        searched += 1
+        row = evaluate(u, profs[u['profile_id']], pause=lambda: SLEEP(GAP))
+        lines.append(row_line(row))
+        if not row['picks']:
+            if not dry:
+                st['seasons'][season_key(u)] = {'title': u['title'], 'season': u['season'], 'status': 'kept',
+                                                'reason': row['reason'], 'checked': row['checked']}
+                log(f'KEPT {u["sid"]} {u["title"]} S{u["season"]:02d}: {row["reason"]}')
+            continue
+        for i, rel in enumerate(row['picks']):
+            if grabbed >= max_grabs:
+                break
+            if rel['size'] > budget:
+                lines.append(f'stop: the night\'s {gb(NIGHT_BYTES)} budget has {gb(max(0, budget))} left')
+                return grabbed, lines
+            why = gate(rel['size'], queue, other)
+            if why:
+                lines.append(f'stop: {why}')
+                return grabbed, lines
+            grabbed += 1
+            if dry:
+                continue
+            call('sonarr', 'POST', '/api/v3/release',
+                 {'guid': rel['guid'], 'indexerId': rel['indexerId'], 'seriesId': u['sid']}, timeout=60)
+            budget -= rel['size']
+            queue.append({'seriesId': u['sid'], 'sizeleft': rel['size']})
+            key = f'{u["sid"]}:{u["season"]}:{rel["eps"][0] if rel["eps"] else 0}:{int(now())}'
+            st['grabs'][key] = {'sid': u['sid'], 'title': u['title'], 'season': u['season'], 'status': 'grabbed',
+                                'grabbed_at': int(now()), 'profile': u['profile'], 'release': rel}
+            # 'partial': the season's other picks wait for a later tick (searched again then)
+            st['seasons'][season_key(u)] = {'title': u['title'], 'season': u['season'], 'checked': int(now()),
+                                            'status': 'grabbed' if i == len(row['picks']) - 1 else 'partial'}
+            count_grab(st, rel['size'])
+            save_state(st)
+            log(f'GRAB {u["sid"]} {u["title"]} S{u["season"]:02d} {len(rel["files"])} remux file(s) '
+                f'{gb(rel["old_size"])} -> {rel["quality"]} {gb(rel["size"])} score {rel["score"]}: {rel["title"]}')
+    return grabbed, lines
+
+
+# ----------------------------------------------------------------------------- follow
+def download_id(g):
+    if g.get('download_id'):
+        return g['download_id']
+    hist = sonarr(f'/api/v3/history/series?seriesId={g["sid"]}&seasonNumber={g["season"]}&eventType=1') or []
+    want = (g.get('release') or {}).get('title')
+    for h in sorted(hist, key=lambda h: h.get('date') or '', reverse=True):
+        if h.get('sourceTitle') == want and h.get('downloadId'):
+            g['download_id'] = h['downloadId']
+            return h['downloadId']
+    return None
+
+
+def override(recs, sid):
+    """ManualImport of a completed download Sonarr blocked only as 'not an upgrade' -> (ok, detail)."""
+    au = unblock()
+    dl = recs[0].get('downloadId')
+    preview = sonarr(f'/api/v3/manualimport?downloadId={media().q(dl)}&filterExistingFiles=true') or []
+    for f in preview:
+        f['rejections'] = [r for r in f.get('rejections') or []
+                           if not UPGRADE_REJ.search(str(r.get('reason') if isinstance(r, dict) else r))]
+    series = sonarr(f'/api/v3/series/{sid}')
+    dec = au.verify_sonarr(recs, series, preview, lambda n: sonarr(f'/api/v3/parse?title={media().q(n)}'))
+    if dec.problems:
+        return False, '; '.join(dec.problems)[:300]
+    res, detail = au.import_now(dec)
+    return res in ('ok', 'pending'), f'{res}: {detail}'
+
+
+def follow(st):
+    lines = []
+    files_cache = {}
+    for _key, g in st['grabs'].items():
+        if g.get('status') != 'grabbed':
+            continue
+        rel, sid = g.get('release') or {}, g['sid']
+        if sid not in files_cache:
+            files = {f['id']: f for f in sonarr(f'/api/v3/episodefile?seriesId={sid}') or []}
+            eps = {e['id']: e for e in sonarr(f'/api/v3/episode?seriesId={sid}') or []}
+            files_cache[sid] = (files, eps)
+        files, eps = files_cache[sid]
+        want = [eps.get(i) or {} for i in rel.get('ep_ids') or []]
+        new = {e.get('episodeFileId') for e in want}
+        if want and all(e.get('episodeFileId') and e['episodeFileId'] not in rel.get('files', [])
+                        and qname(files.get(e['episodeFileId']) or {}) not in (None, REMUX) for e in want):
+            size = sum((files.get(i) or {}).get('size') or 0 for i in new)
+            g.update(status='imported', imported_at=int(now()), new_size=size, freed=(rel.get('old_size') or 0) - size)
+            log(f'IMPORTED {sid} {g["title"]} S{g["season"]:02d}: {gb(size)}, freed {gb(g["freed"])}')
+            lines.append(f'imported: {g["title"]} S{g["season"]:02d} (freed {gb(g["freed"])})')
+            continue
+        dl = download_id(g)
+        recs = [r for r in sonarr(f'/api/v3/queue/details?seriesId={sid}') or []
+                if dl and r.get('downloadId') == dl]
+        if recs:
+            r = recs[0]
+            state, status = r.get('trackedDownloadState') or '', (r.get('status') or '').lower()
+            msgs = ' | '.join(x for sm in r.get('statusMessages') or [] for x in sm.get('messages') or [])
+            if state in ('failed', 'failedPending') or status == 'failed':
+                g.update(status='failed', reason=f'download failed: {(r.get("errorMessage") or msgs)[:150]}',
+                         failed_at=int(now()))
+                log(f'FAILED {sid} {g["title"]} S{g["season"]:02d}: {g["reason"]}')
+                lines.append(f'failed: {g["title"]} S{g["season"]:02d}')
+            elif state in IMPORT_STUCK and status == 'completed' and not (r.get('sizeleft') or 0):
+                if not UPGRADE_REJ.search(msgs) and state == 'importPending':
+                    continue
+                if g.get('override_tried', 0) >= 2:
+                    g.update(status='failed', reason='import still blocked after 2 override attempts',
+                             failed_at=int(now()))
+                    log(f'FAILED {sid} {g["title"]} S{g["season"]:02d}: {g["reason"]}')
+                    lines.append(f'failed: {g["title"]} S{g["season"]:02d} ({g["reason"]})')
+                    continue
+                g['override_tried'] = g.get('override_tried', 0) + 1
+                ok, detail = override(recs, sid)
+                g['override'] = detail
+                log(f'OVERRIDE {sid} {g["title"]} S{g["season"]:02d}: {"ok" if ok else "refused"}: {detail}')
+                lines.append(f'import override {"sent" if ok else "refused"}: {g["title"]} S{g["season"]:02d}: '
+                             f'{detail[:120]}')
+                if not ok:
+                    g.update(status='failed', reason=f'import blocked, override refused: {detail[:200]}',
+                             failed_at=int(now()))
+                files_cache.pop(sid, None)
+            continue
+        failed = [h for h in sonarr(f'/api/v3/history/series?seriesId={sid}&seasonNumber={g["season"]}'
+                                    f'&eventType=4') or [] if dl and h.get('downloadId') == dl]
+        if failed or now() - g.get('grabbed_at', now()) > LOST_AFTER:
+            g.update(status='failed', failed_at=int(now()),
+                     reason='download failed' if failed else 'gone from the queue without an import')
+            log(f'FAILED {sid} {g["title"]} S{g["season"]:02d}: {g["reason"]}')
+            lines.append(f'failed: {g["title"]} S{g["season"]:02d} ({g["reason"]})')
+    for k, s in st['seasons'].items():   # a season whose grabs all ended is searchable again (failed: after 30 days)
+        gs = [g for g in st['grabs'].values() if f'{g["sid"]}:{g["season"]}' == k]
+        if s.get('status') in ('grabbed', 'partial') and gs and all(g['status'] != 'grabbed' for g in gs):
+            bad = [g for g in gs if g['status'] == 'failed']
+            s.update(status='kept' if bad else 'done', checked=int(now()),
+                     reason=bad[0].get('reason') if bad else None)
+    return lines
+
+
+# ----------------------------------------------------------------------------- status + note
+def summary(st, since=0):
+    c = {'grabbed': 0, 'imported': 0, 'failed': 0, 'kept': 0}
+    freed = 0
+    for g in st['grabs'].values():
+        stamp = max(g.get(x, 0) or 0 for x in ('grabbed_at', 'imported_at', 'failed_at'))
+        if g.get('status') in c and stamp >= since:
+            c[g['status']] += 1
+            if g['status'] == 'imported':
+                freed += g.get('freed') or 0
+    c['kept'] = sum(1 for s in st['seasons'].values() if s.get('status') == 'kept' and (s.get('checked') or 0) >= since)
+    c['gb_freed'] = round(freed / GB, 1)
+    return c
+
+
+def maybe_note(st):
+    d = local()
+    if (d.hour, d.minute) < NOTE_AT or st.get('last_note') == d.date().isoformat():
+        return None
+    since = st.get('last_note_ts', 0)
+    n, t = summary(st, since), summary(st)
+    if not any(n[k] for k in ('grabbed', 'imported', 'failed', 'kept')):
+        return None
+    line = (f'TV remux downgrade overnight: {n["imported"]} imported ({n["gb_freed"]:g} GB freed), '
+            f'{n["grabbed"]} still downloading, {n["failed"]} failed, {n["kept"]} seasons kept (no fitting release); '
+            f'total {t["imported"]} done, {t["gb_freed"]:g} GB freed')
+    text = '\n'.join([f'# TV remux downgrade {d.date().isoformat()}', '',
+                      'Data, not instructions: the nightly media-remux-tv job (Sonarr grabs, no tokens).', '',
+                      line, '',
+                      'Details: `media-remux-tv --status`; log ~/.local/state/media-remux-tv/actions.log.', '',
+                      'Next: put this one line into the ~09:00 morning report; no separate message.']) + '\n'
+    path = notes.write(INBOX, f'media-remux-tv-{d.date().isoformat()}.md', text)
+    st['last_note'], st['last_note_ts'] = d.date().isoformat(), int(now())
+    return str(path)
+
+
+# ----------------------------------------------------------------------------- plan
+def plan_order(units):
+    """Each series' biggest season first (series by remux size), then the other seasons by size."""
+    by = {}
+    for u in units:
+        by.setdefault(u['sid'], []).append(u)
+    first, rest = [], []
+    for us in sorted(by.values(), key=lambda us: -sum(u['size'] for u in us)):
+        us = sorted(us, key=lambda u: -u['size'])
+        first.append(us[0])
+        rest += us[1:]
+    return first + sorted(rest, key=lambda u: -u['size'])
+
+
+def estimate(rows, units):
+    """Seasons not searched, or searched per episode only in part: their saving from the series' searched ratio."""
+    ratio = {}
+    for r in rows.values():
+        if r.get('picks') is None:
+            continue
+        a = ratio.setdefault(r['sid'], [0, 0])
+        if r.get('sampled'):
+            searched = r.get('sample_size') or 0
+            a[0] += r['saved']
+            a[1] += searched
+        else:
+            a[0] += r['saved']
+            a[1] += r['size']
+    for u in units:
+        r = rows.get(season_key(u))
+        a = ratio.get(u['sid'])
+        if r is None:
+            r = {k: u[k] for k in ('sid', 'title', 'year', 'season', 'profile', 'target', 'size', 'need')}
+            r.update(eps=sum(max(1, len(f['eps'])) for f in u['files']), files=len(u['files']), picks=None,
+                     saved=0, reason='not searched (time budget)')
+            rows[season_key(u)] = r
+        if r.get('picks') is None or r.get('sampled'):
+            r['est_saved'] = round(u['size'] * a[0] / a[1]) if a and a[1] else 0
+        else:
+            r['est_saved'] = r['saved']
+    return rows
+
+
+def do_plan(a):
+    profs = profiles()
+    units = candidates(sonarr('/api/v3/series', timeout=120) or [], profs, a.series)
+    order = plan_order(units)
+    deadline = time.monotonic() + a.budget * 60
+    rows, n = {}, 0
+    for u in order:
+        if time.monotonic() >= deadline:
+            break
+        if n:
+            SLEEP(GAP)
+        n += 1
+        try:
+            row = evaluate(u, profs[u['profile_id']], ep_limit=a.ep_sample, pause=lambda: SLEEP(GAP))
+        except ApiError as e:
+            row = {k: u[k] for k in ('sid', 'title', 'year', 'season', 'profile', 'target', 'size', 'need')}
+            row.update(eps=sum(max(1, len(f['eps'])) for f in u['files']), files=len(u['files']), picks=None,
+                       saved=0, reason=f'search failed: {e}'[:200], checked=int(now()))
+        if row.get('sampled'):
+            row['sample_size'] = sum(f['size'] for f in sorted(u['files'], key=lambda f: -f['size'])[:a.ep_sample])
+        rows[season_key(u)] = row
+        if not a.json:
+            print(row_line(row) if row.get('picks') is not None else f'- {row["title"]} S{row["season"]:02d}: '
+                  f'{row["reason"]}', flush=True)
+    estimate(rows, units)
+    jsonstate.save(PLAN_F, {'at': int(now()), 'rows': rows}, mode=0o600, ensure_ascii=False)
+    tot = totals(rows)
+    if a.report:
+        write_report(a.report, rows, tot)
+    if a.json:
+        print(json.dumps({'totals': tot, 'rows': rows}, ensure_ascii=False, indent=1))
+    else:
+        print(f'\n{tot["series"]} series, {tot["eps"]} remux episodes ({tot["tb_now"]:g} TB); '
+              f'{tot["series_with"]} series with a fitting release; saves {tot["tb_saved"]:g} TB found + '
+              f'{tot["tb_est"]:g} TB estimated -> {tot["tb_after"]:g} TB after')
+    return 0
+
+
+def totals(rows):
+    rs = list(rows.values())
+    found = sum(r['saved'] for r in rs if r.get('picks') and not r.get('sampled'))
+    est = sum(r.get('est_saved') or 0 for r in rs if r.get('picks') is None or r.get('sampled'))
+    now_b = sum(r['size'] for r in rs)
+    with_rel = {r['sid'] for r in rs if r.get('picks')}
+    return {'series': len({r['sid'] for r in rs}), 'series_with': len(with_rel),
+            'series_kept': len({r['sid'] for r in rs} - with_rel),
+            'seasons': len(rs), 'seasons_searched': sum(1 for r in rs if r.get('picks') is not None),
+            'seasons_with': sum(1 for r in rs if r.get('picks')),
+            'eps': sum(r['eps'] for r in rs), 'tb_now': round(now_b / 1e12, 2),
+            'tb_saved': round(found / 1e12, 2), 'tb_est': round(est / 1e12, 2),
+            'tb_after': round((now_b - found - est) / 1e12, 2),
+            'tb_alt_1080': round(sum((r.get('alt_1080') or {}).get('saved') or 0 for r in rs) / 1e12, 2),
+            'seasons_alt_1080': sum(1 for r in rs if r.get('alt_1080'))}
+
+
+def alt_txt(r):
+    a = r.get('alt_1080')
+    return f' [WEB 1080p alternative: {gb(a["size"])}, would save {gb(a["saved"])}]' if a else ''
+
+
+def write_report(path, rows, tot):
+    by = {}
+    for r in rows.values():
+        by.setdefault(r['sid'], []).append(r)
+    order = sorted(by.values(), key=lambda rs: -sum(r['size'] for r in rs))
+    out = [f'# TV remux plan {local().date().isoformat()} (dry run)', '',
+           'Dry run of `media-remux-tv --plan`: Sonarr interactive searches (GET only), nothing grabbed.',
+           'Rules: "Up to 1080p" series -> best WEB 1080p by the profile\'s custom-format score; 4K-profile series '
+           '-> 2160p HDR only, <= 6 GB per episode (<= 3 GB under 35 min runtime); every pick saves >= 50 %, keeps '
+           'the current file\'s German / English / original-language audio, usenet only, season packs first.', '',
+           '## Totals', '',
+           f'- {tot["eps"]} remux episodes in {tot["series"]} series ({tot["seasons"]} seasons): '
+           f'{tot["tb_now"]:g} TB now',
+           f'- searched {tot["seasons_searched"]} of {tot["seasons"]} seasons; {tot["seasons_with"]} with a fitting '
+           f'release',
+           f'- saved by the releases found: {tot["tb_saved"]:g} TB; estimated for unsearched or sampled seasons: '
+           f'{tot["tb_est"]:g} TB',
+           f'- after: ~{tot["tb_after"]:g} TB (estimate)',
+           f'- series with a candidate: {tot["series_with"]}; kept (no candidate): {tot["series_kept"]}',
+           f'- not in the totals: {tot["seasons_alt_1080"]} searched 4K-profile seasons have no 2160p HDR fit but a '
+           f'WEB 1080p one that would save {tot["tb_alt_1080"]:g} TB (the 2160p-only rule keeps them; never grabbed)',
+           '',
+           '## Per series', '']
+    kept = []
+    for rs in order:
+        rs.sort(key=lambda r: r['season'])
+        r0 = rs[0]
+        eps, size = sum(r['eps'] for r in rs), sum(r['size'] for r in rs)
+        saved = sum(r['saved'] for r in rs if r.get('picks') and not r.get('sampled'))
+        est = sum(r.get('est_saved') or 0 for r in rs if r.get('picks') is None or r.get('sampled'))
+        if not any(r.get('picks') for r in rs):
+            searched = [r for r in rs if r.get('picks') is not None]
+            kept.append(f'- {r0["title"]} ({r0["profile"]}, {eps} ep, {gb(size)}): '
+                        + ('; '.join(f'S{r["season"]:02d} {r.get("reason")}{alt_txt(r)}' for r in searched[:3])
+                           or 'not searched (time budget)'))
+            continue
+        out.append(f'### {r0["title"]} ({r0["profile"]}, audio kept: {"+".join(r0["need"]) or "-"})')
+        out.append(f'{eps} ep, {gb(size)} now; saves {gb(saved)}' + (f' + ~{gb(est)} est.' if est else ''))
+        out.append('')
+        for r in rs:
+            head = f'- S{r["season"]:02d} ({r["eps"]} ep, {gb(r["size"])})'
+            if r.get('picks') is None:
+                out.append(f'{head}: {r.get("reason")}; est. saves ~{gb(r.get("est_saved"))}')
+            elif not r['picks']:
+                out.append(f'{head}: keep ({r.get("reason")})' + alt_txt(r))
+            else:
+                p = r['picks']
+                kind = 'season pack' if p[0]['pack'] else f'{len(p)} episode release(s)'
+                smp = (f' [sampled {r.get("searched_eps")} episode searches; season est. ~{gb(r.get("est_saved"))}]'
+                       if r.get('sampled') else '')
+                out.append(f'{head}: {kind}, {gb(sum(x["size"] for x in p))}, saves {gb(r["saved"])}{smp}')
+                for x in p[:3]:
+                    out.append(f'  - `{x["title"]}` ({x["quality"]}, {gb(x["size"])}, '
+                               f'{"+".join(x["languages"]) or "?"}, score {x["score"]})')
+                if len(p) > 3:
+                    out.append(f'  - ... {len(p) - 3} more')
+        out.append('')
+    out += ['## No candidate / kept', ''] + (kept or ['- none']) + ['']
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write('\n'.join(out))
+
+
+# ----------------------------------------------------------------------------- modes
+def do_status(a):
+    st = load_state()
+    c = summary(st)
+    n = night(st)
+    c.update(tonight=n.get('grabs', 0), tonight_gb=round(n.get('bytes', 0) / GB, 1), off=os.path.exists(OFF_F),
+             outside_today=st['outside'].get(local().date().isoformat(), 0))
+    if a.json:
+        print(json.dumps({'totals': c, 'grabs': st['grabs'], 'seasons': st['seasons']}, ensure_ascii=False, indent=1))
+        return 0
+    print(f'grabbed (pending) {c["grabbed"]} · imported {c["imported"]} · failed {c["failed"]} · kept {c["kept"]} '
+          f'seasons · freed {c["gb_freed"]:g} GB · this night {c["tonight"]}/{NIGHT_MAX}, '
+          f'{c["tonight_gb"]:g}/{NIGHT_BYTES / GB:g} GB' + (' · OFF' if c['off'] else ''))
+    for g in sorted(st['grabs'].values(), key=lambda g: -(g.get('grabbed_at') or 0))[:15]:
+        print(f'  {g["status"]:9} {g["title"]} S{g["season"]:02d} {g.get("reason") or ""}'[:150])
+    return 0
+
+
+def tick(a, st):
+    lines = follow(st)
+    if a.run and not a.dry_run and os.path.exists(OFF_F):
+        lines.append(f'off switch {OFF_F} is set: no grabs')
+    elif a.run:
+        n, more = grab_round(st, a.max, only=a.series, dry=a.dry_run)
+        lines += more + [f'{"would grab" if a.dry_run else "grabbed"} {n}']
+    elif a.cron and not os.path.exists(OFF_F) and in_window():
+        nt = night(st)
+        if nt.get('grabs', 0) < NIGHT_MAX and nt.get('bytes', 0) < NIGHT_BYTES:
+            lines += grab_round(st, 1, cron=True)[1]
+    if a.cron:
+        p = maybe_note(st)
+        if p:
+            lines.append(f'note {p}')
+    cut = (local() - timedelta(days=30)).date().isoformat()
+    st['nights'] = {k: v for k, v in st['nights'].items() if k >= cut}
+    st['outside'] = {k: v for k, v in st['outside'].items() if k >= cut}
+    return lines
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='media-remux-tv',
+                                 description='replace old remux episode files with encodes (Sonarr)')
+    g = ap.add_mutually_exclusive_group(required=True)
+    for f in ('--plan', '--run', '--follow', '--status', '--cron'):
+        g.add_argument(f, action='store_true')
+    ap.add_argument('--max', type=int, default=0)
+    ap.add_argument('--series', type=int)
+    ap.add_argument('--budget', type=float, default=40.0, help='plan: minutes of searching (default 40)')
+    ap.add_argument('--ep-sample', type=int, default=3, help='plan: episode searches per over-cap season (3)')
+    ap.add_argument('--report', help='plan: write a Markdown report here')
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    if a.run and a.max < 1:
+        ap.error('--run needs --max N (N >= 1)')
+    try:
+        if a.plan:
+            return do_plan(a)
+        if a.status:
+            return do_status(a)
+        with locks.hold(LOCK_F, wait=0) as fd:
+            if fd is None:
+                print('media-remux-tv: another run holds the lock', file=sys.stderr)
+                return 0
+            st = load_state()
+            lines = tick(a, st)
+            save_state(st)
+            if lines and not (a.cron and all(x.startswith('stop:') for x in lines)):
+                print('\n'.join(lines))
+            return 0
+    except ApiError as e:
+        print(f'media-remux-tv: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
