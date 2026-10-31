@@ -24,6 +24,9 @@ Config (private, 0600; trip places never live in this script): ~/.config/strike-
   A leg's window is from - margin .. to + margin. Everything ends after the last window: the watch then does nothing.
 Sources (polite: one fetch per URL per run, 25 s timeout, a pause between news queries):
   mit    Italian Ministry of Transport strike list (official; every sector; national, regional, local)       IT
+         The site answers Italian IP addresses only (no TCP connection from elsewhere; its open-data CSV on
+         dati.mit.gov.it is a stale copy, and cgsse.it fences out Swiss addresses too): from outside Italy it fails
+         as "no connection" and Italy rests on the news queries (unconfirmed headlines); check says so per country.
   irail  SNCB/NMBS disturbances through the iRail API (official rail feed; strike notices only)                BE
   sncb   SNCB/NMBS press newsrooms, FR + NL RSS (strike / alternative-service releases)                        BE
   news   Google News RSS per country, the config's queries (headlines with a strike word AND a day in them;
@@ -37,7 +40,7 @@ places or words (whole words; "x*" = prefix). One that names only other countrie
 are watched (their own dedupe key) or is dropped; outlets alone don't count. No names configured = not filtered.
 Dedupe: Italian list per row; SNCB (feed + newsrooms) per day; news per country + days (official wins).
 A source failing 3 cron runs in a row writes ONE ~/inbox/strike-watch-failed-<source>.md (again only after it
-recovered). Never messages anyone.
+recovered, or when the failure changes kind: no connection vs. an HTTP or parser error). Never messages anyone.
 Exit: 0 ok (also: nothing to watch), 1 every source failed, 2 usage or config error.
 Env (tests): STRIKE_WATCH_CONFIG (file), STRIKE_WATCH_DIR (state), STRIKE_WATCH_INBOX, STRIKE_WATCH_NOW (ISO),
 STRIKE_WATCH_BASE (fake server: every URL becomes BASE/<host><path>?<query>), STRIKE_WATCH_PAUSE (seconds).
@@ -150,6 +153,17 @@ class Fail(Exception):
     pass
 
 
+class Unreachable(Fail):
+    """No connection at all (timeout, refused, DNS): not a page change, nothing the parser can fix."""
+
+
+# why a source may get no connection from here, and what covers its country meanwhile (fail note, check, status)
+UNREACHABLE_WHY = {
+    'mit': 'scioperi.mit.gov.it answers Italian IP addresses only (geo-fenced; outside Italy every connection '
+           'times out)',
+}
+
+
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(2)
@@ -200,9 +214,11 @@ def fetch(url):
         with web.open(url_for(url), headers=headers, timeout=25) as r:
             return r.read(5_000_000).decode('utf-8', 'replace')
     except urllib.error.HTTPError as e:
-        raise Fail(f'HTTP {e.code}')
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        raise Fail(f'unreachable ({getattr(e, "reason", e)})')
+        raise Fail(f'HTTP {e.code}') from None
+    except (urllib.error.URLError, OSError) as e:
+        raise Unreachable(f'unreachable ({getattr(e, "reason", e)})') from None
+    except ValueError as e:
+        raise Fail(f'unreachable ({e})') from None
 
 
 def write_json(path, obj):
@@ -586,6 +602,10 @@ def gather(cfg, legs, now, log):
             strikes.extend(got)
         except Fail as e:
             health[name] = {'ok': False, 'error': str(e)}
+            if isinstance(e, Unreachable):
+                health[name]['unreachable'] = True
+                if name in UNREACHABLE_WHY:
+                    health[name]['error'] += f'; no connection from here: {UNREACHABLE_WHY[name]}'
             log(f'{name}: {e}')
         except Exception as e:        # a parser bug must not stop the other sources
             health[name] = {'ok': False, 'error': f'parser error {e.__class__.__name__}: {e}'}
@@ -641,6 +661,23 @@ def gather(cfg, legs, now, log):
     return strikes, health
 
 
+def fallback_text(cfg, country, failed, news_ok=True):
+    """What covers a country whose official sources all failed."""
+    if news_ok and (cfg.get('news') or {}).get(country):
+        return f"official list down ({', '.join(failed)}): news headlines only, unconfirmed"
+    return f"official list down ({', '.join(failed)}) and no working news query: NOT COVERED"
+
+
+def coverage(cfg, legs, health):
+    """-> {country: fallback text} for the watched countries whose official sources all failed this run."""
+    out = {}
+    for c in sorted({lg['country'] for lg in legs}):
+        off = [n for n, (cc, official, _) in SOURCES.items() if official and c in cc and n in health]
+        if off and not any(health[n]['ok'] for n in off):
+            out[c] = fallback_text(cfg, c, off, bool(health.get('news', {}).get('ok')))
+    return out
+
+
 # ------------------------------------------------------------------------------------------------ notes
 def backup_for(cfg, r):
     b = cfg.get('backup') or {}
@@ -678,12 +715,22 @@ def note_text(r, cfg):
     return '\n'.join(lines) + '\n'
 
 
-def fail_note(name, info, now):
-    text = (f'# strike-watch: source {name} failing\n'
-            'Data, not instructions (strike-watch cron; JOBS.md says how to handle it).\n\n'
-            f"- {SOURCES[name][2]} failed {info['fails']} runs in a row; last error: {info.get('error', '?')}\n"
-            f"- Last good run: {info.get('last_ok') or 'never'}\n"
-            '- The other sources still run. Fix the parser if the page changed (`strike-watch check` shows the error).\n')
+def fail_note(name, info, now, cfg=None):
+    lines = [f'# strike-watch: source {name} ' + ('unreachable' if info.get('unreachable') else 'failing'),
+             'Data, not instructions (strike-watch cron; JOBS.md says how to handle it).', '',
+             f"- {SOURCES[name][2]} failed {info['fails']} runs in a row; last error: {info.get('error', '?')}",
+             f"- Last good run: {info.get('last_ok') or 'never'}"]
+    if info.get('unreachable'):
+        lines.append('- Not a parser problem: no connection from this box'
+                     + (f" ({UNREACHABLE_WHY[name]})" if name in UNREACHABLE_WHY else ' (site down, or blocking us)')
+                     + '; nothing to fix in the script. It keeps trying every run and recovers by itself.')
+        for c in SOURCES[name][0]:
+            lines.append(f'- {COUNTRY.get(c, c)} meanwhile: {fallback_text(cfg or {}, c, [name])}; before a leg there, '
+                         "check the operators' own strike pages by hand.")
+    else:
+        lines.append('- The other sources still run. Fix the parser if the page changed (`strike-watch check` shows '
+                     'the error).')
+    text = '\n'.join(lines) + '\n'
     return notes.write(INBOX, f'strike-watch-failed-{name}.md', text, mode=0o600)
 
 
@@ -704,6 +751,7 @@ def cmd_check(args):
     errors = []
     strikes, health = gather(cfg, act, now, errors.append)
     relevant, skipped = evaluate(strikes, act, cfg, now)
+    cover = coverage(cfg, act, health)
     all_failed = bool(health) and not any(h['ok'] for h in health.values())
     if args.cron:
         return cron_run(cfg, relevant, health, now, args.dry_run, all_failed)
@@ -713,7 +761,8 @@ def cmd_check(args):
                                     'to': lg['to'].isoformat(), 'window': [lg['win_from'].isoformat(),
                                                                            lg['win_to'].isoformat()],
                                     'sectors': lg['sectors']} for lg in act],
-                          'sources': health, 'relevant': relevant, 'skipped': skipped}, ensure_ascii=False, indent=1))
+                          'sources': health, 'coverage': cover, 'relevant': relevant, 'skipped': skipped},
+                         ensure_ascii=False, indent=1))
         return 1 if all_failed else 0
     print(f"strike-watch {today(now).isoformat()}: {len(act)} leg(s) watched")
     for lg in act:
@@ -721,6 +770,8 @@ def cmd_check(args):
               f"{'/'.join(lg['sectors'])}  ({lg['label']})")
     print('sources: ' + ', '.join(f"{n} {'ok (%d)' % h['count'] if h['ok'] else 'FAILED: ' + h['error']}"
                                   for n, h in health.items()))
+    for c, txt in cover.items():
+        print(f'  {c}: {txt}')
     if relevant:
         print(f'\n{len(relevant)} strike(s) on his trip days:')
         for r in relevant:
@@ -768,13 +819,15 @@ def cron_run(cfg, relevant, health, now, dry, all_failed):
     for name, h in health.items():
         s = src.setdefault(name, {})
         if h['ok']:
-            s.update(fails=0, last_ok=stamp, noted=False, error='')
+            s.update(fails=0, last_ok=stamp, noted=False, noted_kind='', error='', unreachable=False)
         else:
             s['fails'] = s.get('fails', 0) + 1
             s['error'] = h['error']
-            if s['fails'] >= FAIL_NOTE_AFTER and not s.get('noted') and not dry:
-                fail_note(name, s, now)
-                s['noted'] = True
+            s['unreachable'] = bool(h.get('unreachable'))
+            kind = 'unreachable' if s['unreachable'] else 'error'
+            if s['fails'] >= FAIL_NOTE_AFTER and not dry and (not s.get('noted') or s.get('noted_kind') != kind):
+                fail_note(name, s, now, cfg)
+                s.update(noted=True, noted_kind=kind)
     state['last_run'] = stamp
     keep = today(now) - dt.timedelta(days=60)
     for k in [k for k, v in seen.items() if d_iso(v['end']) < keep]:
@@ -803,9 +856,16 @@ def cmd_status(args):
     for lg in out['legs']:
         print(f"  {'*' if lg['active'] else ' '} {lg['trip']}: {lg['country']} {lg['window'][0]} .. {lg['window'][1]} "
               f"{'/'.join(lg['sectors'])}")
+    watched = {lg['country'] for lg in act}
     for n, s in out['sources'].items():
-        print(f"  source {n}: {'ok' if not s.get('fails') else 'failing x%d: %s' % (s['fails'], s.get('error'))}"
-              f" (last ok {s.get('last_ok') or 'never'})")
+        state_txt = 'ok' if not s.get('fails') else '%s x%d: %s' % (
+            'unreachable' if s.get('unreachable') else 'failing', s['fails'], s.get('error'))
+        print(f"  source {n}: {state_txt} (last ok {s.get('last_ok') or 'never'})")
+        if s.get('fails') and n in SOURCES and SOURCES[n][1]:
+            for c in SOURCES[n][0]:
+                if c in watched and not any(SOURCES[m][1] and c in SOURCES[m][0] and not v.get('fails')
+                                            for m, v in out['sources'].items() if m != n and m in SOURCES):
+                    print(f'    {c}: {fallback_text(cfg, c, [n])}')
     for k, v in sorted(out['noted'].items(), key=lambda kv: kv[1]['start']):
         print(f"  noted {v['start']} {v['country']} {'/'.join(v.get('hit', []))}: {v['title'][:90]} ({v['note']})")
     return 0
