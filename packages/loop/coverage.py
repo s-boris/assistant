@@ -254,7 +254,9 @@ def stack_due(cov: dict[str, Any], reports: Path) -> list[tuple[str, str]]:
     names = [f.name for f in reports.glob("*.md")] if reports.is_dir() else []
     out = []
     for tid, spec in ((cov.get("steps") or {}).get("stack") or {}).items():
-        rx = re.compile(spec.get("match") or re.escape(tid), re.I) if isinstance(spec, dict) else re.compile(tid)
+        own = rf"-{re.escape(tid)}(?:[-.])"  # the topic's own report name, 2026-10-30-<tid>.md
+        extra = spec.get("match") if isinstance(spec, dict) else None
+        rx = re.compile(f"{own}|{extra}" if extra else own, re.I)
         dates = [m.group(1) for n in names if rx.search(n) for m in [DATE_RE.search(n)] if m]
         out.append((tid, max(dates) if dates else ""))
     return sorted(out, key=lambda t: (t[1], t[0]))

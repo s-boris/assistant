@@ -251,3 +251,10 @@ def test_coverage_collector(monkeypatch: pytest.MonkeyPatch) -> None:
     assert r["metrics"]["in_progress"] == 1 and r["metrics"]["parts"] == 5
     assert {"vault", "parts", "coverage"} <= set(health.COLLECTORS)
     assert common  # the loop package imports cleanly next to the collectors
+
+
+def test_stack_rotation_counts_the_topic_id_next_to_its_match(tmp_path: Path) -> None:
+    (tmp_path / "2026-10-30-edge.md").write_text("x")
+    (tmp_path / "2026-10-28-hedge-fund.md").write_text("x")
+    cov = {"steps": {"stack": {"edge": {"match": "nginx|tunnel"}, "unifi": {}}}}
+    assert coverage.stack_due(cov, tmp_path) == [("unifi", ""), ("edge", "2026-10-30")]
