@@ -1373,6 +1373,136 @@ def c_board(ctx: Ctx) -> dict[str, Any]:
     }
 
 
+BACKUP_HA_MAX_H = 36  # ha-backup-pull copies one a day (04:05)
+BACKUP_HA_MIN = 3  # it keeps 14; fewer than this means rotation or the pull is broken
+BACKUP_GIT_MAX_H = 48  # brain auto commits twice an hour
+BACKUP_ARCHIVE_MAX_H = 48  # brain-backup uploads one archive a night (03:47), counted from the archive's day
+BACKUP_VERIFY_DAYS = 35  # brain-backup --verify runs monthly
+HA_TAR_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{4}_[A-Za-z0-9_\-]{4,64}__[A-Za-z0-9._\-]{0,48}\.tar")
+ARCHIVE_RE = re.compile(r"claude-bot-(\d{4}-\d{2}-\d{2})\.tar\.gz")
+
+
+def _age_h(now: float, ts: float | None) -> float | None:
+    return round((now - ts) / 3600, 1) if ts else None
+
+
+def c_backups(ctx: Ctx) -> dict[str, Any]:
+    """Backups the registry knows (schedules.toml feature "backup" + ha-backup-pull): the local HA backups (newest
+    mtime, count), the brain git's last commit time, the newest nightly archive brain-backup logged (its name's date)
+    and monthly restore-check failure notes. Names, mtimes, counts and commit times only: never a backup's content."""
+    now, out = ctx.now, []
+    d = home("backups", "ha")
+    try:
+        tars = [p for p in d.iterdir() if HA_TAR_RE.fullmatch(p.name)]
+    except OSError:
+        tars = []
+    ha_new = max((mtime(p) for p in tars), default=0.0) or None
+    ha_age = _age_h(now, ha_new)
+    if ha_age is None or ha_age > BACKUP_HA_MAX_H:
+        out.append(
+            F(
+                "backups",
+                "ha:stale",
+                "ha_age_h",
+                ha_age,
+                BACKUP_HA_MAX_H,
+                3 if ha_age is None or ha_age > 3 * 24 else 2,
+                "no HA backup in ~/backups/ha"
+                if ha_age is None
+                else f"newest HA backup in ~/backups/ha is {fmtn(ha_age)} h old ({hhmm(ha_new)}; "
+                f"max {BACKUP_HA_MAX_H} h)",
+                "`ha-backup-pull --status`; ~/.local/state/ha-backup-pull/cron.log; `cron-runs stats --job "
+                "ha-backup-pull`; HA's own automatic backup",
+            )
+        )
+    if tars and len(tars) < BACKUP_HA_MIN:
+        out.append(
+            F(
+                "backups",
+                "ha:few",
+                "ha_count",
+                len(tars),
+                BACKUP_HA_MIN,
+                2,
+                f"only {len(tars)} HA backup(s) kept in ~/backups/ha (min {BACKUP_HA_MIN}, the pull keeps 14)",
+                "`ha-backup-pull --status`; its --keep and free space on the appdata share",
+            )
+        )
+    rc, o, _ = common.run(["git", "--git-dir", str(home(".brain.git")), "log", "-1", "--format=%ct"], timeout=30)
+    git_ts = float(o.strip()) if rc == 0 and o.strip().isdigit() else None
+    git_age = _age_h(now, git_ts)
+    if git_age is None or git_age > BACKUP_GIT_MAX_H:
+        out.append(
+            F(
+                "backups",
+                "brain-git",
+                "brain_git_age_h",
+                git_age,
+                BACKUP_GIT_MAX_H,
+                3 if git_age is None else 2,
+                "no readable commit in the brain git (~/.brain.git)"
+                if git_age is None
+                else f"brain git's last commit is {fmtn(git_age)} h old ({hhmm(git_ts)}; max {BACKUP_GIT_MAX_H} h)",
+                '`brain auto` by hand once; `cron-runs stats --job brain-auto`; `brain-commit "msg"`',
+            )
+        )
+    log = home(".local", "state", "brain-backup.log")
+    days = sorted(set(ARCHIVE_RE.findall(tail(log))))  # archive names only, never other log text
+    arc_ts = None
+    if days:
+        try:
+            arc_ts = datetime.fromisoformat(days[-1]).replace(tzinfo=common.tz()).timestamp()
+        except ValueError:
+            arc_ts = None
+    arc_age = _age_h(now, arc_ts)
+    if arc_age is None or arc_age > BACKUP_ARCHIVE_MAX_H:
+        out.append(
+            F(
+                "backups",
+                "brain-archive",
+                "brain_archive_age_h",
+                arc_age,
+                BACKUP_ARCHIVE_MAX_H,
+                2,
+                "brain-backup logged no archive name in ~/.local/state/brain-backup.log"
+                if arc_age is None
+                else f"newest brain-backup archive is from {days[-1]} ({fmtn(arc_age)} h since that day began; "
+                f"max {BACKUP_ARCHIVE_MAX_H} h)",
+                "`brain-backup --list`; the brain-backup log through secretscan --redact; `unraid-ssh mode`",
+            )
+        )
+    verify = [
+        p for p in home("inbox").glob("brain-backup-verify-failed-*.md") if mtime(p) >= now - BACKUP_VERIFY_DAYS * DAY
+    ]
+    if verify:
+        out.append(
+            F(
+                "backups",
+                "brain-verify",
+                "verify_fail_notes",
+                len(verify),
+                0,
+                2,
+                f"{len(verify)} brain-backup restore check failure note(s) in {BACKUP_VERIFY_DAYS} d",
+                "`brain-backup --verify` by hand; fix the archive's contents list, not the note",
+            )
+        )
+    m = {
+        "ha_count": len(tars),
+        "ha_age_h": ha_age,
+        "brain_git_age_h": git_age,
+        "brain_archive_age_h": arc_age,
+        "verify_fail_notes": len(verify),
+    }
+    return {
+        "metrics": m,
+        "sigs": {},
+        "findings": out,
+        "line": f"HA {len(tars)} kept, newest {fmtn(ha_age)} h; brain git {fmtn(git_age)} h; "
+        f"brain archive {fmtn(arc_age)} h; verify failures {len(verify)}",
+    }
+
+
 def run_text(argv: list[str], timeout: float = 60, system: bool = False) -> str:
     """stdout of a command (an own ~/bin verb, or a system binary with system=True); a failure raises."""
     rc, out, _err = common.run([argv[0] if system else common.bin_path(argv[0]), *argv[1:]], timeout)
@@ -2043,6 +2173,7 @@ COLLECTORS: dict[str, tuple[Callable[[Ctx], dict[str, Any]], str]] = {
     "server": (c_server, "server health (docker, disks; read-only verb)"),
     "hooks": (c_hooks, "hook decisions (rule names only)"),
     "board": (c_board, "board-lint"),
+    "backups": (c_backups, "backup freshness: HA backups, brain git, brain archive, restore check (names/mtimes)"),
     "vault": (c_vault, "vault health counts (status, metrics, alerts, audit per event, log signatures, repo)"),
     "parts": (c_parts, "part checks (own containers, media, voice, web agent, reminders late, HA health watch)"),
     "coverage": (c_coverage, "loop coverage map vs the live registries"),

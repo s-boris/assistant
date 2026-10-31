@@ -45,6 +45,7 @@ f = "(f) eval regression of the latest self-evals run"
 "h:server" = "(h) server health: docker, disks, VMs (read-only verb)"
 "h:hooks" = "(h) hook decisions by rule name"
 "h:board" = "(h) board-lint"
+"h:backups" = "(h) backup freshness: HA backups (newest, count), brain git last commit, brain archive, restore check notes"
 "h:vault" = "(h) vault health counts: status, metrics, alerts, audit per event, log signatures, repo"
 "h:parts" = "(h) part checks: own containers by name, media, voice, web agent, reminders overdue, HA health watch"
 "h:coverage" = "(h) this map against the live registries"
@@ -479,6 +480,7 @@ cleanup = ["monorepo"]
 id = "backups"
 title = "brain backups, public repo export"
 features = ["backup", "publish"]
+review = ["h:backups"]
 ideas = ["health"]
 cleanup = ["disk"]
 

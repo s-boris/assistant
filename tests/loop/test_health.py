@@ -5,7 +5,9 @@ transport, the loop's H1 candidates, the switch. All values are fake."""
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -587,3 +589,80 @@ def test_signatures_that_fold_into_one_add_their_counts(env: Path, monkeypatch: 
     monkeypatch.setitem(health.COLLECTORS, "phone", (fake, "test"))
     res = health.run(write=False, now=NOW, only=["phone"])
     assert [(c["sig"], c["n"]) for c in res["clusters"]] == [("phone-inbox exit N", 19)]
+
+
+# ------------------------------------------------------------------------------------------------ backups
+def _brain_git(h: Path, ts: float) -> None:
+    wt = h / "brain-wt"
+    wt.mkdir(exist_ok=True)
+    (wt / "f").write_text(str(ts))
+    e = dict(os.environ, GIT_DIR=str(h / ".brain.git"), GIT_WORK_TREE=str(wt))
+    e |= {"GIT_COMMITTER_DATE": f"@{int(ts)} +0000", "GIT_AUTHOR_DATE": f"@{int(ts)} +0000"}
+    for argv in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                                 "commit", "-q", "-m", "x"]):  # fmt: skip
+        subprocess.run(["git", *argv], env=e, check=True, capture_output=True)
+
+
+def _backups(h: Path, ha_ages_h: list[float], git_age_h: float, archive_day: str | None) -> None:
+    d = h / "backups" / "ha"
+    d.mkdir(parents=True, exist_ok=True)
+    for i, a in enumerate(ha_ages_h):
+        p = d / f"2026-10-{10 + i:02d}_0315_abcd{i:04d}__Automatic_backup_2026.10.2.tar"
+        p.write_text(f"PRIVATE-BACKUP-BODY {SECRETISH}")  # never read: only names and mtimes
+        os.utime(p, (NOW - a * 3600, NOW - a * 3600))
+        (d / (p.name + ".sha256")).write_text("x")
+    (d / "notes.txt").write_text("not a backup")
+    _brain_git(h, NOW - git_age_h * 3600)
+    log = _state(h, "brain-backup.log")
+    lines = [f"secrets escrow updated {SECRETISH}"]
+    if archive_day:
+        lines += [f"-rw-r--r-- 1 root root 5 /mnt/user/backup/claude-bot/claude-bot-{archive_day}.tar.gz"]
+    log.write_text("\n".join(lines) + "\n")
+
+
+def test_backups_fresh_is_quiet(env: Path) -> None:
+    _backups(env, [23.5, 47.5, 71.5, 95.5], 0.5, "2026-10-21")  # NOW = 22.10 04:00 local, before the HA pull
+    r = health.c_backups(health.Ctx("backups", NOW, []))
+    assert r["findings"] == []
+    m = r["metrics"]
+    assert m["ha_count"] == 4 and m["ha_age_h"] == 23.5 and m["brain_git_age_h"] == 0.5
+    assert m["brain_archive_age_h"] == 28 and m["verify_fail_notes"] == 0
+    assert "backups" in health.COLLECTORS
+
+
+def test_backups_stale_few_and_failed_verify(env: Path) -> None:
+    _backups(env, [40, 64], 50, "2026-10-19")
+    (env / "inbox" / "brain-backup-verify-failed-2026-10-01.md").write_text("x")
+    old = env / "inbox" / "brain-backup-verify-failed-2026-08-01.md"
+    old.write_text("x")
+    os.utime(old, (NOW - 80 * DAY_, NOW - 80 * DAY_))
+    r = health.c_backups(health.Ctx("backups", NOW, []))
+    by = {f["key"]: f for f in r["findings"]}
+    assert set(by) == {"backups:ha:stale", "backups:ha:few", "backups:brain-git", "backups:brain-archive",
+                       "backups:brain-verify"}  # fmt: skip
+    assert by["backups:ha:stale"]["sev"] == 2 and by["backups:ha:stale"]["now"] == 40
+    assert by["backups:ha:few"]["now"] == 2
+    assert by["backups:brain-git"]["now"] == 50 and by["backups:brain-git"]["sev"] == 2
+    assert by["backups:brain-archive"]["now"] == 76 and "2026-10-19" in by["backups:brain-archive"]["msg"]
+    assert by["backups:brain-verify"]["now"] == 1
+    assert all(f["fix"] and f["source"] == "backups" for f in r["findings"])
+    blob = json.dumps(r)
+    assert "PRIVATE-BACKUP-BODY" not in blob and SECRETISH not in blob and "escrow updated" not in blob
+
+
+def test_backups_missing_everything_is_high(env: Path) -> None:
+    r = health.c_backups(health.Ctx("backups", NOW, []))
+    by = {f["key"]: f for f in r["findings"]}
+    assert by["backups:ha:stale"]["sev"] == 3 and by["backups:ha:stale"]["now"] is None
+    assert by["backups:brain-git"]["sev"] == 3
+    assert "backups:ha:few" not in by  # zero kept is the stale finding, not a second one
+    assert by["backups:brain-archive"]["now"] is None
+
+
+def test_backups_run_and_report_line(env: Path) -> None:
+    _backups(env, [100], 1, "2026-10-21")
+    res = health.run(write=False, now=NOW, only=["backups"])
+    keys = [f["key"] for f in res["findings"]]
+    assert keys == ["backups:ha:stale", "backups:ha:few"] and res["findings"][0]["sev"] == 3
+    md = health.markdown(res)
+    assert "backups: newest HA backup" in md and "Fix: `ha-backup-pull --status`" in md
