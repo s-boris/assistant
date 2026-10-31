@@ -96,7 +96,11 @@
         back to queued, retried after 5 min. A smoke failure after the deploy (rolled back as before): each
         member once alone. Crash: a new worker adopts a live batch land, else main at the batch tip = landed
         (missing rows written, an undeployed tip deployed once), main unchanged = the members go back to the
-        front. --override skips the queue (the land above).
+        front. --override skips the queue (the land above). Memory gate: the worker starts no batch while the
+        host's MemAvailable is below 6 GB (ASSISTANT_LAND_MIN_MEM_GB, else ~/.config/assistant/land-min-mem holding
+        a number; 0 = off): the entries stay queued, `land status` and waiters show "waiting: memory 3.9 GB < 6 GB".
+        CI's pytest and legacy workers are capped by MemAvailable too (2 GB kept free, 0.5 GB per worker; an
+        explicit ASSISTANT_CI_*_WORKERS count wins).
   assistant land status [qN | BRANCH] [--json] [--wait]   the queue: queued (position, lane), testing (batch,
         members, phase, seconds), landed (commit, time), red / conflict / error (exit, red line, batch-mates),
         superseded; starts the worker when something waits. With qN or BRANCH and --wait: follow that entry
@@ -177,12 +181,14 @@ stderr) · 3 drift or refused · 4 smoke failed (rolled back), or the hub releas
 protected paths) · 9 a voice call stayed live past --wait-calls (deploy --target hub; CURRENT unchanged).
 A stdout reader that quits early (`assistant status | head`) costs no traceback and never cuts a deploy short.
 Env: ASSISTANT_REPO (repo, default ~/opt/assistant) · ASSISTANT_LAND_QUEUE (0|1: the land queue's switch) ·
+ASSISTANT_LAND_MIN_MEM_GB (the queue's memory gate, GB of MemAvailable; 0 = off) ·
 ASSISTANT_LOCK_WAIT (s, 900; per queue position: the clock
 restarts when a waiter moves up) · ASSISTANT_CI_LEGACY_OUT (ci writes its per-suite suite results there; land sets
 it) · ASSISTANT_TEST=1 (refuse the
 real home) · test seams honoured only with ASSISTANT_TEST=1: ASSISTANT_BRAIN_COMMIT_BIN, ASSISTANT_CRONTAB_BIN,
 ASSISTANT_LAND_CI (command run instead of `ci` by land), ASSISTANT_LANDQ_CHECK (instead of the queue's quick
 checks; unset in test mode = skipped), ASSISTANT_LANDQ_TICK (the worker's and waiter's poll, s),
+ASSISTANT_MEMINFO (a meminfo file read instead of /proc/meminfo; unset in test mode = no memory gate or cap),
 ASSISTANT_PUBLISH_BIN (started after a land),
 ASSISTANT_BOARD_MARK_BIN (the `board` a land pokes),
 ASSISTANT_LIVE_BIN (the bin dir the inbox-lint step stages over, default ~/bin), ASSISTANT_INBOX_LINT
@@ -1920,6 +1926,75 @@ def land_queue() -> bool:
         return False
 
 
+LAND_MIN_MEM_GB = 6.0  # the queue starts a batch only while the host's MemAvailable is at least this (land_min_mem)
+
+
+def land_min_mem() -> float:
+    """GB of MemAvailable the land queue needs to start a batch: ASSISTANT_LAND_MIN_MEM_GB, else the file
+    ~/.config/assistant/land-min-mem (a number), else LAND_MIN_MEM_GB; 0 = the gate off."""
+    raw = os.environ.get("ASSISTANT_LAND_MIN_MEM_GB", "").strip()
+    if not raw:
+        try:
+            raw = paths.config("land-min-mem").read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+    try:
+        return max(0.0, float(raw)) if raw else LAND_MIN_MEM_GB
+    except ValueError:
+        return LAND_MIN_MEM_GB
+
+
+def mem_available() -> float | None:
+    """The host's MemAvailable (/proc/meminfo) in GB (GiB); None = unknown. Test mode reads only the
+    ASSISTANT_MEMINFO seam (a file in meminfo format); unset there = unknown (no gate, no cap)."""
+    src = test_seam("ASSISTANT_MEMINFO") if paths.test_mode() else "/proc/meminfo"
+    if not src:
+        return None
+    try:
+        for ln in Path(src).read_text(encoding="ascii", errors="replace").splitlines():
+            if ln.startswith("MemAvailable:"):
+                return int(ln.split()[1]) / (1 << 20)  # kB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def landq_mem_wait() -> tuple[float, float] | None:
+    """The queue's memory gate: (MemAvailable, needed) in GB while MemAvailable is below land_min_mem(), else None
+    (enough, unknown, or the gate off). A CI batch on a box short of memory starved the hub (DNS EAI_AGAIN)."""
+    need = land_min_mem()
+    have = mem_available() if need > 0 else None
+    if have is None or have >= need:
+        return None
+    return have, need
+
+
+def _landq_hold(short: tuple[float, float] | None) -> None:
+    """The worker's hold (landq/hold.json, for `land status` and waiters): set while the gate holds, rewritten when
+    the reading moves by 0.5 GB or more (not every tick), dropped when it lets go; says each change in the log."""
+    p = _lq("hold.json")
+    old = _read_json_safe(p)
+    if short is None:
+        if old:
+            with contextlib.suppress(OSError):
+                p.unlink()
+            say("memory gate: released")
+        return
+    have, need = short
+    if old and abs(float(old.get("have") or 0) - have) < 0.5:
+        return
+    why = f"memory {have:.1f} GB < {need:g} GB"
+    write_json(p, {"why": why, "have": round(have, 2), "since": old.get("since") or round(clock.now(), 3)})
+    say(f"waiting: {why} (no CI batch starts; ASSISTANT_LAND_MIN_MEM_GB or ~/.config/assistant/land-min-mem)")
+
+
+def landq_held() -> str | None:
+    """The hold the worker wrote, while a worker runs: "memory 3.9 GB < 6 GB", else None."""
+    if not _landq_worker_alive():
+        return None
+    return _read_json_safe(_lq("hold.json")).get("why") or None
+
+
 def _lq(*parts: str) -> Path:
     return st("landq", *parts)
 
@@ -2184,12 +2259,16 @@ def _landq_run() -> None:
             if (proc.poll() is not None) if proc else not _landq_alive(b):
                 _landq_finish(_landq_read("batches", b["id"]) or b, proc.returncode if proc else None)
                 del running[lane]
+        queued = any(e.get("state") == "queued" for e in _landq_all("entries"))
+        short = landq_mem_wait() if queued else None  # never start a batch on a box short of memory: wait
+        _landq_hold(short)
         for lane in ("batch", "gated"):
-            if lane not in running:
+            if lane not in running and not short:
                 started = _landq_start(lane)
                 if started:
                     running[lane] = started
         if not running and not any(e.get("state") == "queued" for e in _landq_all("entries")):
+            _landq_hold(None)
             return
         time.sleep(_landq_tick())
 
@@ -2626,6 +2705,10 @@ def _landq_view(e: dict, bs: dict) -> dict:
         nb = float(e.get("not_before") or 0)
         wait = f", retry after {time.strftime('%H:%M', time.localtime(nb))}" if nb > now else ""
         detail = f"position {v['position']}{', gated lane' if e.get('lane') == 'gated' else ''}{wait}"
+        held = landq_held()
+        if held:
+            v["waiting"] = held
+            detail += f" · waiting: {held}"
     elif st_ == "testing" and b:
         phase, since = _landq_phase(b)
         v.update(phase=phase, members=[m["branch"] for m in b.get("members") or []])
@@ -2737,13 +2820,16 @@ def landq_status(ref: str | None, as_json: bool) -> int:
     rows = [_landq_view(e, bs) for e in sel]
     worker = _landq_worker_alive()
     if as_json:
-        say(json.dumps({"switch": land_queue(), "worker": worker, "entries": rows, "front": _landq_front()},
-                       sort_keys=True))  # fmt: skip
+        say(json.dumps({"switch": land_queue(), "worker": worker, "entries": rows, "front": _landq_front(),
+                        "waiting": landq_held()}, sort_keys=True))  # fmt: skip
         return 0
     nq = sum(1 for e in es if e.get("state") == "queued")
     nt = sum(1 for e in es if e.get("state") == "testing")
     say(f"land queue: {'on' if land_queue() else 'off'} · worker {'running' if worker else 'idle'} · {nq} queued · "
         f"{nt} testing")  # fmt: skip
+    held = landq_held()
+    if held:
+        say(f"waiting: {held} (no CI batch starts until memory frees up)")
     for r in rows:
         say("  " + r["line"])
     return 0
@@ -4769,19 +4855,32 @@ def _host_cpus() -> float:
         return float(os.cpu_count() or 1)
 
 
+CI_MEM_FLOOR_GB = 2.0  # CI workers leave this much of the host's MemAvailable free (_mem_cap)
+CI_MEM_PER_WORKER_GB = 0.5  # ... and count this much each
+CGROUP_MEM_MAX = "/sys/fs/cgroup/memory.max"
+
+
 def _mem_cap() -> int | None:
-    """Workers the cgroup memory limit allows (~400 MB each), None when unlimited."""
+    """Workers memory allows, None when unlimited: the cgroup limit (~400 MB each) and the host's MemAvailable
+    (mem_available: CI_MEM_FLOOR_GB kept free, CI_MEM_PER_WORKER_GB each; bites only on a box short of memory)."""
+    caps = []
     try:
-        v = Path("/sys/fs/cgroup/memory.max").read_text().strip()
-        return None if v == "max" else max(1, int(v) // (400 << 20))
+        v = Path(CGROUP_MEM_MAX).read_text().strip()
+        if v != "max":
+            caps.append(max(1, int(v) // (400 << 20)))
     except (OSError, ValueError):
-        return None
+        pass
+    have = mem_available()
+    if have is not None:
+        caps.append(max(1, int((have - CI_MEM_FLOOR_GB) / CI_MEM_PER_WORKER_GB)))
+    return min(caps) if caps else None
 
 
 def pytest_workers(nfiles: int, suites: int, toolchain: bool) -> int:
     """xdist workers for one pytest suite: ASSISTANT_CI_PYTEST_WORKERS wins (0/1 = serial); else the CPUs left
     over the host's 1-min load, shared by the suites running at once (one since 29.10: 3.13 only), 2..PYTEST_WORKERS
-    locally, up to the cgroup quota and memory on the hub runner; never more than the files (loadfile) unless set."""
+    locally, up to the cgroup quota on the hub runner, and memory (_mem_cap: the cgroup limit, the host's
+    MemAvailable); never more than the files (loadfile) unless set."""
     raw = os.environ.get("ASSISTANT_CI_PYTEST_WORKERS", "").strip()
     if raw.isdigit():  # an explicit count is taken as it is (tests ask for xdist on a one-file repo)
         n = int(raw)
@@ -5620,7 +5719,8 @@ LEGACY_SLOW_FILE = ("tests", "legacy", "slow.txt")  # suites that start first (t
 
 def legacy_workers(n: int) -> int:
     """Legacy suites at once: ASSISTANT_CI_LEGACY_WORKERS wins; else the hub runner's CPU quota, here the CPUs left
-    over the 1-min load (at least 2), capped at LEGACY_WORKERS and the suite count. Mostly shell, stubs and sleeps."""
+    over the 1-min load (at least 2), capped at LEGACY_WORKERS, memory (_mem_cap) and the suite count. Mostly shell,
+    stubs and sleeps."""
     raw = os.environ.get("ASSISTANT_CI_LEGACY_WORKERS", "").strip()
     if raw.isdigit():
         w = max(1, int(raw))
@@ -5634,7 +5734,7 @@ def legacy_workers(n: int) -> int:
             except OSError:
                 load = 0.0
             w = max(2, int(cpus - load))
-        w = min(w, LEGACY_WORKERS)
+        w = min(w, LEGACY_WORKERS, _mem_cap() or LEGACY_WORKERS)
     return max(1, min(w, n))
 
 

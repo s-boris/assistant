@@ -1,9 +1,10 @@
 """The land queue (verify, then land): with the switch on, `land BRANCH` runs the quick checks, queues the branch and
 returns (--no-wait) or follows it (--wait); one worker lands batches through today's land() as a child (one runner
 call, one deploy, a land row and a board poke per member), splits a red batch in halves, defers a conflict between
-queued branches, runs gated entries in their own lane and, after a crash, never deploys a tree that was not tested.
+queued branches, runs gated entries in their own lane, starts no batch while memory is short and, after a crash,
+never deploys a tree that was not tested.
 Seams: ASSISTANT_LANDQ_CHECK (the quick checks), ASSISTANT_LAND_CI (the batch's CI), ASSISTANT_LAND_RUNNER,
-ASSISTANT_LAND_EVALS, ASSISTANT_BOARD_MARK_BIN, ASSISTANT_LANDQ_TICK."""
+ASSISTANT_LAND_EVALS, ASSISTANT_BOARD_MARK_BIN, ASSISTANT_LANDQ_TICK, ASSISTANT_MEMINFO (the memory gate)."""
 
 from __future__ import annotations
 
@@ -334,3 +335,70 @@ def test_quick_check_red_and_rebase_conflict_fail_at_once(env, q):
     assert r.returncode == 5 and "git rebase main" in r.stderr
     r = env.run("land", "status", "q9")
     assert r.returncode == 3
+
+
+def meminfo(path, gb: float) -> str:
+    path.write_text(f"MemTotal: 65618092 kB\nMemFree: 500000 kB\nMemAvailable: {int(gb * (1 << 20))} kB\n")
+    return str(path)
+
+
+def test_memory_gate_holds_the_batch_until_memory_frees_up(env, q):
+    """Below the gate (default 6 GB of MemAvailable) the worker starts no batch: the entry stays queued and status
+    says "waiting: memory 3.9 GB < 6 GB"; once memory frees up the batch starts and lands."""
+    mi = env.tmp / "meminfo"
+    env.env["ASSISTANT_MEMINFO"] = meminfo(mi, 3.9)
+    branch(env, "m1", "tools/a.txt", "a-m1\n")
+    assert q.queue("m1") == "q1"
+    until(lambda: q.status().get("waiting"), "the memory hold")
+    st = q.status()
+    assert st["waiting"] == "memory 3.9 GB < 6 GB" and st["entries"][0]["state"] == "queued", st
+    assert st["entries"][0]["waiting"] == "memory 3.9 GB < 6 GB"
+    r = env.run("land", "status")
+    assert "waiting: memory 3.9 GB < 6 GB" in r.stdout, r.stdout
+    time.sleep(1.0)  # ten worker ticks: still nothing started
+    assert q.entry("q1")["state"] == "queued" and not q.batches()
+    meminfo(mi, 12.0)
+    r = env.run("land", "status", "q1", "--wait")
+    assert r.returncode == 0 and "landed m1 on main" in r.stdout, (r.stdout, r.stderr)
+    assert not env.state("landq", "hold.json").exists()
+
+
+def test_memory_gate_settings_and_worker_cap(tool, monkeypatch, tmp_path):
+    monkeypatch.delenv("ASSISTANT_LAND_MIN_MEM_GB", raising=False)
+    monkeypatch.delenv("ASSISTANT_MEMINFO", raising=False)
+    assert tool.land_min_mem() == tool.LAND_MIN_MEM_GB == 6.0
+    assert tool.mem_available() is None and tool.landq_mem_wait() is None  # test mode, no seam: unknown, no gate
+    monkeypatch.setenv("ASSISTANT_MEMINFO", meminfo(tmp_path / "mi", 3.9))
+    assert round(tool.mem_available(), 1) == 3.9
+    have, need = tool.landq_mem_wait()
+    assert round(have, 1) == 3.9 and need == 6.0
+    cfg = tool.paths.config("land-min-mem")
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("3\n")
+    assert tool.land_min_mem() == 3.0 and tool.landq_mem_wait() is None
+    monkeypatch.setenv("ASSISTANT_LAND_MIN_MEM_GB", "0")  # the env wins; 0 = the gate off
+    assert tool.land_min_mem() == 0.0 and tool.landq_mem_wait() is None
+    cfg.write_text("lots\n")
+    monkeypatch.delenv("ASSISTANT_LAND_MIN_MEM_GB")
+    assert tool.land_min_mem() == 6.0  # unreadable: the default
+    # the CI's workers: 2 GB kept free, 0.5 GB each (3.9 GB -> 3), never below 1; plenty -> the cgroup/CPU rules
+    monkeypatch.delenv("ASSISTANT_CI_PYTEST_WORKERS", raising=False)
+    monkeypatch.delenv("ASSISTANT_CI_LEGACY_WORKERS", raising=False)
+    monkeypatch.setenv("ASSISTANT_CI_TOOLCHAIN", "/tc")
+    monkeypatch.setattr(tool, "_host_cpus", lambda: 28.0)
+    monkeypatch.setattr(tool, "CGROUP_MEM_MAX", str(tmp_path / "no-cgroup"))  # no cgroup limit: memory alone
+    monkeypatch.setenv("ASSISTANT_MEMINFO", meminfo(tmp_path / "mi", 3.9))
+    assert tool._mem_cap() == 3
+    assert tool.pytest_workers(100, 1, True) == 3 and tool.legacy_workers(50) == 3
+    monkeypatch.setenv("ASSISTANT_MEMINFO", meminfo(tmp_path / "mi", 1.0))
+    assert tool._mem_cap() == 1
+    assert tool.legacy_workers(50) == 1 and tool.pytest_workers(100, 1, True) == 0  # one worker: serial
+    monkeypatch.setenv("ASSISTANT_MEMINFO", meminfo(tmp_path / "mi", 60.0))
+    assert tool.pytest_workers(100, 1, True) == 28  # plenty: the CPU quota rules
+    (tmp_path / "cg").write_text(str(4 * (400 << 20)) + "\n")
+    monkeypatch.setattr(tool, "CGROUP_MEM_MAX", str(tmp_path / "cg"))
+    assert tool._mem_cap() == 4  # the cgroup limit, as before
+    monkeypatch.setenv("ASSISTANT_MEMINFO", meminfo(tmp_path / "mi", 3.9))
+    monkeypatch.setenv("ASSISTANT_CI_LEGACY_WORKERS", "5")
+    monkeypatch.setenv("ASSISTANT_CI_PYTEST_WORKERS", "5")
+    assert tool.legacy_workers(50) == 5 and tool.pytest_workers(100, 1, True) == 5  # an explicit count wins
