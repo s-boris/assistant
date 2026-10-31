@@ -622,3 +622,40 @@ def test_a_sample_counts_the_episodes_its_picks_cover(tv, capsys):
     r = rows_of(capsys)["rows"]["6:1"]
     assert r["sampled"] and len(r["picks"]) == 2 and r["sample_size"] == 20 * G
     assert r["est_saved"] == 18 * G  # 12 GB saved on 20 GB -> 60 % of 30 GB, never more than the season
+
+
+def test_unsearched_series_get_the_class_average_and_their_own_section(tv, tmp_path):
+    mod = tv()
+    units = [
+        {
+            "sid": s,
+            "title": t,
+            "year": 1,
+            "season": 1,
+            "profile": "Up to 1080p",
+            "target": "1080p",
+            "size": 20 * G,
+            "need": [],
+            "files": [{"eps": [1]}],
+        }
+        for s, t in ((1, "Searched"), (2, "Unsearched"))
+    ]
+    rows = {
+        "1:1": dict(
+            units[0],
+            eps=1,
+            files=1,
+            saved=10 * G,
+            picks=[{"pack": True, "title": "x", "size": 10 * G, "quality": "WEBDL-1080p", "languages": [], "score": 0}],
+        )
+    }
+    rows["1:1"].pop("files")
+    rows["1:1"]["files"] = 1
+    mod.estimate(rows, units)
+    assert rows["2:1"]["est_saved"] == 10 * G and rows["2:1"]["est_from"] == "class"
+    tot = mod.totals(rows)
+    assert (tot["series_with"], tot["series_kept"], tot["series_unsearched"]) == (1, 0, 1)
+    report = tmp_path / "r.md"
+    mod.write_report(str(report), rows, tot)
+    text = report.read_text()
+    assert "## Not searched" in text and "- Unsearched (Up to 1080p, 1 ep, 20.0 GB): est. saves ~10.0 GB" in text

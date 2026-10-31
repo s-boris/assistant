@@ -802,19 +802,17 @@ def plan_order(units):
 
 
 def estimate(rows, units):
-    """Seasons not searched, or searched per episode only in part: their saving from the series' searched ratio."""
-    ratio = {}
+    """Seasons not searched, or searched per episode only in part: their saving from the series' searched ratio; a
+    series with no searched season at all from the ratio of all searched seasons with the same target (1080p /
+    2160p), marked est_from = 'class'."""
+    ratio, cls = {}, {}
     for r in rows.values():
         if r.get('picks') is None:
             continue
-        a = ratio.setdefault(r['sid'], [0, 0])
-        if r.get('sampled'):
-            searched = r.get('sample_size') or 0
+        base = (r.get('sample_size') or 0) if r.get('sampled') else r['size']
+        for a in (ratio.setdefault(r['sid'], [0, 0]), cls.setdefault(r.get('target'), [0, 0])):
             a[0] += r['saved']
-            a[1] += searched
-        else:
-            a[0] += r['saved']
-            a[1] += r['size']
+            a[1] += base
     for u in units:
         r = rows.get(season_key(u))
         a = ratio.get(u['sid'])
@@ -823,10 +821,14 @@ def estimate(rows, units):
             r.update(eps=sum(max(1, len(f['eps'])) for f in u['files']), files=len(u['files']), picks=None,
                      saved=0, reason='not searched (time budget)')
             rows[season_key(u)] = r
+        if not (a and a[1]):
+            a = cls.get(u['target'])
+            r['est_from'] = 'class'
         if r.get('picks') is None or r.get('sampled'):
             r['est_saved'] = round(u['size'] * a[0] / a[1]) if a and a[1] else 0
         else:
             r['est_saved'] = r['saved']
+            r.pop('est_from', None)
     return rows
 
 
@@ -873,7 +875,8 @@ def totals(rows):
     now_b = sum(r['size'] for r in rs)
     with_rel = {r['sid'] for r in rs if r.get('picks')}
     return {'series': len({r['sid'] for r in rs}), 'series_with': len(with_rel),
-            'series_kept': len({r['sid'] for r in rs} - with_rel),
+            'series_kept': len({r['sid'] for r in rs if r.get('picks') is not None} - with_rel),
+            'series_unsearched': len({r['sid'] for r in rs} - {r['sid'] for r in rs if r.get('picks') is not None}),
             'seasons': len(rs), 'seasons_searched': sum(1 for r in rs if r.get('picks') is not None),
             'seasons_with': sum(1 for r in rs if r.get('picks')),
             'eps': sum(r['eps'] for r in rs), 'tb_now': round(now_b / 1e12, 2),
@@ -906,12 +909,13 @@ def write_report(path, rows, tot):
            f'- saved by the releases found: {tot["tb_saved"]:g} TB; estimated for unsearched or sampled seasons: '
            f'{tot["tb_est"]:g} TB',
            f'- after: ~{tot["tb_after"]:g} TB (estimate)',
-           f'- series with a candidate: {tot["series_with"]}; kept (no candidate): {tot["series_kept"]}',
+           f'- series with a candidate: {tot["series_with"]}; kept (no candidate): {tot["series_kept"]}; '
+           f'not searched (estimated): {tot["series_unsearched"]}',
            f'- not in the totals: {tot["seasons_alt_1080"]} searched 4K-profile seasons have no 2160p HDR fit but a '
            f'WEB 1080p one that would save {tot["tb_alt_1080"]:g} TB (the 2160p-only rule keeps them; never grabbed)',
            '',
            '## Per series', '']
-    kept = []
+    kept, unsearched = [], []
     for rs in order:
         rs.sort(key=lambda r: r['season'])
         r0 = rs[0]
@@ -920,9 +924,14 @@ def write_report(path, rows, tot):
         est = sum(r.get('est_saved') or 0 for r in rs if r.get('picks') is None or r.get('sampled'))
         if not any(r.get('picks') for r in rs):
             searched = [r for r in rs if r.get('picks') is not None]
+            if not searched:
+                unsearched.append(f'- {r0["title"]} ({r0["profile"]}, {eps} ep, {gb(size)}): est. saves ~{gb(est)}'
+                                  + (' (class average)' if any(r.get('est_from') == 'class' for r in rs) else ''))
+                continue
             kept.append(f'- {r0["title"]} ({r0["profile"]}, {eps} ep, {gb(size)}): '
-                        + ('; '.join(f'S{r["season"]:02d} {r.get("reason")}{alt_txt(r)}' for r in searched[:3])
-                           or 'not searched (time budget)'))
+                        + '; '.join(f'S{r["season"]:02d} {r.get("reason")}{alt_txt(r)}' for r in searched[:3])
+                        + (f'; {len(rs) - len(searched)} more season(s) not searched' if len(rs) > len(searched)
+                           else ''))
             continue
         out.append(f'### {r0["title"]} ({r0["profile"]}, audio kept: {"+".join(r0["need"]) or "-"})')
         out.append(f'{eps} ep, {gb(size)} now; saves {gb(saved)}' + (f' + ~{gb(est)} est.' if est else ''))
@@ -930,7 +939,8 @@ def write_report(path, rows, tot):
         for r in rs:
             head = f'- S{r["season"]:02d} ({r["eps"]} ep, {gb(r["size"])})'
             if r.get('picks') is None:
-                out.append(f'{head}: {r.get("reason")}; est. saves ~{gb(r.get("est_saved"))}')
+                src = ' (average of the searched ' + r['target'] + ' series)' if r.get('est_from') == 'class' else ''
+                out.append(f'{head}: {r.get("reason")}; est. saves ~{gb(r.get("est_saved"))}{src}')
             elif not r['picks']:
                 out.append(f'{head}: keep ({r.get("reason")})' + alt_txt(r))
             else:
@@ -946,6 +956,9 @@ def write_report(path, rows, tot):
                     out.append(f'  - ... {len(p) - 3} more')
         out.append('')
     out += ['## No candidate / kept', ''] + (kept or ['- none']) + ['']
+    if unsearched:
+        out += ['## Not searched (time budget; estimated from the searched series with the same target)', '']
+        out += unsearched + ['']
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, 'w') as f:
         f.write('\n'.join(out))
