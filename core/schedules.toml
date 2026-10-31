@@ -2641,6 +2641,26 @@ why = "remux downgrade: old Default QP remuxes -> encodes, 1 grab per tick 00:30
 target = "cron-back 29.10"
 cron_line = "*/20 * * * * mkdir -p \"$HOME/.local/state/media-remux\" && cron-fail --after 4 media-remux flock -n -E 0 \"$HOME/.local/state/cron-fail/media-remux.run\" timeout -k 10 900 $HOME/bin/media-remux --cron >> \"$HOME/.local/state/media-remux/cron.log\" 2>&1"
 
+[jobs.media-remux-tv]
+line = "media-remux-tv"
+cron = "10-59/20 * * * *"
+class = "M"
+group = "watches"
+queue = "slow"
+where = "brain"
+runs_on = "cron"
+argv = ["~/bin/media-remux-tv", "--cron"]
+out = "media-remux-tv/cron.log"
+err = "out"
+dirs = ["media-remux-tv"]
+timeout = 900
+after = 4
+feature = "media"
+owner_facing = false
+why = "TV remux downgrade: Bluray-1080p Remux episodes -> WEB/encodes with language parity, grabs 00:30-06:00 (<= 15 grabs / 300 GB per night); follows imports"
+target = "owner on 31.10"
+cron_line = "10-59/20 * * * * mkdir -p \"$HOME/.local/state/media-remux-tv\" && cron-fail --after 4 media-remux-tv flock -n -E 0 \"$HOME/.local/state/cron-fail/media-remux-tv.run\" timeout -k 10 900 $HOME/bin/media-remux-tv --cron >> \"$HOME/.local/state/media-remux-tv/cron.log\" 2>&1"
+
 [jobs.arr-restart]
 line = "arr-restart"
 cron = "45 6 * * *"
