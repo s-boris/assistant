@@ -235,5 +235,37 @@ MEDIA_REMUX_NIGHT_MAX=1 MEDIA_REMUX_NOW=$((NIGHT + 86400 + 2400)) "$BIN" --cron 
 [ "$(posts 'api/v3/release')" = 2 ] && [ "$(st "d['nights'].get('2026-10-29', {}).get('grabs')")" = 1 ]
 ok $? "next night's cron still has its full budget after a daytime run"
 
+# 9 the full movie list (~2,300 movies) is read once a night, not every tick: candidates.json between; a cached
+#   candidate is re-read alone before its search, and one that is no candidate any more is dropped, not searched
+rm -rf "$T/state" "$FAKE_DIR/posts.jsonl"; mk base
+full() { local n; n=$(grep -cx '/api/v3/movie' "$FAKE_DIR/gets.log" 2>/dev/null); echo "${n:-0}"; }
+: > "$FAKE_DIR/gets.log"
+MEDIA_REMUX_NOW=$((NIGHT + 2400)) "$BIN" --cron >/dev/null 2>&1                    # 00:40: refresh + grab
+[ "$(full)" = 1 ] && [ "$(posts 'api/v3/release')" = 1 ] && [ -f "$T/state/candidates.json" ]
+ok $? "first window tick reads the full list once and caches the candidates"
+: > "$FAKE_DIR/gets.log"
+MEDIA_REMUX_NOW=$((NIGHT + 3600)) "$BIN" --cron >/dev/null 2>&1                    # 01:00: a normal tick
+[ "$(full)" = 0 ] && grep -qx '/api/v3/movie/2' "$FAKE_DIR/gets.log" && [ "$(st "d['movies']['2']['status']")" = no-release ]
+ok $? "a normal tick never fetches the full movie list: the cached candidate is read alone (/api/v3/movie/2)"
+: > "$FAKE_DIR/gets.log"
+MEDIA_REMUX_NOW=$((NIGHT + 4 * 3600)) "$BIN" --follow >/dev/null 2>&1
+MEDIA_REMUX_NOW=$((NIGHT + 7 * 3600)) "$BIN" --cron >/dev/null 2>&1                # outside the window: follow only
+[ "$(full)" = 0 ]; ok $? "follow and daytime ticks never fetch the full movie list"
+rm -rf "$T/state" "$FAKE_DIR/posts.jsonl"; mk base
+MEDIA_REMUX_NOW=$NIGHT "$BIN" --plan >/dev/null 2>&1                                # cache: 1, 2, 6
+python3 - "$FAKE_DIR/routes.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))                      # since then movie 1 got an encode (Radarr or by hand)
+r['/api/v3/movie/1']['movieFile']['quality'] = {'quality': {'name': 'Bluray-2160p'}}; json.dump(r, open(sys.argv[1], 'w'))
+PY
+: > "$FAKE_DIR/gets.log"; rm -f "$T/state/plan.json"
+MEDIA_REMUX_NOW=$((NIGHT + 2400)) "$BIN" --cron >/dev/null 2>&1
+[ "$(full)" = 0 ] && [ "$(posts 'api/v3/release')" = 0 ] && ! grep -q 'release?movieId=1' "$FAKE_DIR/gets.log" \
+  && python3 -c 'import json,sys; assert [c["id"] for c in json.load(open(sys.argv[1]))["rows"]] == [2, 6]' "$T/state/candidates.json"
+ok $? "a cached candidate that is no remux any more: not searched, dropped from the cache"
+: > "$FAKE_DIR/gets.log"
+MEDIA_REMUX_NOW=$((NIGHT + 86400 + 2400)) "$BIN" --cron >/dev/null 2>&1           # next night: the cache is old
+[ "$(full)" = 1 ]; ok $? "next night's first tick refreshes the list once"
+
 echo "media-remux tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]

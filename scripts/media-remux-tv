@@ -580,6 +580,9 @@ def grab_round(st, max_grabs, only=None, dry=False, cron=False):
     """Search + grab up to max_grabs releases; returns (grabbed, lines)."""
     lines, grabbed, searched = [], 0, 0
     profs = profiles()
+    # TODO before this job is scheduled: read the full series list at most once a night (a candidate cache, re-read
+    # per series with /api/v3/series/{id} before its search), as media-remux does for Radarr's movie list: a */20
+    # tick reading every series pages a big response through the hub's egress and loads Sonarr.
     units = candidates(sonarr('/api/v3/series', timeout=120) or [], profs, only)
     units.sort(key=lambda u: -u['size'])
     plan = (jsonstate.load(PLAN_F, None) or {}).get('rows') or {}

@@ -1,4 +1,5 @@
-"""Stand-in for ~/bin/media in the media-remux tests: GETs from $FAKE_DIR/routes.json, writes logged to posts.jsonl."""
+"""Stand-in for ~/bin/media in the media-remux tests: GETs from $FAKE_DIR/routes.json (paths logged to gets.log),
+writes logged to posts.jsonl."""
 
 import json
 import os
@@ -20,6 +21,8 @@ def api(svc, method, path, body=None, timeout=None):
         with open(os.path.join(_dir(), "posts.jsonl"), "a") as f:
             f.write(json.dumps({"svc": svc, "method": method, "path": path, "body": body}) + "\n")
         return {}
+    with open(os.path.join(_dir(), "gets.log"), "a") as f:
+        f.write(path + "\n")
     with open(os.path.join(_dir(), "routes.json")) as f:
         routes = json.load(f)
     for key in (path, path.split("?")[0]):

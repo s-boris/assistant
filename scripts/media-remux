@@ -32,7 +32,8 @@ every new file: a name that clearly is another film (arr-mismatch's grab rule) -
 not counted as freed; named in the morning note); the remux sits in Radarr's recycle bin for 3 days. Never deletes.
 
   media-remux --plan [--limit N] [--movie ID] [--json]   read-only: candidates, pick per movie, GB saved
-                                                          (writes only ~/.local/state/media-remux/plan.json)
+                                                          (writes only ~/.local/state/media-remux/plan.json and,
+                                                          without --movie, the candidate cache)
   media-remux --run --max N [--movie ID] [--dry-run]      search + grab up to N movies now (gates as --cron
                                                           except the time window and the night cap; its grabs
                                                           count toward the night's cap only inside the window,
@@ -43,11 +44,18 @@ not counted as freed; named in the morning note); the remux sits in Radarr's rec
                                                           00:30-06:00 one grab per tick, <= 15 per night; first
                                                           tick after 06:30 -> ONE ~/inbox/media-remux-DATE.md line
                                                           for the morning report (only when something happened)
+Radarr reads are per movie: the full movie list (GET /api/v3/movie, ~2,300 movies with their files: a big
+response the hub's egress pages) is read at most once per 20 h, by the first grab round of a night (or --plan),
+and its candidates are cached in candidates.json (id, title, year, quality, size, file id; biggest first). A cached
+candidate is re-read alone (GET /api/v3/movie/{id}) right before its search, so a movie re-profiled, replaced or
+deleted since is skipped as the full list would have skipped it; a movie that became a remux candidate during the
+day is found by the next night's refresh. --follow reads only its grabbed movies (/api/v3/movie/{id}).
 Gates for every grab: Radarr queue <= 10 items, the movie not already queued, the cache pool's live free space
 (unraid-capacity's collector) minus the queue's remaining bytes minus the release >= 100 GB and the pool < 90 %
 used; a gate failing stops the grabs of that tick.
 Off switch: touch ~/.config/media-remux/off (--cron and --run then grab nothing; --follow still finishes grabs).
-State ~/.local/state/media-remux/ (state.json, plan.json, actions.log). Exit 0 ok, 1 usage, 2 Radarr unreachable.
+State ~/.local/state/media-remux/ (state.json, plan.json, candidates.json, actions.log).
+Exit 0 ok, 1 usage, 2 Radarr unreachable.
 Env (tests): MEDIA_REMUX_MEDIA (module with get/api/ApiError, default ~/bin/media), MEDIA_REMUX_UNBLOCK
 (default ~/bin/arr-unblock), MEDIA_REMUX_MISMATCH (default ~/bin/arr-mismatch), MEDIA_REMUX_STATE_DIR,
 MEDIA_REMUX_INBOX, MEDIA_REMUX_OFF, MEDIA_REMUX_NOW (epoch),
@@ -88,6 +96,7 @@ def _env(name, default):
 
 STATE_DIR = os.environ.get('MEDIA_REMUX_STATE_DIR') or f'{HOME}/.local/state/media-remux'
 STATE_F, PLAN_F = f'{STATE_DIR}/state.json', f'{STATE_DIR}/plan.json'
+CAND_F = f'{STATE_DIR}/candidates.json'
 LOG_F, LOCK_F = f'{STATE_DIR}/actions.log', f'{STATE_DIR}/lock'
 INBOX = os.environ.get('MEDIA_REMUX_INBOX') or f'{HOME}/inbox'
 OFF_F = os.environ.get('MEDIA_REMUX_OFF') or f'{HOME}/.config/media-remux/off'
@@ -108,6 +117,7 @@ SEARCHES = _env('MEDIA_REMUX_SEARCHES', 4)
 PROTOCOLS = set((os.environ.get('MEDIA_REMUX_PROTOCOLS') or 'usenet').split(','))
 NO_RELEASE_RETRY = 30 * 86400
 PLAN_REUSE = 14 * 86400  # a plan's no-release verdict spares the search this long
+CAND_TTL = 20 * 3600     # the full movie list is read at most this often (once a night); candidates.json between
 LOST_AFTER = 48 * 3600   # a grab with no queue item, no import and no failure after this long = failed
 WIN_START, WIN_END, NOTE_AT = (0, 30), (6, 0), (6, 30)
 SEARCH_TIMEOUT = 180
@@ -209,6 +219,36 @@ def candidates(movies):
                         'size': mf.get('size') or 0, 'file_id': mf.get('id')})
     out.sort(key=lambda c: -c['size'])     # biggest remux first: the most space per grab
     return out
+
+
+def save_candidates(rows, at=None):
+    """at: when the full list behind rows was read (default now; a row dropped later keeps the list's age)."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    jsonstate.save(CAND_F, {'at': int(now() if at is None else at), 'rows': rows}, mode=0o600, ensure_ascii=False)
+
+
+def candidate_list():
+    """The candidates of the full movie list, read at most once per CAND_TTL and cached in between (the list is
+    ~2,300 movies: too big for every */20 tick). Rows are re-checked one by one before a search (fresh())."""
+    c = jsonstate.load(CAND_F, None) or {}
+    if isinstance(c.get('rows'), list) and 0 <= now() - (c.get('at') or 0) < CAND_TTL:
+        return c['rows']
+    rows = candidates(radarr('/api/v3/movie', timeout=120))
+    save_candidates(rows)
+    return rows
+
+
+def fresh(c):
+    """A cached candidate re-read alone -> (its current candidate row, the movie record), or (None, None) when it
+    is no candidate any more (re-profiled, replaced by an encode, deleted)."""
+    try:
+        m = radarr(f'/api/v3/movie/{c["id"]}')
+    except ApiError as e:
+        if 'HTTP 404 ' in str(e):
+            return None, None
+        raise
+    rows = candidates([m] if m else [])
+    return (rows[0], m) if rows else (None, None)
 
 
 def cf_names(x):
@@ -340,12 +380,13 @@ def current_file(c):
     return f
 
 
-def evaluate(c, scores):
-    """Live search for one candidate -> plan row (release or reason)."""
+def evaluate(c, scores, movie=None):
+    """Live search for one candidate -> plan row (release or reason). movie: its record, when just read."""
     f = current_file(c)
     cur = dict(c, score=f.get('customFormatScore') or 0, lang=lang_score(cf_names(f), scores))
     rels = radarr(f'/api/v3/release?movieId={c["id"]}', timeout=SEARCH_TIMEOUT) or []
-    movie = radarr(f'/api/v3/movie/{c["id"]}') or {}     # the full record: alternate titles + release dates
+    if movie is None:                                     # the full record: alternate titles + release dates
+        movie = radarr(f'/api/v3/movie/{c["id"]}') or {}
     r, reason, wrong = pick(rels, cur, scores, lambda name: same_film(movie, name))
     row = {'id': c['id'], 'title': c['title'], 'year': c['year'], 'quality': c['quality'], 'size': c['size'],
            'file_id': c['file_id'], 'score': cur['score'], 'checked': int(now())}
@@ -456,12 +497,15 @@ def grab_round(st, max_grabs, only=None, dry=False, cron=False):
     """Search + grab up to max_grabs; returns (grabbed, lines)."""
     lines, grabbed, searched = [], 0, 0
     scores = profile()
-    movies = [radarr(f'/api/v3/movie/{only}')] if only else radarr('/api/v3/movie', timeout=120)
-    if only and movies[0].get('qualityProfileId') == BEST_PROFILE_ID:
-        return 0, ['movie is on profile Best: never touched']
-    cands = candidates(movies)
-    if only and not cands:
-        return 0, ['not a candidate (profile, year or file quality)']
+    if only:
+        movie = radarr(f'/api/v3/movie/{only}')
+        if movie.get('qualityProfileId') == BEST_PROFILE_ID:
+            return 0, ['movie is on profile Best: never touched']
+        cands = candidates([movie])
+        if not cands:
+            return 0, ['not a candidate (profile, year or file quality)']
+    else:
+        cands, gone = candidate_list(), set()
     plan = (jsonstate.load(PLAN_F, None) or {}).get('rows') or {}
     queue = queue_records()
     queued = {r.get('movieId') for r in queue}
@@ -486,8 +530,14 @@ def grab_round(st, max_grabs, only=None, dry=False, cron=False):
         if why:
             lines.append(f'stop: {why}')
             break
+        if not only:             # a cached row: this movie alone, now (what the full list would say of it)
+            mid = c['id']
+            c, movie = fresh(c)
+            if c is None:
+                gone.add(mid)
+                continue
         searched += 1
-        row = evaluate(c, scores)
+        row = evaluate(c, scores, movie)
         for w in [] if dry else row.get('wrong') or []:
             log(f'NOT-THIS-FILM {c["id"]} {c["title"]} ({c["year"]}): skipped {w["title"]}: {w["why"]}')
         if not row.get('release'):
@@ -519,6 +569,8 @@ def grab_round(st, max_grabs, only=None, dry=False, cron=False):
         save_state(st)
         log(f'GRAB {c["id"]} {c["title"]} ({c["year"]}) {c["quality"]} {gb(c["size"])} -> {rel["quality"]} '
             f'{gb(rel["size"])} score {rel["score"]} (file {row["score"]}): {rel["title"]}')
+    if not only and gone:        # no candidates any more: drop them from the cache until its next refresh
+        save_candidates([c for c in cands if c['id'] not in gone], at=(jsonstate.load(CAND_F, None) or {}).get('at'))
     return grabbed, lines
 
 
@@ -662,6 +714,8 @@ def do_plan(a):
     scores = profile()
     movies = [radarr(f'/api/v3/movie/{a.movie}')] if a.movie else radarr('/api/v3/movie', timeout=120)
     cands = candidates(movies)
+    if not a.movie:              # the full list was read anyway (--plan is by hand): the grab rounds' cache too
+        save_candidates(cands)
     if a.limit:
         cands = cands[:a.limit]
     old = jsonstate.load(PLAN_F, None) or {}
