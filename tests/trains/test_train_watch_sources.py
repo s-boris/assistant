@@ -460,3 +460,127 @@ def test_station_mismatch_is_cant_watch_never_cancelled(tw, capsys, irail_answer
 )
 def test_same_place(tw, asked, got, same):
     assert tw.same_place(asked, got) is same
+
+
+# ------------------------------------------------------------------------------------------------ feeder buses
+# opendata /connections recorded live (passList trimmed): Uster, Gschwader -> Zürich Flughafen starts with the
+# regular Bus 725 (category B) to Uster station; the way back ends with it. A plan that lists only the trains, or the
+# bus in the compact form `route` writes ("B725"), is fine; only rail-replacement markers or a bus in a planned
+# train's place are a "replacement bus".
+FEED_OUT = {
+    "id": "fb000001",
+    "from": "Uster, Gschwader",
+    "to": "Zürich Flughafen",
+    "dep": "2026-11-20T18:04:00+01:00",
+    "arr": "2026-11-20T18:49:00+01:00",
+    "lines": ["S9", "IC1"],
+    "title": "Uster, Gschwader → Zürich Flughafen",
+    "source": "calendar",
+}
+FEED_BACK = dict(
+    FEED_OUT,
+    id="fb000002",
+    **{
+        "from": "Zürich Flughafen",
+        "to": "Uster, Gschwader",
+        "dep": "2026-11-20T18:09:00+01:00",
+        "arr": "2026-11-20T18:45:00+01:00",
+        "lines": ["IC1", "S14"],
+    },  # fmt: skip
+)
+
+
+def feeder_out(change=None):
+    """The recorded way out; change(sections of the 18:04 connection) edits it."""
+    data = fixture("opendata-feeder-bus-out.json")
+    if change:
+        change(data["connections"][0]["sections"])
+    return data
+
+
+def assess_feed(tw, leg, data):
+    Net(tw, opendata=("ok", data), searchch=("ok", {}))
+    return tw.assess(leg, at(tw, "17:30", "2026-11-20"), {"noted": []}, live=False)
+
+
+@pytest.mark.parametrize(
+    "leg, name, lines",
+    [
+        (FEED_OUT, "opendata-feeder-bus-out.json", ["Bus 725", "S9", "IC1"]),
+        (FEED_BACK, "opendata-feeder-bus-back.json", ["IC1", "S14", "Bus 725"]),
+    ],
+    ids=["bus-first", "bus-last"],
+)
+def test_regular_feeder_bus_around_the_planned_trains_is_fine(tw, capsys, leg, name, lines):
+    found, c, missing = assess_feed(tw, leg, fixture(name))
+    assert (found, missing) == ([], False)
+    assert c["lines"] == lines and [r["bus"] for r in c["rides"]] == [x.startswith("Bus") for x in lines]
+    assert not any(r["ev"] for r in c["rides"]) and tw.plain(c)
+    now = at(tw, "17:30", "2026-11-20")
+    tw.legs_save([leg], now)
+    tw._ROUTE.clear()
+    assert tw.cmd_status(argparse.Namespace(id=leg["id"], json=True, now=None), now) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert (out["fine"], out["problems"]) == (True, [])
+
+
+def test_calendar_leg_with_the_compact_bus_name_lists_the_bus(tw):
+    """`route` and the calendar write rides as category+number ("B725", "T10"): they are the planned bus and tram."""
+    e = {
+        "id": "ev-feeder",
+        "summary": "🚆 Uster, Gschwader → Zürich Flughafen",
+        "start": {"dateTime": FEED_OUT["dep"]},
+        "end": {"dateTime": FEED_OUT["arr"]},
+        "description": "18:00 walk 4 min › 18:04 B725 Uster, Loren › 18:10 S9 Uster pl 2 › 18:37 IC1 Zürich HB pl 33 › "
+        "18:49 Zürich Flughafen · 2 changes\nSBB: https://app.sbbmobile.ch/timetable?from=Uster%2C%20Gschwader&"
+        "to=Z%C3%BCrich%20Flughafen&time=1795194240",
+    }
+    leg = tw.from_event(e)
+    assert leg["lines"] == ["Bus 725", "S9", "IC1"]
+    found, c, _ = assess_feed(tw, leg, fixture("opendata-feeder-bus-out.json"))
+    assert found == [] and c["lines"] == ["Bus 725", "S9", "IC1"]
+
+
+@pytest.mark.parametrize(
+    "text, lines",
+    [
+        ("18:10 B7 Alpha, Post › 18:18 S24 Alpha pl 3 › 19:02 Beta", ["Bus 7", "S24"]),
+        ("07:57 S24 Beta pl 2 › 08:42 Alpha › 08:47 B7 Alpha, Bahnhof › walk 8 min › 09:00 home", ["S24", "Bus 7"]),
+        (
+            "16:58 Bus 21 › RE48 X › T10 Y › EV 5 Z › EXB12 W › BN3 V",
+            ["Bus 21", "RE48", "Tram 10", "EV 5", "Bus 12", "Bus 3"],
+        ),
+        ("10:00 IC8 Bern pl 3 › 11:00 Zürich HB", ["IC8"]),
+    ],
+)
+def test_compact_line_names_parse_alike_in_calcache(tw, text, lines):
+    assert tw.parse_lines(text) == lines
+    loader = importlib.machinery.SourceFileLoader("calcache_lines", str(REPO / "scripts" / "calcache"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec
+    cc = importlib.util.module_from_spec(spec)
+    loader.exec_module(cc)
+    assert cc.parse_lines(text) == lines  # calcache's train fields: the same lines as train-watch's sync
+
+
+def _set(i, **journey):
+    def change(sections):
+        sections[i]["journey"].update(journey)
+
+    return change
+
+
+@pytest.mark.parametrize(
+    "change, key",
+    [
+        (_set(2, category="EV", number="9"), "bus:Uster"),  # Ersatzverkehr in place of the S9
+        (_set(2, category="B", number=""), "bus:Uster"),  # an unmarked bus where the planned S9 was
+        (_set(0, category="EXB", number="725"), "bus:Uster, Loren"),  # Extrabus: replacement even as the feeder
+        (_set(0, name="Bahnersatz"), "bus:Uster, Loren"),  # a regular category named as rail replacement
+    ],
+    ids=["ev", "bus-for-planned-train", "exb-feeder", "ersatz-named"],
+)
+def test_rail_replacement_bus_is_still_a_problem(tw, change, key):
+    found, c, _ = assess_feed(tw, FEED_OUT, feeder_out(change))
+    assert key in [k for k, _ in found]
+    assert next(t for k, t in found if k == key).startswith("replacement bus: ")

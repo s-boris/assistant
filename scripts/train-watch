@@ -35,7 +35,8 @@ the same train: search.ch may take another tram to the station or another walk a
               one run when the departure is under 25 min away)
   delay       departure or arrival 5 min or more late (buckets 5/15/30/60: a worse bucket notes again)
   platform    a ride leaves from another platform than planned
-  bus         a replacement bus (category EV / "Ersatz"), or a bus where the plan had trains only
+  bus         a replacement bus (category EV / EXB / "Ersatz"), or an unplanned bus in place of a train (between
+              trains, or with a planned train missing); a regular bus before or after the planned trains is fine
   timetable   the scheduled arrival is 5 min or more later than the planned one
   transfer    a change shrinks below 2 min
 A new problem writes ONE ~/inbox/train-watch-<id>-<epoch>.md: the leg, what changed, and a suggested alternative
@@ -118,8 +119,14 @@ NAME_NOISE = {'airport', 'aeroport', 'aeroporto', 'flughafen', 'station', 'bahnh
               'bf', 'sbb', 'cff', 'ffs', 'centraal', 'central', 'centrale', 'centre', 'zentrum', 'city', 'main',
               'nord', 'noord', 'north', 'sud', 'zuid', 'south', 'ost', 'oost', 'east', 'west', 'midi', 'the', 'de'}
 BUS_CATS = {'B', 'BN', 'BUS', 'NFB', 'KB', 'EXB', 'BP', 'EV'}
+REPLACEMENT_CATS = {'EV', 'EXB'}            # Ersatzverkehr / Extrabus: rail replacement, never a regular line
 TRAM_CATS = {'T', 'TN', 'TRAM'}
-LINE_RE = re.compile(r'(?i:\b(?:bus|tram)\s+[A-Z]?\d+[A-Z]?\b)|\b(?:SN|S|ICN|ICE|IC|IR|RE|R|EC|EN|NJ|TGV|RJX|RJ|PE)\d{1,4}\b')
+# a planned line: "Bus 7" / "Tram 10", the compact category form `route` and the SBB app write ("B7", "T10", "EV 5"),
+# or a train ("S24", "IC8")
+LINE_RE = re.compile(r'(?i:\b(?:bus|tram)\s+[A-Z]?\d+[A-Z]?\b)'
+                     r'|\b(?:(?:EXB|NFB|BN|BP|KB|B|TN|T)\d{1,4}|EV\s?\d{1,4})[A-Z]?\b'
+                     r'|\b(?:SN|S|ICN|ICE|IC|IR|RE|R|EC|EN|NJ|TGV|RJX|RJ|PE)\d{1,4}\b')
+COMPACT_RE = re.compile(r'(EXB|NFB|BN|BP|KB|EV|B|TN|T)\s?(\d+[A-Z]?)')
 LINK_RE = re.compile(r'https://app\.sbbmobile\.ch/timetable\?[^\s)>\]]+')
 
 
@@ -237,15 +244,25 @@ def is_busline(s):
 
 
 # ------------------------------------------------------------------------------------------------ calendar import
+def canon_line(tok):
+    """A LINE_RE match as line_name() names the ride: 'B7' / 'bus 7' -> 'Bus 7', 'T10' -> 'Tram 10', 'EV5' -> 'EV 5'."""
+    m = COMPACT_RE.fullmatch(tok)
+    if m:
+        cat, num = m.groups()
+        return f"{'EV' if cat == 'EV' else 'Tram' if cat in ('T', 'TN') else 'Bus'} {num}"
+    w = tok.split()
+    return f'{w[0].capitalize()} {w[1]}' if len(w) == 2 else w[0]
+
+
 def parse_lines(text):
-    """Planned lines from a 🚆 description's first line ('16:58 Bus 21 › RE48 X › IC8 Y …'), one per part."""
+    """Planned lines from a 🚆 description's first line ('16:58 Bus 21 › RE48 X › IC8 Y …',
+    '18:10 B7 X › 18:18 S24 Y …'), one per part."""
     first = (str(text or '').strip().splitlines() or [''])[0]
     out = []
     for part in first.split('›'):
         m = LINE_RE.search(part)
         if m:
-            w = m.group(0).split()
-            out.append(f'{w[0].capitalize()} {w[1]}' if len(w) == 2 else w[0])
+            out.append(canon_line(m.group(0)))
     return out
 
 
@@ -272,7 +289,7 @@ def from_event(e):
         a, b = (x.strip() for x in body.split('→', 1))
         lm = re.match(r'^(\S+)\s+(.+)$', a)
         if lm and LINE_RE.fullmatch(lm.group(1)):
-            title_lines, a = [lm.group(1)], lm.group(2)
+            title_lines, a = [canon_line(lm.group(1))], lm.group(2)
         src, dst = a, b
     body = re.sub(r'\s*\([^)]*\)\s*$', '', summary.replace(TRAIN_ICON, '')).strip()
     if '→' in body:                                       # "Home → B": door to door, whatever stop the link names
@@ -522,7 +539,7 @@ def ride(s):
     return {'line': line_name(j), 'from': stname(d), 'at': stname(a), 'sdep': sd, 'sarr': sa,
             'dep': sd + dd * MIN, 'arr': sa + ad * MIN, 'ddelay': dd, 'adelay': ad,
             'platform': pl, 'new_platform': new_pl if new_pl and new_pl != pl else '',
-            'bus': cat in BUS_CATS, 'ev': cat == 'EV' or 'ersatz' in text,
+            'bus': cat in BUS_CATS, 'ev': cat in REPLACEMENT_CATS or 'ersatz' in text,
             'cancelled': flagged_cancel(s, j, d, a)}
 
 
@@ -665,9 +682,13 @@ def problems(g, c, st):
                         f"platform change at {r['from']}: {r['line']} now leaves from pl {r['new_platform']}{was}"))
     known = set(planned) | set(st.get('baseline') or [])
     trains_only = bool(g.get('lines')) and not any(is_busline(x) for x in g['lines'])
-    for r in c['rides']:
+    rail = [i for i, r in enumerate(c['rides']) if not r['bus'] and not norm_line(r['line']).startswith('tram')]
+    planned_rail = {x for x in planned if not x.startswith(('bus', 'ev', 'tram'))}
+    rail_kept = bool(rail) and planned_rail <= {norm_line(c['rides'][i]['line']) for i in rail}
+    for i, r in enumerate(c['rides']):
         ln = norm_line(r['line'])
-        if r['ev'] or (r['bus'] and (ln not in known or (trains_only and ln not in planned))):
+        feeder = rail_kept and (i < rail[0] or i > rail[-1])   # a regular bus to or from the planned trains
+        if r['ev'] or (r['bus'] and not feeder and (ln not in known or (trains_only and ln not in planned))):
             out.append((f"bus:{r['from']}", f"replacement bus: {r['line']} {r['from']} {hm(r['sdep'])} → "
                                              f"{r['at']} {hm(r['sarr'])} instead of the train"))
     arr = iso(g.get('arr'))
