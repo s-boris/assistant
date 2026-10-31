@@ -610,3 +610,15 @@ def test_a_season_search_that_times_out_twice_goes_per_episode(tv, capsys):
     r = rows_of(capsys)["rows"]["6:1"]
     assert r["mode"] == "episodes" and len(r["picks"]) == 3
     assert sum(1 for _s, _m, p in fake.calls if p == "/api/v3/release?seriesId=6&seasonNumber=1") == 2
+
+
+def test_a_sample_counts_the_episodes_its_picks_cover(tv, capsys):
+    """An episode search can return other episodes' releases: the estimate's base includes the files they cover."""
+    fake = world()
+    s = fake.routes["sonarr"]
+    s["/api/v3/release?episodeId=701"] = s["/api/v3/release?episodeId=701"] + s["/api/v3/release?episodeId=702"]
+    mod = tv(fake=fake)
+    assert plan(mod, "--series", "6", "--ep-sample", "1") == 0
+    r = rows_of(capsys)["rows"]["6:1"]
+    assert r["sampled"] and len(r["picks"]) == 2 and r["sample_size"] == 20 * G
+    assert r["est_saved"] == 18 * G  # 12 GB saved on 20 GB -> 60 % of 30 GB, never more than the season

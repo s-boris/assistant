@@ -435,7 +435,7 @@ def search(unit, ep_limit=None, pause=None):
                 raise
             if attempt == 1 and pause:    # the gateway gives up after 30 s; the indexers' cache often answers
                 pause()                   # the second ask at once
-    rs, done = [], 0
+    rs, done, searched = [], 0, []
     for f in sorted(unit['files'], key=lambda f: -f['size']):
         if ep_limit is not None and done >= ep_limit:
             break
@@ -444,12 +444,13 @@ def search(unit, ep_limit=None, pause=None):
         if done and pause:
             pause()
         done += 1
+        searched.append(f['id'])
         try:
             rs += sonarr(f'/api/v3/release?episodeId={f["ep_ids"][0]}', timeout=SEARCH_TIMEOUT) or []
         except ApiError as e:
             if not (TOO_LARGE.search(str(e)) or SLOW.search(str(e))):
                 raise
-    return rs, 'episodes', done
+    return rs, 'episodes', (done, searched)
 
 
 def evaluate(unit, prof, ep_limit=None, pause=None):
@@ -460,8 +461,12 @@ def evaluate(unit, prof, ep_limit=None, pause=None):
                checked=int(now()), picks=picks, saved=sum(p['old_size'] - p['size'] for p in picks))
     row['covered'] = sum(p['old_size'] for p in picks)
     if mode == 'episodes':
-        row['searched_eps'] = done
-        row['sampled'] = done < len([f for f in unit['files'] if f['ep_ids']])
+        row['searched_eps'], row['searched_files'] = done
+        row['sampled'] = done[0] < len([f for f in unit['files'] if f['ep_ids']])
+        # the estimate's base: the files searched plus those the picks cover (an episode search also returns
+        # releases of other episodes of the season)
+        seen = set(row['searched_files']) | {i for p in picks for i in p['files']}
+        row['sample_size'] = sum(f['size'] for f in unit['files'] if f['id'] in seen)
     if reason:
         row['reason'] = reason
         if unit['target'] == '2160p':   # for the owner's call only: what a WEB 1080p would save (never grabbed)
@@ -843,8 +848,6 @@ def do_plan(a):
             row = {k: u[k] for k in ('sid', 'title', 'year', 'season', 'profile', 'target', 'size', 'need')}
             row.update(eps=sum(max(1, len(f['eps'])) for f in u['files']), files=len(u['files']), picks=None,
                        saved=0, reason=f'search failed: {e}'[:200], checked=int(now()))
-        if row.get('sampled'):
-            row['sample_size'] = sum(f['size'] for f in sorted(u['files'], key=lambda f: -f['size'])[:a.ep_sample])
         rows[season_key(u)] = row
         if not a.json:
             print(row_line(row) if row.get('picks') is not None else f'- {row["title"]} S{row["season"]:02d}: '
