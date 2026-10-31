@@ -44,6 +44,7 @@ import secrets
 import subprocess
 import sys
 import time
+import urllib.parse
 
 LIVE_CDP_PORT = "9222"
 SVC_CDP_PORT = "9223"   # the browser service's front (browsersvc.PORT; the hub's claude-hub-browser:9223 too)
@@ -96,16 +97,19 @@ def _route():
 
 
 CDP_ROUTE = _route()
+CDP_HOST = "127.0.0.1"
 if CDP_ROUTE:
     CDP_PORT = str(CDP_ROUTE["port"])
+    # the hub route names its own host (claude-hub-browser); localhost only for a direct Chrome
+    CDP_HOST = urllib.parse.urlsplit(CDP_ROUTE.get("cdp") or "").hostname or "127.0.0.1"
 SF_STATE = _o("SECUREFILL_STATE", f"{HOME}/.local/state/securefill")
 CONFIG = f"{STATE}/config.json"                  # an empty config: no user (~/.agent-browser) or project config
 POLICY = f"{STATE}/policy.json"
 POLICY_BODY = {"default": "allow", "deny": ["state", "network", "upload", "download"]}
 FEATURE = "bin.abx"
 NODE_NEWWIN = r"""
-const [port, url] = process.argv.slice(1);
-const v = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
+const [port, url, host] = process.argv.slice(1);
+const v = await (await fetch(`http://${host || '127.0.0.1'}:${port}/json/version`)).json();
 const ws = new WebSocket(v.webSocketDebuggerUrl);
 ws.onopen = () => ws.send(JSON.stringify({id: 1, method: 'Target.createTarget', params: {url, newWindow: true}}));
 ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id === 1) { console.log(m.result ? m.result.targetId : ''); process.exit(m.result ? 0 : 1); } };
@@ -235,7 +239,8 @@ def ensure_dirs():
 
 def env():
     e = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "LC_ALL", "TZ")}
-    e.update(AGENT_BROWSER_SOCKET_DIR=SOCK, AGENT_BROWSER_CDP=str(CDP_PORT), AGENT_BROWSER_PIN_TAB="1",
+    cdp = str(CDP_PORT) if CDP_HOST == "127.0.0.1" else f"http://{CDP_HOST}:{CDP_PORT}"
+    e.update(AGENT_BROWSER_SOCKET_DIR=SOCK, AGENT_BROWSER_CDP=cdp, AGENT_BROWSER_PIN_TAB="1",
              AGENT_BROWSER_IDLE_TIMEOUT_MS="1800000", AGENT_BROWSER_CONTENT_BOUNDARIES="1",
              AGENT_BROWSER_MAX_OUTPUT="60000", AGENT_BROWSER_NO_WEBMCP="1", AGENT_BROWSER_NO_AUTO_DIALOG="1",
              AGENT_BROWSER_SCREENSHOT_DIR=OUT_DIR, AGENT_BROWSER_ACTION_POLICY=POLICY, AGENT_BROWSER_CONFIG=CONFIG)
@@ -289,14 +294,14 @@ def save(sid, rec):
 
 def cdp_pages():
     import urllib.request
-    with urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json/list", timeout=5) as r:
+    with urllib.request.urlopen(f"http://{CDP_HOST}:{CDP_PORT}/json/list", timeout=5) as r:
         return [t for t in json.load(r) if t.get("type") == "page"]
 
 
 def cdp_get(path):
     import urllib.request
     try:
-        urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}{path}", timeout=3).read()
+        urllib.request.urlopen(f"http://{CDP_HOST}:{CDP_PORT}{path}", timeout=3).read()
     except OSError:
         pass
 
@@ -343,7 +348,7 @@ def start(argv):
     t0 = time.time()
     sid = "ab-" + secrets.token_hex(3)
     try:
-        r = subprocess.run(["node", "--input-type=module", "-e", NODE_NEWWIN, str(CDP_PORT), url or "about:blank"],
+        r = subprocess.run(["node", "--input-type=module", "-e", NODE_NEWWIN, str(CDP_PORT), url or "about:blank", CDP_HOST],
                            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, cwd=STATE)
     except (OSError, subprocess.TimeoutExpired):
         die("could not open a window over CDP (browser start?)", 1)
