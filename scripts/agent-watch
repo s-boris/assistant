@@ -710,7 +710,7 @@ def report_crash(cmd):
             seen[sig] = now
             write_note('crash', sig, f"agent-watch {cmd} crashed: {type(exc).__name__}: {str(exc)[:200]}\n"
                                      f"Traceback in {LOG}. The watchdog is blind until this is fixed. Next: read the traceback and fix "
-                                     "~/bin/agent-watch on a copy (tests: test-all --suite agent-watch).", now)
+                                     "~/bin/agent-watch on a copy (tests: tests/ops/test_agent_watch.py).", now)
             os.makedirs(STATE_DIR, exist_ok=True)
             with open(ERRORS, 'w') as f:
                 json.dump({k: v for k, v in seen.items() if now - v < 7 * 86400}, f)

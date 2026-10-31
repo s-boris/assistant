@@ -932,8 +932,6 @@ src = "scripts/browser"
 dest = "bin/browser"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
-suite = "browser"
-seam = "BROWSER_BIN"
 
 # codebase-sync: its precheck gates every land (ops/assistant.py _precheck_only: a change to it or to this manifest = the whole would-be home)
 [[file]]
@@ -1066,8 +1064,6 @@ src = "scripts/agent-watch"
 dest = "bin/agent-watch"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
-suite = "agent-watch"
-seam = "AGENT_WATCH_BIN"
 
 # agentfeed: the dashboard Agents tab's rows and its ONE privacy filter clean() (dash-data embeds
 # it, flowd streams it); a renamed agent's card shows its title (agent-watch --json "title"), through clean(). Ruff
@@ -1240,8 +1236,6 @@ src = "scripts/watch"
 dest = "bin/watch"
 mode = "0755"
 smoke = "{dest} --help >/dev/null"
-suite = "watch"
-seam = "WATCH_BIN"
 
 [[file]]
 src = "scripts/eventwf"
