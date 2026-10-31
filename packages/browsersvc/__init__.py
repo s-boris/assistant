@@ -15,7 +15,7 @@ Decision (Gate.decide), the web agent's rules (webagent.guard) plus the token:
   a booking/order task's intermediate soft step (send/confirm/settings while every active task is a running
   booking/order task) -> allow; a terms checkbox during a task -> deny (his ✅ covers --tick boxes; securefill ticks);
   Enter in a text field during a task -> deny;
-  any other commit -> the approved (or executing) web task whose pending label it matches, and that task's TOKEN:
+  any other commit -> the approved (or executing) web task whose pending label equals its name, and that task's TOKEN:
   his hub-held approval for exactly this stop (state used, used by webagent:<task>, the sha256 of the task's
   canonical action, used within APPROVED_WINDOW) plus a single-use receipt on the hub (ledger row webtask.commit,
   idem key commit:<nonce>: the first claim wins, a second is refused). No match or no token -> deny.
@@ -382,7 +382,7 @@ class Gate:
             return Decision(False, "terms box during a web task (--tick)", c)
         if self.tasks.auto_soft(c, active):
             return Decision(True, "auto_soft", c)
-        t = self.tasks.match(label)
+        t = self.tasks.match(label, role)
         if t is None:
             return Decision(False, "no approved web task matches", c)
         ok, why = self.tokens.take(t, self.tasks)
@@ -422,13 +422,15 @@ class WebagentTasks:
             and all(a.get("kind") in self.wa.SUMMARY_KINDS and self.wa.effective(a) == "running" for a in active)
         )
 
-    def match(self, text: str) -> dict[str, Any] | None:
+    def match(self, text: str, role: str = "") -> dict[str, Any] | None:
+        """The approved (or executing) task whose label equals this element's accessible name (text) exactly; a
+        toggle or text field (role) never matches."""
         for t in self.wa.all_tasks():
             if (
                 self.wa.effective(t) in ("approved", "executing")
                 and t.get("approval")
-                and self.wa._matches(t, text, None)
-            ):  # noqa: SLF001
+                and self.wa._matches(t, text, None, role or None, [text])  # noqa: SLF001
+            ):
                 return t
         return None
 

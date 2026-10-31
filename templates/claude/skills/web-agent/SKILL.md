@@ -65,7 +65,8 @@ Web task <id> (state: `webagent status <id>`): <task>. Start: <url>. Facts: <acc
   counts too). Then `abx -s $SID screenshot` → `webagent stop <id> --label "<exact button text>" --what "<what
   happens, one line>" --shot <png> [--target "<selector>"] [--verify "<what success looks like>"] [--tick "<label>"]`;
   booking/order also `--summary "<what, dates, people>" --amount "<exact total>" --declined "<extras>"`.
-  End your turn with: STOP <id> and the printed card JSON.
+  End your turn with: STOP <id> and the printed card JSON. After his ✅ only an element whose whole name equals
+  that label passes (case and quotes aside; never a longer name or a checkbox).
 - Never work around a gate block (no JS clicks, Enter, coordinate clicks or other tools).
 - Read-only task: `webagent done <id> --note "<answer>"`, `abx stop -s $SID`, report DONE.
 ```

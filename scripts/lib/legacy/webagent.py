@@ -1493,18 +1493,67 @@ def _glog(rec):
         pass
 
 
-def _matches(t, text, target):
+# The approved click: the element's whole name equals the approved label (case, whitespace, surrounding quotes and
+# punctuation aside), never a part of it ("Senden" does not pass "Kopie an x senden"). An element description may
+# carry its role as a word ("Senden button", 'button "Senden"'); toggles and text fields never match a label.
+ROLE_WORDS = {"button": "button", "btn": "button", "schaltfläche": "button", "knopf": "button", "bouton": "button",
+              "pulsante": "button", "link": "link", "hyperlink": "link", "checkbox": "checkbox",
+              "check box": "checkbox", "check-box": "checkbox", "kontrollkästchen": "checkbox", "radio": "radio",
+              "radio button": "radio", "radiobutton": "radio", "switch": "switch", "toggle": "switch",
+              "schalter": "switch", "menu item": "menuitem", "menuitem": "menuitem", "tab": "tab", "option": "option",
+              "textbox": "textbox", "text box": "textbox", "text field": "textbox", "textfeld": "textbox",
+              "eingabefeld": "textbox", "combobox": "combobox",
+              "dropdown": "combobox"}
+NO_LABEL_ROLES = {"checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio", "textbox", "searchbox",
+                  "combobox", "spinbutton", "slider"}
+_ROLE_ALT = "|".join(re.escape(w) for w in sorted(ROLE_WORDS, key=len, reverse=True))
+_ARTICLE_RX = re.compile(r"^(?:the|der|die|das|den|le|la|il)\s+")
+_ROLE_PREFIX_RX = re.compile(rf"^({_ROLE_ALT})(?![\w])[\s:\-–—]*(.+)$")
+_ROLE_SUFFIX_RX = re.compile(rf"^(.+?)[\s\-–—]+({_ROLE_ALT})$")
+_EDGE_RX = re.compile(r"^[\W_]+|[\W_]+$")
+
+
+def label_key(s):
+    """A label for equality: norm() plus surrounding quotes and punctuation off ('„Senden“ ' == 'senden')."""
+    n = norm(s)
+    return _EDGE_RX.sub("", n) or n
+
+
+def _named(text):
+    """(role word or None, name) readings of an element description: as is, and with a role word split off."""
+    k = _ARTICLE_RX.sub("", label_key(text))
+    out = [(None, k)]
+    for rx, ri, ni in ((_ROLE_PREFIX_RX, 1, 2), (_ROLE_SUFFIX_RX, 2, 1)):
+        m = rx.match(k)
+        if m:
+            out.append((ROLE_WORDS[m.group(ri)], _ARTICLE_RX.sub("", label_key(m.group(ni)))))
+    return out
+
+
+def _matches(t, text, target, role=None, names=None):
+    """Is this click the approved one? target: the call's selector (equal to the stop's --target passes); role: the
+    element's real role when the caller knows it (abx, browsersvc); names: its real accessible-name parts (abx's
+    name / text / aria-label / title / alt / value, browsersvc's name), else text is the element description."""
     p = t.get("pending") or {}
     if p.get("target") and target and str(target).strip() == p["target"]:
         return True
-    lab = norm(p.get("label"))
-    return bool(lab) and lab in norm(text)
+    lab = label_key(p.get("label"))
+    if not lab:
+        return False
+    if role and norm(role) in NO_LABEL_ROLES:
+        return False
+    if names is not None:
+        return any(label_key(n) == lab for n in names if n)
+    reads = _named(text)
+    if any(r in NO_LABEL_ROLES for r, _ in reads):
+        return False
+    return any(n == lab for _, n in reads)
 
 
-def _consume(text, target, tool):
+def _consume(text, target, tool, role=None, names=None):
     """An approved task whose pending action is this one: mark it executing (one use) and return it."""
     for t in all_tasks():
-        if t.get("state") != "approved" or effective(t) != "approved" or not _matches(t, text, target):
+        if t.get("state") != "approved" or effective(t) != "approved" or not _matches(t, text, target, role, names):
             continue
         with Lock(t["id"]):
             t = load(t["id"])
@@ -1559,12 +1608,18 @@ def guard(event):
                 a.get("kind") in SUMMARY_KINDS and effective(a) == "running" for a in active):
             _glog(dict(rec, decision="allow", why="auto_soft"))     # booking/order: intermediate steps run unasked
             return None
+        # the name to compare: the element description (not its selector); abx hands over the element's real role
+        # and name parts (only abx's own events carry them, an MCP call's input never counts as such)
+        role = names = None
+        if str(event.get("agent_id") or "").startswith("abx:") and isinstance(ti.get("names"), list):
+            role, names = str(ti.get("role") or ""), [str(n) for n in ti["names"]]
+        mtext = str(ti.get("element") or "") or text
         cardt = [a for a in active if effective(a) == "approved" and (a.get("pending") or {}).get("card")
-                 and _matches(a, text, ti.get("target"))]
+                 and _matches(a, mtext, ti.get("target"), role, names)]
         if cardt:
             return _deny(f"card payment step: run `securefill commit {cardt[0]['id']}` (it fills the card from the "
                          "vault and clicks this button itself)", rec)
-        t = _consume(text, ti.get("target"), tool)
+        t = _consume(mtext, ti.get("target"), tool, role, names)
         if t:
             _glog(dict(rec, decision="allow", task=t["id"]))
             return None

@@ -122,9 +122,9 @@ class FakeTasks:
     def auto_soft(self, c, active):
         return c.get("tier") == "soft" and bool(active) and all(a.get("kind") == "order" for a in active)
 
-    def match(self, text):
+    def match(self, text, role=""):
         a = self.approved
-        return a if a and a["label"].lower() in text.lower() else None
+        return a if a and a["label"].lower() == text.lower() and role not in ("checkbox", "radio") else None
 
     def action(self, t):
         return "action:" + t["id"]

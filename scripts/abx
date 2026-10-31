@@ -145,7 +145,8 @@ FOCUS_JS = r"""(() => {
     (t === 'input' && (btn.includes(ty) || ty === 'checkbox' || ty === 'radio')) || roles.includes(role);
   const kind = role || (t === 'input' ? (ty === 'checkbox' || ty === 'radio' ? ty : (btn.includes(ty) ? 'button' : 'textbox'))
     : (t === 'a' ? 'link' : t));
-  return {clickable, role: kind, label: [...new Set(parts.filter(Boolean))].join(' ').slice(0, 400)};
+  const names = [...new Set(parts.filter(Boolean))];
+  return {clickable, role: kind, label: names.join(' ').slice(0, 400), names: names.slice(0, 12)};
 })()"""
 
 GET_SUBS = {"text", "html", "value", "attr", "title", "url", "count", "box", "styles"}
@@ -421,7 +422,8 @@ def no_dialog(sid, verb):
 
 
 def ref_label(sid, rec, ref, verb):
-    """Role + accessible name from this session's own snapshot + the live text/attributes. Unknown ref -> deny."""
+    """Role, label (role + name parts in one line, for the classifier) and the name parts (snapshot name, live text,
+    aria-label, title, alt, a button's value: the approved label must equal one of them) of this session's ref."""
     r = ref.lstrip("@")
     known = (rec.get("refs") or {}).get(r)
     if known is None or rec.get("refs_pid") != daemon_pid(sid):
@@ -443,7 +445,7 @@ def ref_label(sid, rec, ref, verb):
         v = re.sub(r"\s+", " ", str(v)).strip()[:200] if v is not None else ""
         if v and v not in parts:
             parts.append(v)
-    return role, " ".join(p for p in parts if p)
+    return role, " ".join(p for p in parts if p), [p for p in parts[1:] if p]
 
 
 def focused(sid, verb):
@@ -485,10 +487,14 @@ def gate_js(sid, verb, code):
     guard(sid, verb, "evaluate", {"function": code})
 
 
-def gate_click(sid, verb, label):
+def gate_click(sid, verb, label, role=None, names=None):
+    """role + names: the element's real role and name parts; an approved step passes only on an exact name."""
     if verb in ("check", "uncheck") and "checkbox" not in label.lower():
-        label = "checkbox " + label
-    guard(sid, verb, "click", {"element": label, "target": ""})
+        label, role = "checkbox " + label, "checkbox"
+    ti = {"element": label, "target": ""}
+    if names is not None:
+        ti.update(role=role or "", names=list(names))
+    guard(sid, verb, "click", ti)
 
 
 def gate_keys(sid, verb, keys_text, is_key):
@@ -502,7 +508,8 @@ def gate_keys(sid, verb, keys_text, is_key):
         return
     f = focused(sid, verb)
     if f.get("clickable"):
-        gate_click(sid, verb, f"{f.get('role') or ''} {f.get('label') or ''}".strip())
+        gate_click(sid, verb, f"{f.get('role') or ''} {f.get('label') or ''}".strip(), f.get("role") or "",
+                   [str(n) for n in (f.get("names") or []) if n])
     elif enter:
         guard(sid, verb, "press_key", {"key": "Enter"})
 
@@ -510,13 +517,13 @@ def gate_keys(sid, verb, keys_text, is_key):
 def gate_type(sid, rec, verb, ref, text):
     if card_like(text):
         deny("card numbers and IBANs are never typed by an agent (securefill fills cards; IBANs: never)", verb, "card")
-    role, label = ref_label(sid, rec, ref, verb)
+    role, label, names = ref_label(sid, rec, ref, verb)
     d = abj(sid, ["get", "attr", "@" + ref.lstrip("@"), "type"], timeout=15) or {}
     if str(d.get("value") or "").lower() == "password" or SECRET_FIELD.search(label):
         deny("passwords, card numbers, CVCs and IBANs are never typed by an agent (his login: hand-off; card: "
              "securefill commit)", verb, "secret_field")
     if role in CLICKABLE_ROLES:                # typing into a button presses it
-        gate_click(sid, verb, label)
+        gate_click(sid, verb, label, role, names)
     if re.search(r"[\r\n]", text):
         guard(sid, verb, "type", {"element": label, "text": "", "submit": True})
 
@@ -525,7 +532,8 @@ def gate(sid, rec, verb, args):
     pos = args
     if verb in ("click", "dblclick", "check", "uncheck"):
         no_dialog(sid, verb)
-        gate_click(sid, verb, ref_label(sid, rec, pos[0], verb)[1])
+        role, label, names = ref_label(sid, rec, pos[0], verb)
+        gate_click(sid, verb, label, role, names)
     elif verb in ("fill", "type"):
         no_dialog(sid, verb)
         gate_type(sid, rec, verb, pos[0], pos[1] if len(pos) > 1 else "")
